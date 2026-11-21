@@ -272,7 +272,11 @@ async fn handle_request(
             if let Ok(drafts) = cache.list_drafts() {
                 let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
             }
-            if let Ok(page) = cache.list_unified_inbox("", 0, 100) {
+            // 初始页大小跟随用户偏好设置（读取失败回退 100）。
+            let page_size = config::load_preferences_in(data_dir)
+                .map(|p| p.page_size)
+                .unwrap_or(100);
+            if let Ok(page) = cache.list_unified_inbox("", 0, page_size) {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
         }
