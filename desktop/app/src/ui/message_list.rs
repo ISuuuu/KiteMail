@@ -18,7 +18,7 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{ContextMenu, ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Disableable, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
@@ -130,11 +130,13 @@ fn row_context_menu(
                         this.archive_message(account_id, message_id, cx);
                     });
                 }))
-                .item(PopupMenuItem::new("标记为垃圾邮件").on_click(move |_, _, cx| {
-                    entity_for_spam.update(cx, |this, cx| {
-                        this.mark_spam_message(account_id, message_id, cx);
-                    });
-                }))
+                .item(
+                    PopupMenuItem::new("标记为垃圾邮件").on_click(move |_, _, cx| {
+                        entity_for_spam.update(cx, |this, cx| {
+                            this.mark_spam_message(account_id, message_id, cx);
+                        });
+                    }),
+                )
                 .submenu("移动到文件夹...", window, cx, move |mut sub, _, _| {
                     if folders_for_move.is_empty() {
                         sub = sub.item(PopupMenuItem::new("暂无可用文件夹").disabled(true));
@@ -230,15 +232,17 @@ fn message_row(
         .when(is_selected, |row| row.bg(p.accent))
         .on_click({
             let draft = draft.clone();
-            cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| match draft.as_ref() {
-                // 草稿行：点击进入写信编辑。
-                Some(d) => this.open_local_draft(d, window, cx),
-                None => {
-                    if event.modifiers().control {
-                        this.toggle_message_selection(msg_id, cx);
-                    } else {
-                        this.selected_message_ids.clear();
-                        this.select_message(account_id, msg_id, uid, unread, &folder_path, cx);
+            cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                match draft.as_ref() {
+                    // 草稿行：点击进入写信编辑。
+                    Some(d) => this.open_local_draft(d, window, cx),
+                    None => {
+                        if event.modifiers().control {
+                            this.toggle_message_selection(msg_id, cx);
+                        } else {
+                            this.selected_message_ids.clear();
+                            this.select_message(account_id, msg_id, uid, unread, &folder_path, cx);
+                        }
                     }
                 }
             })
@@ -398,7 +402,11 @@ fn message_row(
     let account_folders: Vec<(String, String)> = app
         .folders_by_account
         .get(&account_id)
-        .map(|list| list.iter().map(|f| (f.name.clone(), f.path.clone())).collect())
+        .map(|list| {
+            list.iter()
+                .map(|f| (f.name.clone(), f.path.clone()))
+                .collect()
+        })
         .unwrap_or_default();
     row_context_menu(row, msg, draft, account_folders, app.demo_mode, cx)
 }
@@ -413,8 +421,10 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let has_search_query = !app.search_query.trim().is_empty();
     let cross_folder_search = has_search_query && app.search_scope == SearchScope::AllFolders;
     // 本地草稿视图（真实账号）：从 self.drafts 合成列表行（跨文件夹搜索时不拦截）。
-    let drafts_view = app.current_view == CurrentView::Drafts && !app.demo_mode && !cross_folder_search;
-    let show_account_tag = (app.current_view.is_unified() || cross_folder_search) && app.accounts.len() > 1;
+    let drafts_view =
+        app.current_view == CurrentView::Drafts && !app.demo_mode && !cross_folder_search;
+    let show_account_tag =
+        (app.current_view.is_unified() || cross_folder_search) && app.accounts.len() > 1;
     let current_sort = app.list_sort;
     let quick_filters = app.quick_filters;
     let is_unified_list = !drafts_view;
@@ -522,7 +532,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         app.current_page.total + extra_remote_count
     };
     let has_more_local = !drafts_view && loaded_count < app.current_page.total;
-    let has_more_remote = !drafts_view && !cross_folder_search && app.current_view_has_more_remote();
+    let has_more_remote =
+        !drafts_view && !cross_folder_search && app.current_view_has_more_remote();
     let has_more = has_more_local || has_more_remote;
     let is_loading_more = !drafts_view && (app.loading_more_local || app.loading_more_remote);
 
@@ -658,10 +669,12 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             })
     };
 
-    let can_search_server =
-        !app.demo_mode && app.search_query.trim().chars().count() >= 2;
+    let can_search_server = !app.demo_mode && app.search_query.trim().chars().count() >= 2;
     let search_scope = app.search_scope;
     let server_loading = app.server_search_loading;
+    let search_open = app.search_open;
+    // 搜索栏行显示条件：点 🔍 / Ctrl+F 展开时，或已有搜索词时（保持范围胶囊可见）。
+    let show_search_bar = search_open || has_search_query;
 
     v_flex()
         .w(px(LIST_WIDTH))
@@ -670,7 +683,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .bg(surface)
         .border_r_1()
         .border_color(border)
-        // 顶部栏 48px（与左栏、右栏对齐）：折叠开关 + 搜索框 + 计数 + 筛选下拉。
+        // 顶部栏 48px（与左栏、右栏对齐）：折叠开关 + 🔍 图标 + 计数 + 筛选下拉。
+        // 搜索框收纳进顶栏下方按需展开的搜索栏行（对齐原版 L-3）。
         .child(
             h_flex()
                 .h(px(HEADER_HEIGHT))
@@ -680,20 +694,6 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .items_center()
                 .border_b_1()
                 .border_color(border)
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                    // Esc 清空搜索；Enter 在搜索词长度 >= 2 时触发服务端在线搜索。
-                    if event.keystroke.key == "escape" {
-                        this.search_input.update(cx, |s, cx| {
-                            s.set_value("", window, cx);
-                        });
-                        this.search_query = String::new();
-                        this.clear_server_search();
-                        this.reset_list_pagination();
-                        this.reload_current_page(cx);
-                    } else if event.keystroke.key == "enter" {
-                        this.trigger_server_search(cx);
-                    }
-                }))
                 .child(
                     Button::new("list-toggle-sidebar")
                         .ghost()
@@ -709,14 +709,22 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         })),
                 )
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&app.search_input)),
+                    Button::new("list-search-toggle")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Search)
+                        .tooltip("搜索邮件（Ctrl+F）")
+                        .selected(search_open)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // 再点 🔍 收起（有搜索词时范围胶囊行保持显示）。
+                            this.search_open = !this.search_open;
+                            cx.notify();
+                        })),
                 )
                 .child(
                     h_flex()
-                        .flex_shrink_0()
+                        .flex_1()
+                        .min_w_0()
                         .h_full()
                         .items_center()
                         .window_control_area(WindowControlArea::Drag)
@@ -729,8 +737,9 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 )
                 .when(is_unified_list, |el| el.child(filter_menu_button)),
         )
-        // 搜索有内容时显示范围切换胶囊（当前视图 / 全部文件夹 + 搜服务器按钮）。
-        .when(has_search_query, |el| {
+        // 搜索栏行（顶栏下方）：搜索框 + 范围切换胶囊（当前视图 / 全部文件夹）
+        // + 服务端搜索按钮；Esc 清空并收起，Enter 触发服务端在线搜索。
+        .when(show_search_bar, |el| {
             el.child(
                 h_flex()
                     .h(px(34.0))
@@ -740,9 +749,31 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     .items_center()
                     .border_b_1()
                     .border_color(border)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        // Esc 清空搜索并收起；Enter 在搜索词长度 >= 2 时触发服务端在线搜索。
+                        if event.keystroke.key == "escape" {
+                            this.search_open = false;
+                            this.search_input.update(cx, |s, cx| {
+                                s.set_value("", window, cx);
+                            });
+                            this.search_query = String::new();
+                            this.clear_server_search();
+                            this.reset_list_pagination();
+                            this.reload_current_page(cx);
+                        } else if event.keystroke.key == "enter" {
+                            this.trigger_server_search(cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&app.search_input)),
+                    )
                     .child(
                         div()
                             .id("search-scope-this")
+                            .flex_shrink_0()
                             .px_2()
                             .py_0p5()
                             .rounded_full()
@@ -766,6 +797,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     .child(
                         div()
                             .id("search-scope-all")
+                            .flex_shrink_0()
                             .px_2()
                             .py_0p5()
                             .rounded_full()
@@ -786,7 +818,6 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             }))
                             .child("全部文件夹"),
                     )
-                    .child(div().flex_1())
                     .when(can_search_server, |bar| {
                         bar.child(
                             Button::new("search-server-btn")
@@ -975,14 +1006,11 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                                 )
                                             })
                                             .when(!is_loading_more && !has_more, |f| {
-                                                f.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(muted_fg)
-                                                        .child(SharedString::from(format!(
-                                                            "已加载全部 {total} 封邮件"
-                                                        ))),
-                                                )
+                                                f.child(div().text_xs().text_color(muted_fg).child(
+                                                    SharedString::from(format!(
+                                                        "已加载全部 {total} 封邮件"
+                                                    )),
+                                                ))
                                             }),
                                     )
                                 }),

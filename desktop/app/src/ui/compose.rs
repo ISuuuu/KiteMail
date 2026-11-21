@@ -1,8 +1,8 @@
 //! 写信 / 回复面板（方案文档第三节页面 3）：
-//! - 顶部操作栏：标题（写新邮件 / 回复邮件）+ 发件账号胶囊切换（多账号时）
-//!   + 右侧「存草稿 / 添加附件 / 取消 / 发送」按钮组。
-//! - 信头表单区（细底边框分隔、紧凑对齐）：收件人行右侧「抄送 / 密送」小按钮，
-//!   默认折叠，展开后显示 Cc / Bcc 输入行；主题输入行。
+//! - 顶部操作按钮（取消 / 存草稿 / 附件 / 发送）合并进 app.rs 的 48px 顶栏（B-8），
+//!   本面板不再画第二层标题。
+//! - 信头表单区（细底边框分隔、紧凑对齐）：发件人账号胶囊行 + 收件人行右侧
+//!   「抄送 / 密送」小按钮，默认折叠，展开后显示 Cc / Bcc 输入行；主题输入行。
 //! - 附件芯片条：圆角胶囊标签（📎 文件名 (大小 KB) ×，点击移除）。
 //! - 正文编辑区：`TextareaState` 多行编辑器，`flex-1` 撑满剩余高度。
 
@@ -172,7 +172,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let bcc_suggestions =
         render_autocomplete_dropdown(app, ComposeAddressField::Bcc, &bcc_value, &p, cx);
 
-    // 发件账号胶囊（多账号时切换 compose_account_id）。
+    // 发件账号胶囊（B-8：From 行入信头表单第一行，多账号时行内切换 compose_account_id）。
     let account_pills: Vec<gpui_kit::AnyElement> = app
         .accounts
         .iter()
@@ -206,72 +206,6 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .bg(p.canvas)
         .p_4()
         .gap_3()
-        // 顶部操作栏：标题 + 发件账号 / 右侧按钮组。
-        .child(
-            h_flex()
-                .justify_between()
-                .items_start()
-                .gap_2()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .min_w_0()
-                        .child(div().text_base().font_weight(FontWeight::BOLD).child(
-                            if app.compose_in_reply_to.is_empty() {
-                                "写新邮件"
-                            } else {
-                                "回复邮件"
-                            },
-                        ))
-                        .when(!app.accounts.is_empty(), |el| {
-                            el.child(
-                                h_flex()
-                                    .gap_1()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .child(div().text_xs().text_color(muted_fg).child("发件账号："))
-                                    .children(account_pills),
-                            )
-                        }),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .flex_shrink_0()
-                        .child(
-                            Button::new("compose-save-draft")
-                                .outline()
-                                .label("存草稿")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.save_local_draft(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("compose-attach")
-                                .outline()
-                                .label("添加附件")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.pick_attachments(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("compose-cancel")
-                                .ghost()
-                                .label("取消")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.request_close_compose(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("compose-send")
-                                .primary()
-                                .label("发送")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.send_compose(cx);
-                                })),
-                        ),
-                ),
-        )
         // 未保存退出确认条。
         .when(app.compose_confirm_discard, |el| {
             el.child(
@@ -327,7 +261,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     ),
             )
         })
-        // 信头表单区：收件人（右侧「抄送 / 密送」小按钮）+ 可选 Cc / Bcc + 主题。
+        // 信头表单区：发件人（多账号行内切换）+ 收件人（右侧「抄送 / 密送」小按钮）+ 可选 Cc / Bcc + 主题。
         .child(
             v_flex()
                 .rounded(px(8.0))
@@ -336,6 +270,33 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .bg(p.surface)
                 .px_3()
                 .gap_0p5()
+                .when(!app.accounts.is_empty(), |form| {
+                    // 发件人行（B-8：From 入信头表单第一行，标签与其它行左对齐）。
+                    form.child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(p.border)
+                            .py_1()
+                            .child(
+                                div()
+                                    .w(px(LABEL_WIDTH))
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .text_color(muted_fg)
+                                    .child("发件人"),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(account_pills),
+                            ),
+                    )
+                })
                 .child(
                     h_flex()
                         .items_center()

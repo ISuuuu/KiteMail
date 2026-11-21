@@ -902,42 +902,13 @@ pub(crate) fn render(
                         })
                 })
                 .child(window_controls::drag_spacer())
-                // 右侧操作组：字号缩放 + HTML/纯文本切换 + 动态标记已读/未读 + 复制正文（严格放在 48px 顶栏内）。
+                // 右侧操作组：HTML/纯文本切换 + 动态标记已读/未读 + 复制正文（严格放在 48px 顶栏内）。
+                // 缩放改为 Ctrl+= / Ctrl+- / Ctrl+0 快捷键 + 标题区缩放胶囊（S-8），不再常驻顶栏。
                 .child(
                     h_flex()
                         .gap_1()
                         .pr_1()
                         .items_center()
-                        .child(
-                            Button::new("reader-zoom-out")
-                                .ghost()
-                                .compact()
-                                .label("-")
-                                .tooltip("缩小正文字号")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.adjust_reader_zoom(-10, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("reader-zoom-reset")
-                                .ghost()
-                                .compact()
-                                .label(SharedString::from(format!("{zoom_percent}%")))
-                                .tooltip("重置正文字号为 100%")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_reader_zoom(100, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("reader-zoom-in")
-                                .ghost()
-                                .compact()
-                                .label("+")
-                                .tooltip("放大正文字号")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.adjust_reader_zoom(10, cx);
-                                })),
-                        )
                         .when(has_any_html, |el| {
                             el.child(
                                 Button::new("reader-toggle-html")
@@ -986,19 +957,21 @@ pub(crate) fn render(
                 )
                 .child(win_controls),
         )
-        // 标题区（16px 24px 8px）：账号胶囊 + 可选会话数胶囊 + 展开/折叠全部 & 保存全部附件 + 20px 粗体主题。
+        // 标题区（8px 24px 8px，L-5 实测顶边距）：账号胶囊 + 缩放胶囊 + 可选会话数胶囊
+        // + 展开/折叠全部 & 保存全部附件 + 20px 粗体主题。
         .child(
             v_flex()
                 .flex_shrink_0()
                 .w_full()
-                .pt(px(16.0))
+                .pt(px(8.0))
                 .px(px(24.0))
                 .pb(px(8.0))
                 .gap_1()
                 .when(
                     !owner_email.is_empty()
                         || thread_count > 1
-                        || all_thread_attachment_ids.len() >= 2,
+                        || all_thread_attachment_ids.len() >= 2
+                        || zoom_percent != 100,
                     |el| {
                         let save_all_ids = all_thread_attachment_ids.clone();
                         let save_all_count = save_all_ids.len();
@@ -1023,6 +996,28 @@ pub(crate) fn render(
                                                     .text_xs()
                                                     .font_weight(gpui_kit::FontWeight::MEDIUM)
                                                     .child(SharedString::from(owner_email)),
+                                            )
+                                        })
+                                        // 缩放胶囊（S-8）：非 100% 时显示，点击重置（Ctrl+0 同效）。
+                                        .when(zoom_percent != 100, |row| {
+                                            row.child(
+                                                div()
+                                                    .id("reader-zoom-pill")
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_full()
+                                                    .border_1()
+                                                    .border_color(border)
+                                                    .text_color(accent)
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(p.accent_soft()))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.set_reader_zoom(100, cx);
+                                                    }))
+                                                    .child(SharedString::from(format!(
+                                                        "{zoom_percent}%"
+                                                    ))),
                                             )
                                         })
                                         .when(thread_count > 1, |row| {
@@ -1055,12 +1050,14 @@ pub(crate) fn render(
                                                     .label(SharedString::from(format!(
                                                         "保存全部附件 ({save_all_count})"
                                                     )))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.save_all_attachments(
-                                                            save_all_ids.clone(),
-                                                            cx,
-                                                        );
-                                                    })),
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.save_all_attachments(
+                                                                save_all_ids.clone(),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
                                             )
                                         })
                                         .when(thread_count > 1, |row| {
@@ -1073,13 +1070,17 @@ pub(crate) fn render(
                                                     } else {
                                                         "折叠全部"
                                                     })
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        if any_card_collapsed {
-                                                            this.expand_all_thread_cards(cx);
-                                                        } else {
-                                                            this.collapse_older_thread_cards(cx);
-                                                        }
-                                                    })),
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            if any_card_collapsed {
+                                                                this.expand_all_thread_cards(cx);
+                                                            } else {
+                                                                this.collapse_older_thread_cards(
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        },
+                                                    )),
                                             )
                                         }),
                                 ),
