@@ -17,8 +17,8 @@ use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    actions, black, div, px, AppContext, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Window,
+    actions, black, div, px, AppContext, ClipboardItem, Context, Entity, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Window,
 };
 use hylki_mail_core::cache::CachedAttachment;
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend, SecurityMode};
@@ -198,15 +198,6 @@ impl ListFilter {
             Self::All => "全部",
             Self::Unread => "仅未读",
             Self::Starred => "仅星标",
-        }
-    }
-
-    /// 元素 id（gpui `ElementId` 不支持 (&str, &str) 元组）。
-    pub(crate) fn id(self) -> &'static str {
-        match self {
-            Self::All => "filter-all",
-            Self::Unread => "filter-unread",
-            Self::Starred => "filter-starred",
         }
     }
 }
@@ -456,6 +447,9 @@ impl HylkiApp {
                 .default_value(first_cfg.oauth_client_id.clone())
         });
 
+        let initial_theme_id = theme::static_theme_id(&prefs.theme_id);
+        let initial_dark_mode = prefs.dark_mode.unwrap_or(false);
+
         if demo_mode {
             let current_page = demo_store.list_messages_page(DEMO_INBOX_ID, "", 0, prefs.page_size);
             let selected_message = current_page
@@ -516,8 +510,8 @@ impl HylkiApp {
                 cfg_feedback: None,
                 status_line: SharedString::from("演示模式 (--demo)：已加载 10,000 封模拟邮件"),
                 error_banner: None,
-                theme_id: "default",
-                dark_mode: false,
+                theme_id: initial_theme_id,
+                dark_mode: initial_dark_mode,
                 sidebar_hidden: false,
                 list_filter: ListFilter::All,
                 collapsed_accounts: HashSet::new(),
@@ -643,8 +637,8 @@ impl HylkiApp {
             cfg_feedback: None,
             status_line,
             error_banner: None,
-            theme_id: "default",
-            dark_mode: false,
+            theme_id: initial_theme_id,
+            dark_mode: initial_dark_mode,
             sidebar_hidden: false,
             list_filter: ListFilter::All,
             collapsed_accounts: HashSet::new(),
@@ -1036,15 +1030,26 @@ impl HylkiApp {
         }
     }
 
-    /// 标记已读 / 未读（复用现有 `MailRequest::SetSeen`）。
+    /// 当前阅读邮件在列表中的未读状态（默认已读）。
+    pub(crate) fn selected_message_unread(&self) -> bool {
+        let Some(detail) = self.selected_message.as_ref() else {
+            return false;
+        };
+        self.current_page
+            .items
+            .iter()
+            .find(|m| m.id == detail.id)
+            .map(|m| m.unread)
+            .unwrap_or(false)
+    }
+
+    /// 标记已读 / 未读（双向切换，复用现有 `MailRequest::SetSeen`）。
     pub(crate) fn toggle_message_seen(&mut self, cx: &mut Context<Self>) {
         let Some(detail) = self.selected_message.clone() else {
             return;
         };
-        if self.demo_mode {
-            return;
-        }
-        let next_seen = false; // 阅读态下点击「标记为未读」
+        // 当前未读则标为已读（seen = true），当前已读则标为未读（seen = false）。
+        let next_seen = self.selected_message_unread();
         if let Some(item) = self
             .current_page
             .items
@@ -1053,15 +1058,32 @@ impl HylkiApp {
         {
             item.unread = !next_seen;
         }
-        if let Some(ref w) = self.worker {
-            w.send(MailRequest::SetSeen {
-                account_id: detail.account_id,
-                folder_path: detail.folder_path.clone(),
-                message_id: detail.id,
-                uid: detail.uid,
-                seen: next_seen,
-            });
+        if !self.demo_mode {
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::SetSeen {
+                    account_id: detail.account_id,
+                    folder_path: detail.folder_path.clone(),
+                    message_id: detail.id,
+                    uid: detail.uid,
+                    seen: next_seen,
+                });
+            }
         }
+        self.status_line = SharedString::from(if next_seen {
+            "已标记为已读"
+        } else {
+            "已标记为未读"
+        });
+        cx.notify();
+    }
+
+    /// 复制当前阅读邮件的正文到系统剪贴板。
+    pub(crate) fn copy_selected_body(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.selected_message.as_ref() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(detail.body_text.clone()));
+        self.status_line = SharedString::from("已复制邮件正文到剪贴板");
         cx.notify();
     }
 
@@ -2204,8 +2226,11 @@ impl HylkiApp {
                 self.open_account_manager(cx);
             }
             PaletteCommand::OpenPreferences => {
+                // 先关闭命令面板再打开偏好设置，避免下方 close_modal 误关刚打开的偏好设置。
+                self.close_modal(cx);
                 self.main_view = MainContentView::Mail;
                 self.open_preferences(window, cx);
+                return;
             }
             PaletteCommand::ToggleTheme => {
                 self.toggle_theme(cx);
@@ -2384,27 +2409,25 @@ impl Render for HylkiApp {
                 )
             })
             .child(body)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(border)
-                    .bg(p.sidebar)
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(self.status_line.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(if self.demo_mode { "DEMO" } else { "WINDOWS" }),
-                    ),
-            )
+            .when(!self.status_line.is_empty(), |el| {
+                el.child(
+                    h_flex()
+                        .h(px(24.0))
+                        .flex_shrink_0()
+                        .px_3()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(border)
+                        .bg(p.sidebar)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .truncate()
+                                .child(self.status_line.clone()),
+                        ),
+                )
+            })
             // 全局快捷键动作（键绑定注册在 main.rs，方案文档五.3）。
             .on_action(cx.listener(|this, _: &NewCompose, window, cx| {
                 // 浮层打开时不响应（先 Esc 关闭），避免动作穿透。
@@ -2452,6 +2475,12 @@ impl Render for HylkiApp {
                             .left(px(0.0))
                             .size_full()
                             .bg(black().opacity(0.4))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_modal(cx);
+                                }),
+                            )
                             .child(
                                 h_flex().size_full().items_center().justify_center().child(
                                     v_flex()
@@ -2463,6 +2492,12 @@ impl Render for HylkiApp {
                                         .border_color(border)
                                         .shadow_xl()
                                         .overflow_hidden()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _, _, cx| {
+                                                cx.stop_propagation();
+                                            }),
+                                        )
                                         .child(entity),
                                 ),
                             ),

@@ -361,7 +361,7 @@ impl Render for PreferencesState {
                             .cursor_pointer()
                             .text_color(if is_active { accent } else { text })
                             .when(is_active, |row| {
-                                row.bg(theme::palette_for(&prefs.theme_id, false).accent_soft())
+                                row.bg(p.accent_soft())
                                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                             })
                             .when(!is_active, |row| row.hover(|s| s.bg(p.accent_soft())))
@@ -578,22 +578,13 @@ impl Render for PreferencesState {
                         setting_row(
                             "正文缓存",
                             Some("清理已缓存的邮件正文，保留账号与配置"),
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("pref-clear-body-cache")
-                                        .danger()
-                                        .label("清理正文缓存")
-                                        .on_click(cx.listener(|_, _, _, cx| {
-                                            cx.emit(PreferencesEvent::ClearBodyCache);
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(Button::new("pref-close").ghost().label("关闭").on_click(
-                                    cx.listener(|_, _, _, cx| {
-                                        cx.emit(PreferencesEvent::Closed);
-                                    }),
-                                )),
+                            Button::new("pref-clear-body-cache")
+                                .danger()
+                                .label("清理正文缓存")
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(PreferencesEvent::ClearBodyCache);
+                                    cx.notify();
+                                })),
                             &p,
                         ),
                     ],
@@ -604,22 +595,48 @@ impl Render for PreferencesState {
         v_flex().size_full().bg(canvas).child(
             h_flex().flex_1().min_h_0().child(categories).child(
                 v_flex()
-                    .id("prefs-content")
                     .flex_1()
                     .min_w_0()
-                    .overflow_y_scrollbar()
-                    .px_6()
-                    .py_4()
-                    .gap_4()
+                    .h_full()
+                    // 顶部 48px 栏：当前分类标题 + 全局关闭按钮（任意 Tab 均可直接关闭）。
                     .child(
-                        div()
-                            .text_base()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(text)
-                            .pb_1()
-                            .child(SharedString::from(active_tab.label())),
+                        h_flex()
+                            .h(px(HEADER_HEIGHT))
+                            .flex_shrink_0()
+                            .px_6()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(border)
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(text)
+                                    .child(SharedString::from(active_tab.label())),
+                            )
+                            .child(
+                                Button::new("pref-close")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::X)
+                                    .tooltip("关闭偏好设置 (Esc)")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(PreferencesEvent::Closed);
+                                    })),
+                            ),
                     )
-                    .child(content),
+                    .child(
+                        v_flex()
+                            .id("prefs-content")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scrollbar()
+                            .px_6()
+                            .py_4()
+                            .gap_4()
+                            .child(content),
+                    ),
             ),
         )
     }

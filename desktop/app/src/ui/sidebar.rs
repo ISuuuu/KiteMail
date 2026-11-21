@@ -32,7 +32,7 @@ const HEADER_HEIGHT: f32 = 48.0;
 /// 导航行高度。
 const NAV_ROW_HEIGHT: f32 = 34.0;
 
-/// 未读 / 计数胶囊（选中行反白，告警行标红）。
+/// 未读 / 计数胶囊（柔和区分普通与告警状态）。
 fn count_pill(
     n: u32,
     selected: bool,
@@ -58,14 +58,34 @@ fn count_pill(
             pill.bg(palette.danger).text_color(palette.accent_fg)
         })
         .when(!danger && selected, |pill| {
-            pill.bg(palette.accent_fg).text_color(palette.accent)
+            pill.bg(palette.accent).text_color(palette.accent_fg)
         })
         .when(!danger && !selected, |pill| {
             pill.bg(palette.accent).text_color(palette.accent_fg)
         })
 }
 
-/// 统一导航行：图标 + 名称 + 右侧胶囊（34px 高、圆角 8px）。
+/// 根据文件夹路径或中文名挑选语义图标。
+fn folder_icon(path: &str, name: &str) -> IconName {
+    let p = path.to_ascii_uppercase();
+    if p == "INBOX" || name.contains("收件箱") {
+        IconName::Inbox
+    } else if p.contains("SENT") || name.contains("已发送") {
+        IconName::Send
+    } else if p.contains("DRAFT") || name.contains("草稿") {
+        IconName::FilePen
+    } else if p.contains("ARCHIVE") || name.contains("归档") {
+        IconName::Archive
+    } else if p.contains("TRASH") || p.contains("DELETED") || name.contains("已删除") {
+        IconName::Trash
+    } else if p.contains("JUNK") || p.contains("SPAM") || name.contains("垃圾") {
+        IconName::TriangleAlert
+    } else {
+        IconName::Folder
+    }
+}
+
+/// 统一导航行：图标 + 名称 + 右侧胶囊（34px 高、圆角 8px，柔和选中态避免与中栏撞色）。
 fn nav_row(
     id: &'static str,
     icon: IconName,
@@ -83,10 +103,10 @@ fn nav_row(
         .rounded(px(8.0))
         .cursor_pointer()
         .hover(|s| s.bg(palette.accent_soft()))
-        .when(selected, |el| el.bg(palette.accent));
+        .when(selected, |el| el.bg(palette.accent_soft()));
 
     row = row.child(Icon::new(icon).with_size(px(16.0)).text_color(if selected {
-        palette.accent_fg
+        palette.accent
     } else {
         palette.text_muted
     }));
@@ -101,7 +121,7 @@ fn nav_row(
                 gpui_kit::FontWeight::NORMAL
             })
             .text_color(if selected {
-                palette.accent_fg
+                palette.accent
             } else {
                 palette.text
             })
@@ -125,8 +145,7 @@ fn account_section(
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
-    let (sidebar_bg, text, muted_fg, accent, accent_fg) =
-        (p.sidebar, p.text, p.text_muted, p.accent, p.accent_fg);
+    let (sidebar_bg, text, muted_fg, accent) = (p.sidebar, p.text, p.text_muted, p.accent);
     let selected_folder_id = app.selected_folder_id;
     let expanded = app.account_expanded(acc_id);
     let account_unread: u32 = folders
@@ -185,11 +204,23 @@ fn account_section(
                             .ghost()
                             .compact()
                             .icon(IconName::RefreshCw)
+                            .tooltip("刷新此账号")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(ref w) = this.worker {
                                     w.send(MailRequest::SyncAccount { account_id: acc_id });
                                     cx.notify();
                                 }
+                            })),
+                    )
+                    .child(
+                        Button::new(("cfg-acc", acc_id))
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Settings)
+                            .tooltip("账号设置")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let cfg = this.accounts.iter().find(|a| a.id == acc_id).cloned();
+                                this.load_account_into_form(cfg.as_ref(), window, cx);
                             })),
                     )
                 })
@@ -213,27 +244,38 @@ fn account_section(
                 let unread = folder.unread_count;
                 let total = folder.total_count as u32;
                 let folder_name = folder.name.clone();
+                let icon = folder_icon(&folder_path, &folder_name);
 
                 h_flex()
                     .id(("folder", folder_id))
                     .h(px(NAV_ROW_HEIGHT))
-                    .pl(px(38.0))
+                    .pl(px(28.0))
                     .pr_2()
                     .gap_2()
                     .items_center()
                     .rounded(px(8.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(p.accent_soft()))
-                    .when(is_selected, |row| row.bg(p.accent))
+                    .when(is_selected, |row| row.bg(p.accent_soft()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_folder(acc_id, folder_id, folder_path.clone(), cx);
                     }))
+                    .child(
+                        Icon::new(icon)
+                            .with_size(px(15.0))
+                            .text_color(if is_selected { accent } else { muted_fg }),
+                    )
                     .child(
                         div()
                             .flex_1()
                             .text_sm()
                             .truncate()
-                            .text_color(if is_selected { accent_fg } else { text })
+                            .font_weight(if is_selected {
+                                gpui_kit::FontWeight::SEMIBOLD
+                            } else {
+                                gpui_kit::FontWeight::NORMAL
+                            })
+                            .text_color(if is_selected { accent } else { text })
                             .child(SharedString::from(folder_name)),
                     )
                     .when(unread > 0, |row| {
@@ -243,7 +285,7 @@ fn account_section(
                         row.child(
                             div()
                                 .text_xs()
-                                .text_color(if is_selected { accent_fg } else { muted_fg })
+                                .text_color(if is_selected { accent } else { muted_fg })
                                 .child(SharedString::from(total.to_string())),
                         )
                     })

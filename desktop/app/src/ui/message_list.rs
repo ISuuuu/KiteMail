@@ -1,24 +1,22 @@
 //! 中栏（方案文档第三节 1.2 与五.3）：
-//! - 顶部栏 48px：侧栏折叠开关 + 搜索框（即时过滤，Esc 清空）+ 列表计数。
-//! - 次级工具条 34px：筛选切换（全部 / 仅未读 / 仅星标，对当前页客户端过滤）
-//!   + 上一页 / 下一页分页按钮（沿用现有分页逻辑）。
+//! - 顶部栏 48px（与左栏、右栏严格齐平）：侧栏折叠开关 + 搜索框（即时过滤，Esc 清空）
+//!   + 列表计数 + 筛选下拉按钮（全部 / 仅未读 / 仅星标）。
 //! - 邮件列表行：行高约 82px（偏好 compact_list 紧凑密度为 64px 且隐藏摘要行）、
-//!   水平内边距 12px、外边距 4px 8px、圆角 10px；
-//!   左侧 36x36 圆形头像 + 7px 蓝色未读圆点；右侧三行（发件人 / 主题 /
-//!   摘要），未读加粗；选中态整行 accent 蓝底白字。
+//!   水平内边距 12px、外边距 2px 8px、圆角 10px；
+//!   左侧 36x36 圆形头像 + 固定 8px 宽未读蓝点占位（保证已读/未读文字严格左对齐）；
+//!   右侧三行（发件人 / 主题 / 摘要 + 多账号胶囊），未读加粗；选中态整行 accent 蓝底白字。
+//! - 底部轻量分页条：仅当存在上一页 / 下一页时显示。
 //! - 邮件行右键菜单：标记已读/未读、加星/取消星标、归档、删除
 //!   （演示模式仅保留本地的已读 / 星标两项，归档 / 删除隐藏）；
 //!   草稿视图行右键为「打开草稿 / 删除草稿」。
-//! - 本地草稿视图（真实账号）：从本地草稿合成列表行，点击进入写信编辑。
-//! - 演示模式下不支持星标视图：空列表 + 提示（DemoStore 无星标查询）。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
-use gpui_kit::component::menu::{ContextMenu, ContextMenuExt, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenu, ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
@@ -32,10 +30,8 @@ use crate::ui::avatar;
 
 /// 中栏宽度（方案文档：340 ~ 380px）。
 const LIST_WIDTH: f32 = 360.0;
-/// 顶部栏高度。
+/// 顶部栏高度（与左栏 / 右栏统一为 48px）。
 const HEADER_HEIGHT: f32 = 48.0;
-/// 次级工具条高度。
-const TOOLBAR_HEIGHT: f32 = 34.0;
 /// 列表行高度。
 const ROW_HEIGHT: f32 = 82.0;
 /// 紧凑列表行高（偏好 compact_list，隐藏摘要行，方案文档五.2）。
@@ -180,7 +176,7 @@ fn message_row(
             ROW_HEIGHT
         }))
         .mx_2()
-        .my_1()
+        .my_0p5()
         .px_3()
         .py_2()
         .gap_2()
@@ -196,9 +192,6 @@ fn message_row(
             }
         })
         .when(is_selected, |row| row.bg(p.accent))
-        .when(!is_selected && unread, |row| {
-            row.bg(p.surface_raised).border_1().border_color(p.border)
-        })
         .on_click({
             let draft = draft.clone();
             cx.listener(move |this, _, window, cx| match draft.as_ref() {
@@ -207,15 +200,31 @@ fn message_row(
                 None => this.select_message(account_id, msg_id, uid, unread, &folder_path, cx),
             })
         })
-        // 左侧：36x36 圆形头像 + 头像右侧 7px 蓝色未读圆点。
+        // 左侧：36x36 圆形头像 + 固定 8px 宽未读圆点占位（确保已读/未读文字严格左对齐）。
         .child(
             h_flex()
+                .flex_shrink_0()
                 .items_center()
                 .gap_1()
+                .pt_0p5()
                 .child(avatar::avatar(&display_name, &avatar_key, 36.0))
-                .when(unread, |dot| {
-                    dot.child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(p.accent))
-                }),
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(unread, |dot| {
+                            dot.child(
+                                div()
+                                    .w(px(7.0))
+                                    .h(px(7.0))
+                                    .rounded_full()
+                                    .bg(if is_selected { p.accent_fg } else { p.accent }),
+                            )
+                        }),
+                ),
         )
         // 右侧三行信息。
         .child(
@@ -296,22 +305,49 @@ fn message_row(
                         .text_color(if is_selected { p.accent_fg } else { p.text })
                         .child(SharedString::from(msg.subject.clone())),
                 )
-                // 第 3 行：两行以内摘要（行高裁剪由固定行高 + overflow_hidden 完成）；
-                // 紧凑密度下隐藏（阶段 3 偏好 compact_list）。
+                // 第 3 行：摘要 + 多账号小胶囊标签；紧凑密度下隐藏。
                 .when(!compact, |row| {
                     row.child(
-                        div()
-                            .text_xs()
-                            .text_color(if is_selected {
-                                p.accent_fg
-                            } else {
-                                p.text_muted
-                            })
-                            .child(SharedString::from(if acc_email.is_empty() {
-                                msg.preview.clone()
-                            } else {
-                                format!("[{acc_email}] {}", msg.preview)
-                            })),
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(if is_selected {
+                                        p.accent_fg.opacity(0.88)
+                                    } else {
+                                        p.text_muted
+                                    })
+                                    .child(SharedString::from(msg.preview.clone())),
+                            )
+                            .when(!acc_email.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .max_w(px(110.0))
+                                        .truncate()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .text_size(px(10.0))
+                                        .bg(if is_selected {
+                                            p.accent_fg.opacity(0.22)
+                                        } else {
+                                            p.accent_soft()
+                                        })
+                                        .text_color(if is_selected {
+                                            p.accent_fg
+                                        } else {
+                                            p.accent
+                                        })
+                                        .child(SharedString::from(acc_email)),
+                                )
+                            }),
                     )
                 }),
         );
@@ -443,6 +479,40 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         (IconName::Inbox, "暂无邮件", "")
     };
 
+    // 顶部筛选下拉菜单（与左栏 / 右栏同为 48px 顶栏，去除突兀的第二层工具条）。
+    let filter_menu_button = {
+        let entity = cx.entity();
+        let active_tooltip = match current_filter {
+            ListFilter::All => "筛选邮件（当前：全部）",
+            ListFilter::Unread => "筛选邮件（当前：仅未读）",
+            ListFilter::Starred => "筛选邮件（当前：仅星标）",
+        };
+        Button::new("list-filter-menu")
+            .ghost()
+            .compact()
+            .icon(IconName::ListFilter)
+            .tooltip(active_tooltip)
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu;
+                for filter in [ListFilter::All, ListFilter::Unread, ListFilter::Starred] {
+                    let entity_for_item = entity.clone();
+                    let is_current = current_filter == filter;
+                    menu = menu.item(
+                        PopupMenuItem::new(filter.label())
+                            .when(is_current, |item| item.icon(Icon::new(IconName::Check)))
+                            .on_click(move |_, _, cx| {
+                                entity_for_item.update(cx, |this, cx| {
+                                    this.set_list_filter(filter, cx);
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+    };
+
+    let show_pagination = has_prev || has_next;
+
     v_flex()
         .w(px(LIST_WIDTH))
         .h_full()
@@ -450,13 +520,13 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .bg(surface)
         .border_r_1()
         .border_color(border)
-        // 顶部栏 48px：侧栏折叠开关 + 搜索框 + 列表计数。
+        // 顶部栏 48px（与左栏、右栏对齐）：折叠开关 + 搜索框 + 计数 + 筛选下拉。
         .child(
             h_flex()
                 .h(px(HEADER_HEIGHT))
                 .flex_shrink_0()
                 .px_2()
-                .gap_2()
+                .gap_1p5()
                 .items_center()
                 .border_b_1()
                 .border_color(border)
@@ -491,61 +561,14 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .min_w_0()
                         .child(Input::new(&app.search_input)),
                 )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(SharedString::from(count_text)),
-                ),
-        )
-        // 次级工具条：筛选切换 + 分页（草稿视图无分页 / 筛选）。
-        .child(
-            h_flex()
-                .h(px(TOOLBAR_HEIGHT))
-                .flex_shrink_0()
-                .px_2()
-                .gap_1()
-                .items_center()
-                .border_b_1()
-                .border_color(border)
-                .when(is_unified_list, |el| {
-                    el.children(
-                        [ListFilter::All, ListFilter::Unread, ListFilter::Starred].map(|filter| {
-                            Button::new(filter.id())
-                                .ghost()
-                                .compact()
-                                .selected(current_filter == filter)
-                                .label(filter.label())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_list_filter(filter, cx);
-                                }))
-                        }),
-                    )
-                })
-                .child(div().flex_1())
-                .child(
-                    Button::new("list-prev-page")
-                        .ghost()
-                        .compact()
-                        .icon(IconName::ChevronLeft)
-                        .tooltip("上一页")
-                        .disabled(!has_prev)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.prev_page(cx);
-                        })),
-                )
-                .child(
-                    Button::new("list-next-page")
-                        .ghost()
-                        .compact()
-                        .icon(IconName::ChevronRight)
-                        .tooltip("下一页")
-                        .disabled(!has_next)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.next_page(cx);
-                        })),
-                ),
+                .child(div().flex_shrink_0().text_xs().text_color(muted_fg).child(
+                    SharedString::from(if drafts_view || total == 0 {
+                        count_text.clone()
+                    } else {
+                        total.to_string()
+                    }),
+                ))
+                .when(is_unified_list, |el| el.child(filter_menu_button)),
         )
         // 列表（滚动）。
         .child(
@@ -577,5 +600,47 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     )
                 }),
         )
+        // 底部轻量分页条：仅在总数超过一页时显示。
+        .when(show_pagination, |el| {
+            el.child(
+                h_flex()
+                    .h(px(34.0))
+                    .flex_shrink_0()
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        Button::new("list-prev-page")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::ChevronLeft)
+                            .label("上一页")
+                            .disabled(!has_prev)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.prev_page(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(SharedString::from(count_text)),
+                    )
+                    .child(
+                        Button::new("list-next-page")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::ChevronRight)
+                            .label("下一页")
+                            .disabled(!has_next)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.next_page(cx);
+                            })),
+                    ),
+            )
+        })
         .into_any_element()
 }

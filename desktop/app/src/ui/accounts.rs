@@ -192,6 +192,19 @@ fn account_card(
         .into_any_element()
 }
 
+/// 带小标题的表单字段容器，避免输入内容后分不清字段含义。
+fn labeled_field(
+    label: &'static str,
+    input: gpui_kit::AnyElement,
+    muted_fg: gpui_kit::Hsla,
+) -> gpui_kit::Div {
+    v_flex()
+        .gap_1()
+        .min_w_0()
+        .child(div().text_xs().text_color(muted_fg).child(label))
+        .child(input)
+}
+
 pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 成局部变量。
     let p = theme::current(cx);
@@ -320,93 +333,177 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             "授权码仅保存在 Windows 凭据管理器中，配置文件 accounts.toml 不记录密码。",
         ))
         .child(
-            h_flex()
-                .gap_2()
-                .child(div().flex_1().child(Input::new(&app.cfg_display_name)))
-                .child(div().flex_1().child(Input::new(&app.cfg_email))),
-        )
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::BOLD)
-                .child("收信设置 (IMAP)"),
-        )
-        .child(
-            h_flex()
-                .gap_2()
-                .child(div().flex_1().child(Input::new(&app.cfg_imap_host)))
-                .child(div().w(px(100.0)).child(Input::new(&app.cfg_imap_port)))
+            v_flex()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(border)
+                .bg(p.surface_raised)
+                .p_4()
+                .gap_3()
                 .child(
-                    Button::new("toggle-imap-tls")
-                        .outline()
-                        .label(if app.cfg_imap_tls {
-                            "TLS (993)"
-                        } else {
-                            "STARTTLS (143)"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.cfg_imap_tls = !this.cfg_imap_tls;
-                            cx.notify();
-                        })),
-                ),
-        )
-        .child(
-            h_flex()
-                .gap_2()
-                .child(div().flex_1().child(Input::new(&app.cfg_imap_user)))
-                .child(div().flex_1().child(Input::new(&app.cfg_imap_pass))),
-        )
-        .child(
-            h_flex()
-                .justify_between()
-                .items_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .child("发信设置 (SMTP)"),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            labeled_field(
+                                "显示名称",
+                                Input::new(&app.cfg_display_name).into_any_element(),
+                                muted_fg,
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            labeled_field(
+                                "邮箱地址",
+                                Input::new(&app.cfg_email).into_any_element(),
+                                muted_fg,
+                            )
+                            .flex_1(),
+                        ),
                 )
                 .child(
-                    Button::new("toggle-smtp-sep")
-                        .ghost()
-                        .label(if app.cfg_smtp_separate {
-                            "✓ 使用独立 SMTP 凭据"
-                        } else {
-                            "复用 IMAP 凭据"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.cfg_smtp_separate = !this.cfg_smtp_separate;
-                            cx.notify();
-                        })),
-                ),
-        )
-        .child(
-            h_flex()
-                .gap_2()
-                .child(div().flex_1().child(Input::new(&app.cfg_smtp_host)))
-                .child(div().w(px(100.0)).child(Input::new(&app.cfg_smtp_port)))
+                    div()
+                        .pt_1()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .child("收信设置 (IMAP)"),
+                )
                 .child(
-                    Button::new("toggle-smtp-tls")
-                        .outline()
-                        .label(if app.cfg_smtp_tls {
-                            "TLS (465)"
-                        } else {
-                            "STARTTLS (587)"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.cfg_smtp_tls = !this.cfg_smtp_tls;
-                            cx.notify();
-                        })),
-                ),
+                    h_flex()
+                        .gap_2()
+                        .items_end()
+                        .child(
+                            labeled_field(
+                                "IMAP 服务器",
+                                Input::new(&app.cfg_imap_host).into_any_element(),
+                                muted_fg,
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            labeled_field(
+                                "端口",
+                                Input::new(&app.cfg_imap_port).into_any_element(),
+                                muted_fg,
+                            )
+                            .w(px(100.0)),
+                        )
+                        .child(
+                            Button::new("toggle-imap-tls")
+                                .outline()
+                                .label(if app.cfg_imap_tls {
+                                    "TLS (993)"
+                                } else {
+                                    "STARTTLS (143)"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cfg_imap_tls = !this.cfg_imap_tls;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            labeled_field(
+                                "IMAP 用户名（留空默认邮箱地址）",
+                                Input::new(&app.cfg_imap_user).into_any_element(),
+                                muted_fg,
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            labeled_field(
+                                "客户端授权码 / 密码",
+                                Input::new(&app.cfg_imap_pass).into_any_element(),
+                                muted_fg,
+                            )
+                            .flex_1(),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .pt_1()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .child("发信设置 (SMTP)"),
+                        )
+                        .child(
+                            Button::new("toggle-smtp-sep")
+                                .ghost()
+                                .compact()
+                                .label(if app.cfg_smtp_separate {
+                                    "✓ 使用独立 SMTP 凭据"
+                                } else {
+                                    "复用 IMAP 凭据"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cfg_smtp_separate = !this.cfg_smtp_separate;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_end()
+                        .child(
+                            labeled_field(
+                                "SMTP 服务器",
+                                Input::new(&app.cfg_smtp_host).into_any_element(),
+                                muted_fg,
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            labeled_field(
+                                "端口",
+                                Input::new(&app.cfg_smtp_port).into_any_element(),
+                                muted_fg,
+                            )
+                            .w(px(100.0)),
+                        )
+                        .child(
+                            Button::new("toggle-smtp-tls")
+                                .outline()
+                                .label(if app.cfg_smtp_tls {
+                                    "TLS (465)"
+                                } else {
+                                    "STARTTLS (587)"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cfg_smtp_tls = !this.cfg_smtp_tls;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .when(app.cfg_smtp_separate, |el| {
+                    el.child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                labeled_field(
+                                    "SMTP 独立用户名",
+                                    Input::new(&app.cfg_smtp_user).into_any_element(),
+                                    muted_fg,
+                                )
+                                .flex_1(),
+                            )
+                            .child(
+                                labeled_field(
+                                    "SMTP 独立授权码",
+                                    Input::new(&app.cfg_smtp_pass).into_any_element(),
+                                    muted_fg,
+                                )
+                                .flex_1(),
+                            ),
+                    )
+                }),
         )
-        .when(app.cfg_smtp_separate, |el| {
-            el.child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(Input::new(&app.cfg_smtp_user)))
-                    .child(div().flex_1().child(Input::new(&app.cfg_smtp_pass))),
-            )
-        })
         .when_some(app.cfg_feedback.as_ref(), |el, (ok, msg)| {
             el.child(
                 div()

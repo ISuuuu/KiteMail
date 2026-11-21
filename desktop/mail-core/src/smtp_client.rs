@@ -106,9 +106,10 @@ pub async fn send_message(
         Ok(m) => m,
         Err(e) => return SendOutcome::Failed(format!("发件人地址格式无效: {e}")),
     };
-    let to_mailbox: Mailbox = match to_addr.trim().parse() {
-        Ok(m) => m,
-        Err(e) => return SendOutcome::Failed(format!("收件人地址格式无效: {e}")),
+    let to_mailboxes = match parse_mailbox_list(to_addr, "收件人") {
+        Ok(list) if !list.is_empty() => list,
+        Ok(_) => return SendOutcome::Failed("收件人地址不能为空".to_string()),
+        Err(e) => return SendOutcome::Failed(e),
     };
     let cc_mailboxes = match parse_mailbox_list(cc_addrs, "抄送") {
         Ok(list) => list,
@@ -119,10 +120,10 @@ pub async fn send_message(
         Err(e) => return SendOutcome::Failed(e),
     };
 
-    let mut builder = Message::builder()
-        .from(from_mailbox)
-        .to(to_mailbox)
-        .subject(subject);
+    let mut builder = Message::builder().from(from_mailbox).subject(subject);
+    for mailbox in to_mailboxes {
+        builder = builder.to(mailbox);
+    }
     for mailbox in cc_mailboxes {
         builder = builder.cc(mailbox);
     }
@@ -180,5 +181,21 @@ pub async fn send_message(
                 SendOutcome::Failed(format!("SMTP 发送被拒绝: {e}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mailbox_list_supports_multiple_comma_separated_addresses() {
+        let list = parse_mailbox_list("Alice <alice@example.com>, bob@example.com, ", "收件人")
+            .expect("multiple recipients should parse");
+        assert_eq!(list.len(), 2);
+        assert!(parse_mailbox_list("   ,  ", "收件人")
+            .expect("empty list parses as empty")
+            .is_empty());
+        assert!(parse_mailbox_list("not-an-email", "收件人").is_err());
     }
 }

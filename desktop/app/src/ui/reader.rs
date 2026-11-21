@@ -1,17 +1,17 @@
 //! 右栏阅读态（方案文档第三节 1.3）：
-//! - 顶部操作栏 48px：回复 / 回复全部 / 转发 / 星标切换（沿用现有逻辑）；
-//!   归档、删除本轮渲染但禁用置灰（TODO phase2）；右侧标记已读/未读。
+//! - 顶部操作栏 48px：左侧回复 / 回复全部 / 转发 / 星标 / 归档 / 删除；
+//!   右侧标记已读/未读（双向动态切换）+ 复制正文。
 //! - 标题区（内边距 16px 24px 8px）：所属账号邮箱胶囊（浅蓝底蓝字圆角）
 //!   + 20px 粗体主题。
 //! - 卡片式正文（外层滚动、内边距 12px 24px 24px）：`surface_raised`
-//!   圆角 12px、1px border、内边距 20px；卡片头部：34x34 头像 +
-//!   发件人姓名与 <邮箱> + 「收件人」胶囊 + 右侧时间；正文行高 1.6；
-//!   附件条：横向圆角附件小卡片（附件图标 + 文件名 + 大小 + 「保存」，
-//!   接现有 SaveAttachment + rfd 流程）。
+//!   圆角 12px、1px border、微阴影、内边距 20px；卡片头部：34x34 头像 +
+//!   发件人姓名与 <邮箱> + 真实收件人胶囊 + 右侧时间 + `...` 更多操作菜单；
+//!   正文行高 1.6；附件条：横向圆角附件小卡片（接 SaveAttachment + rfd）。
 //! - 空状态：居中淡色邮箱图标 + 「选择一封邮件查看正文」。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Sizable};
@@ -37,6 +37,20 @@ fn action_button(id: &'static str, icon: IconName, tooltip: &'static str) -> But
         .compact()
         .icon(icon)
         .tooltip(tooltip)
+}
+
+/// 解析收件人列表，返回 `(计数胶囊文案, 收件人预览文本)`。
+fn recipient_summary(raw: &str) -> (String, String) {
+    let list: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if list.is_empty() {
+        ("无收件人".to_string(), String::new())
+    } else {
+        (format!("{} 位收件人", list.len()), list.join(", "))
+    }
 }
 
 pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
@@ -75,6 +89,77 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     };
     let owner_email = app.account_email_for(detail.account_id).to_string();
     let flagged = detail.flagged;
+    let is_unread = app.selected_message_unread();
+    let (recipient_pill, recipient_list) = recipient_summary(&detail.recipients);
+
+    // 卡片头部 `...` 更多操作菜单。
+    let card_more_menu = {
+        let entity = cx.entity();
+        let reply_detail = detail.clone();
+        let reply_all_detail = detail.clone();
+        let forward_detail = detail.clone();
+        let star_detail = detail.clone();
+        Button::new("reader-card-more")
+            .ghost()
+            .compact()
+            .icon(IconName::Ellipsis)
+            .tooltip("更多操作")
+            .dropdown_menu(move |menu, _, _| {
+                let e_reply = entity.clone();
+                let e_reply_all = entity.clone();
+                let e_forward = entity.clone();
+                let e_star = entity.clone();
+                let e_copy = entity.clone();
+                let d_reply = reply_detail.clone();
+                let d_reply_all = reply_all_detail.clone();
+                let d_forward = forward_detail.clone();
+                let d_star = star_detail.clone();
+                menu.item(
+                    PopupMenuItem::new("回复")
+                        .icon(Icon::new(IconName::Reply))
+                        .on_click(move |_, window, cx| {
+                            let d = d_reply.clone();
+                            e_reply.update(cx, |this, cx| this.start_reply(&d, window, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("回复全部")
+                        .icon(Icon::new(IconName::ReplyAll))
+                        .on_click(move |_, window, cx| {
+                            let d = d_reply_all.clone();
+                            e_reply_all.update(cx, |this, cx| this.start_reply_all(&d, window, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("转发")
+                        .icon(Icon::new(IconName::Forward))
+                        .on_click(move |_, window, cx| {
+                            let d = d_forward.clone();
+                            e_forward.update(cx, |this, cx| this.start_forward(&d, window, cx));
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(if flagged { "取消星标" } else { "加星标" })
+                        .icon(Icon::new(if flagged {
+                            IconName::StarFill
+                        } else {
+                            IconName::Star
+                        }))
+                        .on_click(move |_, _, cx| {
+                            let d = d_star.clone();
+                            e_star.update(cx, |this, cx| this.toggle_flagged(&d, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("复制邮件正文")
+                        .icon(Icon::new(IconName::Copy))
+                        .on_click(move |_, _, cx| {
+                            e_copy.update(cx, |this, cx| this.copy_selected_body(cx));
+                        }),
+                )
+            })
+    };
 
     // 附件条。
     let attachment_rows: Vec<gpui_kit::AnyElement> = detail
@@ -200,20 +285,39 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 ),
                             )
                         })
-                }),
+                })
+                // 右侧操作组：动态标记已读/未读 + 复制正文（严格放在 48px 顶栏内）。
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Button::new("reader-toggle-seen")
+                                .ghost()
+                                .compact()
+                                .icon(if is_unread {
+                                    IconName::MailOpen
+                                } else {
+                                    IconName::Mail
+                                })
+                                .tooltip(if is_unread {
+                                    "标记为已读"
+                                } else {
+                                    "标记为未读"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_message_seen(cx);
+                                })),
+                        )
+                        .child(
+                            action_button("reader-copy-body", IconName::Copy, "复制正文").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.copy_selected_body(cx);
+                                }),
+                            ),
+                        ),
+                ),
         )
-        .child(h_flex().gap_1().items_center().when(!app.demo_mode, |el| {
-            el.child(
-                Button::new("reader-toggle-seen")
-                    .ghost()
-                    .compact()
-                    .icon(IconName::EyeOff)
-                    .tooltip("标记为未读（沿用现有 SetSeen）")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_message_seen(cx);
-                    })),
-            )
-        }))
         // 标题区（16px 24px 8px）。
         .child(
             v_flex()
@@ -262,47 +366,82 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .rounded(px(12.0))
                         .border_1()
                         .border_color(border)
+                        .shadow_xs()
                         .p(px(20.0))
                         .gap_3()
-                        // 卡片头部：34x34 头像 + 姓名 <邮箱> + 「收件人」胶囊 + 右侧时间。
+                        // 卡片头部：34x34 头像 + 姓名 <邮箱> + 真实收件人胶囊 + 右侧时间 + 更多菜单。
                         .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(avatar::avatar(&display_name, &sender_email, CARD_AVATAR))
+                            v_flex()
+                                .gap_1()
                                 .child(
-                                    v_flex()
-                                        .min_w_0()
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(avatar::avatar(
+                                            &display_name,
+                                            &sender_email,
+                                            CARD_AVATAR,
+                                        ))
+                                        .child(
+                                            v_flex()
+                                                .min_w_0()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_weight(gpui_kit::FontWeight::BOLD)
+                                                        .text_color(p.text)
+                                                        .truncate()
+                                                        .child(SharedString::from(display_name)),
+                                                )
+                                                .when(!sender_email.is_empty(), |el| {
+                                                    el.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(muted_fg)
+                                                            .truncate()
+                                                            .child(SharedString::from(format!(
+                                                                "<{sender_email}>"
+                                                            ))),
+                                                    )
+                                                }),
+                                        )
                                         .child(
                                             div()
-                                                .text_sm()
-                                                .font_weight(gpui_kit::FontWeight::BOLD)
-                                                .text_color(p.text)
-                                                .child(SharedString::from(display_name)),
+                                                .flex_shrink_0()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_full()
+                                                .bg(canvas)
+                                                .border_1()
+                                                .border_color(border)
+                                                .text_color(muted_fg)
+                                                .text_xs()
+                                                .child(SharedString::from(recipient_pill)),
                                         )
-                                        .when(!sender_email.is_empty(), |el| {
-                                            el.child(div().text_xs().text_color(muted_fg).child(
-                                                SharedString::from(format!("<{sender_email}>")),
-                                            ))
-                                        }),
+                                        .child(div().flex_1())
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .text_color(muted_fg)
+                                                .child(SharedString::from(
+                                                    detail.date_display.clone(),
+                                                )),
+                                        )
+                                        .child(card_more_menu),
                                 )
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .bg(p.accent_soft())
-                                        .text_color(p.text)
-                                        .text_xs()
-                                        .child("收件人"),
-                                )
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted_fg)
-                                        .child(SharedString::from(detail.date_display.clone())),
-                                ),
+                                .when(!recipient_list.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .pl(px(CARD_AVATAR + 8.0))
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .truncate()
+                                            .child(SharedString::from(format!(
+                                                "收件人：{recipient_list}"
+                                            ))),
+                                    )
+                                }),
                         )
                         // 正文：行高 1.6。
                         .child(
