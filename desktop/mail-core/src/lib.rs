@@ -526,6 +526,23 @@ pub enum MailRequest {
     },
     /// Clear all cached message bodies (headers and accounts are kept).
     ClearBodyCaches,
+    /// Batch-mark every message in `folder_path` as read on the server
+    /// (IMAP: chunked `UID STORE +FLAGS (\Seen)`; Graph: per-message update
+    /// over cached unread messages), zero the folder's local unread count
+    /// and emit refreshed folders.
+    MarkFolderAllRead {
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+    },
+    /// Empty a Trash / Junk folder on the server: IMAP marks every message
+    /// `\Deleted` and expunges. Not supported for Graph accounts (dropped in
+    /// the UI); clears the folder's local cache and emits refreshed folders.
+    EmptyFolder {
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+    },
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.

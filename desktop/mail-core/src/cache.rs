@@ -2222,6 +2222,74 @@ impl CacheStore {
         tx.commit().map_err(|e| format!("提交已读状态失败: {e}"))
     }
 
+    /// Batch-mark every cached message of `folder_id` as read and zero the
+    /// folder's unread counter (right-click "Mark as Read" on a folder).
+    pub fn set_folder_all_seen(&mut self, folder_id: u32) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE messages SET unread = 0 WHERE folder_id = ?1",
+                params![folder_id],
+            )
+            .map_err(|e| format!("批量更新已读状态失败: {e}"))?;
+        self.conn
+            .execute(
+                "
+                UPDATE folders
+                SET unread_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND unread = 1)
+                WHERE id = ?1
+                ",
+                params![folder_id],
+            )
+            .map_err(|e| format!("更新文件夹未读数失败: {e}"))?;
+        Ok(())
+    }
+
+    /// Remove every cached message of `folder_id` (attachments cascade) and
+    /// zero its counters (right-click "Empty Folder" after server expunge).
+    pub fn clear_folder(&mut self, folder_id: u32) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM messages WHERE folder_id = ?1",
+                params![folder_id],
+            )
+            .map_err(|e| format!("清空文件夹缓存失败: {e}"))?;
+        self.conn
+            .execute(
+                "
+                UPDATE folders
+                SET unread_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND unread = 1),
+                    total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1)
+                WHERE id = ?1
+                ",
+                params![folder_id],
+            )
+            .map_err(|e| format!("更新文件夹计数失败: {e}"))?;
+        Ok(())
+    }
+
+    /// `(message_id, remote_id)` of every cached unread message in
+    /// `folder_id` — drives the per-message Graph path of MarkFolderAllRead.
+    pub fn folder_unread_remote_ids(&self, folder_id: u32) -> Result<Vec<(u32, String)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, remote_id
+                FROM messages
+                WHERE folder_id = ?1 AND unread = 1 AND remote_id != ''
+                ORDER BY id ASC
+                ",
+            )
+            .map_err(|e| format!("查询文件夹未读邮件失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![folder_id], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("读取文件夹未读邮件失败: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析文件夹未读邮件失败: {e}"))
+    }
+
     /// Update local flagged/starred state.
     pub fn set_message_flagged(&mut self, message_id: u32, flagged: bool) -> Result<(), String> {
         self.conn

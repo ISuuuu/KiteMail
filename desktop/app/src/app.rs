@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -193,6 +194,7 @@ actions!(
     [
         NewCompose,
         OpenCommandPalette,
+        OpenCommandPaletteActions,
         FocusSearch,
         RefreshAllAccounts,
         CloseOverlay,
@@ -204,7 +206,10 @@ actions!(
         SelectPrevMessage,
         ZoomIn,
         ZoomOut,
-        ZoomReset
+        ZoomReset,
+        ToggleFullscreen,
+        ToggleAccountsList,
+        OpenShortcutsWindow
     ]
 );
 
@@ -242,6 +247,10 @@ pub(crate) enum ActiveModal {
     Accounts,
     Preferences,
     CommandPalette,
+    /// 键盘快捷键速查（F1 / ?，对齐原版 win.shortcuts）。
+    Shortcuts,
+    /// 关于 Hylki（对齐原版 win.about）。
+    About,
 }
 
 pub(crate) struct HylkiApp {
@@ -344,6 +353,10 @@ pub(crate) struct HylkiApp {
     pub(crate) server_search_results: Vec<MessageSummary>,
     /// 账号分组折叠状态（缺省展开）。
     pub(crate) collapsed_accounts: HashSet<u32>,
+    /// 是否在左栏显示账号列表（对齐原版 show-accounts 偏好，Ctrl+Shift+A / 主菜单切换）。
+    pub(crate) show_accounts: bool,
+    /// 待二次确认的「清空文件夹」目标 `(account_id, folder_id, folder_path, 显示名)`。
+    pub(crate) pending_empty_folder: Option<(u32, u32, String, String)>,
     /// 阅读器是否强制以纯文本渲染（false = 有 HTML 时渲染富文本）。
     pub(crate) reader_prefer_plain: bool,
     /// 本次会话中用户手动放行远程图片的邮件 ID 集合。
@@ -702,6 +715,8 @@ impl HylkiApp {
                 server_search_query: String::new(),
                 server_search_results: Vec::new(),
                 collapsed_accounts: HashSet::new(),
+                show_accounts: true,
+                pending_empty_folder: None,
                 reader_prefer_plain: false,
                 allowed_remote_image_ids: HashSet::new(),
                 collapsed_thread_cards: initial_collapsed,
@@ -859,6 +874,8 @@ impl HylkiApp {
             server_search_query: String::new(),
             server_search_results: Vec::new(),
             collapsed_accounts: HashSet::new(),
+            show_accounts: true,
+            pending_empty_folder: None,
             reader_prefer_plain: false,
             allowed_remote_image_ids: HashSet::new(),
             collapsed_thread_cards: HashSet::new(),
@@ -3118,6 +3135,182 @@ impl HylkiApp {
         cx.notify();
     }
 
+    // ---- 阶段二：主菜单补齐（对齐原版 boot.rs / window.rs 的菜单动作）----
+
+    /// 主菜单「显示 / 隐藏账号列表」（Ctrl+Shift+A）：对齐原版
+    /// `app.show-accounts`——隐藏或恢复侧栏的账号区段（统一导航保持不动，
+    /// 不是隐藏整个侧栏，故不复用 toggle_sidebar）。
+    pub(crate) fn toggle_accounts_list(&mut self, cx: &mut Context<Self>) {
+        self.show_accounts = !self.show_accounts;
+        self.status_line = SharedString::from(if self.show_accounts {
+            "已显示账号列表"
+        } else {
+            "已隐藏账号列表"
+        });
+        cx.notify();
+    }
+
+    /// F11 全屏切换（对齐原版 `win.fullscreen`）。
+    pub(crate) fn toggle_fullscreen(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        window.toggle_fullscreen();
+    }
+
+    /// F1 / ? 快捷键速查弹窗（原版同键可再次按下关闭）。
+    pub(crate) fn open_shortcuts(&mut self, cx: &mut Context<Self>) {
+        if self.active_modal == ActiveModal::Shortcuts {
+            self.active_modal = ActiveModal::None;
+        } else {
+            self.active_modal = ActiveModal::Shortcuts;
+        }
+        cx.notify();
+    }
+
+    /// 「关于 Hylki」弹窗（对齐原版 win.about）。
+    pub(crate) fn open_about(&mut self, cx: &mut Context<Self>) {
+        self.active_modal = ActiveModal::About;
+        cx.notify();
+    }
+
+    // ---- 阶段二：文件夹右键动作（对齐原版 sidebar/menus.rs 的 folder_menu_items）----
+
+    /// 右键「刷新此文件夹」：复用现有 `MailRequest::SyncFolder`（demo 模式禁用）。
+    pub(crate) fn refresh_folder(
+        &mut self,
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from("正在刷新文件夹...");
+            w.send(MailRequest::SyncFolder {
+                account_id,
+                folder_id,
+                folder_path,
+            });
+        }
+        cx.notify();
+    }
+
+    /// 右键「全部标为已读」：对一个账号文件夹批量发起 `MarkFolderAllRead`
+    /// 并乐观清除当前列表中该文件夹的未读标记（demo 模式禁用）。
+    pub(crate) fn mark_folder_all_read(
+        &mut self,
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        let current_folder =
+            self.current_view == CurrentView::AccountFolder && self.selected_folder_id == folder_id;
+        if current_folder || self.current_view == CurrentView::UnifiedInbox {
+            for item in self
+                .current_page
+                .items
+                .iter_mut()
+                .filter(|m| m.folder_id == folder_id)
+            {
+                item.unread = false;
+            }
+        }
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from("正在把文件夹全部标为已读...");
+            w.send(MailRequest::MarkFolderAllRead {
+                account_id,
+                folder_id,
+                folder_path,
+            });
+        }
+        cx.notify();
+    }
+
+    /// 统一收件箱行右键「全部标为已读」：对所有账号的收件箱批量发起，
+    /// 并乐观清除当前统一收件箱页面的未读标记（demo 模式禁用）。
+    pub(crate) fn mark_all_inboxes_read(&mut self, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            return;
+        }
+        let targets: Vec<(u32, u32, String)> = self
+            .folders_by_account
+            .values()
+            .flatten()
+            .filter(|f| f.path.eq_ignore_ascii_case("INBOX") || f.name.contains("收件箱"))
+            .map(|f| (f.account_id, f.id, f.path.clone()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            for (account_id, folder_id, folder_path) in &targets {
+                w.send(MailRequest::MarkFolderAllRead {
+                    account_id: *account_id,
+                    folder_id: *folder_id,
+                    folder_path: folder_path.clone(),
+                });
+            }
+        }
+        if self.current_view == CurrentView::UnifiedInbox {
+            let inbox_folder_ids: HashSet<u32> = targets.iter().map(|(_, id, _)| *id).collect();
+            for item in self.current_page.items.iter_mut() {
+                if inbox_folder_ids.contains(&item.folder_id) {
+                    item.unread = false;
+                }
+            }
+        }
+        self.status_line = SharedString::from(format!(
+            "正在把 {} 个账号的收件箱全部标为已读...",
+            targets.len()
+        ));
+        cx.notify();
+    }
+
+    /// 右键 Trash / Junk「清空文件夹…」：进入二次确认（对齐原版
+    /// Empty Trash… 的确认交互；Graph 账号已在菜单禁用）。
+    pub(crate) fn request_empty_folder(
+        &mut self,
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+        folder_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_empty_folder = Some((account_id, folder_id, folder_path, folder_name));
+        cx.notify();
+    }
+
+    /// 取消「清空文件夹」确认。
+    pub(crate) fn cancel_empty_folder(&mut self, cx: &mut Context<Self>) {
+        self.pending_empty_folder = None;
+        cx.notify();
+    }
+
+    /// 确认清空：发 `MailRequest::EmptyFolder` 并乐观清空当前列表中该文件夹的条目。
+    pub(crate) fn confirm_empty_folder(&mut self, cx: &mut Context<Self>) {
+        let Some((account_id, folder_id, folder_path, _)) = self.pending_empty_folder.take() else {
+            return;
+        };
+        if self.current_view == CurrentView::AccountFolder && self.selected_folder_id == folder_id {
+            self.current_page.items.clear();
+            self.current_page.total = 0;
+            self.selected_message = None;
+        }
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from("正在清空文件夹...");
+            w.send(MailRequest::EmptyFolder {
+                account_id,
+                folder_id,
+                folder_path,
+            });
+        }
+        cx.notify();
+    }
+
     // ---- 阶段 3：全局路由、偏好、命令面板、快捷键（方案文档第五节）----
 
     /// 附件总览数据请求（进入视图 / 搜索词变化时触发；demo 模式直接加载模拟附件）。
@@ -3381,12 +3574,18 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 打开命令面板浮层（侧栏菜单 / Ctrl+K）。
-    pub(crate) fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 打开命令面板浮层（侧栏菜单 / Ctrl+K）；`actions_only` 为 true 时
+    /// 预填 `>` 仅筛选操作命令（Ctrl+Shift+K，对齐原版「actions only」）。
+    pub(crate) fn open_command_palette(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        actions_only: bool,
+    ) {
         self.active_modal = ActiveModal::CommandPalette;
         if self.palette.is_none() {
             let commands = self.palette_commands();
-            let entity = cx.new(|cx| CommandPaletteState::new(window, cx, commands));
+            let entity = cx.new(|cx| CommandPaletteState::new(window, cx, commands, actions_only));
             let sub = cx.subscribe_in(
                 &entity,
                 window,
@@ -3407,7 +3606,8 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 固定命令 + 遍历 folders_by_account 生成的文件夹跳转命令。
+    /// 固定命令 + 选中邮件操作 + 统一视图 / 联系人 / 附件入口 +
+    /// 遍历 folders_by_account 生成的文件夹跳转命令。
     fn palette_commands(&self) -> Vec<PaletteCommand> {
         let mut commands = vec![
             PaletteCommand::NewCompose,
@@ -3417,6 +3617,24 @@ impl HylkiApp {
             PaletteCommand::OpenPreferences,
             PaletteCommand::ToggleTheme,
         ];
+        // 对当前选中邮件的操作：无选中时不显示（对齐原版 acts_on_selection）；
+        // 归档 / 删除仅真实账号可用（demo 模式下右键菜单同样隐藏）。
+        if self.selected_message.is_some() {
+            commands.push(PaletteCommand::ReplySelected);
+            commands.push(PaletteCommand::MarkUnreadSelected);
+            commands.push(PaletteCommand::ToggleStarSelected);
+            if !self.demo_mode {
+                commands.push(PaletteCommand::ArchiveSelected);
+                commands.push(PaletteCommand::DeleteSelected);
+            }
+        }
+        // 统一视图与联系人 / 附件入口（原版命令面板的 go-to 分组）。
+        commands.push(PaletteCommand::GoStarred);
+        commands.push(PaletteCommand::GoSent);
+        commands.push(PaletteCommand::GoDrafts);
+        commands.push(PaletteCommand::GoArchive);
+        commands.push(PaletteCommand::OpenContacts);
+        commands.push(PaletteCommand::OpenGallery);
         for (&account_id, folders) in &self.folders_by_account {
             for folder in folders {
                 commands.push(PaletteCommand::GoFolder {
@@ -3492,6 +3710,66 @@ impl HylkiApp {
             }
             PaletteCommand::ToggleTheme => {
                 self.toggle_theme(cx);
+            }
+            PaletteCommand::GoStarred => {
+                self.main_view = MainContentView::Mail;
+                self.select_unified_view(CurrentView::Starred, cx);
+            }
+            PaletteCommand::GoSent => {
+                self.main_view = MainContentView::Mail;
+                self.select_unified_view(CurrentView::Sent, cx);
+            }
+            PaletteCommand::GoDrafts => {
+                self.main_view = MainContentView::Mail;
+                self.select_unified_view(CurrentView::Drafts, cx);
+            }
+            PaletteCommand::GoArchive => {
+                self.main_view = MainContentView::Mail;
+                self.select_unified_view(CurrentView::Archive, cx);
+            }
+            PaletteCommand::OpenContacts => {
+                self.close_modal(cx);
+                self.open_contacts(window, cx);
+                return;
+            }
+            PaletteCommand::OpenGallery => {
+                self.close_modal(cx);
+                self.open_gallery(window, cx);
+                return;
+            }
+            PaletteCommand::ReplySelected => {
+                let Some(detail) = self.selected_message.clone() else {
+                    return;
+                };
+                self.close_modal(cx);
+                self.main_view = MainContentView::Mail;
+                self.start_reply(&detail, window, cx);
+                return;
+            }
+            PaletteCommand::ArchiveSelected => {
+                self.archive_selected(cx);
+            }
+            PaletteCommand::DeleteSelected => {
+                self.delete_selected(cx);
+            }
+            PaletteCommand::MarkUnreadSelected => {
+                let Some(detail) = self.selected_message.clone() else {
+                    return;
+                };
+                self.set_row_seen(
+                    detail.account_id,
+                    detail.id,
+                    detail.uid,
+                    detail.folder_path.clone(),
+                    false,
+                    cx,
+                );
+            }
+            PaletteCommand::ToggleStarSelected => {
+                let Some(detail) = self.selected_message.clone() else {
+                    return;
+                };
+                self.toggle_flagged(&detail, cx);
             }
             PaletteCommand::GoFolder {
                 account_id,
@@ -3871,6 +4149,55 @@ impl Render for HylkiApp {
                         ),
                 )
             })
+            // 「清空文件夹」二次确认条（右键 Trash / Junk 触发，Esc 取消）。
+            .when_some(self.pending_empty_folder.as_ref(), |el, pending| {
+                let (_, _, _, name) = pending.clone();
+                el.child(
+                    h_flex()
+                        .px_3()
+                        .py_1p5()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .bg(p.danger.opacity(0.12))
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .text_color(p.danger)
+                                .truncate()
+                                .child(SharedString::from(format!(
+                                    "确认清空文件夹「{name}」？其中全部邮件将被永久删除，此操作不可撤销。"
+                                ))),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .flex_shrink_0()
+                                .items_center()
+                                .child(
+                                    Button::new("empty-folder-confirm")
+                                        .primary()
+                                        .compact()
+                                        .label("确认清空")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_empty_folder(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("empty-folder-cancel")
+                                        .outline()
+                                        .compact()
+                                        .label("取消")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_empty_folder(cx);
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .child(body)
             .when(!self.status_line.is_empty(), |el| {
                 el.child(
@@ -3901,7 +4228,13 @@ impl Render for HylkiApp {
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 if this.active_modal == ActiveModal::None {
-                    this.open_command_palette(window, cx);
+                    this.open_command_palette(window, cx, false);
+                }
+            }))
+            // Ctrl+Shift+K：命令面板预填 `>`，仅筛选操作命令。
+            .on_action(cx.listener(|this, _: &OpenCommandPaletteActions, window, cx| {
+                if this.active_modal == ActiveModal::None {
+                    this.open_command_palette(window, cx, true);
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
@@ -3935,6 +4268,22 @@ impl Render for HylkiApp {
             }))
             .on_action(cx.listener(|this, _: &QuitApp, _window, cx| {
                 this.quit_app(cx);
+            }))
+            // F11 全屏切换（不设浮层守卫：全屏与浮层互不干扰）。
+            .on_action(cx.listener(|this, _: &ToggleFullscreen, window, cx| {
+                this.toggle_fullscreen(window, cx);
+            }))
+            // Ctrl+Shift+A 显示 / 隐藏账号列表（对齐原版 show-accounts）。
+            .on_action(cx.listener(|this, _: &ToggleAccountsList, _window, cx| {
+                this.toggle_accounts_list(cx);
+            }))
+            // F1 / ? 快捷键速查：无浮层或已在速查浮层时响应（同键再按关闭）。
+            .on_action(cx.listener(|this, _: &OpenShortcutsWindow, _window, cx| {
+                if this.active_modal == ActiveModal::None
+                    || this.active_modal == ActiveModal::Shortcuts
+                {
+                    this.open_shortcuts(cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &DeleteSelectedMessage, window, cx| {
                 if this.active_modal == ActiveModal::None
@@ -3996,9 +4345,11 @@ impl Render for HylkiApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
-                // Esc 优先级：关闭浮层 > 写信退出确认 > 撤销发送 > 取消多选。
+                // Esc 优先级：关闭浮层 > 清空文件夹确认 > 写信退出确认 > 撤销发送 > 取消多选。
                 if this.active_modal != ActiveModal::None {
                     this.close_modal(cx);
+                } else if this.pending_empty_folder.is_some() {
+                    this.cancel_empty_folder(cx);
                 } else if this.main_view == MainContentView::Mail
                     && this.right_mode == RightPaneMode::Compose
                 {
@@ -4093,10 +4444,360 @@ impl Render for HylkiApp {
                     root = root.child(entity);
                 }
             }
+            ActiveModal::Shortcuts => {
+                root = root.child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .size_full()
+                        .bg(black().opacity(0.4))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_modal(cx);
+                            }),
+                        )
+                        .child(
+                            h_flex().size_full().items_center().justify_center().child(
+                                v_flex()
+                                    .w(px(600.0))
+                                    .h(px(560.0))
+                                    .bg(p.surface)
+                                    .rounded(px(12.0))
+                                    .border_1()
+                                    .border_color(border)
+                                    .shadow_xl()
+                                    .overflow_hidden()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| {
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(shortcuts_modal(&p, cx)),
+                            ),
+                        ),
+                );
+            }
+            ActiveModal::About => {
+                root = root.child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .size_full()
+                        .bg(black().opacity(0.4))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_modal(cx);
+                            }),
+                        )
+                        .child(
+                            h_flex().size_full().items_center().justify_center().child(
+                                v_flex()
+                                    .w(px(440.0))
+                                    .h(px(540.0))
+                                    .bg(p.surface)
+                                    .rounded(px(12.0))
+                                    .border_1()
+                                    .border_color(border)
+                                    .shadow_xl()
+                                    .overflow_hidden()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| {
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(about_modal(&p, border, cx)),
+                            ),
+                        ),
+                );
+            }
             ActiveModal::None => {}
         }
         root
     }
+}
+
+/// 快捷键速查分组数据（键位 + 说明）。文案结构对齐原版
+/// `docs/KEYBOARD_SHORTCUTS.md`：其中部分单键导航（j/k/r/a 等）要到
+/// 阶段三才实现，此处先按原版文档完整展示，阶段三再校准。
+const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "移动",
+        &[
+            ("下一条邮件", "j / ↓"),
+            ("上一条邮件", "k / ↑"),
+            ("打开选中的邮件", "l / →"),
+            ("返回邮件列表", "h / ← / u"),
+            ("搜索", "/"),
+            ("写邮件", "c"),
+            ("本清单", "?"),
+            ("删除选中邮件", "Delete"),
+        ],
+    ),
+    (
+        "对邮件的操作",
+        &[
+            ("回复", "r"),
+            ("回复全部", "Shift+R"),
+            ("转发", "f"),
+            ("归档", "a"),
+            ("删除", "d / Delete"),
+            ("标记为垃圾邮件", "!"),
+            ("加星标 / 取消星标", "s"),
+            ("已读 / 未读切换", "m"),
+            ("选中该行（批量操作）", "x"),
+        ],
+    ),
+    (
+        "全局快捷键（始终可用）",
+        &[
+            ("写新邮件", "Ctrl+N"),
+            ("命令面板", "Ctrl+K"),
+            ("命令面板（仅操作）", "Ctrl+Shift+K"),
+            ("检查新邮件", "Ctrl+R / F5"),
+            ("搜索邮件列表", "Ctrl+F"),
+            ("显示 / 隐藏侧栏账号列表", "Ctrl+Shift+A"),
+            ("全屏切换", "F11"),
+            ("本清单", "F1 / Ctrl+?"),
+            ("打开偏好设置", "Ctrl+,"),
+            ("退出 Hylki", "Ctrl+Q"),
+            ("关闭浮层 / 返回", "Esc"),
+        ],
+    ),
+];
+
+/// 键盘快捷键速查弹窗内容（F1 / ?，风格复用现有模态卡片）。
+fn shortcuts_modal(p: &theme::HylkiPalette, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
+    let (text, muted_fg, accent, accent_soft, border) =
+        (p.text, p.text_muted, p.accent, p.accent_soft(), p.border);
+    let mut list = v_flex()
+        .id("shortcuts-list")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scrollbar()
+        .px_5()
+        .py_3()
+        .gap_1p5();
+    for (group_title, rows) in SHORTCUT_GROUPS {
+        list = list
+            .child(
+                div()
+                    .pt_2()
+                    .pb_1()
+                    .text_sm()
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .text_color(accent)
+                    .child(SharedString::from(*group_title)),
+            )
+            .children(rows.iter().map(|(desc, keys)| {
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .min_h(px(28.0))
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(text)
+                            .truncate()
+                            .child(SharedString::from(*desc)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(px(6.0))
+                            .bg(accent_soft)
+                            .text_xs()
+                            .text_color(accent)
+                            .child(SharedString::from(*keys)),
+                    )
+            }));
+    }
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .child(
+            // 标题栏：标题 + 关闭按钮（Esc 亦可关闭）。
+            h_flex()
+                .flex_shrink_0()
+                .px_5()
+                .py_3()
+                .items_start()
+                .justify_between()
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    v_flex().gap_1().child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .text_color(text)
+                            .child("键盘快捷键"),
+                    ),
+                )
+                .child(
+                    Button::new("shortcuts-close")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::X)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_modal(cx);
+                        })),
+                ),
+        )
+        .child(list)
+        .child(
+            div()
+                .flex_shrink_0()
+                .px_5()
+                .py_2()
+                .border_t_1()
+                .border_color(border)
+                .text_xs()
+                .text_color(muted_fg)
+                .child("部分单键快捷键将在后续版本启用；完整清单以原版文档 KEYBOARD_SHORTCUTS.md 为准。"),
+        )
+        .into_any_element()
+}
+
+/// 「关于 Hylki」弹窗内容（对齐原版 about.rs：版本、描述、协议、链接与致谢）。
+fn about_modal(
+    p: &theme::HylkiPalette,
+    border: gpui_kit::Hsla,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let (text, muted_fg, accent, accent_soft) = (p.text, p.text_muted, p.accent, p.accent_soft());
+    let repo = "https://github.com/hyprlab/hylki";
+    let issues = "https://github.com/hyprlab/hylki/issues";
+    let license_url = "https://www.gnu.org/licenses/agpl-3.0.html";
+    let link_row =
+        |cx: &mut Context<HylkiApp>, id: &'static str, label: &'static str, url: &'static str| {
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .min_h(px(30.0))
+                .child(
+                    div()
+                        .text_sm()
+                        .truncate()
+                        .text_color(p.text)
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    Button::new(id)
+                        .outline()
+                        .compact()
+                        .label("打开")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.open_url(url);
+                        })),
+                )
+        };
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .px_6()
+        .py_5()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(div())
+                .child(
+                    Button::new("about-close")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::X)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_modal(cx);
+                        })),
+                ),
+        )
+        .child(
+            v_flex().items_center().gap_1().child(
+                div()
+                    .text_2xl()
+                    .font_weight(gpui_kit::FontWeight::BOLD)
+                    .text_color(text)
+                    .child("Hylki"),
+            ),
+        )
+        .child(
+            div()
+                .mx_auto()
+                .px_2()
+                .py_0p5()
+                .rounded_full()
+                .bg(accent_soft)
+                .text_xs()
+                .text_color(accent)
+                .child(SharedString::from(format!(
+                    "版本 {}",
+                    env!("CARGO_PKG_VERSION")
+                ))),
+        )
+        .child(
+            div()
+                .mt_1()
+                .text_center()
+                .text_sm()
+                .text_color(muted_fg)
+                .child("一个快速、原生的电子邮件客户端"),
+        )
+        .child(
+            div()
+                .mt_1()
+                .text_center()
+                .text_xs()
+                .text_color(muted_fg)
+                .child("本程序基于 GNU AGPL-3.0 或更新版本授权发布，不含任何形式的担保。"),
+        )
+        .child(div().mt_3().w_full().h(px(1.0)).bg(border))
+        .child(
+            div()
+                .mt_2()
+                .text_sm()
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(accent)
+                .child("项目"),
+        )
+        .children([
+            link_row(cx, "about-link-repo", "源代码", repo),
+            link_row(cx, "about-link-issues", "问题反馈", issues),
+            link_row(
+                cx,
+                "about-link-license",
+                "许可证 (GNU AGPL v3)",
+                license_url,
+            ),
+        ])
+        .child(div().mt_3().w_full().h(px(1.0)).bg(border))
+        .child(
+            div()
+                .mt_2()
+                .text_center()
+                .text_xs()
+                .text_color(muted_fg)
+                .child("感谢所有贡献者与翻译者（详见仓库 data/CONTRIBUTORS 与 data/TRANSLATORS）"),
+        )
+        .child(
+            div()
+                .text_center()
+                .text_xs()
+                .text_color(muted_fg)
+                .child("© 2026 Hyprlab"),
+        )
+        .into_any_element()
 }
 
 /// 检测单个账号的收件箱未读增长量：首次出现仅建立基线返回 0，避免启动加载误报通知。

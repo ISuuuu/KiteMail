@@ -592,6 +592,139 @@ async fn handle_request(
             }
         }
 
+        MailRequest::MarkFolderAllRead {
+            account_id,
+            folder_id,
+            folder_path,
+        } => {
+            // 先落本地：未读归零并即时回发文件夹计数，再同步服务器（失败走 Error 事件）。
+            let _ = cache.set_folder_all_seen(folder_id);
+            if let Ok(folders) = cache.list_folders(account_id) {
+                let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                    account_id,
+                    folders,
+                });
+            }
+            let Ok(account) = load_account_config(data_dir, account_id) else {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: format!("账号 #{account_id} 未找到配置"),
+                });
+                return;
+            };
+            let res = match account.auth_backend {
+                AuthBackend::MicrosoftGraphOAuth2 => {
+                    // graph_client 无批量接口：对本文件夹缓存内的未读邮件逐封置已读。
+                    let unread = match cache.folder_unread_remote_ids(folder_id) {
+                        Ok(list) => list,
+                        Err(e) => {
+                            let _ = evt_tx.send(WorkerEvent::Error {
+                                account_id: Some(account_id),
+                                message: e,
+                            });
+                            return;
+                        }
+                    };
+                    match ensure_graph_token(tokens, &account).await {
+                        Ok(token) => {
+                            let mut last = Ok(());
+                            for (_, remote_id) in unread {
+                                let token = token.clone();
+                                last = tokio::task::spawn_blocking(move || {
+                                    graph_client::set_seen(&token, &remote_id, true)
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}")));
+                                if last.is_err() {
+                                    break;
+                                }
+                            }
+                            last
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                AuthBackend::Password => match secrets::load_account_secrets(account_id) {
+                    Ok(sec) => {
+                        imap_client::mark_folder_all_read(
+                            &account,
+                            &sec.imap_password,
+                            &folder_path,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            match res {
+                Ok(()) => {
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: Some(account_id),
+                        text: format!("[{}] 已将文件夹全部标为已读", account.email),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: format!("[{}] {e}", account.email),
+                    });
+                }
+            }
+        }
+
+        MailRequest::EmptyFolder {
+            account_id,
+            folder_id,
+            folder_path,
+        } => {
+            let Ok(account) = load_account_config(data_dir, account_id) else {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: format!("账号 #{account_id} 未找到配置"),
+                });
+                return;
+            };
+            // Graph（Outlook）账号：graph_client 无批量删除 / 清空能力，降级不支持。
+            if account.auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: format!(
+                        "[{}] Graph (Outlook) 账号暂不支持清空文件夹，请在网页端操作",
+                        account.email
+                    ),
+                });
+                return;
+            }
+            let res = match secrets::load_account_secrets(account_id) {
+                Ok(sec) => {
+                    imap_client::empty_folder(&account, &sec.imap_password, &folder_path).await
+                }
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => {
+                    // 服务器已 EXPUNGE：同步清空该文件夹本地缓存并刷新计数。
+                    let _ = cache.clear_folder(folder_id);
+                    if let Ok(folders) = cache.list_folders(account_id) {
+                        let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                            account_id,
+                            folders,
+                        });
+                    }
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: Some(account_id),
+                        text: format!("[{}] 文件夹已清空", account.email),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: format!("[{}] {e}", account.email),
+                    });
+                }
+            }
+        }
+
         MailRequest::ArchiveMessage {
             account_id,
             message_id,
