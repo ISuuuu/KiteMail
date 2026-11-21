@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail, MessageSummary, OutboxItem,
@@ -41,6 +42,38 @@ pub struct CachedAttachmentInput {
     pub mime_type: String,
     pub content: Vec<u8>,
 }
+
+/// Cached attachment joined with its owning message for the gallery view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedAttachment {
+    pub id: u32,
+    pub message_id: u32,
+    pub account_id: u32,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: usize,
+    pub sender: String,
+    pub subject: String,
+    pub date_display: String,
+}
+
+/// Contact aggregated from cached senders/recipients for the contacts view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownContact {
+    pub name: String,
+    pub email: String,
+    pub message_count: usize,
+}
+
+/// SQL predicate matching every account's Sent folder by friendly name or raw path.
+const SENT_FOLDER_MATCH: &str = "(f.name = '已发送' OR UPPER(f.path) LIKE '%SENT%')";
+
+/// SQL predicate matching every account's Archive folder by friendly name or raw path.
+const ARCHIVE_FOLDER_MATCH: &str = "(f.name = '归档' OR UPPER(f.path) LIKE '%ARCHIVE%')";
+
+/// SQL predicate matching every account's Trash/Deleted folder by friendly name or raw path.
+const TRASH_FOLDER_MATCH: &str =
+    "(f.name = '已删除' OR UPPER(f.path) LIKE '%TRASH%' OR UPPER(f.path) LIKE '%DELETED%')";
 
 /// Persistent SQLite mail cache.
 pub struct CacheStore {
@@ -608,6 +641,142 @@ impl CacheStore {
         })
     }
 
+    /// Query a page of starred (flagged) messages across all accounts and folders.
+    pub fn list_starred_messages(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages("m.flagged = 1", "星标邮件", query, offset, limit)
+    }
+
+    /// Query a page of messages aggregated across every account's Sent folder
+    /// (matched by friendly name or raw IMAP/Graph path, like [`Self::list_unified_inbox`]).
+    pub fn list_sent_messages(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages(SENT_FOLDER_MATCH, "已发送", query, offset, limit)
+    }
+
+    /// Query a page of messages aggregated across every account's Archive folder.
+    pub fn list_archived_messages(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages(ARCHIVE_FOLDER_MATCH, "归档", query, offset, limit)
+    }
+
+    /// Shared implementation for unified message pages: `predicate` is a trusted
+    /// constant SQL fragment applied to the `messages JOIN folders` row set.
+    fn list_role_messages(
+        &self,
+        predicate: &str,
+        label: &str,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        let trimmed = query.trim();
+        let (total, items) = if trimmed.is_empty() {
+            let total: i64 = self
+                .conn
+                .query_row(
+                    &format!(
+                        "
+                        SELECT COUNT(*)
+                        FROM messages m
+                        JOIN folders f ON f.id = m.folder_id
+                        WHERE {predicate}
+                        "
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("统计{label}总数失败: {e}"))?;
+
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "
+                    SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
+                           m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    WHERE {predicate}
+                    ORDER BY m.date_ts DESC, m.uid DESC
+                    LIMIT ?1 OFFSET ?2
+                    "
+                ))
+                .map_err(|e| format!("准备{label}分页查询失败: {e}"))?;
+
+            let rows = stmt
+                .query_map(params![limit as i64, offset as i64], map_summary_row)
+                .map_err(|e| format!("执行{label}分页查询失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析{label}结果失败: {e}"))?;
+
+            (total.max(0) as usize, rows)
+        } else {
+            let pattern = format!("%{trimmed}%");
+            let total: i64 = self
+                .conn
+                .query_row(
+                    &format!(
+                        "
+                        SELECT COUNT(*)
+                        FROM messages m
+                        JOIN folders f ON f.id = m.folder_id
+                        WHERE {predicate}
+                          AND (m.subject LIKE ?1 OR m.sender LIKE ?1)
+                        "
+                    ),
+                    params![pattern],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("统计{label}搜索总数失败: {e}"))?;
+
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "
+                    SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
+                           m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    WHERE {predicate}
+                      AND (m.subject LIKE ?1 OR m.sender LIKE ?1)
+                    ORDER BY m.date_ts DESC, m.uid DESC
+                    LIMIT ?2 OFFSET ?3
+                    "
+                ))
+                .map_err(|e| format!("准备{label}搜索查询失败: {e}"))?;
+
+            let rows = stmt
+                .query_map(
+                    params![pattern, limit as i64, offset as i64],
+                    map_summary_row,
+                )
+                .map_err(|e| format!("执行{label}搜索查询失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析{label}搜索结果失败: {e}"))?;
+
+            (total.max(0) as usize, rows)
+        };
+
+        Ok(MailPage {
+            folder_id: 0,
+            offset,
+            total,
+            items,
+        })
+    }
+
     /// Return cached message detail and whether its body has already been downloaded.
     pub fn get_message_detail(
         &self,
@@ -772,6 +941,208 @@ impl CacheStore {
             .optional()
             .map(|opt| opt.filter(|s| !s.is_empty()))
             .map_err(|e| format!("读取邮件远端 ID 失败: {e}"))
+    }
+
+    /// List cached attachments joined with their owning messages for the gallery view,
+    /// filtered by `query` against filename / sender / subject, newest first.
+    pub fn list_cached_attachments(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<CachedAttachment>, String> {
+        let trimmed = query.trim();
+        let rows = if trimmed.is_empty() {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT a.id, a.message_id, m.account_id, a.filename, a.mime_type, a.size_bytes,
+                           m.sender, m.subject, m.date_display
+                    FROM attachments a
+                    JOIN messages m ON m.id = a.message_id
+                    ORDER BY m.date_ts DESC, a.id ASC
+                    LIMIT ?1 OFFSET ?2
+                    ",
+                )
+                .map_err(|e| format!("准备附件总览查询失败: {e}"))?;
+            let rows = stmt
+                .query_map(params![limit as i64, offset as i64], map_attachment_row)
+                .map_err(|e| format!("执行附件总览查询失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析附件总览结果失败: {e}"))?;
+            rows
+        } else {
+            let pattern = format!("%{trimmed}%");
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT a.id, a.message_id, m.account_id, a.filename, a.mime_type, a.size_bytes,
+                           m.sender, m.subject, m.date_display
+                    FROM attachments a
+                    JOIN messages m ON m.id = a.message_id
+                    WHERE (a.filename LIKE ?1 OR m.sender LIKE ?1 OR m.subject LIKE ?1)
+                    ORDER BY m.date_ts DESC, a.id ASC
+                    LIMIT ?2 OFFSET ?3
+                    ",
+                )
+                .map_err(|e| format!("准备附件总览搜索查询失败: {e}"))?;
+            let rows = stmt
+                .query_map(
+                    params![pattern, limit as i64, offset as i64],
+                    map_attachment_row,
+                )
+                .map_err(|e| format!("执行附件总览搜索查询失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析附件总览搜索结果失败: {e}"))?;
+            rows
+        };
+        Ok(rows)
+    }
+
+    /// Aggregate known contacts from cached senders/recipients, deduplicated by
+    /// e-mail address, filtered by `query` against name / e-mail, ranked by
+    /// message count in descending order.
+    pub fn list_known_contacts(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<KnownContact>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT sender, recipients FROM messages")
+            .map_err(|e| format!("查询联系人来源失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("读取联系人来源失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析联系人来源失败: {e}"))?;
+
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut emails: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (sender, recipients) in rows {
+            // Count each contact once per message, even if listed twice in it.
+            let mut seen_in_message: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut pairs = vec![split_address(&sender)];
+            for part in recipients.split(',') {
+                pairs.push(split_address(part));
+            }
+            for (name, email) in pairs {
+                // Skip empty parts and display-name fallbacks like `(未知)`.
+                if !email.contains('@') {
+                    continue;
+                }
+                let key = email.to_lowercase();
+                if !seen_in_message.insert(key.clone()) {
+                    continue;
+                }
+                emails.entry(key.clone()).or_insert(email);
+                let name_slot = names.entry(key.clone()).or_default();
+                if name_slot.is_empty() && !name.is_empty() {
+                    *name_slot = name;
+                }
+                *counts.entry(key).or_insert(0) += 1;
+            }
+        }
+
+        let trimmed = query.trim().to_lowercase();
+        let mut contacts: Vec<KnownContact> = counts
+            .into_iter()
+            .map(|(key, message_count)| KnownContact {
+                name: names.get(&key).cloned().unwrap_or_default(),
+                email: emails.get(&key).cloned().unwrap_or(key.clone()),
+                message_count,
+            })
+            .filter(|c| {
+                trimmed.is_empty()
+                    || c.name.to_lowercase().contains(&trimmed)
+                    || c.email.to_lowercase().contains(&trimmed)
+            })
+            .collect();
+
+        // Rank by message count (descending) with a stable e-mail tie-break.
+        contacts.sort_by(|a, b| {
+            b.message_count
+                .cmp(&a.message_count)
+                .then_with(|| a.email.cmp(&b.email))
+        });
+        Ok(contacts.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// Find the account's Archive folder `(folder_id, path)` using the same
+    /// rules as [`Self::list_archived_messages`].
+    pub fn find_archive_folder(&self, account_id: u32) -> Result<Option<(u32, String)>, String> {
+        self.find_role_folder(account_id, ARCHIVE_FOLDER_MATCH)
+    }
+
+    /// Find the account's Trash/Deleted folder `(folder_id, path)` using the
+    /// same rules as the unified views.
+    pub fn find_trash_folder(&self, account_id: u32) -> Result<Option<(u32, String)>, String> {
+        self.find_role_folder(account_id, TRASH_FOLDER_MATCH)
+    }
+
+    fn find_role_folder(
+        &self,
+        account_id: u32,
+        predicate: &str,
+    ) -> Result<Option<(u32, String)>, String> {
+        self.conn
+            .query_row(
+                &format!(
+                    "
+                    SELECT f.id, f.path FROM folders f
+                    WHERE f.account_id = ?1 AND {predicate}
+                    ORDER BY f.id ASC LIMIT 1
+                    "
+                ),
+                params![account_id],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("查找角色文件夹失败: {e}"))
+    }
+
+    /// Remove a cached message (with its body and attachments) after it was
+    /// moved or deleted on the server. Returns the owning folder ID if the
+    /// message existed, so callers can refresh folder counters.
+    pub fn remove_message(&mut self, message_id: u32) -> Result<Option<u32>, String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("开启邮件清理事务失败: {e}"))?;
+        let folder_id: Option<u32> = tx
+            .query_row(
+                "SELECT folder_id FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("查询邮件所在文件夹失败: {e}"))?;
+        let Some(folder_id) = folder_id else {
+            return Ok(None);
+        };
+        tx.execute("DELETE FROM messages WHERE id = ?1", params![message_id])
+            .map_err(|e| format!("移除缓存邮件失败: {e}"))?;
+        tx.execute(
+            "
+            UPDATE folders
+            SET unread_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND unread = 1),
+                total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1)
+            WHERE id = ?1
+            ",
+            params![folder_id],
+        )
+        .map_err(|e| format!("更新文件夹计数失败: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("提交邮件清理事务失败: {e}"))?;
+        Ok(Some(folder_id))
     }
 
     /// Read raw attachment bytes from local cache.
@@ -1071,6 +1442,34 @@ fn map_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> 
     })
 }
 
+fn map_attachment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedAttachment> {
+    Ok(CachedAttachment {
+        id: row.get(0)?,
+        message_id: row.get(1)?,
+        account_id: row.get(2)?,
+        filename: row.get(3)?,
+        mime_type: row.get(4)?,
+        size_bytes: row.get::<_, i64>(5)?.max(0) as usize,
+        sender: row.get(6)?,
+        subject: row.get(7)?,
+        date_display: row.get(8)?,
+    })
+}
+
+/// Split a `Name <email>` (or bare `email`) address string into its parts.
+fn split_address(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('<'), trimmed.find('>')) {
+        if start < end {
+            return (
+                trimmed[..start].trim().to_string(),
+                trimmed[start + 1..end].trim().to_string(),
+            );
+        }
+    }
+    (String::new(), trimmed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1486,40 @@ mod tests {
             date_display: "15:00".to_string(),
             unread: true,
             flagged: false,
+            has_attachment: false,
+        }
+    }
+
+    fn folder(name: &str, path: &str) -> RemoteFolder {
+        RemoteFolder {
+            name: name.to_string(),
+            path: path.to_string(),
+            unread_count: 0,
+            total_count: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn header_with(
+        uid: u32,
+        subject: &str,
+        sender: &str,
+        recipients: &str,
+        flagged: bool,
+        unread: bool,
+        date_ts: i64,
+    ) -> CachedHeaderInput {
+        CachedHeaderInput {
+            uid,
+            message_id: format!("<msg-{uid}@example.com>"),
+            sender: sender.to_string(),
+            recipients: recipients.to_string(),
+            subject: subject.to_string(),
+            preview: String::new(),
+            date_ts,
+            date_display: String::new(),
+            unread,
+            flagged,
             has_attachment: false,
         }
     }
@@ -1273,5 +1706,492 @@ mod tests {
 
         cache.delete_draft(id).unwrap();
         assert!(cache.list_drafts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn starred_view_filters_flagged_and_searches() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let f1 = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let f2 = cache.sync_folders(2, &[folder("收件箱", "INBOX")]).unwrap();
+
+        cache
+            .commit_folder_headers(
+                1,
+                f1[0].id,
+                10,
+                &[
+                    header_with(1, "星标周报", "Alice <alice@a.com>", "", true, false, 100),
+                    header_with(2, "普通邮件", "Bob <bob@b.com>", "", false, false, 200),
+                ],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                2,
+                f2[0].id,
+                20,
+                &[header_with(
+                    1,
+                    "另一账号星标",
+                    "Carol <carol@c.com>",
+                    "",
+                    true,
+                    false,
+                    300,
+                )],
+                None,
+            )
+            .unwrap();
+
+        let starred = cache.list_starred_messages("", 0, 10).unwrap();
+        assert_eq!(starred.total, 2);
+        assert_eq!(starred.folder_id, 0);
+        assert_eq!(starred.items[0].subject, "另一账号星标");
+        assert_eq!(starred.items[0].account_id, 2);
+        assert_eq!(starred.items[1].subject, "星标周报");
+        assert!(starred.items.iter().all(|m| m.flagged));
+
+        let search = cache.list_starred_messages("周报", 0, 10).unwrap();
+        assert_eq!(search.total, 1);
+        assert_eq!(search.items[0].subject, "星标周报");
+
+        let paged = cache.list_starred_messages("", 1, 1).unwrap();
+        assert_eq!(paged.total, 2);
+        assert_eq!(paged.items.len(), 1);
+        assert_eq!(paged.items[0].subject, "星标周报");
+    }
+
+    #[test]
+    fn sent_view_aggregates_by_name_and_path() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let f1 = cache
+            .sync_folders(
+                1,
+                &[
+                    folder("收件箱", "INBOX"),
+                    folder("已发送", "Sent"),
+                    folder("垃圾邮件", "Junk"),
+                ],
+            )
+            .unwrap();
+        let f2 = cache
+            .sync_folders(2, &[folder("已发送", "AAMkGraphFolderId")])
+            .unwrap();
+
+        let inbox = f1.iter().find(|f| f.path == "INBOX").unwrap().id;
+        let sent = f1.iter().find(|f| f.path == "Sent").unwrap().id;
+        let junk = f1.iter().find(|f| f.path == "Junk").unwrap().id;
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                10,
+                &[header_with(
+                    1,
+                    "收到的邮件",
+                    "x@x.com",
+                    "",
+                    false,
+                    false,
+                    50,
+                )],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                sent,
+                11,
+                &[header_with(
+                    1,
+                    "发出的邮件",
+                    "me@me.com",
+                    "you@you.com",
+                    false,
+                    false,
+                    100,
+                )],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                junk,
+                12,
+                &[header_with(
+                    1,
+                    "广告邮件",
+                    "ad@ad.com",
+                    "",
+                    false,
+                    false,
+                    200,
+                )],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                2,
+                f2[0].id,
+                20,
+                &[header_with(
+                    1,
+                    "Graph 已发送",
+                    "me2@me.com",
+                    "",
+                    false,
+                    false,
+                    300,
+                )],
+                None,
+            )
+            .unwrap();
+
+        let sent_page = cache.list_sent_messages("", 0, 10).unwrap();
+        assert_eq!(sent_page.total, 2);
+        assert_eq!(sent_page.items[0].subject, "Graph 已发送");
+        assert_eq!(sent_page.items[0].account_id, 2);
+        assert_eq!(sent_page.items[1].subject, "发出的邮件");
+        assert_eq!(sent_page.items[1].account_id, 1);
+
+        let search = cache.list_sent_messages("发出", 0, 10).unwrap();
+        assert_eq!(search.total, 1);
+        assert_eq!(search.items[0].subject, "发出的邮件");
+    }
+
+    #[test]
+    fn archived_view_aggregates_by_name_and_path() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let f1 = cache
+            .sync_folders(
+                1,
+                &[
+                    folder("收件箱", "INBOX"),
+                    folder("归档", "Archive"),
+                    folder("Notes", "Notes"),
+                ],
+            )
+            .unwrap();
+        let f2 = cache
+            .sync_folders(2, &[folder("Archive", "INBOX/Archive")])
+            .unwrap();
+
+        let inbox = f1.iter().find(|f| f.path == "INBOX").unwrap().id;
+        let archive = f1.iter().find(|f| f.path == "Archive").unwrap().id;
+        let notes = f1.iter().find(|f| f.path == "Notes").unwrap().id;
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                10,
+                &[header_with(
+                    1,
+                    "收件箱邮件",
+                    "x@x.com",
+                    "",
+                    false,
+                    false,
+                    50,
+                )],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                archive,
+                11,
+                &[header_with(
+                    1,
+                    "已归档邮件",
+                    "y@y.com",
+                    "",
+                    false,
+                    false,
+                    100,
+                )],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                notes,
+                12,
+                &[header_with(1, "笔记", "z@z.com", "", false, false, 200)],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                2,
+                f2[0].id,
+                20,
+                &[header_with(
+                    1,
+                    "INBOX 下归档",
+                    "w@w.com",
+                    "",
+                    false,
+                    false,
+                    300,
+                )],
+                None,
+            )
+            .unwrap();
+
+        let archived = cache.list_archived_messages("", 0, 10).unwrap();
+        assert_eq!(archived.total, 2);
+        assert_eq!(archived.items[0].subject, "INBOX 下归档");
+        assert_eq!(archived.items[1].subject, "已归档邮件");
+
+        let found = cache.find_archive_folder(1).unwrap();
+        assert_eq!(found, Some((archive, "Archive".to_string())));
+    }
+
+    #[test]
+    fn attachment_gallery_joins_messages_and_filters() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let folders = cache
+            .sync_folders(1, &[folder("收件箱", "INBOX"), folder("已发送", "Sent")])
+            .unwrap();
+        let inbox = folders.iter().find(|f| f.path == "INBOX").unwrap().id;
+        let sent = folders.iter().find(|f| f.path == "Sent").unwrap().id;
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                10,
+                &[
+                    header_with(1, "照片分享", "Bob <bob@b.com>", "", false, false, 200),
+                    header_with(2, "季度报告", "Alice <alice@a.com>", "", false, false, 100),
+                ],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                sent,
+                20,
+                &[header_with(
+                    1,
+                    "合同扫描件",
+                    "Carol <carol@c.com>",
+                    "",
+                    false,
+                    false,
+                    300,
+                )],
+                None,
+            )
+            .unwrap();
+
+        let inbox_page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let photo_id = inbox_page.items[0].id;
+        let sent_page = cache.list_messages_page(sent, "", 0, 10).unwrap();
+        let contract_id = sent_page.items[0].id;
+
+        cache
+            .store_message_body(
+                photo_id,
+                "正文",
+                &[CachedAttachmentInput {
+                    filename: "holiday.jpg".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    content: vec![1, 2, 3],
+                }],
+            )
+            .unwrap();
+        cache
+            .store_message_body(
+                contract_id,
+                "正文",
+                &[CachedAttachmentInput {
+                    filename: "contract.pdf".to_string(),
+                    mime_type: "application/pdf".to_string(),
+                    content: vec![4],
+                }],
+            )
+            .unwrap();
+
+        let all = cache.list_cached_attachments("", 0, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        // Newest message first.
+        assert_eq!(all[0].filename, "contract.pdf");
+        assert_eq!(all[0].subject, "合同扫描件");
+        assert_eq!(all[0].sender, "Carol <carol@c.com>");
+        assert_eq!(all[0].size_bytes, 1);
+        assert_eq!(all[1].filename, "holiday.jpg");
+        assert_eq!(all[1].message_id, photo_id);
+        assert_eq!(all[1].account_id, 1);
+        assert_eq!(all[1].mime_type, "image/jpeg");
+
+        let by_name = cache.list_cached_attachments("contract", 0, 10).unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].filename, "contract.pdf");
+
+        let by_subject = cache.list_cached_attachments("照片", 0, 10).unwrap();
+        assert_eq!(by_subject.len(), 1);
+        assert_eq!(by_subject[0].filename, "holiday.jpg");
+
+        let by_sender = cache.list_cached_attachments("bob@", 0, 10).unwrap();
+        assert_eq!(by_sender.len(), 1);
+        assert_eq!(by_sender[0].filename, "holiday.jpg");
+
+        let paged = cache.list_cached_attachments("", 1, 1).unwrap();
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].filename, "holiday.jpg");
+    }
+
+    #[test]
+    fn known_contacts_dedupe_rank_and_filter() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+
+        cache
+            .commit_folder_headers(
+                1,
+                folders[0].id,
+                10,
+                &[
+                    // Alice sends once with display name, once bare (same address, lowercased).
+                    header_with(
+                        1,
+                        "A",
+                        "Alice <alice@a.com>",
+                        "bob@b.com, Carol <carol@c.com>",
+                        false,
+                        false,
+                        100,
+                    ),
+                    header_with(2, "B", "alice@a.com", "Bob <BOB@b.com>", false, false, 200),
+                    // No usable address at all.
+                    header_with(3, "C", "(未知)", "名字 <>", false, false, 300),
+                ],
+                None,
+            )
+            .unwrap();
+
+        let contacts = cache.list_known_contacts("", 0, 50).unwrap();
+        assert_eq!(contacts.len(), 3);
+        assert_eq!(contacts[0].email, "alice@a.com");
+        assert_eq!(contacts[0].name, "Alice");
+        assert_eq!(contacts[0].message_count, 2);
+        assert_eq!(contacts[1].email, "bob@b.com");
+        assert_eq!(contacts[1].name, "Bob");
+        assert_eq!(contacts[1].message_count, 2);
+        assert_eq!(contacts[2].email, "carol@c.com");
+        assert_eq!(contacts[2].name, "Carol");
+        assert_eq!(contacts[2].message_count, 1);
+
+        let filtered = cache.list_known_contacts("carol", 0, 50).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].email, "carol@c.com");
+
+        let paged = cache.list_known_contacts("", 1, 1).unwrap();
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].email, "bob@b.com");
+    }
+
+    #[test]
+    fn role_folder_finders_match_names_and_paths() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let folders = cache
+            .sync_folders(
+                1,
+                &[
+                    folder("收件箱", "INBOX"),
+                    folder("已删除", "Trash"),
+                    folder("归档", "Archive"),
+                    folder("Notes", "Notes"),
+                ],
+            )
+            .unwrap();
+        let archive = folders.iter().find(|f| f.path == "Archive").unwrap();
+        let trash = folders.iter().find(|f| f.path == "Trash").unwrap();
+
+        assert_eq!(
+            cache.find_archive_folder(1).unwrap(),
+            Some((archive.id, "Archive".to_string()))
+        );
+        assert_eq!(
+            cache.find_trash_folder(1).unwrap(),
+            Some((trash.id, "Trash".to_string()))
+        );
+        // Account 2 has no cached folders at all.
+        assert_eq!(cache.find_archive_folder(2).unwrap(), None);
+        assert_eq!(cache.find_trash_folder(2).unwrap(), None);
+    }
+
+    #[test]
+    fn remove_message_updates_counts_and_cascades_attachments() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let inbox = folders[0].id;
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                10,
+                &[
+                    header_with(
+                        1,
+                        "被移除的邮件",
+                        "Alice <alice@a.com>",
+                        "",
+                        false,
+                        false,
+                        100,
+                    ),
+                    header_with(2, "保留的未读邮件", "Bob <bob@b.com>", "", false, true, 200),
+                ],
+                None,
+            )
+            .unwrap();
+
+        let page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let target_id = page
+            .items
+            .iter()
+            .find(|m| m.subject == "被移除的邮件")
+            .unwrap()
+            .id;
+        cache
+            .store_message_body(
+                target_id,
+                "正文",
+                &[CachedAttachmentInput {
+                    filename: "gone.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    content: vec![1],
+                }],
+            )
+            .unwrap();
+        assert_eq!(cache.list_cached_attachments("", 0, 10).unwrap().len(), 1);
+
+        let removed = cache.remove_message(target_id).unwrap();
+        assert_eq!(removed, Some(inbox));
+        assert!(cache.get_message_detail(target_id).unwrap().is_none());
+        assert!(cache.list_cached_attachments("", 0, 10).unwrap().is_empty());
+
+        let folders_after = cache.list_folders(1).unwrap();
+        assert_eq!(folders_after[0].total_count, 1);
+        assert_eq!(folders_after[0].unread_count, 1);
+
+        let page_after = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        assert_eq!(page_after.total, 1);
+        assert_eq!(page_after.items[0].subject, "保留的未读邮件");
+
+        // Removing again is a no-op.
+        assert_eq!(cache.remove_message(target_id).unwrap(), None);
     }
 }

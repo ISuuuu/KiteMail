@@ -255,6 +255,23 @@ pub fn set_flagged(access_token: &str, remote_id: &str, flagged: bool) -> Result
     Ok(())
 }
 
+/// Move a message to another folder via Microsoft Graph.
+/// `dest_folder_id` accepts a Graph folder ID or a well-known folder name
+/// such as `deleteditems`.
+pub fn move_message(
+    access_token: &str,
+    remote_id: &str,
+    dest_folder_id: &str,
+) -> Result<(), String> {
+    let encoded_id = urlencoding_segment(remote_id);
+    let url = format!("{GRAPH_BASE}/messages/{encoded_id}/move");
+    ureq::post(&url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .send_json(serde_json::json!({ "destinationId": dest_folder_id }))
+        .map_err(format_graph_error)?;
+    Ok(())
+}
+
 /// Send an email (with optional attachments) via Microsoft Graph `sendMail`.
 pub fn send_message(
     access_token: &str,

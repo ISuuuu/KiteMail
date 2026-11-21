@@ -227,6 +227,14 @@ pub enum MailRequest {
         uid: u32,
         flagged: bool,
     },
+    ArchiveMessage {
+        account_id: u32,
+        message_id: u32,
+    },
+    DeleteMessage {
+        account_id: u32,
+        message_id: u32,
+    },
     SaveAttachment {
         attachment_id: u32,
         dest_path: std::path::PathBuf,
@@ -280,6 +288,18 @@ pub enum WorkerEvent {
     },
     AttachmentSaved {
         path: std::path::PathBuf,
+    },
+    /// A message was moved to the account's archive folder on the server and
+    /// removed from the local cache; the UI should refresh its lists.
+    MessageArchived {
+        account_id: u32,
+        message_id: u32,
+    },
+    /// A message was moved to the account's trash folder (or permanently
+    /// deleted) on the server and removed from the local cache.
+    MessageDeleted {
+        account_id: u32,
+        message_id: u32,
     },
     Status {
         account_id: Option<u32>,
