@@ -181,7 +181,7 @@ pub fn fetch_folder_headers(
 pub fn fetch_message_body(
     access_token: &str,
     remote_id: &str,
-) -> Result<(String, Vec<CachedAttachmentInput>), String> {
+) -> Result<(String, Option<String>, Vec<CachedAttachmentInput>), String> {
     let encoded_id = urlencoding_segment(remote_id);
     let url = format!("{GRAPH_BASE}/messages/{encoded_id}?$select=body,hasAttachments");
     let resp = ureq::get(&url)
@@ -195,10 +195,13 @@ pub fn fetch_message_body(
 
     let content_type = json["body"]["contentType"].as_str().unwrap_or("text");
     let raw_content = json["body"]["content"].as_str().unwrap_or("");
-    let body_text = if content_type.eq_ignore_ascii_case("html") {
-        html_to_readable_text(raw_content)
+    let (body_text, body_html) = if content_type.eq_ignore_ascii_case("html") {
+        (
+            html_to_readable_text(raw_content),
+            Some(raw_content.to_string()),
+        )
     } else {
-        raw_content.to_string()
+        (raw_content.to_string(), None)
     };
 
     let mut attachments = Vec::new();
@@ -229,7 +232,7 @@ pub fn fetch_message_body(
         }
     }
 
-    Ok((body_text, attachments))
+    Ok((body_text, body_html, attachments))
 }
 
 /// Update read (`isRead`) state on Microsoft Graph.

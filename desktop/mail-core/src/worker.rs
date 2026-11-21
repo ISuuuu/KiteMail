@@ -402,8 +402,13 @@ async fn handle_request(
             };
 
             match fetch_res {
-                Ok((body_text, attachments)) => {
-                    if let Err(e) = cache.store_message_body(message_id, &body_text, &attachments) {
+                Ok((body_text, body_html, attachments)) => {
+                    if let Err(e) = cache.store_message_body_with_html(
+                        message_id,
+                        &body_text,
+                        body_html.as_deref(),
+                        &attachments,
+                    ) {
                         let _ = evt_tx.send(WorkerEvent::Error {
                             account_id: Some(account_id),
                             message: e,

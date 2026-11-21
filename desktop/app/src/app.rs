@@ -310,6 +310,10 @@ pub(crate) struct HylkiApp {
     pub(crate) list_filter: ListFilter,
     /// 账号分组折叠状态（缺省展开）。
     pub(crate) collapsed_accounts: HashSet<u32>,
+    /// 阅读器是否强制以纯文本渲染（false = 有 HTML 时渲染富文本）。
+    pub(crate) reader_prefer_plain: bool,
+    /// 本次会话中用户手动放行远程图片的邮件 ID 集合。
+    pub(crate) allowed_remote_image_ids: HashSet<u32>,
 
     // ---- 阶段 3：全局路由 / 模态 / 偏好（方案文档五.1、五.2）----
     /// 持久化偏好副本（preferences.toml；last_view / last_folder 随切换落盘）。
@@ -534,6 +538,8 @@ impl HylkiApp {
                 sidebar_hidden: false,
                 list_filter: ListFilter::All,
                 collapsed_accounts: HashSet::new(),
+                reader_prefer_plain: false,
+                allowed_remote_image_ids: HashSet::new(),
                 prefs,
                 main_view: MainContentView::Mail,
                 active_modal: ActiveModal::None,
@@ -662,6 +668,8 @@ impl HylkiApp {
             sidebar_hidden: false,
             list_filter: ListFilter::All,
             collapsed_accounts: HashSet::new(),
+            reader_prefer_plain: false,
+            allowed_remote_image_ids: HashSet::new(),
             prefs,
             main_view: MainContentView::Mail,
             active_modal: ActiveModal::None,
@@ -1105,6 +1113,23 @@ impl HylkiApp {
         } else {
             "已标记为未读"
         });
+        cx.notify();
+    }
+
+    /// 切换阅读器「原样 HTML / 纯文本」显示模式。
+    pub(crate) fn toggle_reader_plain_mode(&mut self, cx: &mut Context<Self>) {
+        self.reader_prefer_plain = !self.reader_prefer_plain;
+        self.status_line = SharedString::from(if self.reader_prefer_plain {
+            "阅读器已切换为纯文本模式"
+        } else {
+            "阅读器已切换为富文本 HTML 模式"
+        });
+        cx.notify();
+    }
+
+    /// 临时允许指定邮件加载远程图片。
+    pub(crate) fn allow_remote_images_for(&mut self, message_id: u32, cx: &mut Context<Self>) {
+        self.allowed_remote_image_ids.insert(message_id);
         cx.notify();
     }
 

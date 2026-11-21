@@ -83,6 +83,8 @@ pub struct ThreadMessage {
     pub recipients: String,
     pub date_display: String,
     pub body_text: String,
+    #[serde(default)]
+    pub body_html: Option<String>,
     pub body_loaded: bool,
     pub flagged: bool,
     pub attachments: Vec<AttachmentMeta>,
@@ -102,6 +104,8 @@ pub struct MessageDetail {
     pub subject: String,
     pub date_display: String,
     pub body_text: String,
+    #[serde(default)]
+    pub body_html: Option<String>,
     pub flagged: bool,
     pub attachments: Vec<AttachmentMeta>,
     /// Chronological messages belonging to the same conversation thread (empty or 1 item for standalone mails).

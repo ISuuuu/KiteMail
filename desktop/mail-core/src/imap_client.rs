@@ -200,7 +200,7 @@ pub async fn fetch_message_body(
     password: &str,
     folder_path: &str,
     uid: u32,
-) -> Result<(String, Vec<CachedAttachmentInput>), String> {
+) -> Result<(String, Option<String>, Vec<CachedAttachmentInput>), String> {
     let mut session = connect_imap(account, password).await?;
     session
         .select(folder_path)
@@ -229,10 +229,11 @@ pub async fn fetch_message_body(
         .parse(&bytes)
         .ok_or_else(|| "解析邮件 MIME 内容失败".to_string())?;
 
+    let body_html = parsed.body_html(0).map(|h| h.into_owned());
     let body_text = if let Some(text) = parsed.body_text(0) {
         text.into_owned()
-    } else if let Some(html) = parsed.body_html(0) {
-        html_to_readable_text(&html)
+    } else if let Some(ref html) = body_html {
+        html_to_readable_text(html)
     } else {
         "(此邮件无可读正文)".to_string()
     };
@@ -257,7 +258,7 @@ pub async fn fetch_message_body(
         });
     }
 
-    Ok((body_text, attachments))
+    Ok((body_text, body_html, attachments))
 }
 
 /// Add or remove `\Seen` or `\Flagged` on the server for `uid`.
@@ -572,6 +573,109 @@ fn is_block_break_tag(lower: &str) -> bool {
     )
 }
 
+/// Sanitize HTML email bodies for safe native display:
+/// strips `<script>`, `<style>`, `<head>`, `<iframe>`, and HTML comments,
+/// and optionally removes `<img>` elements referencing remote `http(s)://` URLs.
+/// Returns `(sanitized_html, blocked_remote_image_count)`.
+pub fn sanitize_html_for_display(html: &str, block_remote_images: bool) -> (String, usize) {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut skip_block: Option<&'static str> = None;
+    let mut tag_buf = String::new();
+    let mut blocked_images = 0usize;
+
+    for ch in html.chars() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+            continue;
+        }
+        if ch == '>' && in_tag {
+            in_tag = false;
+            let trimmed = tag_buf.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            let tag_name = lower
+                .trim_start_matches('/')
+                .split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or("");
+            let is_closing = lower.starts_with('/');
+
+            if lower.starts_with("!--") {
+                continue;
+            }
+            if let Some(active) = skip_block {
+                if is_closing && tag_name == active {
+                    skip_block = None;
+                }
+                continue;
+            }
+            if !is_closing && matches!(tag_name, "script" | "style" | "head" | "iframe" | "object")
+            {
+                skip_block = Some(match tag_name {
+                    "script" => "script",
+                    "style" => "style",
+                    "head" => "head",
+                    "iframe" => "iframe",
+                    _ => "object",
+                });
+                continue;
+            }
+            if !is_closing
+                && tag_name == "img"
+                && block_remote_images
+                && (lower.contains("http://") || lower.contains("https://"))
+            {
+                blocked_images += 1;
+                continue;
+            }
+            out.push('<');
+            out.push_str(trimmed);
+            out.push('>');
+            continue;
+        }
+        if in_tag {
+            tag_buf.push(ch);
+            continue;
+        }
+        if skip_block.is_none() {
+            out.push(ch);
+        }
+    }
+
+    (out, blocked_images)
+}
+
+/// Convert plain text into escaped HTML paragraphs so it can be rendered in a
+/// selectable rich-text view without accidental Markdown interpretation.
+pub fn plain_text_to_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    for para in text.split("\n\n") {
+        out.push_str("<p>");
+        let mut first_line = true;
+        for line in para.lines() {
+            if !first_line {
+                out.push_str("<br>");
+            }
+            first_line = false;
+            for ch in line.chars() {
+                match ch {
+                    '&' => out.push_str("&amp;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    _ => out.push(ch),
+                }
+            }
+        }
+        out.push_str("</p>");
+    }
+    if out.is_empty() {
+        "<p></p>".to_string()
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +696,28 @@ mod tests {
         assert_eq!(
             text,
             "You authored the thread.\nMessage ID: <abc@github.com>"
+        );
+    }
+
+    #[test]
+    fn sanitize_html_blocks_remote_images_and_scripts() {
+        let raw = "<html><head><style>x{}</style></head><body><script>alert(1)</script><p>正文</p><img src=\"https://tracker.example/p.png\"></body></html>";
+        let (clean, blocked) = sanitize_html_for_display(raw, true);
+        assert_eq!(blocked, 1);
+        assert!(clean.contains("<p>正文</p>"));
+        assert!(!clean.contains("alert(1)"));
+        assert!(!clean.contains("tracker.example"));
+
+        let (allowed, blocked2) = sanitize_html_for_display(raw, false);
+        assert_eq!(blocked2, 0);
+        assert!(allowed.contains("tracker.example"));
+    }
+
+    #[test]
+    fn plain_text_to_html_escapes_special_chars() {
+        assert_eq!(
+            plain_text_to_html("a < b & c\nline2"),
+            "<p>a &lt; b &amp; c<br>line2</p>"
         );
     }
 }

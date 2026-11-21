@@ -222,6 +222,8 @@ impl CacheStore {
         self.ensure_column("outbox", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("drafts", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
+        // HTML 正文（迭代 3）：旧库无列时补充，历史数据视为 NULL。
+        self.ensure_column("messages", "body_html", "TEXT")?;
         Ok(())
     }
 
@@ -816,7 +818,7 @@ impl CacheStore {
             .query_row(
                 "
                 SELECT m.id, m.account_id, m.folder_id, m.uid, m.message_id, m.sender, m.recipients,
-                       m.subject, m.date_display, m.body_text, m.flagged, f.path
+                       m.subject, m.date_display, m.body_text, m.body_html, m.flagged, f.path
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE m.id = ?1
@@ -824,6 +826,7 @@ impl CacheStore {
                 params![message_id],
                 |row| {
                     let body: Option<String> = row.get(9)?;
+                    let body_html: Option<String> = row.get(10)?;
                     Ok((
                         row.get::<_, u32>(0)?,
                         row.get::<_, u32>(1)?,
@@ -835,8 +838,9 @@ impl CacheStore {
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
                         body,
-                        row.get::<_, i32>(10)? != 0,
-                        row.get::<_, String>(11)?,
+                        body_html,
+                        row.get::<_, i32>(11)? != 0,
+                        row.get::<_, String>(12)?,
                     ))
                 },
             )
@@ -854,6 +858,7 @@ impl CacheStore {
             subject,
             date_display,
             body_opt,
+            body_html,
             flagged,
             folder_path,
         )) = row
@@ -879,6 +884,7 @@ impl CacheStore {
             subject,
             date_display,
             body_text,
+            body_html,
             flagged,
             attachments,
             thread_messages,
@@ -922,7 +928,7 @@ impl CacheStore {
             .conn
             .prepare(
                 "
-                SELECT id, sender, recipients, subject, date_display, body_text, preview, flagged
+                SELECT id, sender, recipients, subject, date_display, body_text, body_html, preview, flagged
                 FROM messages
                 WHERE account_id = ?1 AND LOWER(subject) LIKE ?2
                 ORDER BY date_ts ASC, uid ASC
@@ -940,8 +946,9 @@ impl CacheStore {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i32>(7)? != 0,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i32>(8)? != 0,
                 ))
             })
             .map_err(|e| format!("执行会话查询失败: {e}"))?
@@ -949,8 +956,17 @@ impl CacheStore {
             .map_err(|e| format!("解析会话结果失败: {e}"))?;
 
         let mut out = Vec::new();
-        for (id, sender, recipients, row_subject, date_display, body_opt, preview, flagged) in
-            raw_rows
+        for (
+            id,
+            sender,
+            recipients,
+            row_subject,
+            date_display,
+            body_opt,
+            body_html,
+            preview,
+            flagged,
+        ) in raw_rows
         {
             if normalize_thread_subject(&row_subject) != key {
                 continue;
@@ -964,6 +980,7 @@ impl CacheStore {
                 recipients,
                 date_display,
                 body_text,
+                body_html,
                 body_loaded,
                 flagged,
                 attachments,
@@ -1010,6 +1027,17 @@ impl CacheStore {
         body_text: &str,
         attachments: &[CachedAttachmentInput],
     ) -> Result<(), String> {
+        self.store_message_body_with_html(message_id, body_text, None, attachments)
+    }
+
+    /// Save fetched message plain text, optional HTML body, and attachments in one transaction.
+    pub fn store_message_body_with_html(
+        &mut self,
+        message_id: u32,
+        body_text: &str,
+        body_html: Option<&str>,
+        attachments: &[CachedAttachmentInput],
+    ) -> Result<(), String> {
         let tx = self
             .conn
             .transaction()
@@ -1018,10 +1046,12 @@ impl CacheStore {
         tx.execute(
             "
             UPDATE messages
-            SET body_text = ?1, has_attachment = CASE WHEN ?2 > 0 THEN 1 ELSE has_attachment END
-            WHERE id = ?3
+            SET body_text = ?1,
+                body_html = ?2,
+                has_attachment = CASE WHEN ?3 > 0 THEN 1 ELSE has_attachment END
+            WHERE id = ?4
             ",
-            params![body_text, attachments.len() as i64, message_id],
+            params![body_text, body_html, attachments.len() as i64, message_id],
         )
         .map_err(|e| format!("保存邮件正文失败: {e}"))?;
 
@@ -1071,7 +1101,7 @@ impl CacheStore {
             .conn
             .transaction()
             .map_err(|e| format!("开启正文缓存清理事务失败: {e}"))?;
-        tx.execute("UPDATE messages SET body_text = NULL", [])
+        tx.execute("UPDATE messages SET body_text = NULL, body_html = NULL", [])
             .map_err(|e| format!("清空邮件正文缓存失败: {e}"))?;
         tx.execute("DELETE FROM attachments", [])
             .map_err(|e| format!("清空附件缓存失败: {e}"))?;

@@ -477,6 +477,27 @@ impl DemoStore {
         }
         .to_string();
 
+        let demo_html = match summary.id {
+            1 => Some(
+                "<h3>Windows 移植阶段 1 构建基线确认</h3>\
+                <p>你好，</p>\
+                <p>请确认以下三项核心指标已通过验证：</p>\
+                <ul>\
+                  <li><strong>MSVC 工具链</strong>：独立 <code>desktop/Cargo.toml</code> 工作区编译通过</li>\
+                  <li><strong>中文输入与复制</strong>：阅读器正文支持鼠标选中与 <code>Ctrl+C</code> 复制</li>\
+                  <li><strong>隐私保护</strong>：默认拦截远程跟踪像素 <img src=\"https://tracker.hylki.example/pixel.png\"></li>\
+                </ul>\
+                <p>详细文档见 <a href=\"https://github.com/hyprlab/hylki\">Hylki 上游仓库</a>。</p>"
+                    .to_string(),
+            ),
+            3 => Some(
+                "<p>三栏布局已完成 <strong>48px 顶栏对齐</strong> 与亮/暗主题语义色板统一。</p>\
+                <blockquote><p>左栏柔和选中态 + 中栏主蓝高亮 + 右栏卡片式会话阅读。</p></blockquote>"
+                    .to_string(),
+            ),
+            _ => None,
+        };
+
         // 为演示邮件 #1 与 #3 构造多封往来会话，便于在 --demo 直观体验线程卡片阅读。
         let thread_messages = match summary.id {
             1 => vec![
@@ -486,6 +507,7 @@ impl DemoStore {
                     recipients: "林晓明 <xiaoming@example.com>, demo@hylki.example".to_string(),
                     date_display: "13:10".to_string(),
                     body_text: "我这边已经用 MSVC 工具链验证完 x86_64-pc-windows-msvc 独立工作区编译，依赖树完全隔离了 GTK 和 Wayland。".to_string(),
+                    body_html: None,
                     body_loaded: true,
                     flagged: false,
                     attachments: Vec::new(),
@@ -496,6 +518,7 @@ impl DemoStore {
                     recipients: "demo@hylki.example, 陈思远 <siyuan@example.org>".to_string(),
                     date_display: summary.date_display.clone(),
                     body_text: body_text.clone(),
+                    body_html: demo_html.clone(),
                     body_loaded: true,
                     flagged: summary.flagged,
                     attachments: attachments.clone(),
@@ -508,6 +531,7 @@ impl DemoStore {
                     recipients: "产品设计组 <design@hylki.example>".to_string(),
                     date_display: "前天 16:40".to_string(),
                     body_text: "请设计组同步一份三栏间距与亮/暗主题语义色板，我们按 48px 顶栏对齐。".to_string(),
+                    body_html: None,
                     body_loaded: true,
                     flagged: false,
                     attachments: Vec::new(),
@@ -518,6 +542,7 @@ impl DemoStore {
                     recipients: "demo@hylki.example".to_string(),
                     date_display: summary.date_display.clone(),
                     body_text: body_text.clone(),
+                    body_html: demo_html.clone(),
                     body_loaded: true,
                     flagged: summary.flagged,
                     attachments: attachments.clone(),
@@ -538,6 +563,7 @@ impl DemoStore {
             subject: summary.subject.clone(),
             date_display: summary.date_display.clone(),
             body_text,
+            body_html: demo_html,
             flagged: summary.flagged,
             attachments,
             thread_messages,

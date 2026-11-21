@@ -13,13 +13,14 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, relative, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Styled,
+    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString, Styled,
 };
+use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display};
 use hylki_mail_core::{AttachmentMeta, MailRequest, ThreadMessage};
 
 use crate::app::{split_sender, HylkiApp};
@@ -63,7 +64,10 @@ fn render_message_card(
     recipients: &str,
     date_display: &str,
     body_text: &str,
+    body_html: Option<&str>,
     body_loaded: bool,
+    prefer_plain: bool,
+    block_remote_images: bool,
     attachments: &[AttachmentMeta],
     is_current: bool,
     more_menu: Option<gpui_kit::AnyElement>,
@@ -78,6 +82,19 @@ fn render_message_card(
         sender_name
     };
     let (recipient_pill, recipient_list) = recipient_summary(recipients);
+
+    // 决定原生富文本渲染内容：有 HTML 且未切纯文本模式时渲染净化后的 HTML，
+    // 否则将纯文本安全转义后通过 TextView::html(...).selectable(true) 渲染，
+    // 保证所有邮件正文均支持鼠标框选与 Ctrl+C 复制。
+    let (rendered_html, blocked_images) = if !prefer_plain {
+        if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
+            sanitize_html_for_display(raw_html, block_remote_images)
+        } else {
+            (plain_text_to_html(body_text), 0)
+        }
+    } else {
+        (plain_text_to_html(body_text), 0)
+    };
 
     let attachment_rows: Vec<gpui_kit::AnyElement> = attachments
         .iter()
@@ -201,12 +218,49 @@ fn render_message_card(
                     )
                 }),
         )
+        .when(blocked_images > 0, |card| {
+            card.child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.0))
+                    .bg(p.accent_soft())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.text)
+                            .child(SharedString::from(format!(
+                                "已拦截 {blocked_images} 张远程图片以保护隐私"
+                            ))),
+                    )
+                    .child(
+                        Button::new(("allow-remote-img", msg_id))
+                            .outline()
+                            .compact()
+                            .label("显示远程图片")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.allow_remote_images_for(msg_id, cx);
+                            })),
+                    ),
+            )
+        })
         .child(
             div()
                 .text_sm()
-                .line_height(relative(1.6))
                 .text_color(if body_loaded { p.text } else { muted_fg })
-                .child(SharedString::from(body_text.to_string())),
+                .child(
+                    TextView::html(
+                        SharedString::from(format!(
+                            "reader-body-{msg_id}-{}-{}",
+                            prefer_plain as u8, block_remote_images as u8
+                        )),
+                        rendered_html,
+                    )
+                    .selectable(true),
+                ),
         )
         .when(!body_loaded, |card| {
             card.child(
@@ -272,7 +326,16 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let owner_email = app.account_email_for(detail.account_id).to_string();
     let flagged = detail.flagged;
     let is_unread = app.selected_message_unread();
+    let prefer_plain = app.reader_prefer_plain;
     let thread_count = detail.thread_messages.len();
+    let has_any_html = detail
+        .body_html
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || detail
+            .thread_messages
+            .iter()
+            .any(|m| m.body_html.as_deref().is_some_and(|s| !s.trim().is_empty()));
 
     // 卡片头部 `...` 更多操作菜单。
     let card_more_menu = {
@@ -353,6 +416,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             .map(|tm: &ThreadMessage| {
                 let is_current = tm.id == detail.id;
                 let menu = if is_current { more_menu.take() } else { None };
+                let block_remote =
+                    app.prefs.block_remote_images && !app.allowed_remote_image_ids.contains(&tm.id);
                 render_message_card(
                     detail.account_id,
                     tm.id,
@@ -360,7 +425,10 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     &tm.recipients,
                     &tm.date_display,
                     &tm.body_text,
+                    tm.body_html.as_deref(),
                     tm.body_loaded,
+                    prefer_plain,
+                    block_remote,
                     &tm.attachments,
                     is_current,
                     menu,
@@ -370,6 +438,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             })
             .collect()
     } else {
+        let block_remote =
+            app.prefs.block_remote_images && !app.allowed_remote_image_ids.contains(&detail.id);
         vec![render_message_card(
             detail.account_id,
             detail.id,
@@ -377,7 +447,10 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             &detail.recipients,
             &detail.date_display,
             &detail.body_text,
+            detail.body_html.as_deref(),
             true,
+            prefer_plain,
+            block_remote,
             &detail.attachments,
             false,
             Some(card_more_menu),
@@ -462,11 +535,31 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             )
                         })
                 })
-                // 右侧操作组：动态标记已读/未读 + 复制正文（严格放在 48px 顶栏内）。
+                // 右侧操作组：动态标记已读/未读 + HTML/纯文本切换 + 复制正文（严格放在 48px 顶栏内）。
                 .child(
                     h_flex()
                         .gap_1()
                         .items_center()
+                        .when(has_any_html, |el| {
+                            el.child(
+                                Button::new("reader-toggle-html")
+                                    .ghost()
+                                    .compact()
+                                    .icon(if prefer_plain {
+                                        IconName::FileCode
+                                    } else {
+                                        IconName::FileText
+                                    })
+                                    .tooltip(if prefer_plain {
+                                        "切换为富文本 HTML 视图"
+                                    } else {
+                                        "切换为纯文本视图"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_reader_plain_mode(cx);
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("reader-toggle-seen")
                                 .ghost()

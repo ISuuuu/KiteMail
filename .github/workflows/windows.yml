@@ -58,6 +58,12 @@ jobs:
           Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/hylki-windows.exe" $stage
           Copy-Item "LICENSE" $stage
           Copy-Item "README.md" $stage
+          @"
+          Hylki Windows x64 — AGPL-3.0-or-later Source Offer
+          Commit: ${{ github.sha }}
+          Repository: https://github.com/${{ github.repository }}
+          License: GNU Affero General Public License v3.0 or later (see LICENSE)
+          "@ | Set-Content -Encoding UTF8 "$stage/SOURCE_OFFER.txt"
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/hylki-windows-x64.zip" -Force
 
       - name: Upload Windows x64 ZIP artifact
