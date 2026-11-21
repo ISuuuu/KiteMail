@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 
 use crate::cache::{CachedAttachment, KnownContact};
+use crate::search_query::SearchQuery;
 use crate::{
-    AccountSummary, AttachmentMeta, FolderSummary, MailPage, MessageDetail, MessageFilter,
-    MessageSummary, ThreadMessage,
+    start_of_today_ts, AccountSummary, AttachmentMeta, FolderSummary, MailPage, MessageDetail,
+    MessageFilter, MessageSort, MessageSummary, QuickFilterSet, ThreadMessage,
 };
 
 pub const DEMO_INBOX_ID: u32 = 1;
@@ -117,10 +118,17 @@ impl DemoStore {
             ),
         ];
 
+        let now_ts = chrono::Utc::now().timestamp();
         for (idx, (sender, subject, preview, date_display, unread, has_attachment)) in
             pinned_samples.iter().enumerate()
         {
             let id = (idx + 1) as u32;
+            let date_ts = match idx {
+                0 => now_ts - 600,
+                1 => now_ts - 3600,
+                2 => now_ts - 86_400 - 1800,
+                _ => now_ts - 86_400 - 7200,
+            };
             inbox_messages.push(MessageSummary {
                 id,
                 account_id: 1,
@@ -130,6 +138,7 @@ impl DemoStore {
                 sender: (*sender).to_string(),
                 subject: (*subject).to_string(),
                 preview: (*preview).to_string(),
+                date_ts,
                 date_display: (*date_display).to_string(),
                 unread: *unread,
                 flagged: idx == 0,
@@ -142,6 +151,12 @@ impl DemoStore {
             let day = (idx % 28) + 1;
             let hour = (idx * 7) % 24;
             let minute = (idx * 13) % 60;
+            let days_ago = if idx < 10 {
+                (idx as i64) - 2
+            } else {
+                10 + (idx as i64 % 90)
+            };
+            let date_ts = now_ts - days_ago * 86_400 - (idx as i64 * 17);
             inbox_messages.push(MessageSummary {
                 id,
                 account_id: 1,
@@ -153,6 +168,7 @@ impl DemoStore {
                 preview: format!(
                     "这是第 {id} 封模拟邮件摘要，用于验证 10,000 封邮件下的分页查询、中文排版与列表滚动性能。"
                 ),
+                date_ts,
                 date_display: format!("11-{day:02} {hour:02}:{minute:02}"),
                 unread: idx < 128,
                 flagged: idx < 30 && idx % 7 == 0,
@@ -172,6 +188,7 @@ impl DemoStore {
                     sender: "我 <demo@hylki.example>".to_string(),
                     subject: format!("已发送测试主题 #{}", i + 1),
                     preview: "这封邮件已通过测试发件流程发出，用于检查已发送列表显示。".to_string(),
+                    date_ts: now_ts - ((i as i64 + 1) * 86_400),
                     date_display: format!("11-{:02}", 20 - i),
                     unread: false,
                     flagged: false,
@@ -192,6 +209,7 @@ impl DemoStore {
                     sender: "草稿 <demo@hylki.example>".to_string(),
                     subject: format!("未完成草稿 #{}", i + 1),
                     preview: "待补充正文内容与收件人地址...".to_string(),
+                    date_ts: now_ts - (i as i64 * 3600),
                     date_display: "草稿".to_string(),
                     unread: false,
                     flagged: false,
@@ -212,6 +230,7 @@ impl DemoStore {
                     sender: format!("归档联系人 #{}", i + 1),
                     subject: format!("历史归档记录 #{}", i + 1),
                     preview: "该邮件已归档保存，用于离线检索与分页切换测试。".to_string(),
+                    date_ts: now_ts - ((i as i64 + 15) * 86_400),
                     date_display: "10-15".to_string(),
                     unread: false,
                     flagged: false,
@@ -260,9 +279,29 @@ impl DemoStore {
         offset: usize,
         limit: usize,
     ) -> MailPage {
+        self.list_messages_page_with_options(
+            folder_id,
+            query,
+            QuickFilterSet::from_message_filter(filter),
+            MessageSort::DateNewest,
+            offset,
+            limit,
+        )
+    }
+
+    /// Return a slice of messages in `folder_id` with structured query, quick filters, and sort.
+    pub fn list_messages_page_with_options(
+        &self,
+        folder_id: u32,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> MailPage {
         let all = self.messages_for_folder(folder_id);
-        let q = query.trim().to_lowercase();
-        if q.is_empty() && filter == MessageFilter::All {
+        let parsed = SearchQuery::parse(query);
+        if parsed.is_empty() && quick_filters.is_empty() && sort == MessageSort::DateNewest {
             let total = all.len();
             let start = offset.min(total);
             let end = start.saturating_add(limit).min(total);
@@ -274,16 +313,19 @@ impl DemoStore {
             };
         }
 
-        let filtered: Vec<MessageSummary> = all
+        let folder_name = self.folder_name_for(folder_id);
+        let today_start = start_of_today_ts();
+        let mut filtered: Vec<MessageSummary> = all
             .iter()
-            .filter(|m| Self::matches_filter(m, filter))
+            .filter(|m| Self::matches_quick_filters(m, quick_filters, today_start))
             .filter(|m| {
-                q.is_empty()
-                    || m.subject.to_lowercase().contains(&q)
-                    || m.sender.to_lowercase().contains(&q)
+                parsed.is_empty()
+                    || parsed.matches_summary(m, folder_name, "demo@hylki.example", None)
             })
             .cloned()
             .collect();
+
+        Self::sort_summaries(&mut filtered, sort);
 
         let total = filtered.len();
         let start = offset.min(total);
@@ -304,20 +346,45 @@ impl DemoStore {
         offset: usize,
         limit: usize,
     ) -> MailPage {
-        let q = query.trim().to_lowercase();
-        let filtered: Vec<MessageSummary> = self
+        self.list_starred_page_with_options(
+            query,
+            QuickFilterSet::from_message_filter(filter),
+            MessageSort::DateNewest,
+            offset,
+            limit,
+        )
+    }
+
+    /// Return a page of starred demo messages with structured query, quick filters, and sort.
+    pub fn list_starred_page_with_options(
+        &self,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> MailPage {
+        let parsed = SearchQuery::parse(query);
+        let today_start = start_of_today_ts();
+        let mut filtered: Vec<MessageSummary> = self
             .inbox_messages
             .iter()
             .chain(self.sent_messages.iter())
             .chain(self.archive_messages.iter())
-            .filter(|m| m.flagged && Self::matches_filter(m, filter))
+            .filter(|m| m.flagged && Self::matches_quick_filters(m, quick_filters, today_start))
             .filter(|m| {
-                q.is_empty()
-                    || m.subject.to_lowercase().contains(&q)
-                    || m.sender.to_lowercase().contains(&q)
+                parsed.is_empty()
+                    || parsed.matches_summary(
+                        m,
+                        self.folder_name_for(m.folder_id),
+                        "demo@hylki.example",
+                        None,
+                    )
             })
             .cloned()
             .collect();
+
+        Self::sort_summaries(&mut filtered, sort);
 
         let total = filtered.len();
         let start = offset.min(total);
@@ -327,6 +394,104 @@ impl DemoStore {
             offset: start,
             total,
             items: filtered[start..end].to_vec(),
+        }
+    }
+
+    /// Cross-folder search across all demo folders.
+    pub fn search_all_folders(
+        &self,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> MailPage {
+        let parsed = SearchQuery::parse(query);
+        let today_start = start_of_today_ts();
+        let mut filtered: Vec<MessageSummary> = self
+            .inbox_messages
+            .iter()
+            .chain(self.sent_messages.iter())
+            .chain(self.archive_messages.iter())
+            .filter(|m| Self::matches_quick_filters(m, quick_filters, today_start))
+            .filter(|m| {
+                parsed.is_empty()
+                    || parsed.matches_summary(
+                        m,
+                        self.folder_name_for(m.folder_id),
+                        "demo@hylki.example",
+                        None,
+                    )
+            })
+            .cloned()
+            .collect();
+
+        Self::sort_summaries(&mut filtered, sort);
+
+        let total = filtered.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        MailPage {
+            folder_id: 0,
+            offset: start,
+            total,
+            items: filtered[start..end].to_vec(),
+        }
+    }
+
+    fn folder_name_for(&self, folder_id: u32) -> &str {
+        self.folders
+            .iter()
+            .find(|f| f.id == folder_id)
+            .map(|f| f.name.as_str())
+            .unwrap_or("")
+    }
+
+    fn matches_quick_filters(
+        m: &MessageSummary,
+        filters: QuickFilterSet,
+        today_start_ts: i64,
+    ) -> bool {
+        (!filters.unread || m.unread)
+            && (!filters.starred || m.flagged)
+            && (!filters.has_attachment || m.has_attachment)
+            && (!filters.today || m.date_ts >= today_start_ts)
+    }
+
+    fn sort_summaries(items: &mut [MessageSummary], sort: MessageSort) {
+        match sort {
+            MessageSort::DateNewest => {
+                items.sort_by(|a, b| b.date_ts.cmp(&a.date_ts).then_with(|| b.uid.cmp(&a.uid)));
+            }
+            MessageSort::DateOldest => {
+                items.sort_by(|a, b| a.date_ts.cmp(&b.date_ts).then_with(|| a.uid.cmp(&b.uid)));
+            }
+            MessageSort::SenderAsc => {
+                items.sort_by(|a, b| {
+                    a.sender
+                        .to_lowercase()
+                        .cmp(&b.sender.to_lowercase())
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
+            MessageSort::SubjectAsc => {
+                items.sort_by(|a, b| {
+                    a.subject
+                        .to_lowercase()
+                        .cmp(&b.subject.to_lowercase())
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
+            MessageSort::UnreadFirst => {
+                items.sort_by(|a, b| b.unread.cmp(&a.unread).then_with(|| b.date_ts.cmp(&a.date_ts)));
+            }
+            MessageSort::StarredFirst => {
+                items.sort_by(|a, b| {
+                    b.flagged
+                        .cmp(&a.flagged)
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
         }
     }
 
@@ -423,14 +588,6 @@ impl DemoStore {
                 .then_with(|| a.name.cmp(&b.name))
         });
         items.into_iter().skip(offset).take(limit).collect()
-    }
-
-    fn matches_filter(m: &MessageSummary, filter: MessageFilter) -> bool {
-        match filter {
-            MessageFilter::All => true,
-            MessageFilter::Unread => m.unread,
-            MessageFilter::Starred => m.flagged,
-        }
     }
 
     /// Return full message details for `message_id`.

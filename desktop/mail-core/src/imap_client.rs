@@ -417,6 +417,85 @@ pub async fn append_sent_message(
     Ok(())
 }
 
+/// Escape a string for an IMAP quoted search argument.
+pub(crate) fn escape_imap_search_arg(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\r', '\n'], " ")
+}
+
+/// Build an IMAP `UID SEARCH` query string matching `query` in subject or message text.
+pub(crate) fn build_imap_search_query(query: &str) -> String {
+    let escaped = escape_imap_search_arg(query.trim());
+    if query.is_ascii() {
+        format!("OR SUBJECT \"{escaped}\" TEXT \"{escaped}\"")
+    } else {
+        format!("CHARSET UTF-8 OR SUBJECT \"{escaped}\" TEXT \"{escaped}\"")
+    }
+}
+
+/// Search messages on the IMAP server in `folder_path` using `UID SEARCH`,
+/// returning headers for up to `limit` newest matching UIDs.
+pub async fn search_folder_messages(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<CachedHeaderInput>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let search_timeout = Duration::from_secs(15);
+    let mut session = tokio::time::timeout(search_timeout, connect_imap(account, password))
+        .await
+        .map_err(|_| "IMAP 服务器搜索连接超时".to_string())??;
+
+    tokio::time::timeout(search_timeout, session.select(folder_path))
+        .await
+        .map_err(|_| format!("打开文件夹 {folder_path} 超时"))?
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    let imap_query = build_imap_search_query(trimmed);
+    let uids_res = tokio::time::timeout(search_timeout, session.uid_search(&imap_query))
+        .await
+        .map_err(|_| "IMAP 服务器搜索超时".to_string())?;
+
+    let uids_set = match uids_res {
+        Ok(set) => set,
+        Err(_) if !trimmed.is_ascii() => {
+            // Fallback for servers that reject CHARSET UTF-8 with OR: try simpler TEXT query.
+            let fallback = format!("CHARSET UTF-8 TEXT \"{}\"", escape_imap_search_arg(trimmed));
+            tokio::time::timeout(search_timeout, session.uid_search(&fallback))
+                .await
+                .map_err(|_| "IMAP 服务器搜索超时".to_string())?
+                .map_err(|e| format!("IMAP 服务端搜索失败: {e}"))?
+        }
+        Err(e) => {
+            let _ = session.logout().await;
+            return Err(format!("IMAP 服务端搜索失败: {e}"));
+        }
+    };
+
+    let mut uids: Vec<u32> = uids_set.into_iter().collect();
+    uids.sort_unstable();
+    if uids.is_empty() {
+        let _ = session.logout().await;
+        return Ok(Vec::new());
+    }
+
+    let cap = limit.max(1);
+    let start = uids.len().saturating_sub(cap);
+    let target_uids = &uids[start..];
+    let headers = tokio::time::timeout(search_timeout, fetch_headers_for_uids(&mut session, target_uids))
+        .await
+        .map_err(|_| "拉取服务端搜索结果邮件头超时".to_string())??;
+    let _ = session.logout().await;
+    Ok(headers)
+}
+
 fn parse_header_bytes(
     parser: &MessageParser,
     uid: u32,
@@ -773,6 +852,18 @@ mod tests {
         assert_eq!(
             plain_text_to_html("a < b & c\nline2"),
             "<p>a &lt; b &amp; c<br>line2</p>"
+        );
+    }
+
+    #[test]
+    fn build_imap_search_query_handles_ascii_and_utf8() {
+        assert_eq!(
+            build_imap_search_query("invoice \"2026\""),
+            "OR SUBJECT \"invoice \\\"2026\\\"\" TEXT \"invoice \\\"2026\\\"\""
+        );
+        assert_eq!(
+            build_imap_search_query("发票"),
+            "CHARSET UTF-8 OR SUBJECT \"发票\" TEXT \"发票\""
         );
     }
 }

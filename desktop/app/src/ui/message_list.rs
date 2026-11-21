@@ -10,21 +10,23 @@
 //!   （演示模式仅保留本地的已读 / 星标两项，归档 / 删除隐藏）；
 //!   草稿视图行右键为「打开草稿 / 删除草稿」。
 
+use std::collections::HashSet;
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{ContextMenu, ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
 };
-use hylki_mail_core::{LocalDraft, MessageSummary};
+use hylki_mail_core::{date_group_label, LocalDraft, MessageSort, MessageSummary, SearchScope};
 
-use crate::app::{CurrentView, HylkiApp, ListFilter};
+use crate::app::{CurrentView, HylkiApp};
 use crate::theme;
 use crate::ui::avatar;
 
@@ -363,10 +365,13 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let (surface, border, muted_fg) = (p.surface, p.border, p.text_muted);
 
     let selected_id = app.selected_message.as_ref().map(|m| m.id);
-    // 本地草稿视图（真实账号）：从 self.drafts 合成列表行。
-    let drafts_view = app.current_view == CurrentView::Drafts && !app.demo_mode;
-    let show_account_tag = app.current_view.is_unified() && app.accounts.len() > 1;
-    let current_filter = app.list_filter;
+    let has_search_query = !app.search_query.trim().is_empty();
+    let cross_folder_search = has_search_query && app.search_scope == SearchScope::AllFolders;
+    // 本地草稿视图（真实账号）：从 self.drafts 合成列表行（跨文件夹搜索时不拦截）。
+    let drafts_view = app.current_view == CurrentView::Drafts && !app.demo_mode && !cross_folder_search;
+    let show_account_tag = (app.current_view.is_unified() || cross_folder_search) && app.accounts.len() > 1;
+    let current_sort = app.list_sort;
+    let quick_filters = app.quick_filters;
     let is_unified_list = !drafts_view;
 
     let search_key = app.search_query.trim().to_lowercase();
@@ -399,20 +404,66 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         Vec::new()
     };
 
-    // 常规邮件行（过滤已下沉到 SQLite / DemoStore，current_page.items 即精准结果）。
-    let filtered_rows: Vec<gpui_kit::AnyElement> = if drafts_view {
-        Vec::new()
-    } else {
-        app.current_page
-            .items
-            .iter()
-            .map(|msg| {
-                let is_selected = selected_id == Some(msg.id);
+    // 合并本地结果与服务端在线搜索命中（按 id 与 (account_id, uid) 去重）。
+    let mut merged_items: Vec<&MessageSummary> = Vec::new();
+    let mut extra_remote_count = 0usize;
+    if !drafts_view {
+        let mut seen_ids: HashSet<u32> = HashSet::new();
+        let mut seen_uid_keys: HashSet<(u32, u32)> = HashSet::new();
+        for msg in &app.current_page.items {
+            seen_ids.insert(msg.id);
+            seen_uid_keys.insert((msg.account_id, msg.uid));
+            merged_items.push(msg);
+        }
+        if has_search_query && app.server_search_query.trim() == app.search_query.trim() {
+            for msg in &app.server_search_results {
+                if !seen_ids.contains(&msg.id)
+                    && !seen_uid_keys.contains(&(msg.account_id, msg.uid))
+                {
+                    seen_ids.insert(msg.id);
+                    seen_uid_keys.insert((msg.account_id, msg.uid));
+                    merged_items.push(msg);
+                    extra_remote_count += 1;
+                }
+            }
+        }
+    }
+
+    // 常规邮件行：按时间排序时在列表行之间插入轻量日期分组头（今天 / 昨天 / 本周 / 更早）。
+    let show_date_groups = !drafts_view && current_sort.uses_date_groups();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut filtered_rows: Vec<gpui_kit::AnyElement> = Vec::with_capacity(merged_items.len() + 4);
+    if !drafts_view {
+        let mut last_group: Option<&'static str> = None;
+        for msg in &merged_items {
+            if show_date_groups {
+                let group = date_group_label(msg.date_ts, now_ts);
+                if last_group != Some(group) {
+                    last_group = Some(group);
+                    filtered_rows.push(
+                        div()
+                            .flex_shrink_0()
+                            .px_4()
+                            .pt_2()
+                            .pb_1()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(muted_fg)
+                            .child(group)
+                            .into_any_element(),
+                    );
+                }
+            }
+            let is_selected = selected_id == Some(msg.id);
+            filtered_rows.push(
                 message_row(app, msg, None, is_selected, show_account_tag, &p, cx)
-                    .into_any_element()
-            })
-            .collect()
-    };
+                    .into_any_element(),
+            );
+        }
+    }
 
     let loaded_count = if drafts_view {
         draft_rows.len()
@@ -422,17 +473,17 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let total = if drafts_view {
         draft_rows.len()
     } else {
-        app.current_page.total
+        app.current_page.total + extra_remote_count
     };
-    let has_more_local = !drafts_view && loaded_count < total;
-    let has_more_remote = !drafts_view && app.current_view_has_more_remote();
+    let has_more_local = !drafts_view && loaded_count < app.current_page.total;
+    let has_more_remote = !drafts_view && !cross_folder_search && app.current_view_has_more_remote();
     let has_more = has_more_local || has_more_remote;
     let is_loading_more = !drafts_view && (app.loading_more_local || app.loading_more_remote);
 
     let has_visible_rows = if drafts_view {
         !draft_rows.is_empty()
     } else {
-        !app.current_page.items.is_empty()
+        !merged_items.is_empty()
     };
 
     let count_text = if drafts_view {
@@ -456,45 +507,115 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             "暂无本地草稿",
             "在写信面板点击「存草稿」后显示在这里",
         )
-    } else if current_filter == ListFilter::Unread {
-        (IconName::Inbox, "暂无未读邮件", "")
-    } else if current_filter == ListFilter::Starred {
-        (IconName::Star, "暂无星标邮件", "")
+    } else if has_search_query {
+        (
+            IconName::Search,
+            "未找到匹配的邮件",
+            "可尝试切换「全部文件夹」或按回车「搜服务器」",
+        )
+    } else if !quick_filters.is_empty() {
+        (IconName::ListFilter, "当前筛选条件下暂无邮件", "")
     } else {
         (IconName::Inbox, "暂无邮件", "")
     };
 
-    // 顶部筛选下拉菜单（与左栏 / 右栏同为 48px 顶栏，去除突兀的第二层工具条）。
+    // 顶部排序与多条件筛选下拉菜单。
     let filter_menu_button = {
         let entity = cx.entity();
-        let active_tooltip = match current_filter {
-            ListFilter::All => "筛选邮件（当前：全部）",
-            ListFilter::Unread => "筛选邮件（当前：仅未读）",
-            ListFilter::Starred => "筛选邮件（当前：仅星标）",
+        let active_labels = quick_filters.active_labels();
+        let active_tooltip = if active_labels.is_empty() {
+            format!("排序与筛选（{}）", current_sort.label())
+        } else {
+            format!(
+                "排序：{}｜已筛选：{}",
+                current_sort.label(),
+                active_labels.join("、")
+            )
         };
+        let has_active_filter = !quick_filters.is_empty();
         Button::new("list-filter-menu")
             .ghost()
             .compact()
             .icon(IconName::ListFilter)
+            .when(has_active_filter, |btn| btn.text_color(p.accent))
             .tooltip(active_tooltip)
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu;
-                for filter in [ListFilter::All, ListFilter::Unread, ListFilter::Starred] {
+                for sort in MessageSort::ALL {
                     let entity_for_item = entity.clone();
-                    let is_current = current_filter == filter;
+                    let is_current = current_sort == sort;
                     menu = menu.item(
-                        PopupMenuItem::new(filter.label())
+                        PopupMenuItem::new(sort.label())
                             .when(is_current, |item| item.icon(Icon::new(IconName::Check)))
                             .on_click(move |_, _, cx| {
                                 entity_for_item.update(cx, |this, cx| {
-                                    this.set_list_filter(filter, cx);
+                                    this.set_list_sort(sort, cx);
                                 });
                             }),
                     );
                 }
+                menu = menu.separator();
+
+                let e_unread = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("仅未读")
+                        .when(quick_filters.unread, |item| {
+                            item.icon(Icon::new(IconName::Check))
+                        })
+                        .on_click(move |_, _, cx| {
+                            e_unread.update(cx, |this, cx| this.toggle_quick_filter_unread(cx));
+                        }),
+                );
+
+                let e_starred = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("仅星标")
+                        .when(quick_filters.starred, |item| {
+                            item.icon(Icon::new(IconName::Check))
+                        })
+                        .on_click(move |_, _, cx| {
+                            e_starred.update(cx, |this, cx| this.toggle_quick_filter_starred(cx));
+                        }),
+                );
+
+                let e_att = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("含附件")
+                        .when(quick_filters.has_attachment, |item| {
+                            item.icon(Icon::new(IconName::Check))
+                        })
+                        .on_click(move |_, _, cx| {
+                            e_att.update(cx, |this, cx| this.toggle_quick_filter_attachment(cx));
+                        }),
+                );
+
+                let e_today = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("今天")
+                        .when(quick_filters.today, |item| {
+                            item.icon(Icon::new(IconName::Check))
+                        })
+                        .on_click(move |_, _, cx| {
+                            e_today.update(cx, |this, cx| this.toggle_quick_filter_today(cx));
+                        }),
+                );
+
+                let e_clear = entity.clone();
+                menu = menu.separator().item(
+                    PopupMenuItem::new("清除筛选")
+                        .disabled(quick_filters.is_empty())
+                        .on_click(move |_, _, cx| {
+                            e_clear.update(cx, |this, cx| this.clear_quick_filters(cx));
+                        }),
+                );
                 menu
             })
     };
+
+    let can_search_server =
+        !app.demo_mode && app.search_query.trim().chars().count() >= 2;
+    let search_scope = app.search_scope;
+    let server_loading = app.server_search_loading;
 
     v_flex()
         .w(px(LIST_WIDTH))
@@ -514,14 +635,17 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .border_b_1()
                 .border_color(border)
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                    // Esc 清空搜索（搜索框获得焦点时按键事件冒泡到此处）。
+                    // Esc 清空搜索；Enter 在搜索词长度 >= 2 时触发服务端在线搜索。
                     if event.keystroke.key == "escape" {
                         this.search_input.update(cx, |s, cx| {
                             s.set_value("", window, cx);
                         });
                         this.search_query = String::new();
+                        this.clear_server_search();
                         this.reset_list_pagination();
                         this.reload_current_page(cx);
+                    } else if event.keystroke.key == "enter" {
+                        this.trigger_server_search(cx);
                     }
                 }))
                 .child(
@@ -553,6 +677,82 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 )
                 .when(is_unified_list, |el| el.child(filter_menu_button)),
         )
+        // 搜索有内容时显示范围切换胶囊（当前视图 / 全部文件夹 + 搜服务器按钮）。
+        .when(has_search_query, |el| {
+            el.child(
+                h_flex()
+                    .h(px(34.0))
+                    .flex_shrink_0()
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .id("search-scope-this")
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .text_xs()
+                            .cursor_pointer()
+                            .bg(if search_scope == SearchScope::ThisFolder {
+                                p.accent
+                            } else {
+                                p.accent_soft()
+                            })
+                            .text_color(if search_scope == SearchScope::ThisFolder {
+                                p.accent_fg
+                            } else {
+                                p.text
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_search_scope(SearchScope::ThisFolder, cx);
+                            }))
+                            .child("当前视图"),
+                    )
+                    .child(
+                        div()
+                            .id("search-scope-all")
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .text_xs()
+                            .cursor_pointer()
+                            .bg(if search_scope == SearchScope::AllFolders {
+                                p.accent
+                            } else {
+                                p.accent_soft()
+                            })
+                            .text_color(if search_scope == SearchScope::AllFolders {
+                                p.accent_fg
+                            } else {
+                                p.text
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_search_scope(SearchScope::AllFolders, cx);
+                            }))
+                            .child("全部文件夹"),
+                    )
+                    .child(div().flex_1())
+                    .when(can_search_server, |bar| {
+                        bar.child(
+                            Button::new("search-server-btn")
+                                .ghost()
+                                .compact()
+                                .label(if server_loading {
+                                    "搜索中..."
+                                } else {
+                                    "搜服务器"
+                                })
+                                .disabled(server_loading)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.trigger_server_search(cx);
+                                })),
+                        )
+                    }),
+            )
+        })
         // 列表（滚到底部自动预加载下一批 100 条）。
         .child(
             div()

@@ -7,9 +7,12 @@ pub mod demo;
 pub mod graph_client;
 pub mod imap_client;
 pub mod oauth;
+pub mod search_query;
 pub mod secrets;
 pub mod smtp_client;
 pub mod worker;
+
+pub use search_query::SearchQuery;
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +66,8 @@ pub struct MessageSummary {
     pub sender: String,
     pub subject: String,
     pub preview: String,
+    #[serde(default)]
+    pub date_ts: i64,
     pub date_display: String,
     pub unread: bool,
     pub flagged: bool,
@@ -212,13 +217,161 @@ pub enum UnifiedView {
     Archive,
 }
 
-/// Server/cache-side filter applied to message list queries.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Server/cache-side single-choice filter (kept for backward compatibility).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageFilter {
     #[default]
     All,
     Unread,
     Starred,
+}
+
+/// Multi-select quick filter conditions applied to message list queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickFilterSet {
+    pub unread: bool,
+    pub starred: bool,
+    pub has_attachment: bool,
+    pub today: bool,
+}
+
+impl QuickFilterSet {
+    /// Convert legacy single-choice [`MessageFilter`] into a [`QuickFilterSet`].
+    pub fn from_message_filter(filter: MessageFilter) -> Self {
+        match filter {
+            MessageFilter::All => Self::default(),
+            MessageFilter::Unread => Self {
+                unread: true,
+                ..Self::default()
+            },
+            MessageFilter::Starred => Self {
+                starred: true,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// True when no quick filter condition is enabled.
+    pub fn is_empty(self) -> bool {
+        !self.unread && !self.starred && !self.has_attachment && !self.today
+    }
+
+    /// Number of active quick filter conditions.
+    pub fn active_count(self) -> usize {
+        usize::from(self.unread)
+            + usize::from(self.starred)
+            + usize::from(self.has_attachment)
+            + usize::from(self.today)
+    }
+
+    /// Clear all active quick filter conditions.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Human-readable labels of active quick filters.
+    pub fn active_labels(self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.unread {
+            out.push("仅未读");
+        }
+        if self.starred {
+            out.push("仅星标");
+        }
+        if self.has_attachment {
+            out.push("含附件");
+        }
+        if self.today {
+            out.push("今天");
+        }
+        out
+    }
+}
+
+/// Sort order for message list queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageSort {
+    #[default]
+    DateNewest,
+    DateOldest,
+    SenderAsc,
+    SubjectAsc,
+    UnreadFirst,
+    StarredFirst,
+}
+
+impl MessageSort {
+    /// All 6 sort orders in menu display order.
+    pub const ALL: [Self; 6] = [
+        Self::DateNewest,
+        Self::DateOldest,
+        Self::SenderAsc,
+        Self::SubjectAsc,
+        Self::UnreadFirst,
+        Self::StarredFirst,
+    ];
+
+    /// Localized Chinese label for the sort dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DateNewest => "日期（最新优先）",
+            Self::DateOldest => "日期（最早优先）",
+            Self::SenderAsc => "发件人（A-Z）",
+            Self::SubjectAsc => "主题（A-Z）",
+            Self::UnreadFirst => "未读优先",
+            Self::StarredFirst => "星标优先",
+        }
+    }
+
+    /// Whether date-group headers (`今天` / `昨天` / `本周` / `更早`) should be shown.
+    pub fn uses_date_groups(self) -> bool {
+        matches!(self, Self::DateNewest | Self::DateOldest)
+    }
+}
+
+/// Search scope for local message search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchScope {
+    #[default]
+    ThisFolder,
+    AllFolders,
+}
+
+/// Local Unix timestamp for the start of today (00:00:00 local time).
+pub fn start_of_today_ts() -> i64 {
+    use chrono::TimeZone;
+    let today = chrono::Local::now().date_naive();
+    today
+        .and_hms_opt(0, 0, 0)
+        .and_then(|dt| chrono::Local.from_local_datetime(&dt).earliest())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+/// Classify a message's Unix timestamp into a date-group header (`今天`, `昨天`, `本周`, `更早`)
+/// relative to `now_ts` in the local timezone.
+pub fn date_group_label(date_ts: i64, now_ts: i64) -> &'static str {
+    if date_ts <= 0 {
+        return "更早";
+    }
+    let Some(msg_dt) = chrono::DateTime::from_timestamp(date_ts, 0) else {
+        return "更早";
+    };
+    let Some(now_dt) = chrono::DateTime::from_timestamp(now_ts, 0) else {
+        return "更早";
+    };
+    let msg_day = msg_dt.with_timezone(&chrono::Local).date_naive();
+    let today = now_dt.with_timezone(&chrono::Local).date_naive();
+    let delta_days = today.signed_duration_since(msg_day).num_days();
+    if delta_days <= 0 {
+        "今天"
+    } else if delta_days == 1 {
+        "昨天"
+    } else if delta_days <= 6 {
+        "本周"
+    } else {
+        "更早"
+    }
 }
 
 /// Commands sent from the GPUI frontend to the mail worker.
@@ -254,6 +407,8 @@ pub enum MailRequest {
     LoadUnifiedInbox {
         query: String,
         filter: MessageFilter,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
         offset: usize,
         limit: usize,
     },
@@ -261,8 +416,23 @@ pub enum MailRequest {
         folder_id: u32,
         query: String,
         filter: MessageFilter,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
         offset: usize,
         limit: usize,
+    },
+    /// Cross-account / cross-folder local search (excludes Trash/Junk by default, deduped by message_id).
+    SearchAllFolders {
+        query: String,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    },
+    /// Online remote server search (IMAP UID SEARCH / Microsoft Graph `$search`).
+    SearchServer {
+        query: String,
+        account_id: Option<u32>,
     },
     LoadMessageBody {
         account_id: u32,
@@ -313,6 +483,8 @@ pub enum MailRequest {
         view: UnifiedView,
         query: String,
         filter: MessageFilter,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
         offset: usize,
         limit: usize,
     },
@@ -381,6 +553,13 @@ pub enum WorkerEvent {
         account_id: u32,
         message_id: u32,
     },
+    /// A page of cross-folder local search results was loaded.
+    AllFoldersSearchLoaded(MailPage),
+    /// Online server search results (IMAP / Graph) for `query`.
+    ServerSearchResults {
+        query: String,
+        items: Vec<MessageSummary>,
+    },
     /// A page of one unified view (starred / sent / archive) was loaded.
     UnifiedViewLoaded {
         view: UnifiedView,
@@ -408,4 +587,57 @@ pub enum WorkerEvent {
         account_id: Option<u32>,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_group_label_classifies_today_yesterday_week_and_older() {
+        use chrono::TimeZone;
+        // 固定一个本地中午基准时间，避免跨午夜或夏令时边界抖动。
+        let base_day = chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+        let noon = |days_ago: i64| -> i64 {
+            let day = base_day - chrono::Duration::days(days_ago);
+            let dt = day.and_hms_opt(12, 0, 0).unwrap();
+            chrono::Local
+                .from_local_datetime(&dt)
+                .earliest()
+                .unwrap()
+                .timestamp()
+        };
+        let now_ts = noon(0);
+        assert_eq!(date_group_label(now_ts, now_ts), "今天");
+        assert_eq!(date_group_label(now_ts + 3600, now_ts), "今天");
+        assert_eq!(date_group_label(noon(1), now_ts), "昨天");
+        assert_eq!(date_group_label(noon(2), now_ts), "本周");
+        assert_eq!(date_group_label(noon(6), now_ts), "本周");
+        assert_eq!(date_group_label(noon(7), now_ts), "更早");
+        assert_eq!(date_group_label(noon(30), now_ts), "更早");
+        assert_eq!(date_group_label(0, now_ts), "更早");
+    }
+
+    #[test]
+    fn quick_filter_set_and_sort_metadata() {
+        let mut qf = QuickFilterSet::default();
+        assert!(qf.is_empty());
+        assert_eq!(qf.active_count(), 0);
+        qf.unread = true;
+        qf.has_attachment = true;
+        qf.today = true;
+        assert!(!qf.is_empty());
+        assert_eq!(qf.active_count(), 3);
+        assert_eq!(qf.active_labels(), vec!["仅未读", "含附件", "今天"]);
+        qf.clear();
+        assert!(qf.is_empty());
+
+        assert_eq!(MessageSort::ALL.len(), 6);
+        assert!(MessageSort::DateNewest.uses_date_groups());
+        assert!(MessageSort::DateOldest.uses_date_groups());
+        assert!(!MessageSort::SenderAsc.uses_date_groups());
+        assert!(!MessageSort::SubjectAsc.uses_date_groups());
+        assert!(!MessageSort::UnreadFirst.uses_date_groups());
+        assert!(!MessageSort::StarredFirst.uses_date_groups());
+    }
 }

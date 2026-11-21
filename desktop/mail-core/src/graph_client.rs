@@ -108,6 +108,39 @@ pub fn fetch_folder_headers_next(
     fetch_headers_from_url(access_token, next_link_url)
 }
 
+/// Search messages across the mailbox using Microsoft Graph `$search` with timeout protection.
+pub fn search_messages(
+    access_token: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(CachedHeaderInput, String)>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sanitized = trimmed.replace('"', " ");
+    let quoted = format!("\"{sanitized}\"");
+    let encoded_search = urlencoding_segment(&quoted);
+    let top = limit.clamp(1, 100);
+    let url = format!(
+        "{GRAPH_BASE}/messages?$search={encoded_search}&$top={top}&\
+         $select=id,subject,from,toRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId"
+    );
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("ConsistencyLevel", "eventual")
+        .call()
+        .map_err(format_graph_error)?;
+
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("解析 Graph 搜索结果失败: {e}"))?;
+
+    let (items, _) = parse_graph_messages_json(&json);
+    Ok(items)
+}
+
 fn fetch_headers_from_url(
     access_token: &str,
     url: &str,
@@ -121,6 +154,12 @@ fn fetch_headers_from_url(
         .into_json()
         .map_err(|e| format!("解析 Graph 邮件列表失败: {e}"))?;
 
+    Ok(parse_graph_messages_json(&json))
+}
+
+fn parse_graph_messages_json(
+    json: &serde_json::Value,
+) -> (Vec<(CachedHeaderInput, String)>, Option<String>) {
     let next_link = json["@odata.nextLink"]
         .as_str()
         .map(str::trim)
@@ -195,7 +234,7 @@ fn fetch_headers_from_url(
         }
     }
 
-    Ok((items, next_link))
+    (items, next_link)
 }
 
 /// Fetch message body and file attachments via Microsoft Graph.
