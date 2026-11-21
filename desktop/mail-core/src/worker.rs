@@ -484,6 +484,65 @@ async fn handle_request(
             }
         }
 
+        MailRequest::FetchRawMessage {
+            account_id,
+            message_id,
+            uid,
+            folder_path,
+        } => {
+            let Ok(account) = load_account_config(data_dir, account_id) else {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: format!("账号 #{account_id} 未找到配置"),
+                });
+                return;
+            };
+            let _ = evt_tx.send(WorkerEvent::Status {
+                account_id: Some(account_id),
+                text: format!("[{}] 正在获取邮件原文...", account.email),
+            });
+            let res = match account.auth_backend {
+                AuthBackend::MicrosoftGraphOAuth2 => {
+                    // Graph 路径：按本地缓存的远端字符串 ID 取完整 MIME（/$value）。
+                    match cache.get_message_remote_id(message_id) {
+                        Ok(Some(remote_id)) => match ensure_graph_token(tokens, &account).await {
+                            Ok(token) => tokio::task::spawn_blocking(move || {
+                                graph_client::fetch_raw_message(&token, &remote_id)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
+                            Err(e) => Err(e),
+                        },
+                        Ok(None) => Err("本地缓存中缺少该邮件的远端 ID，无法导出原文".to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+                AuthBackend::Password => match secrets::load_account_secrets(account_id) {
+                    Ok(sec) => {
+                        imap_client::fetch_raw_message(
+                            &account,
+                            &sec.imap_password,
+                            &folder_path,
+                            uid,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            match res {
+                Ok(bytes) => {
+                    let _ = evt_tx.send(WorkerEvent::RawMessageFetched { message_id, bytes });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: format!("[{}] {e}", account.email),
+                    });
+                }
+            }
+        }
+
         MailRequest::SetSeen {
             account_id,
             folder_path,
@@ -655,6 +714,91 @@ async fn handle_request(
                 evt_tx,
             )
             .await;
+        }
+
+        MailRequest::UndoMessageMove {
+            account_id,
+            message_id: _,
+            rfc_message_id,
+            current_folder_path,
+            original_folder_path,
+        } => {
+            let Ok(account) = load_account_config(data_dir, account_id) else {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: format!("账号 #{account_id} 未找到配置"),
+                });
+                return;
+            };
+            let _ = evt_tx.send(WorkerEvent::Status {
+                account_id: Some(account_id),
+                text: format!("[{}] 正在撤销移动，移回原文件夹...", account.email),
+            });
+            let res = match account.auth_backend {
+                AuthBackend::MicrosoftGraphOAuth2 => {
+                    // 闭包会接管参数，撤销成功后还要用 original_folder_path 重新同步原文件夹。
+                    let cur = current_folder_path.clone();
+                    let rfc = rfc_message_id.clone();
+                    let orig = original_folder_path.clone();
+                    match ensure_graph_token(tokens, &account).await {
+                        Ok(token) => tokio::task::spawn_blocking(move || {
+                            graph_client::undo_move_by_message_id(&token, &cur, &rfc, &orig)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
+                        Err(e) => Err(e),
+                    }
+                }
+                AuthBackend::Password => match secrets::load_account_secrets(account_id) {
+                    Ok(sec) => {
+                        imap_client::undo_move_by_message_id(
+                            &account,
+                            &sec.imap_password,
+                            &current_folder_path,
+                            &rfc_message_id,
+                            &original_folder_path,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            match res {
+                Ok(()) => {
+                    // 撤销成功：重新同步原文件夹，把邮件拉回本地缓存并刷新计数。
+                    if let Ok(folders) = cache.list_folders(account_id) {
+                        let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                            account_id,
+                            folders: folders.clone(),
+                        });
+                        if let Some(folder) =
+                            folders.iter().find(|f| f.path == original_folder_path)
+                        {
+                            let page_size = pref_page_size(data_dir);
+                            sync_folder_inner(
+                                cache,
+                                tokens,
+                                &account,
+                                folder.id,
+                                &folder.path.clone(),
+                                page_size,
+                                evt_tx,
+                            )
+                            .await;
+                        }
+                    }
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: Some(account_id),
+                        text: format!("[{}] 已撤销：邮件已移回原文件夹", account.email),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: format!("[{}] {e}", account.email),
+                    });
+                }
+            }
         }
 
         MailRequest::ExportForwardAttachments { message_id } => {
@@ -968,6 +1112,9 @@ async fn move_message_inner(
         MoveTarget::Folder(_) => "移动",
     };
 
+    // F-3：记录移动目标（撤销时按 Message-ID 在该文件夹检索）；IMAP 无回收站的
+    // 永久删除（\Deleted + EXPUNGE）不可撤销，保持 None。
+    let mut dest_for_undo: Option<String> = None;
     let res = match account.auth_backend {
         AuthBackend::MicrosoftGraphOAuth2 => {
             let Ok(Some(remote_id)) = cache.get_message_remote_id(message_id) else {
@@ -993,14 +1140,17 @@ async fn move_message_inner(
                 MoveTarget::Folder(path) => Ok(path.clone()),
             };
             match dest_folder {
-                Ok(dest) => match ensure_graph_token(tokens, &account).await {
-                    Ok(token) => tokio::task::spawn_blocking(move || {
-                        graph_client::move_message(&token, &remote_id, &dest)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
-                    Err(e) => Err(e),
-                },
+                Ok(dest) => {
+                    dest_for_undo = Some(dest.clone());
+                    match ensure_graph_token(tokens, &account).await {
+                        Ok(token) => tokio::task::spawn_blocking(move || {
+                            graph_client::move_message(&token, &remote_id, &dest)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
+                        Err(e) => Err(e),
+                    }
+                }
                 Err(e) => Err(e),
             }
         }
@@ -1025,19 +1175,22 @@ async fn move_message_inner(
                 MoveTarget::Folder(path) => Ok(Some(path.clone())),
             };
             match dest_folder {
-                Ok(Some(dest)) => match secrets::load_account_secrets(account_id) {
-                    Ok(sec) => {
-                        imap_client::move_message(
-                            &account,
-                            &sec.imap_password,
-                            &detail.folder_path,
-                            uid,
-                            &dest,
-                        )
-                        .await
+                Ok(Some(dest)) => {
+                    dest_for_undo = Some(dest.clone());
+                    match secrets::load_account_secrets(account_id) {
+                        Ok(sec) => {
+                            imap_client::move_message(
+                                &account,
+                                &sec.imap_password,
+                                &detail.folder_path,
+                                uid,
+                                &dest,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
-                },
+                }
                 Ok(None) => match secrets::load_account_secrets(account_id) {
                     Ok(sec) => {
                         imap_client::delete_message(
@@ -1066,23 +1219,32 @@ async fn move_message_inner(
                     folders,
                 });
             }
+            let dest_folder_path = dest_for_undo.unwrap_or_default();
+            let rfc_message_id = detail.rfc_message_id.clone();
             let _ = evt_tx.send(match target {
                 MoveTarget::Archive => WorkerEvent::MessageArchived {
                     account_id,
                     message_id,
+                    dest_folder_path,
+                    rfc_message_id,
                 },
                 MoveTarget::Trash => WorkerEvent::MessageDeleted {
                     account_id,
                     message_id,
+                    dest_folder_path,
+                    rfc_message_id,
                 },
                 MoveTarget::Spam => WorkerEvent::MessageMarkedSpam {
                     account_id,
                     message_id,
+                    dest_folder_path,
+                    rfc_message_id,
                 },
                 MoveTarget::Folder(target_folder_path) => WorkerEvent::MessageMoved {
                     account_id,
                     message_id,
                     target_folder_path,
+                    rfc_message_id,
                 },
             });
             let _ = evt_tx.send(WorkerEvent::Status {
@@ -1286,9 +1448,8 @@ async fn sync_folder_inner(
             match fetched {
                 Ok((items, next_link)) => {
                     // 传入 None 避免误删用户此前已预加载到本地的更早历史邮件。
-                    let commit_res = cache.commit_folder_headers_with_remote(
-                        account.id, folder_id, 1, &items, None,
-                    );
+                    let commit_res = cache
+                        .commit_folder_headers_with_remote(account.id, folder_id, 1, &items, None);
                     if commit_res.is_ok() && prev_cached <= 100 {
                         let _ = cache.set_folder_remote_cursor(
                             folder_id,
@@ -1628,7 +1789,10 @@ async fn send_outbox_item(
     }
 }
 
-fn merge_filter_options(filter: MessageFilter, mut quick_filters: QuickFilterSet) -> QuickFilterSet {
+fn merge_filter_options(
+    filter: MessageFilter,
+    mut quick_filters: QuickFilterSet,
+) -> QuickFilterSet {
     match filter {
         MessageFilter::All => quick_filters,
         MessageFilter::Unread => {
@@ -1711,9 +1875,8 @@ async fn search_server_inner(
 
                 if let Ok(items) = res {
                     let uids: Vec<u32> = items.iter().map(|(h, _)| h.uid).collect();
-                    let _ = cache.commit_folder_headers_with_remote(
-                        account.id, inbox_id, 1, &items, None,
-                    );
+                    let _ = cache
+                        .commit_folder_headers_with_remote(account.id, inbox_id, 1, &items, None);
                     if let Ok(summaries) = cache.list_summaries_by_uids(inbox_id, &uids) {
                         for item in summaries {
                             if seen_keys.insert((item.account_id, item.uid)) {

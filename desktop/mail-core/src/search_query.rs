@@ -194,6 +194,8 @@ mod tests {
             unread: true,
             flagged: true,
             has_attachment: true,
+            recipients: String::new(),
+            thread_count: 1,
         }
     }
 

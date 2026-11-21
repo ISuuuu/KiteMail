@@ -22,7 +22,7 @@ use gpui_kit::{
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollHandle,
     SharedString, Styled, Subscription, Window, WindowAppearance, WindowBounds,
 };
-use hylki_mail_core::cache::{CachedAttachment, KnownContact};
+use hylki_mail_core::cache::{sanitize_filename, CachedAttachment, KnownContact};
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend, SecurityMode};
 use hylki_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_SENT_ID,
@@ -202,6 +202,7 @@ actions!(
         DeleteSelectedMessage,
         SelectNextMessage,
         SelectPrevMessage,
+        UndoLastMove,
         ZoomIn,
         ZoomOut,
         ZoomReset
@@ -242,6 +243,61 @@ pub(crate) enum ActiveModal {
     Accounts,
     Preferences,
     CommandPalette,
+}
+
+/// F-3：最近一次可撤销的移动 / 删除 / 归档记录（状态栏轻量撤销条，15 秒后自动消失）。
+#[derive(Clone, Debug)]
+pub(crate) struct UndoRecord {
+    pub(crate) account_id: u32,
+    pub(crate) message_id: u32,
+    /// RFC Message-ID（撤销时用于在服务端当前文件夹定位邮件）。
+    pub(crate) rfc_message_id: String,
+    /// 撤销时邮件所在的文件夹（回收站 / 归档 / 垃圾 / 移动目标）。
+    pub(crate) current_folder_path: String,
+    /// 移动 / 删除 / 归档前邮件所在的文件夹路径（撤销时的恢复目标）。
+    pub(crate) original_folder_path: String,
+    /// 动作描述（如「已删除」「已归档」「已移动」）。
+    pub(crate) action_label: SharedString,
+    /// 记录时刻（用于 15 秒过期与定时清理比对）。
+    pub(crate) at: Instant,
+}
+
+/// F-3：请求发出时捕获的撤销前半段信息（成功回执到达后补全为 [`UndoRecord`]）。
+#[derive(Clone, Debug)]
+struct PendingUndo {
+    account_id: u32,
+    message_id: u32,
+    original_folder_path: String,
+    action_label: SharedString,
+    at: Instant,
+}
+
+impl PendingUndo {
+    /// 用成功回执携带的服务端定位信息补全撤销记录。
+    fn into_record(self, dest_folder_path: String, rfc_message_id: String) -> UndoRecord {
+        UndoRecord {
+            account_id: self.account_id,
+            message_id: self.message_id,
+            rfc_message_id,
+            current_folder_path: dest_folder_path,
+            original_folder_path: self.original_folder_path,
+            action_label: self.action_label,
+            at: self.at,
+        }
+    }
+}
+
+/// 撤销条过期时长（秒）。
+const UNDO_TTL_SECS: u64 = 15;
+
+/// B-2：列表行菜单触发的「等正文加载完成后执行」的后续动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingRowAction {
+    Reply,
+    ReplyAll,
+    Forward,
+    CopyBody,
+    ViewSource,
 }
 
 pub(crate) struct HylkiApp {
@@ -352,6 +408,14 @@ pub(crate) struct HylkiApp {
     pub(crate) collapsed_thread_cards: HashSet<u32>,
     /// 当前会话阅读器中处于「查看邮件原文」模式的卡片邮件 ID 集合。
     pub(crate) raw_source_message_ids: HashSet<u32>,
+    /// B-2：列表行菜单挂起的后续动作（等对应正文加载完成后执行）。
+    pub(crate) pending_row_action: Option<(u32, PendingRowAction)>,
+    /// B-2：正在抓取原始 MIME 以导出 .eml 的邮件 ID（「导出中…」状态，防重复点击）。
+    pub(crate) pending_eml_export: Option<u32>,
+    /// F-3：进行中的移动 / 删除 / 归档（成功回执到达后转成 `last_move_undo`）。
+    pending_undo: Option<PendingUndo>,
+    /// F-3：最近一次可撤销的移动 / 删除 / 归档记录（状态栏撤销条）。
+    pub(crate) last_move_undo: Option<UndoRecord>,
 
     // ---- 阶段 3：全局路由 / 模态 / 偏好（方案文档五.1、五.2）----
     /// 持久化偏好副本（preferences.toml；last_view / last_folder 随切换落盘）。
@@ -706,6 +770,10 @@ impl HylkiApp {
                 allowed_remote_image_ids: HashSet::new(),
                 collapsed_thread_cards: initial_collapsed,
                 raw_source_message_ids: HashSet::new(),
+                pending_row_action: None,
+                pending_eml_export: None,
+                pending_undo: None,
+                last_move_undo: None,
                 prefs,
                 main_view: MainContentView::Mail,
                 active_modal: ActiveModal::None,
@@ -863,6 +931,10 @@ impl HylkiApp {
             allowed_remote_image_ids: HashSet::new(),
             collapsed_thread_cards: HashSet::new(),
             raw_source_message_ids: HashSet::new(),
+            pending_row_action: None,
+            pending_eml_export: None,
+            pending_undo: None,
+            last_move_undo: None,
             prefs,
             main_view: MainContentView::Mail,
             active_modal: ActiveModal::None,
@@ -1025,8 +1097,40 @@ impl HylkiApp {
                     }
                 }
                 WorkerEvent::MessageBodyLoaded(detail) => {
-                    self.set_selected_message(detail);
+                    let pending = self.pending_row_action.take();
+                    self.set_selected_message(detail.clone());
                     self.error_banner = None;
+                    // B-2：行菜单挂起的动作（回复 / 复制正文 / 查看原文）在正文就绪后执行。
+                    if let Some((msg_id, action)) = pending {
+                        if msg_id == detail.id {
+                            let entity = cx.entity();
+                            let _ = self.window_handle.update(cx, |_, window, cx| {
+                                entity.update(cx, |app, cx| {
+                                    app.finish_pending_row_action(&detail, window, cx);
+                                });
+                            });
+                        } else {
+                            self.pending_row_action = Some((msg_id, action));
+                        }
+                    }
+                }
+                WorkerEvent::RawMessageFetched { message_id, bytes } => {
+                    // B-2：.eml 原始字节已取回，弹系统保存对话框写出「主题.eml」。
+                    self.pending_eml_export = None;
+                    let subject = self
+                        .selected_message
+                        .as_ref()
+                        .filter(|d| d.id == message_id)
+                        .map(|d| d.subject.clone())
+                        .or_else(|| {
+                            self.current_page
+                                .items
+                                .iter()
+                                .find(|m| m.id == message_id)
+                                .map(|m| m.subject.clone())
+                        })
+                        .unwrap_or_else(|| "邮件".to_string());
+                    self.export_eml_bytes(&subject, bytes, cx);
                 }
                 WorkerEvent::DraftsUpdated { drafts } => {
                     self.drafts = drafts;
@@ -1069,28 +1173,60 @@ impl HylkiApp {
                     account_id: _,
                     message,
                 } => {
+                    // B-2：抓取原文失败时退出「导出中…」状态。
+                    self.pending_eml_export = None;
                     self.error_banner = Some(SharedString::from(message.clone()));
                     self.status_line = SharedString::from(message);
                 }
                 WorkerEvent::MessageArchived {
                     account_id,
                     message_id,
+                    dest_folder_path,
+                    rfc_message_id,
                 }
                 | WorkerEvent::MessageDeleted {
                     account_id,
                     message_id,
+                    dest_folder_path,
+                    rfc_message_id,
                 }
                 | WorkerEvent::MessageMarkedSpam {
                     account_id,
                     message_id,
-                }
-                | WorkerEvent::MessageMoved {
-                    account_id,
-                    message_id,
-                    ..
+                    dest_folder_path,
+                    rfc_message_id,
                 } => {
+                    // F-3：请求时已捕获撤销前半段，成功回执补全定位信息后转为可撤销条；
+                    // 永久删除（无回收站）或缺少 Message-ID 时不提供撤销。
+                    if let Some(pending) = self.pending_undo.take() {
+                        if pending.account_id == account_id
+                            && pending.message_id == message_id
+                            && !dest_folder_path.is_empty()
+                            && !rfc_message_id.is_empty()
+                        {
+                            let record = pending.into_record(dest_folder_path, rfc_message_id);
+                            self.set_last_move_undo(record, cx);
+                        }
+                    }
                     // 后端回执：随事件先行到达的 FoldersLoaded 已刷新文件夹计数；
                     // 这里刷新当前列表并在阅读态显示该邮件时回到空态。
+                    self.after_message_moved(account_id, message_id, cx);
+                }
+                WorkerEvent::MessageMoved {
+                    account_id,
+                    message_id,
+                    target_folder_path,
+                    rfc_message_id,
+                } => {
+                    if let Some(pending) = self.pending_undo.take() {
+                        if pending.account_id == account_id
+                            && pending.message_id == message_id
+                            && !rfc_message_id.is_empty()
+                        {
+                            let record = pending.into_record(target_folder_path, rfc_message_id);
+                            self.set_last_move_undo(record, cx);
+                        }
+                    }
                     self.after_message_moved(account_id, message_id, cx);
                 }
                 WorkerEvent::AllFoldersSearchLoaded(page) => {
@@ -1746,15 +1882,40 @@ impl HylkiApp {
 
     // ---- 迭代 2：归档 / 删除与列表行操作（方案文档五.3）----
 
-    /// 归档 / 删除 / 移动 / 标垃圾完成后的公共收尾：清空正在显示的目标邮件并刷新当前列表。
+    /// 归档 / 删除 / 移动 / 标垃圾完成后的公共收尾：清空正在显示的目标邮件并刷新当前列表；
+    /// F-2：被移除邮件正显示在阅读态时，自动推进选中相邻下一封（末尾则上一封）并加载其正文。
     fn after_message_moved(&mut self, account_id: u32, message_id: u32, cx: &mut Context<Self>) {
         self.selected_message_ids.remove(&message_id);
-        if self
+        let was_displayed = self
             .selected_message
             .as_ref()
-            .is_some_and(|m| m.account_id == account_id && m.id == message_id)
-        {
+            .is_some_and(|m| m.account_id == account_id && m.id == message_id);
+        // 先在旧列表中定位被移除邮件的下标（F-2），再刷新列表。
+        let advance_to = if was_displayed {
+            let len = self.current_page.items.len();
+            self.current_page
+                .items
+                .iter()
+                .position(|m| m.id == message_id)
+                .and_then(|idx| next_index_after_removal(idx, len))
+                .and_then(|next_idx| self.current_page.items.get(next_idx).cloned())
+        } else {
+            None
+        };
+        if was_displayed {
             self.selected_message = None;
+        }
+        // 先请求相邻邮件正文、后刷新列表：worker 按顺序处理，详情先回、页面后回，
+        // 避免 merge_loaded_page 在 selected_message 仍为空时误选第一封。
+        if let Some(next) = advance_to.as_ref() {
+            self.select_message(
+                next.account_id,
+                next.id,
+                next.uid,
+                next.unread,
+                &next.folder_path,
+                cx,
+            );
         }
         self.reload_current_page(cx);
     }
@@ -1794,6 +1955,7 @@ impl HylkiApp {
             return;
         }
         if let Some(ref w) = self.worker {
+            self.pending_undo = self.capture_undo_record(account_id, message_id, "已归档");
             self.status_line = SharedString::from("正在归档邮件...");
             w.send(MailRequest::ArchiveMessage {
                 account_id,
@@ -1814,6 +1976,7 @@ impl HylkiApp {
             return;
         }
         if let Some(ref w) = self.worker {
+            self.pending_undo = self.capture_undo_record(account_id, message_id, "已删除");
             self.status_line = SharedString::from("正在删除邮件...");
             w.send(MailRequest::DeleteMessage {
                 account_id,
@@ -1834,6 +1997,8 @@ impl HylkiApp {
             return;
         }
         if let Some(ref w) = self.worker {
+            self.pending_undo =
+                self.capture_undo_record(account_id, message_id, "已标记为垃圾邮件");
             self.status_line = SharedString::from("正在标记为垃圾邮件...");
             w.send(MailRequest::MarkSpam {
                 account_id,
@@ -1855,6 +2020,7 @@ impl HylkiApp {
             return;
         }
         if let Some(ref w) = self.worker {
+            self.pending_undo = self.capture_undo_record(account_id, message_id, "已移动");
             self.status_line = SharedString::from("正在移动邮件...");
             w.send(MailRequest::MoveMessage {
                 account_id,
@@ -1863,6 +2029,240 @@ impl HylkiApp {
             });
         }
         cx.notify();
+    }
+
+    // ---- B-2 行菜单挂起动作 / F-3 撤销 / .eml 导出 ----
+
+    /// F-3：请求发出前从当前列表捕获撤销前半段信息（原文件夹路径；定位信息由成功回执补全）。
+    fn capture_undo_record(
+        &self,
+        account_id: u32,
+        message_id: u32,
+        action_label: &str,
+    ) -> Option<PendingUndo> {
+        let msg = self
+            .current_page
+            .items
+            .iter()
+            .find(|m| m.id == message_id && m.account_id == account_id)?;
+        Some(PendingUndo {
+            account_id,
+            message_id: msg.id,
+            original_folder_path: msg.folder_path.clone(),
+            action_label: SharedString::from(action_label.to_string()),
+            at: Instant::now(),
+        })
+    }
+
+    /// F-3：写入可撤销记录并安排 15 秒后自动清理（新记录覆盖旧记录）。
+    fn set_last_move_undo(&mut self, record: UndoRecord, cx: &mut Context<Self>) {
+        let at = record.at;
+        self.last_move_undo = Some(record);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(UNDO_TTL_SECS))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.last_move_undo.as_ref().is_some_and(|r| r.at == at) {
+                    app.last_move_undo = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// F-3：撤销最近一次移动 / 删除 / 归档——邮件已不在本地缓存，走专用
+    /// `UndoMessageMove`（服务端按 Message-ID 定位后移回原文件夹），不再记录新的撤销。
+    pub(crate) fn undo_last_move(&mut self, cx: &mut Context<Self>) {
+        let Some(record) = self.last_move_undo.take() else {
+            return;
+        };
+        if let Some(ref w) = self.worker {
+            self.status_line =
+                SharedString::from(format!("正在撤销{}，移回原文件夹...", record.action_label));
+            w.send(MailRequest::UndoMessageMove {
+                account_id: record.account_id,
+                message_id: record.message_id,
+                rfc_message_id: record.rfc_message_id,
+                current_folder_path: record.current_folder_path,
+                original_folder_path: record.original_folder_path,
+            });
+        }
+        cx.notify();
+    }
+
+    /// B-2：列表行菜单的回复 / 复制正文 / 查看原文入口。
+    ///
+    /// 详情已就绪（demo 或当前选中）时立即执行；否则挂起动作并按需加载正文。
+    pub(crate) fn begin_row_action(
+        &mut self,
+        action: PendingRowAction,
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        unread: bool,
+        folder_path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            if let Some(detail) = self.demo_message_detail(message_id) {
+                self.right_mode = RightPaneMode::Reader;
+                // 查看原文 / 回复针对当前显示的邮件：先切换选中再执行动作。
+                self.set_selected_message(detail.clone());
+                self.run_row_action(action, &detail, window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        if self
+            .selected_message
+            .as_ref()
+            .is_some_and(|d| d.id == message_id)
+        {
+            if let Some(detail) = self.selected_message.clone() {
+                self.run_row_action(action, &detail, window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        self.right_mode = RightPaneMode::Reader;
+        self.pending_row_action = Some((message_id, action));
+        self.request_message_detail(account_id, message_id, uid, unread, folder_path);
+        cx.notify();
+    }
+
+    /// 执行已就绪的行菜单动作（B-2）。
+    fn run_row_action(
+        &mut self,
+        action: PendingRowAction,
+        detail: &MessageDetail,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            PendingRowAction::Reply => self.start_reply(detail, window, cx),
+            PendingRowAction::ReplyAll => self.start_reply_all(detail, window, cx),
+            PendingRowAction::Forward => self.start_forward(detail, window, cx),
+            PendingRowAction::CopyBody => {
+                let text = detail.body_text.clone();
+                self.copy_text_to_clipboard(text, cx);
+            }
+            PendingRowAction::ViewSource => {
+                self.raw_source_message_ids.insert(detail.id);
+                self.collapsed_thread_cards.remove(&detail.id);
+                cx.notify();
+            }
+        }
+    }
+
+    /// 正文加载完成后执行挂起的行菜单动作（MessageBodyLoaded 回调入口）。
+    fn finish_pending_row_action(
+        &mut self,
+        detail: &MessageDetail,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((msg_id, action)) = self.pending_row_action.take() else {
+            return;
+        };
+        if msg_id != detail.id {
+            // 回执与挂起动作不匹配（用户切换了目标）：放回等待对应正文。
+            self.pending_row_action = Some((msg_id, action));
+            return;
+        }
+        self.run_row_action(action, detail, window, cx);
+    }
+
+    /// B-2：请求导出 .eml——真实账号异步抓取原文（导出中…），演示模式直接合成。
+    pub(crate) fn request_export_eml(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        folder_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_eml_export == Some(message_id) {
+            return;
+        }
+        if self.demo_mode {
+            match self.demo_message_detail(message_id) {
+                Some(detail) => {
+                    let bytes = compose_demo_eml(&detail);
+                    self.export_eml_bytes(&detail.subject, bytes, cx);
+                }
+                None => {
+                    self.status_line = SharedString::from("演示数据没有该邮件的原始正文，无法导出");
+                }
+            }
+            cx.notify();
+            return;
+        }
+        self.pending_eml_export = Some(message_id);
+        self.status_line = SharedString::from("正在获取邮件原文...");
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::FetchRawMessage {
+                account_id,
+                message_id,
+                uid,
+                folder_path,
+            });
+        }
+        cx.notify();
+    }
+
+    /// B-2：弹系统保存对话框并把 .eml 字节写出（文件名 = 过滤非法字符后的主题）。
+    fn export_eml_bytes(&mut self, subject: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let filename = format!("{}.eml", sanitize_filename(subject));
+        if let Some(dest) = rfd::FileDialog::new().set_file_name(&filename).save_file() {
+            match std::fs::write(&dest, &bytes) {
+                Ok(()) => {
+                    self.status_line =
+                        SharedString::from(format!("已导出邮件原文至：{}", dest.display()));
+                }
+                Err(e) => {
+                    self.error_banner = Some(SharedString::from(format!("保存邮件原文失败: {e}")));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 查找账号的收件箱文件夹路径（B-2 Trash/Junk 恢复目标）。
+    pub(crate) fn inbox_folder_path(&self, account_id: u32) -> Option<String> {
+        self.folders_by_account
+            .get(&account_id)?
+            .iter()
+            .find(|f| {
+                f.path.eq_ignore_ascii_case("INBOX")
+                    || f.name.eq_ignore_ascii_case("INBOX")
+                    || f.name == "收件箱"
+            })
+            .map(|f| f.path.clone())
+    }
+
+    /// 判定指定文件夹是否为回收站 / 垃圾邮件文件夹（B-2 菜单语义切换）。
+    pub(crate) fn folder_is_trash_or_junk(&self, account_id: u32, folder_id: u32) -> bool {
+        self.folders_by_account
+            .get(&account_id)
+            .and_then(|list| list.iter().find(|f| f.id == folder_id))
+            .is_some_and(|f| is_trash_or_junk_folder(&f.name, &f.path))
+    }
+
+    /// B-6：当前列表视图是否显示收件人（统一已发送 / 草稿视图 / 账号 Sent 文件夹）。
+    pub(crate) fn list_view_shows_recipients(&self) -> bool {
+        match self.current_view {
+            CurrentView::Sent | CurrentView::Drafts => true,
+            CurrentView::AccountFolder => self
+                .folders_by_account
+                .values()
+                .flatten()
+                .find(|f| f.id == self.selected_folder_id)
+                .is_some_and(|f| is_sent_folder(&f.name, &f.path)),
+            CurrentView::UnifiedInbox | CurrentView::Starred | CurrentView::Archive => false,
+        }
     }
 
     // ---- 多选与批量操作 ----
@@ -2140,6 +2540,9 @@ impl HylkiApp {
             unread: false,
             flagged: false,
             has_attachment: !draft.attachment_paths.is_empty(),
+            // B-6：草稿视图列表行显示「致：收件人」。
+            recipients: draft.to_addr.clone(),
+            thread_count: 1,
         }
     }
 
@@ -3713,6 +4116,14 @@ impl Render for HylkiApp {
         let p = theme::current(cx);
         let border = p.border;
         let muted_fg = p.text_muted;
+        // F-3：撤销条过期（15 秒）时顺手清理（定时器负责主动通知）。
+        if self
+            .last_move_undo
+            .as_ref()
+            .is_some_and(|r| r.at.elapsed() > Duration::from_secs(UNDO_TTL_SECS))
+        {
+            self.last_move_undo = None;
+        }
 
         let sidebar_el = if self.sidebar_hidden {
             // 折叠为 80px 图标窄轨（对齐原版 rail），不再整体移除左栏。
@@ -3884,11 +4295,39 @@ impl Render for HylkiApp {
                         .bg(p.sidebar)
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .text_xs()
                                 .text_color(muted_fg)
                                 .truncate()
                                 .child(self.status_line.clone()),
-                        ),
+                        )
+                        // F-3：右侧轻量撤销条「已删除 / 已归档 / 已移动 — 撤销」。
+                        .when_some(self.last_move_undo.clone(), |el, record| {
+                            el.child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(p.text)
+                                            .child(record.action_label.clone()),
+                                    )
+                                    .child(
+                                        Button::new("undo-last-move")
+                                            .ghost()
+                                            .compact()
+                                            .text_size(px(11.0))
+                                            .label("撤销")
+                                            .tooltip("撤销最近一次移动 / 删除 / 归档（Ctrl+Z）")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.undo_last_move(cx);
+                                            })),
+                                    ),
+                            )
+                        }),
                 )
             })
             // 全局快捷键动作（键绑定注册在 main.rs，方案文档五.3）。
@@ -3965,6 +4404,16 @@ impl Render for HylkiApp {
                     && !this.is_text_input_focused(window, cx)
                 {
                     this.select_adjacent_message(-1, cx);
+                }
+            }))
+            // F-3：Ctrl+Z 撤销最近一次移动 / 删除 / 归档（条件与 DeleteSelectedMessage 一致）。
+            .on_action(cx.listener(|this, _: &UndoLastMove, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    this.undo_last_move(cx);
                 }
             }))
             // 阅读器缩放快捷键（Ctrl+= / Ctrl+- / Ctrl+0，复用现有持久化路径）。
@@ -4288,6 +4737,50 @@ pub(crate) fn next_adjacent_index(
     }
 }
 
+/// F-2：删除 / 归档后自动推进的目标下标——优先选中同位置的后一封（原 `removed + 1`，
+/// 移除后即原位），已是最后一封则选上一封；列表只剩这一封时不选。
+pub(crate) fn next_index_after_removal(removed: usize, len: usize) -> Option<usize> {
+    if len <= 1 {
+        return None;
+    }
+    if removed + 1 < len {
+        Some(removed + 1)
+    } else {
+        Some(removed - 1)
+    }
+}
+
+/// B-2：判定文件夹是否为回收站 / 垃圾邮件（语义对齐 cache.rs 的
+/// TRASH_FOLDER_MATCH / JUNK_FOLDER_MATCH 与原版 FolderKind::Trash / Junk）。
+pub(crate) fn is_trash_or_junk_folder(name: &str, path: &str) -> bool {
+    let upper = path.to_ascii_uppercase();
+    name == "已删除"
+        || name == "垃圾邮件"
+        || upper.contains("TRASH")
+        || upper.contains("DELETED")
+        || upper.contains("JUNK")
+        || upper.contains("SPAM")
+}
+
+/// B-6：判定文件夹是否为已发送（语义对齐 cache.rs 的 SENT_FOLDER_MATCH）。
+pub(crate) fn is_sent_folder(name: &str, path: &str) -> bool {
+    name == "已发送" || path.to_ascii_uppercase().contains("SENT")
+}
+
+/// B-2：演示模式合成 .eml 内容（信头 + 正文；非严格 RFC，仅用于演示导出链路）。
+pub(crate) fn compose_demo_eml(detail: &MessageDetail) -> Vec<u8> {
+    let eml = format!(
+        "From: {}\r\nTo: {}\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: {}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{}",
+        detail.sender,
+        detail.recipients,
+        detail.subject,
+        detail.date_display,
+        detail.rfc_message_id,
+        detail.body_text,
+    );
+    eml.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4405,6 +4898,8 @@ mod tests {
             body_loaded: true,
             flagged: false,
             attachments: Vec::new(),
+            uid: id,
+            folder_path: "INBOX".to_string(),
         };
         let detail = MessageDetail {
             id: 2,
@@ -4534,5 +5029,68 @@ mod tests {
         assert_eq!(next_adjacent_index(Some(0), 3, -1), None);
         assert_eq!(next_adjacent_index(Some(2), 3, 1), None);
         assert_eq!(next_adjacent_index(Some(2), 3, -1), Some(1));
+    }
+
+    /// F-2：删除 / 归档后自动推进的目标下标（优先后一封，末尾则上一封，单封不推进）。
+    #[test]
+    fn next_index_after_removal_advances_to_neighbor() {
+        assert_eq!(next_index_after_removal(0, 0), None);
+        assert_eq!(next_index_after_removal(0, 1), None);
+        assert_eq!(next_index_after_removal(0, 2), Some(1));
+        assert_eq!(next_index_after_removal(1, 2), Some(0));
+        assert_eq!(next_index_after_removal(2, 5), Some(3));
+        assert_eq!(next_index_after_removal(4, 5), Some(3));
+    }
+
+    /// B-2：Trash / Junk 文件夹判定（对齐 cache.rs 匹配规则）。
+    #[test]
+    fn trash_or_junk_folder_detection_matches_cache_rules() {
+        assert!(is_trash_or_junk_folder("已删除", "INBOX/Trash"));
+        assert!(is_trash_or_junk_folder("", "Deleted Messages"));
+        assert!(is_trash_or_junk_folder("垃圾邮件", "Junk"));
+        assert!(is_trash_or_junk_folder("", "spam"));
+        // 普通文件夹不误判。
+        assert!(!is_trash_or_junk_folder("收件箱", "INBOX"));
+        assert!(!is_trash_or_junk_folder("已发送", "Sent"));
+        assert!(!is_trash_or_junk_folder("归档", "Archive"));
+    }
+
+    /// B-6：已发送文件夹判定（对齐 cache.rs SENT_FOLDER_MATCH）。
+    #[test]
+    fn sent_folder_detection_matches_cache_rules() {
+        assert!(is_sent_folder("已发送", "INBOX/Sent"));
+        assert!(is_sent_folder("", "Sent Messages"));
+        assert!(is_sent_folder("", "sentitems"));
+        assert!(!is_sent_folder("收件箱", "INBOX"));
+        assert!(!is_sent_folder("垃圾邮件", "Junk"));
+    }
+
+    /// B-2：演示模式合成 .eml 包含基本信头与正文。
+    #[test]
+    fn compose_demo_eml_includes_headers_and_body() {
+        let detail = MessageDetail {
+            id: 7,
+            account_id: 1,
+            folder_id: 1,
+            folder_path: "INBOX".to_string(),
+            uid: 7,
+            rfc_message_id: "<demo-7@hylki.example>".to_string(),
+            sender: "林晓明 <xiaoming@example.com>".to_string(),
+            recipients: "demo@hylki.example".to_string(),
+            subject: "周报".to_string(),
+            date_display: "11-21 09:30".to_string(),
+            body_text: "正文第一行".to_string(),
+            body_html: None,
+            flagged: false,
+            attachments: Vec::new(),
+            thread_messages: Vec::new(),
+        };
+        let bytes = compose_demo_eml(&detail);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("From: 林晓明 <xiaoming@example.com>\r\n"));
+        assert!(text.contains("To: demo@hylki.example\r\n"));
+        assert!(text.contains("Subject: 周报\r\n"));
+        assert!(text.contains("Message-ID: <demo-7@hylki.example>\r\n"));
+        assert!(text.contains("\r\n\r\n正文第一行"));
     }
 }

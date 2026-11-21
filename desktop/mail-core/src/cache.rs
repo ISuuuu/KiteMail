@@ -156,6 +156,26 @@ fn is_trash_folder(name: &str, path: &str) -> bool {
     name == "已删除" || upper_path.contains("TRASH") || upper_path.contains("DELETED")
 }
 
+/// Strip characters that Windows forbids in file names (same mapping as
+/// [`unique_attachment_path`]) and trim surrounding whitespace / dots;
+/// fall back to `attachment` when nothing usable remains.
+pub fn sanitize_filename(name: &str) -> String {
+    let safe: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    let safe = safe.trim().trim_matches('.').trim().to_string();
+    if safe.trim_matches('.').is_empty() {
+        "attachment".to_string()
+    } else {
+        safe
+    }
+}
+
 /// Compute a non-colliding file path in `dir` for `filename`, appending `(1)`, `(2)`, ...
 /// before the file extension when a file with the same name already exists.
 pub fn unique_attachment_path(dir: &Path, filename: &str) -> PathBuf {
@@ -937,7 +957,8 @@ impl CacheStore {
             .prepare(&format!(
                 "
                 SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
+                       m.recipients
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE {where_sql}
@@ -947,11 +968,15 @@ impl CacheStore {
             ))
             .map_err(|e| format!("准备分页查询失败: {e}"))?;
 
-        let items = stmt
-            .query_map(rusqlite::params_from_iter(page_args.iter()), map_summary_row)
+        let mut items = stmt
+            .query_map(
+                rusqlite::params_from_iter(page_args.iter()),
+                map_summary_row,
+            )
             .map_err(|e| format!("执行分页查询失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析分页结果失败: {e}"))?;
+        self.fill_thread_counts(&mut items);
 
         Ok(MailPage {
             folder_id,
@@ -1188,6 +1213,7 @@ impl CacheStore {
             WITH ranked AS (
                 SELECT m.id, m.account_id, m.folder_id, f.path AS folder_path, m.uid, m.sender, m.subject,
                        m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
+                       m.recipients,
                        ROW_NUMBER() OVER (
                            PARTITION BY CASE
                                WHEN m.message_id != '' THEN m.message_id
@@ -1226,7 +1252,7 @@ impl CacheStore {
                 "
                 {cte}
                 SELECT id, account_id, folder_id, folder_path, uid, sender, subject,
-                       preview, date_ts, date_display, unread, flagged, has_attachment
+                       preview, date_ts, date_display, unread, flagged, has_attachment, recipients
                 FROM ranked
                 WHERE rn = 1
                 ORDER BY {order_sql}
@@ -1235,11 +1261,15 @@ impl CacheStore {
             ))
             .map_err(|e| format!("准备跨文件夹搜索查询失败: {e}"))?;
 
-        let items = stmt
-            .query_map(rusqlite::params_from_iter(page_args.iter()), map_summary_row)
+        let mut items = stmt
+            .query_map(
+                rusqlite::params_from_iter(page_args.iter()),
+                map_summary_row,
+            )
             .map_err(|e| format!("执行跨文件夹搜索查询失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析跨文件夹搜索结果失败: {e}"))?;
+        self.fill_thread_counts(&mut items);
 
         Ok(MailPage {
             folder_id: 0,
@@ -1252,6 +1282,68 @@ impl CacheStore {
     /// Find the account's Inbox folder `(folder_id, path)` if synced.
     pub fn find_inbox_folder(&self, account_id: u32) -> Result<Option<(u32, String)>, String> {
         self.find_role_folder(account_id, "(UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)")
+    }
+
+    /// B-4：为页面内邮件回填会话计数 `thread_count`（同账号内同一会话的邮件总数）。
+    ///
+    /// 数据来源（只读扩展，不改 schema）：按 `normalize_thread_subject` 归一化主题计数。
+    /// 说明：RFC 会话闭包需要逐封递归展开（见 [`Self::list_thread_messages`]），对列表页
+    /// 代价过高，这里降级为「同主题（归一化）计数」——先按原始 subject 在 SQL 侧
+    /// `GROUP BY` 计数，再在 Rust 侧按归一化键聚合，语义与 `list_thread_messages`
+    /// 的主题回退路径一致。
+    fn fill_thread_counts(&self, items: &mut [MessageSummary]) {
+        if items.is_empty() {
+            return;
+        }
+        // 每个账号一次查询：页内主题分批绑定（避免超出 SQLite 变量上限）。
+        let mut accounts: Vec<u32> = items.iter().map(|m| m.account_id).collect();
+        accounts.sort_unstable();
+        accounts.dedup();
+
+        let mut counts: HashMap<(u32, String), u32> = HashMap::new();
+        for account_id in accounts {
+            let mut subjects: Vec<String> = items
+                .iter()
+                .filter(|m| m.account_id == account_id)
+                .map(|m| m.subject.to_lowercase())
+                .collect();
+            subjects.sort_unstable();
+            subjects.dedup();
+            for chunk in subjects.chunks(200) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let sql = format!(
+                    "
+                    SELECT subject, COUNT(*) FROM messages
+                    WHERE account_id = ? AND LOWER(subject) IN ({placeholders})
+                    GROUP BY subject
+                    "
+                );
+                let mut args: Vec<rusqlite::types::Value> = vec![i64::from(account_id).into()];
+                args.extend(chunk.iter().map(|s| s.clone().into()));
+                let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                    continue;
+                };
+                let Ok(rows) = stmt
+                    .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map(|iter| iter.collect::<Result<Vec<_>, _>>())
+                else {
+                    continue;
+                };
+                if let Ok(rows) = rows {
+                    for (subject, count) in rows {
+                        let key = (account_id, normalize_thread_subject(&subject));
+                        *counts.entry(key).or_insert(0) += count.max(0) as u32;
+                    }
+                }
+            }
+        }
+
+        for m in items.iter_mut() {
+            let key = (m.account_id, normalize_thread_subject(&m.subject));
+            m.thread_count = counts.get(&key).copied().unwrap_or(1).max(1);
+        }
     }
 
     /// Look up cached [`MessageSummary`] rows by `(folder_id, uids)` (used after server search commits).
@@ -1271,7 +1363,8 @@ impl CacheStore {
             .prepare(&format!(
                 "
                 SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
+                       m.recipients
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE m.folder_id = ? AND m.uid IN ({marks})
@@ -1279,11 +1372,12 @@ impl CacheStore {
                 "
             ))
             .map_err(|e| format!("准备按 UID 查询邮件摘要失败: {e}"))?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), map_summary_row)
             .map_err(|e| format!("执行按 UID 查询邮件摘要失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析按 UID 查询邮件摘要失败: {e}"))?;
+        self.fill_thread_counts(&mut rows);
         Ok(rows)
     }
 
@@ -1338,7 +1432,8 @@ impl CacheStore {
             .prepare(&format!(
                 "
                 SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
+                       m.recipients
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE {where_sql}
@@ -1348,11 +1443,15 @@ impl CacheStore {
             ))
             .map_err(|e| format!("准备{label}分页查询失败: {e}"))?;
 
-        let items = stmt
-            .query_map(rusqlite::params_from_iter(page_args.iter()), map_summary_row)
+        let mut items = stmt
+            .query_map(
+                rusqlite::params_from_iter(page_args.iter()),
+                map_summary_row,
+            )
             .map_err(|e| format!("执行{label}分页查询失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析{label}结果失败: {e}"))?;
+        self.fill_thread_counts(&mut items);
 
         Ok(MailPage {
             folder_id: 0,
@@ -1607,7 +1706,8 @@ impl CacheStore {
         }
 
         // 3. Load candidate rows either from RFC matches or from subject fallback.
-        let use_rfc = matched_ids.len() >= 2 || (anchor_has_reply_headers && !matched_ids.is_empty());
+        let use_rfc =
+            matched_ids.len() >= 2 || (anchor_has_reply_headers && !matched_ids.is_empty());
 
         let mut raw_rows: Vec<RawRow> = Vec::new();
         if use_rfc {
@@ -1789,6 +1889,8 @@ impl CacheStore {
                 body_loaded,
                 flagged: row.flagged,
                 attachments,
+                uid: row.uid,
+                folder_path: row.folder_path,
             });
         }
         Ok(out)
@@ -2482,6 +2584,9 @@ fn map_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> 
         unread: row.get::<_, i32>(10)? != 0,
         flagged: row.get::<_, i32>(11)? != 0,
         has_attachment: row.get::<_, i32>(12)? != 0,
+        recipients: row.get(13)?,
+        // 会话计数由 `fill_thread_counts` 在查询后统一回填。
+        thread_count: 1,
     })
 }
 
@@ -3867,7 +3972,10 @@ mod tests {
                 1,
                 inbox,
                 1,
-                &[sample_header(101, "较新邮件1"), sample_header(102, "最新邮件2")],
+                &[
+                    sample_header(101, "较新邮件1"),
+                    sample_header(102, "最新邮件2"),
+                ],
                 Some(&[50, 51, 101, 102]),
             )
             .unwrap();
@@ -3894,7 +4002,10 @@ mod tests {
                 1,
                 inbox,
                 1,
-                &[sample_header(50, "更早邮件1"), sample_header(51, "更早邮件2")],
+                &[
+                    sample_header(50, "更早邮件1"),
+                    sample_header(51, "更早邮件2"),
+                ],
                 Some(&[50, 51, 101, 102]),
             )
             .unwrap();
@@ -3911,7 +4022,10 @@ mod tests {
         assert!(next_after.is_empty());
         assert_eq!(min_uid_after, Some(50));
         assert_eq!(count_after, 5);
-        assert!(cache.list_inbox_folders_with_more_remote().unwrap().is_empty());
+        assert!(cache
+            .list_inbox_folders_with_more_remote()
+            .unwrap()
+            .is_empty());
 
         let reloaded = cache.list_folders(1).unwrap();
         assert!(!reloaded[0].has_more_remote);
@@ -3996,7 +4110,13 @@ mod tests {
         assert_eq!(cn_invoice.items[0].uid, 1);
 
         let cn_contract = cache
-            .search_all_folders("合同", QuickFilterSet::default(), MessageSort::DateNewest, 0, 10)
+            .search_all_folders(
+                "合同",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                10,
+            )
             .unwrap();
         assert_eq!(cn_contract.total, 1);
         assert_eq!(cn_contract.items[0].uid, 3);
@@ -4087,14 +4207,7 @@ mod tests {
 
         let uids_for = |sort: MessageSort| -> Vec<u32> {
             cache
-                .list_messages_page_with_options(
-                    inbox,
-                    "",
-                    QuickFilterSet::default(),
-                    sort,
-                    0,
-                    10,
-                )
+                .list_messages_page_with_options(inbox, "", QuickFilterSet::default(), sort, 0, 10)
                 .unwrap()
                 .items
                 .into_iter()
@@ -4188,11 +4301,23 @@ mod tests {
             .unwrap();
 
         let all = cache
-            .search_all_folders("合同", QuickFilterSet::default(), MessageSort::DateNewest, 0, 20)
+            .search_all_folders(
+                "合同",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                20,
+            )
             .unwrap();
         assert_eq!(all.total, 2, "应排除 Trash/Junk 并按 message_id 去重");
-        assert!(all.items.iter().any(|m| m.folder_path == "INBOX" && m.uid == 10));
-        assert!(all.items.iter().any(|m| m.folder_path == "Archive" && m.uid == 21));
+        assert!(all
+            .items
+            .iter()
+            .any(|m| m.folder_path == "INBOX" && m.uid == 10));
+        assert!(all
+            .items
+            .iter()
+            .any(|m| m.folder_path == "Archive" && m.uid == 21));
 
         // 显式指定 in:trash 时可搜到已删除邮件。
         let in_trash = cache
@@ -4230,7 +4355,10 @@ mod tests {
                 ],
             )
             .unwrap();
-        let (_, path1) = cache.find_spam_folder(1).unwrap().expect("should find Junk");
+        let (_, path1) = cache
+            .find_spam_folder(1)
+            .unwrap()
+            .expect("should find Junk");
         assert_eq!(path1, "Junk");
 
         cache
@@ -4244,7 +4372,10 @@ mod tests {
                 }],
             )
             .unwrap();
-        let (_, path2) = cache.find_spam_folder(2).unwrap().expect("should find Spam");
+        let (_, path2) = cache
+            .find_spam_folder(2)
+            .unwrap()
+            .expect("should find Spam");
         assert_eq!(path2, "[Gmail]/Spam");
 
         assert!(cache.find_spam_folder(99).unwrap().is_none());
@@ -4305,6 +4436,84 @@ mod tests {
         assert!(paths[2].starts_with(&dest_dir));
         let _ = std::fs::remove_dir_all(&dest_dir);
     }
+
+    /// B-2：.eml 导出文件名过滤 Windows 非法字符（与附件文件名同一规则）。
+    #[test]
+    fn sanitize_filename_replaces_windows_illegal_chars() {
+        assert_eq!(
+            sanitize_filename("周报 Q3/四季度:评审?"),
+            "周报 Q3_四季度_评审_"
+        );
+        assert_eq!(sanitize_filename("  a*b|c<d>e \"f\"  "), "a_b_c_d_e _f_");
+        // 全部为点 / 空白时回落默认名。
+        assert_eq!(sanitize_filename(" . .. "), "attachment");
+        assert_eq!(sanitize_filename(""), "attachment");
+        assert_eq!(sanitize_filename("普通主题"), "普通主题");
+    }
+
+    /// B-4：会话计数按归一化主题聚合（Re: / Fwd: 前缀剔除后同键），并随分页查询返回。
+    #[test]
+    fn list_page_fills_thread_counts_by_normalized_subject() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let folders = cache
+            .sync_folders(
+                1,
+                &[
+                    RemoteFolder {
+                        name: "收件箱".to_string(),
+                        path: "INBOX".to_string(),
+                        unread_count: 0,
+                        total_count: 3,
+                    },
+                    RemoteFolder {
+                        name: "已发送".to_string(),
+                        path: "Sent".to_string(),
+                        unread_count: 0,
+                        total_count: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let inbox_id = folders[0].id;
+        let sent_id = folders[1].id;
+
+        let mut h1 = sample_header(1, "项目排期讨论");
+        h1.date_ts = 1_700_000_100;
+        let mut h2 = sample_header(2, "Re: 项目排期讨论");
+        h2.date_ts = 1_700_000_200;
+        h2.recipients = "team@example.com".to_string();
+        let mut h3 = sample_header(3, "Fwd: 项目排期讨论");
+        h3.date_ts = 1_700_000_300;
+        let mut h4 = sample_header(4, "独立主题邮件");
+        h4.date_ts = 1_700_000_400;
+        cache
+            .commit_folder_headers(1, inbox_id, 100, &[h1, h2, h3, h4], None)
+            .unwrap();
+        let mut hs = sample_header(5, "Re: 项目排期讨论");
+        hs.date_ts = 1_700_000_500;
+        cache
+            .commit_folder_headers(1, sent_id, 200, &[hs], None)
+            .unwrap();
+
+        let page = cache.list_messages_page(inbox_id, "", 0, 10).unwrap();
+        let by_subject: std::collections::HashMap<String, u32> = page
+            .items
+            .iter()
+            .map(|m| (m.subject.clone(), m.thread_count))
+            .collect();
+        // 同一归一化主题跨文件夹共 4 封；独立主题只有 1 封（不显示胶囊）。
+        assert_eq!(by_subject["项目排期讨论"], 4);
+        assert_eq!(by_subject["Re: 项目排期讨论"], 4);
+        assert_eq!(by_subject["Fwd: 项目排期讨论"], 4);
+        assert_eq!(by_subject["独立主题邮件"], 1);
+        // B-6：收件人列随摘要一并返回。
+        let with_recipients = page
+            .items
+            .iter()
+            .find(|m| m.subject == "Re: 项目排期讨论")
+            .unwrap();
+        assert_eq!(with_recipients.recipients, "team@example.com");
+    }
 }
 
 fn sanitize_attachment_filename(raw: &str) -> String {
@@ -4329,10 +4538,7 @@ fn sanitize_attachment_filename(raw: &str) -> String {
     }
 }
 
-fn deduplicate_filename(
-    filename: &str,
-    used: &mut std::collections::HashSet<String>,
-) -> String {
+fn deduplicate_filename(filename: &str, used: &mut std::collections::HashSet<String>) -> String {
     let lower = filename.to_lowercase();
     if used.insert(lower) {
         return filename.to_string();

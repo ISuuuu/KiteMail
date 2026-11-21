@@ -1,5 +1,6 @@
 //! Microsoft Graph REST mail client (folders, messages, attachments, flags, sendMail).
 
+use std::io::Read;
 use std::path::Path;
 
 use base64::Engine;
@@ -300,6 +301,58 @@ pub fn fetch_message_body(
     }
 
     Ok((body_text, body_html, attachments))
+}
+
+/// Fetch the complete raw MIME message via Graph `/$value` (used for .eml export).
+pub fn fetch_raw_message(access_token: &str, remote_id: &str) -> Result<Vec<u8>, String> {
+    let encoded_id = urlencoding_segment(remote_id);
+    let url = format!("{GRAPH_BASE}/messages/{encoded_id}/$value");
+    let resp = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .call()
+        .map_err(format_graph_error)?;
+    let mut reader = resp.into_reader();
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取 Graph 原始邮件失败: {e}"))?;
+    Ok(bytes)
+}
+
+/// F-3 撤销：按 `internetMessageId` 在 `current_folder_id` 中检索邮件并移回
+/// `original_folder_id`（移动 / 删除后的邮件已不在本地缓存，需服务端检索定位）。
+pub fn undo_move_by_message_id(
+    access_token: &str,
+    current_folder_id: &str,
+    rfc_message_id: &str,
+    original_folder_id: &str,
+) -> Result<(), String> {
+    let id = rfc_message_id.trim();
+    if id.is_empty() {
+        return Err("缺少 Message-ID，无法撤销移动".to_string());
+    }
+    let encoded_folder = urlencoding_segment(current_folder_id);
+    let filter = format!("internetMessageId eq '{id}'");
+    let encoded_filter = urlencoding_segment(&filter);
+    let url = format!(
+        "{GRAPH_BASE}/mailFolders/{encoded_folder}/messages?$filter={encoded_filter}&$select=id&$top=1"
+    );
+    let resp = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .call()
+        .map_err(format_graph_error)?;
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("解析 Graph 撤销检索结果失败: {e}"))?;
+    let Some(remote_id) = json["value"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|msg| msg["id"].as_str())
+        .map(str::to_string)
+    else {
+        return Err("在当前文件夹中未找到该邮件，无法撤销移动".to_string());
+    };
+    move_message(access_token, &remote_id, original_folder_id)
 }
 
 /// Update read (`isRead`) state on Microsoft Graph.
