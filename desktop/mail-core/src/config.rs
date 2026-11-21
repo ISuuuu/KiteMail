@@ -70,6 +70,38 @@ struct AccountsFile {
     accounts: Vec<AccountConfig>,
 }
 
+/// User interface & sync preferences persisted in `preferences.toml`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppPreferences {
+    /// Active theme identifier (e.g. `"default"`, `"rose"`).
+    pub theme_id: String,
+    /// `None` follows the OS setting; `Some(true/false)` forces dark/light.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dark_mode: Option<bool>,
+    /// Denser list rows in the main window.
+    pub compact_list: bool,
+    /// Number of messages fetched per page.
+    pub page_size: usize,
+    /// Background sync interval in minutes; `0` means manual sync only.
+    pub auto_sync_minutes: u32,
+    /// Block remote images in HTML mail bodies.
+    pub block_remote_images: bool,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            theme_id: "default".to_string(),
+            dark_mode: None,
+            compact_list: false,
+            page_size: 100,
+            auto_sync_minutes: 5,
+            block_remote_images: true,
+        }
+    }
+}
+
 /// Return the Hylki Windows local data directory (`%LOCALAPPDATA%\Hylki`).
 pub fn data_dir() -> PathBuf {
     dirs::data_local_dir()
@@ -85,6 +117,31 @@ pub fn accounts_file_in(dir: &Path) -> PathBuf {
 /// Return the path to the SQLite cache database inside `dir`.
 pub fn cache_db_in(dir: &Path) -> PathBuf {
     dir.join("hylki-cache.db")
+}
+
+/// Return the path to `preferences.toml` inside `dir`.
+pub fn preferences_file_in(dir: &Path) -> PathBuf {
+    dir.join("preferences.toml")
+}
+
+/// Load user preferences from `dir`; a missing file yields the defaults.
+pub fn load_preferences_in(dir: &Path) -> Result<AppPreferences, String> {
+    let path = preferences_file_in(dir);
+    if !path.exists() {
+        return Ok(AppPreferences::default());
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("读取偏好设置失败 ({}): {e}", path.display()))?;
+    toml::from_str(&text).map_err(|e| format!("解析偏好设置失败 ({}): {e}", path.display()))
+}
+
+/// Persist user preferences into `dir`.
+pub fn save_preferences_in(dir: &Path, prefs: &AppPreferences) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败 ({}): {e}", dir.display()))?;
+    let path = preferences_file_in(dir);
+    let text = toml::to_string_pretty(prefs).map_err(|e| format!("序列化偏好设置失败: {e}"))?;
+    fs::write(&path, text).map_err(|e| format!("写入偏好设置失败 ({}): {e}", path.display()))?;
+    Ok(())
 }
 
 /// Load saved non-sensitive account configurations from `dir`.
@@ -166,6 +223,67 @@ mod tests {
         upsert_account_in(&base, account.clone()).expect("upsert should succeed");
         let loaded = load_accounts_in(&base).expect("load should succeed");
         assert_eq!(loaded, vec![account]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preferences_roundtrip_in_temp_dir() {
+        let base = std::env::temp_dir().join("hylki test 偏好目录");
+        let _ = fs::remove_dir_all(&base);
+
+        assert_eq!(preferences_file_in(&base), base.join("preferences.toml"));
+
+        // Missing file yields defaults without error.
+        let defaults = load_preferences_in(&base).expect("load missing file");
+        assert_eq!(defaults, AppPreferences::default());
+        assert_eq!(defaults.theme_id, "default");
+        assert_eq!(defaults.dark_mode, None);
+        assert_eq!(defaults.page_size, 100);
+        assert_eq!(defaults.auto_sync_minutes, 5);
+        assert!(defaults.block_remote_images);
+
+        // Round-trip including dark_mode = None (skipped in TOML output).
+        let prefs = AppPreferences {
+            theme_id: "rose".to_string(),
+            dark_mode: Some(true),
+            compact_list: true,
+            page_size: 50,
+            auto_sync_minutes: 0,
+            block_remote_images: false,
+        };
+        save_preferences_in(&base, &prefs).expect("save should succeed");
+        let loaded = load_preferences_in(&base).expect("load should succeed");
+        assert_eq!(loaded, prefs);
+
+        let none_dark = AppPreferences {
+            dark_mode: None,
+            ..prefs.clone()
+        };
+        save_preferences_in(&base, &none_dark).expect("save None dark_mode should succeed");
+        assert_eq!(load_preferences_in(&base).expect("reload"), none_dark);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preferences_partial_file_fills_defaults() {
+        let base = std::env::temp_dir().join("hylki test 偏好目录2");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            preferences_file_in(&base),
+            "theme_id = 'rose'\ncompact_list = true\n",
+        )
+        .expect("write partial prefs");
+
+        let loaded = load_preferences_in(&base).expect("load partial file");
+        assert_eq!(loaded.theme_id, "rose");
+        assert!(loaded.compact_list);
+        assert_eq!(loaded.dark_mode, None);
+        assert_eq!(loaded.page_size, 100);
+        assert_eq!(loaded.auto_sync_minutes, 5);
+        assert!(loaded.block_remote_images);
 
         let _ = fs::remove_dir_all(&base);
     }

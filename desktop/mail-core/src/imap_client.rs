@@ -291,6 +291,57 @@ pub async fn set_flag(
     Ok(())
 }
 
+/// Move a message to another mailbox via `UID MOVE` (RFC 6851).
+pub async fn move_message(
+    account: &AccountConfig,
+    password: &str,
+    src_folder: &str,
+    uid: u32,
+    dest_folder: &str,
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .select(src_folder)
+        .await
+        .map_err(|e| format!("打开文件夹 {src_folder} 失败: {e}"))?;
+    session
+        .uid_mv(uid.to_string(), dest_folder)
+        .await
+        .map_err(|e| format!("移动邮件到 {dest_folder} 失败: {e}"))?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+/// Mark a message `\Deleted` and expunge the mailbox. Fallback for deleting
+/// when the server has no dedicated trash folder.
+pub async fn delete_message(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+    let mut stores = session
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .await
+        .map_err(|e| format!("标记邮件删除失败: {e}"))?;
+    while stores.next().await.is_some() {}
+    drop(stores);
+    {
+        let mut expunged = std::pin::pin!(session
+            .expunge()
+            .await
+            .map_err(|e| format!("执行 EXPUNGE 失败: {e}"))?);
+        while expunged.as_mut().next().await.is_some() {}
+    }
+    let _ = session.logout().await;
+    Ok(())
+}
+
 fn parse_header_bytes(
     parser: &MessageParser,
     uid: u32,

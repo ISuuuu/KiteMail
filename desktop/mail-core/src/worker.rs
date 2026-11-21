@@ -521,6 +521,38 @@ async fn handle_request(
             }
         }
 
+        MailRequest::ArchiveMessage {
+            account_id,
+            message_id,
+        } => {
+            move_message_inner(
+                data_dir,
+                cache,
+                tokens,
+                account_id,
+                message_id,
+                MoveTarget::Archive,
+                evt_tx,
+            )
+            .await;
+        }
+
+        MailRequest::DeleteMessage {
+            account_id,
+            message_id,
+        } => {
+            move_message_inner(
+                data_dir,
+                cache,
+                tokens,
+                account_id,
+                message_id,
+                MoveTarget::Trash,
+                evt_tx,
+            )
+            .await;
+        }
+
         MailRequest::SaveAttachment {
             attachment_id,
             dest_path,
@@ -616,6 +648,156 @@ async fn handle_request(
             outbox_id,
         } => {
             send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+        }
+    }
+}
+
+/// Destination folder role for server-side message moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveTarget {
+    Archive,
+    Trash,
+}
+
+/// Move a message to the account's archive or trash folder on the server,
+/// then drop it from the local cache and emit a completion event. Failures
+/// (missing account config, missing remote ID, no target folder, remote
+/// error) are reported through the regular error event channel.
+async fn move_message_inner(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    account_id: u32,
+    message_id: u32,
+    target: MoveTarget,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let Some((detail, uid, _)) = cache.get_message_detail(message_id).ok().flatten() else {
+        let _ = evt_tx.send(WorkerEvent::Error {
+            account_id: Some(account_id),
+            message: "本地缓存中未找到该邮件，无法执行归档/删除".to_string(),
+        });
+        return;
+    };
+    let Ok(account) = load_account_config(data_dir, account_id) else {
+        let _ = evt_tx.send(WorkerEvent::Error {
+            account_id: Some(account_id),
+            message: format!("账号 #{account_id} 未找到配置"),
+        });
+        return;
+    };
+
+    let op_name = match target {
+        MoveTarget::Archive => "归档",
+        MoveTarget::Trash => "删除",
+    };
+
+    let res = match account.auth_backend {
+        AuthBackend::MicrosoftGraphOAuth2 => {
+            let Ok(Some(remote_id)) = cache.get_message_remote_id(message_id) else {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: format!("[{}] 缺少远端 ID，无法{}该邮件", account.email, op_name),
+                });
+                return;
+            };
+            let dest_folder = match target {
+                // Graph accepts well-known folder names directly.
+                MoveTarget::Trash => Ok("deleteditems".to_string()),
+                MoveTarget::Archive => match cache.find_archive_folder(account_id) {
+                    Ok(Some((_, path))) => Ok(path),
+                    Ok(None) => Err("该账号没有归档文件夹，无法归档邮件".to_string()),
+                    Err(e) => Err(e),
+                },
+            };
+            match dest_folder {
+                Ok(dest) => match ensure_graph_token(tokens, &account).await {
+                    Ok(token) => tokio::task::spawn_blocking(move || {
+                        graph_client::move_message(&token, &remote_id, &dest)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            }
+        }
+        AuthBackend::Password => {
+            let dest_folder = match target {
+                MoveTarget::Archive => match cache.find_archive_folder(account_id) {
+                    Ok(Some((_, path))) => Ok(Some(path)),
+                    Ok(None) => Err("该账号没有归档文件夹，无法归档邮件".to_string()),
+                    Err(e) => Err(e),
+                },
+                // No trash folder: fall back to \Deleted + EXPUNGE.
+                MoveTarget::Trash => Ok(cache
+                    .find_trash_folder(account_id)
+                    .ok()
+                    .flatten()
+                    .map(|(_, path)| path)),
+            };
+            match dest_folder {
+                Ok(Some(dest)) => match secrets::load_account_secrets(account_id) {
+                    Ok(sec) => {
+                        imap_client::move_message(
+                            &account,
+                            &sec.imap_password,
+                            &detail.folder_path,
+                            uid,
+                            &dest,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                },
+                Ok(None) => match secrets::load_account_secrets(account_id) {
+                    Ok(sec) => {
+                        imap_client::delete_message(
+                            &account,
+                            &sec.imap_password,
+                            &detail.folder_path,
+                            uid,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    match res {
+        Ok(()) => {
+            // Drop the message from the old folder's cache; the UI refreshes
+            // its lists when it receives the completion event.
+            let _ = cache.remove_message(message_id);
+            if let Ok(folders) = cache.list_folders(account_id) {
+                let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                    account_id,
+                    folders,
+                });
+            }
+            let _ = evt_tx.send(match target {
+                MoveTarget::Archive => WorkerEvent::MessageArchived {
+                    account_id,
+                    message_id,
+                },
+                MoveTarget::Trash => WorkerEvent::MessageDeleted {
+                    account_id,
+                    message_id,
+                },
+            });
+            let _ = evt_tx.send(WorkerEvent::Status {
+                account_id: Some(account_id),
+                text: format!("[{}] 邮件{}完成", account.email, op_name),
+            });
+        }
+        Err(e) => {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: format!("[{}] {e}", account.email),
+            });
         }
     }
 }

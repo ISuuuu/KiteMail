@@ -518,6 +518,10 @@ impl HylkiApp {
                     self.error_banner = Some(SharedString::from(message.clone()));
                     self.status_line = SharedString::from(message);
                 }
+                WorkerEvent::MessageArchived { .. } | WorkerEvent::MessageDeleted { .. } => {
+                    // Backend receipt for archive/delete; the accompanying
+                    // FoldersLoaded event already refreshes folder counters.
+                }
             }
         }
         cx.notify();
