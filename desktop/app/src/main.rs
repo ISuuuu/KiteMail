@@ -23,8 +23,12 @@ use hylki_mail_core::config;
 use crate::app::{
     CloseOverlay, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose, OpenCommandPalette,
     OpenCommandPaletteActions, OpenPreferences, OpenShortcutsWindow, QuitApp, RefreshAllAccounts,
-    SelectNextMessage, SelectPrevMessage, SendCompose, ToggleAccountsList, ToggleFullscreen,
-    UndoLastMove, ZoomIn, ZoomOut, ZoomReset,
+    ReplyAllCurrent, ReplyCurrent, SelectNextMessage, SelectPrevMessage, SendCompose,
+    SingleKeyArchive, SingleKeyBackToList, SingleKeyCompose, SingleKeyDelete, SingleKeyForward,
+    SingleKeyMarkSpam, SingleKeyNextCard, SingleKeyNextMessage, SingleKeyPrevCard,
+    SingleKeyPrevMessage, SingleKeyReply, SingleKeyReplyAll, SingleKeyToggleRead,
+    SingleKeyToggleStar, ToggleAccountsList, ToggleFullscreen, UndoLastMove, ViewMessageSource,
+    ZoomIn, ZoomOut, ZoomReset,
 };
 
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
@@ -184,7 +188,11 @@ fn main() {
                 KeyBinding::new("ctrl-f", FocusSearch, None),
                 // `/` 亦展开中栏搜索栏（输入框聚焦时按键被输入框消费，不会误触）。
                 KeyBinding::new("/", FocusSearch, None),
-                KeyBinding::new("ctrl-r", RefreshAllAccounts, None),
+                // F-1 阶段三组合键修正：Ctrl+R 是「回复」（原误绑刷新），刷新仅保留 F5。
+                KeyBinding::new("ctrl-r", ReplyCurrent, None),
+                KeyBinding::new("ctrl-shift-r", ReplyAllCurrent, None),
+                // Ctrl+U 查看 / 收起当前阅读邮件的原文（再按返回正文）。
+                KeyBinding::new("ctrl-u", ViewMessageSource, None),
                 KeyBinding::new("f5", RefreshAllAccounts, None),
                 KeyBinding::new("ctrl-enter", SendCompose, None),
                 KeyBinding::new("ctrl-,", OpenPreferences, None),
@@ -208,6 +216,29 @@ fn main() {
                 KeyBinding::new("f1", OpenShortcutsWindow, None),
                 KeyBinding::new("shift-/", OpenShortcutsWindow, None),
                 KeyBinding::new("?", OpenShortcutsWindow, None),
+                // ---- F-1 阶段三：单键快捷键（偏好「启用单键快捷键」可整体关闭）----
+                // 输入框聚焦时按键先被输入框消费（守卫 no-op 不拦传播），与 `/` 同理安全。
+                // j / k 与 ↓ / ↑ 并存（↓↑ 绑定原动作不受偏好控制）。
+                KeyBinding::new("j", SingleKeyNextMessage, None),
+                KeyBinding::new("k", SingleKeyPrevMessage, None),
+                KeyBinding::new("r", SingleKeyReply, None),
+                // 回复全部：Windows 上 Shift+R 上报 {key:"r", shift:true}，"R" 解析后
+                // 归一化为同一目标键（parse 对单字符大写键自动加 shift），二者等价；
+                // 同时注册 "shift-r" 兜底部分布局 / 平台（与上方 `?` 双绑做法一致）。
+                KeyBinding::new("R", SingleKeyReplyAll, None),
+                KeyBinding::new("shift-r", SingleKeyReplyAll, None),
+                KeyBinding::new("f", SingleKeyForward, None),
+                KeyBinding::new("a", SingleKeyArchive, None),
+                KeyBinding::new("d", SingleKeyDelete, None),
+                KeyBinding::new("backspace", SingleKeyDelete, None),
+                // `!` 同 `?`：Windows 上 Shift+1 实际产生 `!` 键（shift 修饰被清除）。
+                KeyBinding::new("!", SingleKeyMarkSpam, None),
+                KeyBinding::new("s", SingleKeyToggleStar, None),
+                KeyBinding::new("m", SingleKeyToggleRead, None),
+                KeyBinding::new("c", SingleKeyCompose, None),
+                KeyBinding::new("u", SingleKeyBackToList, None),
+                KeyBinding::new("w", SingleKeyNextCard, None),
+                KeyBinding::new("b", SingleKeyPrevCard, None),
             ]);
 
             let (win_w, win_h) = resolve_window_size(&prefs);

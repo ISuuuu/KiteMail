@@ -441,6 +441,16 @@ impl Render for PreferencesState {
                             this.emit_changed(cx);
                         });
                     });
+                // F-1：单键快捷键总开关（关闭后 j / r / a 等无修饰键快捷键停用）。
+                let entity_for_single_key = cx.entity();
+                let single_key_switch = Switch::new("pref-single-key-shortcuts")
+                    .checked(prefs.single_key_shortcuts)
+                    .on_click(move |checked, _, cx| {
+                        entity_for_single_key.update(cx, |this, cx| {
+                            this.prefs.single_key_shortcuts = *checked;
+                            this.emit_changed(cx);
+                        });
+                    });
                 setting_card(
                     "常规",
                     &p,
@@ -473,6 +483,12 @@ impl Render for PreferencesState {
                             "新邮件系统通知",
                             Some("后台同步收到新未读邮件时通过系统托盘弹出桌面通知"),
                             desktop_notify_switch,
+                            &p,
+                        ),
+                        setting_row(
+                            "启用单键快捷键",
+                            Some("关闭后 j / k / r / a 等无修饰键快捷键不再生效，Ctrl 组合键不受影响"),
+                            single_key_switch,
                             &p,
                         ),
                     ],

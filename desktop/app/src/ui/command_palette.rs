@@ -143,7 +143,8 @@ impl PaletteCommand {
     fn shortcut(self) -> Option<&'static str> {
         match self {
             PaletteCommand::NewCompose => Some("Ctrl+N"),
-            PaletteCommand::RefreshAll => Some("Ctrl+R"),
+            // 阶段三起刷新仅保留 F5（Ctrl+R 改绑回复）。
+            PaletteCommand::RefreshAll => Some("F5"),
             _ => None,
         }
     }

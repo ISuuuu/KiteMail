@@ -131,6 +131,10 @@ pub struct AppPreferences {
     /// Reader body zoom percentage (`70..=160`, default `100`).
     #[serde(default = "default_reader_zoom_percent")]
     pub reader_zoom_percent: u32,
+    /// Enable the Gmail-style single-key shortcuts (`j` / `r` / `a` ...);
+    /// Ctrl combos always work regardless of this flag.
+    #[serde(default = "default_true")]
+    pub single_key_shortcuts: bool,
 }
 
 fn default_true() -> bool {
@@ -210,6 +214,7 @@ impl Default for AppPreferences {
             fold_older_messages: true,
             allowed_remote_senders: Vec::new(),
             reader_zoom_percent: 100,
+            single_key_shortcuts: true,
         }
     }
 }
@@ -404,6 +409,7 @@ smtp_separate_credentials = false
             fold_older_messages: false,
             allowed_remote_senders: vec!["trusted@example.com".to_string()],
             reader_zoom_percent: 125,
+            single_key_shortcuts: false,
         };
         save_preferences_in(&base, &prefs).expect("save should succeed");
         let loaded = load_preferences_in(&base).expect("load should succeed");
@@ -491,6 +497,8 @@ smtp_separate_credentials = false
         assert_eq!(legacy.window_width, None);
         assert_eq!(legacy.window_height, None);
         assert!(!legacy.window_maximized);
+        // 阶段 3：旧文件缺 single_key_shortcuts 字段时默认开启。
+        assert!(legacy.single_key_shortcuts);
 
         // 完整往返保存与读取。
         let custom = AppPreferences {
@@ -514,6 +522,8 @@ smtp_separate_credentials = false
         assert!(prefs.thread_newest_first);
         assert!(prefs.fold_older_messages);
         assert_eq!(prefs.reader_zoom_percent, 100);
+        // 阶段 3：单键快捷键默认开启。
+        assert!(prefs.single_key_shortcuts);
         assert!(prefs.allowed_remote_senders.is_empty());
 
         assert!(!prefs.is_remote_sender_allowed("Alice <Alice@Example.COM>"));
