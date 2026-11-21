@@ -47,6 +47,9 @@ pub struct FolderSummary {
     pub path: String,
     pub unread_count: u32,
     pub total_count: usize,
+    /// Whether the remote server still has older messages beyond what is cached locally.
+    #[serde(default)]
+    pub has_more_remote: bool,
 }
 
 /// Lightweight message row used for virtualized / paginated list rendering.
@@ -323,6 +326,12 @@ pub enum MailRequest {
         offset: usize,
         limit: usize,
     },
+    /// Fetch the next batch of older messages from the remote server for `folder_id`
+    /// (`0` = all inbox folders across configured accounts).
+    LoadOlderMessages {
+        folder_id: u32,
+        limit: usize,
+    },
     /// Clear all cached message bodies (headers and accounts are kept).
     ClearBodyCaches,
 }
@@ -384,6 +393,12 @@ pub enum WorkerEvent {
     /// Aggregated known contacts were loaded for the contacts view.
     KnownContactsLoaded {
         items: Vec<KnownContact>,
+    },
+    /// Result of fetching an older batch of messages from the remote server.
+    OlderMessagesLoaded {
+        folder_id: u32,
+        fetched_count: usize,
+        has_more_remote: bool,
     },
     Status {
         account_id: Option<u32>,

@@ -248,7 +248,8 @@ async fn handle_request(
             if let Ok(drafts) = cache.list_drafts() {
                 let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
             }
-            if let Ok(page) = cache.list_unified_inbox("", 0, 100) {
+            let page_size = pref_page_size(data_dir);
+            if let Ok(page) = cache.list_unified_inbox("", 0, page_size) {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
         }
@@ -272,10 +273,7 @@ async fn handle_request(
             if let Ok(drafts) = cache.list_drafts() {
                 let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
             }
-            // 初始页大小跟随用户偏好设置（读取失败回退 100）。
-            let page_size = config::load_preferences_in(data_dir)
-                .map(|p| p.page_size)
-                .unwrap_or(100);
+            let page_size = pref_page_size(data_dir);
             if let Ok(page) = cache.list_unified_inbox("", 0, page_size) {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
@@ -286,7 +284,8 @@ async fn handle_request(
             for acc in accounts {
                 sync_account_inner(data_dir, cache, tokens, acc.id, evt_tx).await;
             }
-            if let Ok(page) = cache.list_unified_inbox("", 0, 100) {
+            let page_size = pref_page_size(data_dir);
+            if let Ok(page) = cache.list_unified_inbox("", 0, page_size) {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
         }
@@ -307,7 +306,17 @@ async fn handle_request(
                 });
                 return;
             };
-            sync_folder_inner(cache, tokens, &account, folder_id, &folder_path, evt_tx).await;
+            let page_size = pref_page_size(data_dir);
+            sync_folder_inner(
+                cache,
+                tokens,
+                &account,
+                folder_id,
+                &folder_path,
+                page_size,
+                evt_tx,
+            )
+            .await;
         }
 
         MailRequest::LoadUnifiedInbox {
@@ -727,6 +736,10 @@ async fn handle_request(
             }
         },
 
+        MailRequest::LoadOlderMessages { folder_id, limit } => {
+            load_older_messages_inner(data_dir, cache, tokens, folder_id, limit, evt_tx).await;
+        }
+
         MailRequest::ClearBodyCaches => match cache.clear_message_bodies() {
             Ok(_) => {
                 let _ = evt_tx.send(WorkerEvent::Status {
@@ -1012,7 +1025,17 @@ async fn sync_account_inner(
         .find(|f| f.path.eq_ignore_ascii_case("INBOX") || f.name == "收件箱")
         .or_else(|| folders.first())
     {
-        sync_folder_inner(cache, tokens, &account, inbox.id, &inbox.path, evt_tx).await;
+        let page_size = pref_page_size(data_dir);
+        sync_folder_inner(
+            cache,
+            tokens,
+            &account,
+            inbox.id,
+            &inbox.path,
+            page_size,
+            evt_tx,
+        )
+        .await;
     }
 
     if let Ok(updated_folders) = cache.list_folders(account_id) {
@@ -1023,12 +1046,19 @@ async fn sync_account_inner(
     }
 }
 
+fn pref_page_size(data_dir: &PathBuf) -> usize {
+    config::load_preferences_in(data_dir)
+        .map(|p| p.page_size)
+        .unwrap_or(100)
+}
+
 async fn sync_folder_inner(
     cache: &mut CacheStore,
     tokens: &mut TokenCache,
     account: &AccountConfig,
     folder_id: u32,
     folder_path: &str,
+    page_size: usize,
     evt_tx: &mpsc::Sender<WorkerEvent>,
 ) {
     let sync_res: Result<(), String> = match account.auth_backend {
@@ -1043,6 +1073,12 @@ async fn sync_folder_inner(
                     return;
                 }
             };
+            let prev_cached = cache
+                .folder_remote_cursor(folder_id)
+                .ok()
+                .flatten()
+                .map(|(_, _, _, _, _, cnt)| cnt)
+                .unwrap_or(0);
             let fp = folder_path.to_string();
             let fetched = tokio::task::spawn_blocking(move || {
                 graph_client::fetch_folder_headers(&token, &fp)
@@ -1050,15 +1086,19 @@ async fn sync_folder_inner(
             .await
             .unwrap_or_else(|e| Err(format!("Graph 拉取邮件头任务异常: {e}")));
             match fetched {
-                Ok(items) => {
-                    let live_uids: Vec<u32> = items.iter().map(|(h, _)| h.uid).collect();
-                    cache.commit_folder_headers_with_remote(
-                        account.id,
-                        folder_id,
-                        1,
-                        &items,
-                        Some(&live_uids),
-                    )
+                Ok((items, next_link)) => {
+                    // 传入 None 避免误删用户此前已预加载到本地的更早历史邮件。
+                    let commit_res = cache.commit_folder_headers_with_remote(
+                        account.id, folder_id, 1, &items, None,
+                    );
+                    if commit_res.is_ok() && prev_cached <= 100 {
+                        let _ = cache.set_folder_remote_cursor(
+                            folder_id,
+                            next_link.is_some(),
+                            next_link.as_deref().unwrap_or(""),
+                        );
+                    }
+                    commit_res
                 }
                 Err(e) => Err(e),
             }
@@ -1068,13 +1108,28 @@ async fn sync_folder_inner(
                 match imap_client::fetch_folder_headers(account, &sec.imap_password, folder_path)
                     .await
                 {
-                    Ok((uid_validity, headers, live_uids)) => cache.commit_folder_headers(
-                        account.id,
-                        folder_id,
-                        uid_validity,
-                        &headers,
-                        Some(&live_uids),
-                    ),
+                    Ok((uid_validity, headers, live_uids)) => {
+                        let commit_res = cache.commit_folder_headers(
+                            account.id,
+                            folder_id,
+                            uid_validity,
+                            &headers,
+                            Some(&live_uids),
+                        );
+                        if commit_res.is_ok() {
+                            let min_cached_uid = cache
+                                .folder_remote_cursor(folder_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|(_, _, _, _, min_uid, _)| min_uid);
+                            let has_more = live_uids
+                                .first()
+                                .zip(min_cached_uid)
+                                .is_some_and(|(&min_remote, min_cached)| min_remote < min_cached);
+                            let _ = cache.set_folder_remote_cursor(folder_id, has_more, "");
+                        }
+                        commit_res
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -1084,7 +1139,7 @@ async fn sync_folder_inner(
 
     match sync_res {
         Ok(()) => {
-            if let Ok(page) = cache.list_messages_page(folder_id, "", 0, 100) {
+            if let Ok(page) = cache.list_messages_page(folder_id, "", 0, page_size) {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
             if let Ok(folders) = cache.list_folders(account.id) {
@@ -1105,6 +1160,150 @@ async fn sync_folder_inner(
             });
         }
     }
+}
+
+/// Fetch the next older batch (up to `limit`, default 100) from the remote server for `folder_id`
+/// (`0` = all inbox folders that still have older remote messages).
+async fn load_older_messages_inner(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    folder_id: u32,
+    limit: usize,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let batch = if limit == 0 { 100 } else { limit };
+    let targets: Vec<u32> = if folder_id == 0 {
+        cache
+            .list_inbox_folders_with_more_remote()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(fid, _, _)| fid)
+            .collect()
+    } else {
+        vec![folder_id]
+    };
+
+    let mut total_fetched = 0usize;
+    let mut any_more_remote = false;
+
+    for fid in targets {
+        let Some((account_id, folder_path, has_more_flag, next_link, min_cached_uid, _)) =
+            cache.folder_remote_cursor(fid).ok().flatten()
+        else {
+            continue;
+        };
+        if !has_more_flag {
+            continue;
+        }
+        let Ok(account) = load_account_config(data_dir, account_id) else {
+            continue;
+        };
+
+        let res: Result<(usize, bool), String> = match account.auth_backend {
+            AuthBackend::MicrosoftGraphOAuth2 => {
+                if next_link.is_empty() {
+                    let _ = cache.set_folder_remote_cursor(fid, false, "");
+                    Ok((0, false))
+                } else {
+                    match ensure_graph_token(tokens, &account).await {
+                        Ok(token) => {
+                            let url = next_link.clone();
+                            let fetched = tokio::task::spawn_blocking(move || {
+                                graph_client::fetch_folder_headers_next(&token, &url)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("Graph 拉取历史邮件任务异常: {e}")));
+                            match fetched {
+                                Ok((items, new_next)) => {
+                                    let count = items.len();
+                                    let more = new_next.is_some();
+                                    match cache.commit_folder_headers_with_remote(
+                                        account.id, fid, 1, &items, None,
+                                    ) {
+                                        Ok(()) => {
+                                            let _ = cache.set_folder_remote_cursor(
+                                                fid,
+                                                more,
+                                                new_next.as_deref().unwrap_or(""),
+                                            );
+                                            Ok((count, more))
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+            AuthBackend::Password => {
+                let Some(before_uid) = min_cached_uid else {
+                    let _ = cache.set_folder_remote_cursor(fid, false, "");
+                    continue;
+                };
+                match secrets::load_account_secrets(account.id) {
+                    Ok(sec) => match imap_client::fetch_older_folder_headers(
+                        &account,
+                        &sec.imap_password,
+                        &folder_path,
+                        before_uid,
+                        batch,
+                    )
+                    .await
+                    {
+                        Ok((uid_validity, headers, live_uids, has_more)) => {
+                            let count = headers.len();
+                            match cache.commit_folder_headers(
+                                account.id,
+                                fid,
+                                uid_validity,
+                                &headers,
+                                Some(&live_uids),
+                            ) {
+                                Ok(()) => {
+                                    let _ = cache.set_folder_remote_cursor(fid, has_more, "");
+                                    Ok((count, has_more))
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        match res {
+            Ok((count, more)) => {
+                total_fetched += count;
+                if more {
+                    any_more_remote = true;
+                }
+                if let Ok(folders) = cache.list_folders(account.id) {
+                    let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                        account_id: account.id,
+                        folders,
+                    });
+                }
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account.id),
+                    message: format!("[{}] 加载更早邮件失败: {e}", account.email),
+                });
+            }
+        }
+    }
+
+    let _ = evt_tx.send(WorkerEvent::OlderMessagesLoaded {
+        folder_id,
+        fetched_count: total_fetched,
+        has_more_remote: any_more_remote,
+    });
 }
 
 async fn send_outbox_item(

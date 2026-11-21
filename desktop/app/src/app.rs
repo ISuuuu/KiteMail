@@ -17,9 +17,9 @@ use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    actions, black, div, px, AppContext, ClipboardItem, Context, Entity, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Window,
-    WindowAppearance,
+    actions, black, div, point, px, AppContext, ClipboardItem, Context, Entity, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled,
+    Subscription, Window, WindowAppearance,
 };
 use hylki_mail_core::cache::CachedAttachment;
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend, SecurityMode};
@@ -251,7 +251,14 @@ pub(crate) struct HylkiApp {
     pub(crate) selected_folder_id: u32,
     /// 左栏统一导航当前视图（决定列表请求走统一视图还是具体文件夹）。
     pub(crate) current_view: CurrentView,
-    pub(crate) page_offset: usize,
+    /// 当前列表已展开的总条数上限（初始为偏好 `page_size`，滚到底部每次递增一批）。
+    pub(crate) loaded_limit: usize,
+    /// 中栏邮件列表滚动句柄（用于检测滚动到底部自动预加载下一批）。
+    pub(crate) list_scroll_handle: ScrollHandle,
+    /// 正在从本地缓存增量追加下一批邮件（防止重复触发）。
+    pub(crate) loading_more_local: bool,
+    /// 正在从远端服务器（IMAP / Graph）预加载更早历史邮件（防止重复触发）。
+    pub(crate) loading_more_remote: bool,
     pub(crate) current_page: MailPage,
     pub(crate) selected_message: Option<MessageDetail>,
     pub(crate) drafts: Vec<LocalDraft>,
@@ -392,7 +399,7 @@ impl HylkiApp {
         cx.subscribe(&search_input, |this, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.search_query = input.read(cx).value().to_string();
-                this.page_offset = 0;
+                this.reset_list_pagination();
                 this.reload_current_page(cx);
             }
         })
@@ -506,7 +513,10 @@ impl HylkiApp {
                 folders_by_account,
                 selected_folder_id: DEMO_INBOX_ID,
                 current_view: CurrentView::UnifiedInbox,
-                page_offset: 0,
+                loaded_limit: prefs.page_size,
+                list_scroll_handle: ScrollHandle::new(),
+                loading_more_local: false,
+                loading_more_remote: false,
                 current_page,
                 selected_message,
                 drafts: Vec::new(),
@@ -626,7 +636,10 @@ impl HylkiApp {
             folders_by_account: BTreeMap::new(),
             selected_folder_id: start_folder_id,
             current_view: start_view,
-            page_offset: 0,
+            loaded_limit: prefs.page_size,
+            list_scroll_handle: ScrollHandle::new(),
+            loading_more_local: false,
+            loading_more_remote: false,
             current_page: MailPage {
                 folder_id: UNIFIED_INBOX_FOLDER_ID,
                 offset: 0,
@@ -765,6 +778,7 @@ impl HylkiApp {
                     self.folders_by_account.insert(account_id, folders);
                 }
                 WorkerEvent::MessagesPageLoaded(page) => {
+                    self.loading_more_local = false;
                     // 仅当事件页与当前视图匹配时才采用；统一视图（星标/已发送/归档）
                     // 忽略文件夹级页面事件。
                     let page_matches = match self.current_view {
@@ -778,23 +792,26 @@ impl HylkiApp {
                         | CurrentView::Archive => false,
                     };
                     if page_matches {
-                        self.current_page = page;
-                        if self.selected_message.is_none() {
-                            if let Some(first) = self.current_page.items.first() {
-                                self.request_message_detail(
-                                    first.account_id,
-                                    first.id,
-                                    first.uid,
-                                    first.unread,
-                                    &first.folder_path.clone(),
-                                );
-                            }
-                        }
+                        self.merge_loaded_page(page, cx);
                     } else if matches!(
                         self.current_view,
                         CurrentView::UnifiedInbox | CurrentView::AccountFolder
                     ) {
                         self.reload_current_page(cx);
+                    }
+                }
+                WorkerEvent::OlderMessagesLoaded {
+                    folder_id: _,
+                    fetched_count,
+                    has_more_remote: _,
+                } => {
+                    self.loading_more_remote = false;
+                    if fetched_count > 0 {
+                        self.status_line =
+                            SharedString::from(format!("已预加载 {fetched_count} 封更早邮件"));
+                        self.reload_current_page(cx);
+                    } else {
+                        self.status_line = SharedString::from("已加载全部历史邮件");
                     }
                 }
                 WorkerEvent::MessageBodyLoaded(detail) => {
@@ -852,20 +869,9 @@ impl HylkiApp {
                     self.after_message_moved(account_id, message_id, cx);
                 }
                 WorkerEvent::UnifiedViewLoaded { view, page } => {
+                    self.loading_more_local = false;
                     if self.current_view.unified() == Some(view) {
-                        self.current_page = page;
-                        self.page_offset = self.current_page.offset;
-                        if self.selected_message.is_none() {
-                            if let Some(first) = self.current_page.items.first() {
-                                self.request_message_detail(
-                                    first.account_id,
-                                    first.id,
-                                    first.uid,
-                                    first.unread,
-                                    &first.folder_path.clone(),
-                                );
-                            }
-                        }
+                        self.merge_loaded_page(page, cx);
                     }
                 }
                 WorkerEvent::CachedAttachmentsLoaded { items } => {
@@ -890,17 +896,56 @@ impl HylkiApp {
         cx.notify();
     }
 
+    fn merge_loaded_page(&mut self, page: MailPage, cx: &mut Context<Self>) {
+        if page.offset > 0 && page.offset == self.current_page.items.len() {
+            let existing: HashSet<u32> = self.current_page.items.iter().map(|m| m.id).collect();
+            for item in page.items {
+                if !existing.contains(&item.id) {
+                    self.current_page.items.push(item);
+                }
+            }
+            self.current_page.total = page.total;
+        } else {
+            self.current_page = page;
+            // 若后台同步推回了默认首屏（如 100 条），而用户此前已向下滚动加载了更多条，
+            // 则按当前 loaded_limit 补刷一次以保持已展开列表不回弹。
+            if self.loaded_limit > self.prefs.page_size
+                && self.current_page.items.len() < self.loaded_limit
+                && self.current_page.items.len() < self.current_page.total
+            {
+                self.reload_current_page(cx);
+            }
+        }
+        if self.selected_message.is_none() {
+            if let Some(first) = self.current_page.items.first() {
+                self.request_message_detail(
+                    first.account_id,
+                    first.id,
+                    first.uid,
+                    first.unread,
+                    &first.folder_path.clone(),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn reset_list_pagination(&mut self) {
+        self.loaded_limit = self.prefs.page_size;
+        self.loading_more_local = false;
+        self.loading_more_remote = false;
+        self.list_scroll_handle.set_offset(point(px(0.0), px(0.0)));
+    }
+
     pub(crate) fn reload_current_page(&mut self, cx: &mut Context<Self>) {
         let filter = self.list_filter.to_mail_filter();
+        let limit = self.loaded_limit.max(self.prefs.page_size);
         if self.demo_mode {
-            // 演示模式：全部统一视图（含星标）与文件夹均支持筛选和分页。
+            // 演示模式：全部统一视图（含星标）与文件夹均支持筛选和滚动预加载。
             self.current_page = match self.current_view {
-                CurrentView::Starred => self.demo_store.list_starred_page(
-                    &self.search_query,
-                    filter,
-                    self.page_offset,
-                    self.prefs.page_size,
-                ),
+                CurrentView::Starred => {
+                    self.demo_store
+                        .list_starred_page(&self.search_query, filter, 0, limit)
+                }
                 other => {
                     let folder_id = match other {
                         CurrentView::UnifiedInbox | CurrentView::AccountFolder => {
@@ -915,8 +960,8 @@ impl HylkiApp {
                         folder_id,
                         &self.search_query,
                         filter,
-                        self.page_offset,
-                        self.prefs.page_size,
+                        0,
+                        limit,
                     )
                 }
             };
@@ -928,14 +973,19 @@ impl HylkiApp {
             cx.notify();
             return;
         }
+        self.send_page_request(0, limit);
+    }
+
+    fn send_page_request(&self, offset: usize, limit: usize) {
+        let filter = self.list_filter.to_mail_filter();
         if let Some(ref w) = self.worker {
             match self.current_view {
                 CurrentView::UnifiedInbox => {
                     w.send(MailRequest::LoadUnifiedInbox {
                         query: self.search_query.clone(),
                         filter,
-                        offset: self.page_offset,
-                        limit: self.prefs.page_size,
+                        offset,
+                        limit,
                     });
                 }
                 CurrentView::Starred | CurrentView::Sent | CurrentView::Archive => {
@@ -945,8 +995,8 @@ impl HylkiApp {
                             view,
                             query: self.search_query.clone(),
                             filter,
-                            offset: self.page_offset,
-                            limit: self.prefs.page_size,
+                            offset,
+                            limit,
                         });
                     }
                 }
@@ -955,8 +1005,8 @@ impl HylkiApp {
                         folder_id: self.selected_folder_id,
                         query: self.search_query.clone(),
                         filter,
-                        offset: self.page_offset,
-                        limit: self.prefs.page_size,
+                        offset,
+                        limit,
                     });
                 }
                 CurrentView::Drafts => {}
@@ -972,7 +1022,7 @@ impl HylkiApp {
     /// 切换左栏统一导航视图（收件箱 / 星标 / 已发送 / 草稿 / 归档）。
     pub(crate) fn select_unified_view(&mut self, view: CurrentView, cx: &mut Context<Self>) {
         self.current_view = view;
-        self.page_offset = 0;
+        self.reset_list_pagination();
         self.selected_message = None;
         self.right_mode = RightPaneMode::Reader;
         self.main_view = MainContentView::Mail;
@@ -1000,7 +1050,7 @@ impl HylkiApp {
     ) {
         self.selected_folder_id = folder_id;
         self.current_view = CurrentView::AccountFolder;
-        self.page_offset = 0;
+        self.reset_list_pagination();
         self.selected_message = None;
         self.right_mode = RightPaneMode::Reader;
         self.main_view = MainContentView::Mail;
@@ -1729,7 +1779,7 @@ impl HylkiApp {
         self.accounts = vec![demo_acc];
         self.selected_folder_id = DEMO_INBOX_ID;
         self.current_view = CurrentView::UnifiedInbox;
-        self.page_offset = 0;
+        self.reset_list_pagination();
         self.compose_account_id = 1;
         self.editing_account_id = Some(1);
         self.pending_delete_account_id = None;
@@ -1895,21 +1945,89 @@ impl HylkiApp {
         cx.notify();
     }
 
-    pub(crate) fn prev_page(&mut self, cx: &mut Context<Self>) {
-        if self.page_offset == 0 {
-            return;
+    /// 当前视图对应的远端邮箱是否仍有未拉取的更早历史邮件。
+    pub(crate) fn current_view_has_more_remote(&self) -> bool {
+        if self.demo_mode || !self.search_query.trim().is_empty() {
+            return false;
         }
-        self.page_offset = self.page_offset.saturating_sub(self.prefs.page_size);
-        self.reload_current_page(cx);
+        match self.current_view {
+            CurrentView::UnifiedInbox => self
+                .folders_by_account
+                .values()
+                .flatten()
+                .any(|f| {
+                    (f.path.eq_ignore_ascii_case("INBOX")
+                        || f.name.eq_ignore_ascii_case("INBOX")
+                        || f.name == "收件箱")
+                        && f.has_more_remote
+                }),
+            CurrentView::AccountFolder => self
+                .folders_by_account
+                .values()
+                .flatten()
+                .find(|f| f.id == self.selected_folder_id)
+                .is_some_and(|f| f.has_more_remote),
+            CurrentView::Starred
+            | CurrentView::Sent
+            | CurrentView::Drafts
+            | CurrentView::Archive => false,
+        }
     }
 
-    pub(crate) fn next_page(&mut self, cx: &mut Context<Self>) {
-        let next = self.page_offset + self.prefs.page_size;
-        if next >= self.current_page.total {
+    /// 滚动位置接近底部（距底不足约 3 行高度）时自动预加载下一批 100 条。
+    pub(crate) fn maybe_preload_more(&mut self, cx: &mut Context<Self>) {
+        if self.current_view == CurrentView::Drafts && !self.demo_mode {
             return;
         }
-        self.page_offset = next;
-        self.reload_current_page(cx);
+        let max_y = self.list_scroll_handle.max_offset().y.abs();
+        let offset_y = (-self.list_scroll_handle.offset().y).max(px(0.0));
+        if max_y > px(0.0) && offset_y + px(240.0) >= max_y {
+            self.trigger_load_more(cx);
+        }
+    }
+
+    /// 立即预加载下一批邮件（优先从本地缓存/Demo 追加，本地见底后再向远端拉取更早批次）。
+    pub(crate) fn trigger_load_more(&mut self, cx: &mut Context<Self>) {
+        if self.current_view == CurrentView::Drafts && !self.demo_mode {
+            return;
+        }
+        let batch = self.prefs.page_size.max(1);
+        let loaded = self.current_page.items.len();
+
+        // 1. 本地缓存或演示数据还有剩余：直接追加下一批。
+        if loaded < self.current_page.total {
+            if self.loading_more_local {
+                return;
+            }
+            self.loaded_limit = loaded + batch;
+            if self.demo_mode {
+                self.reload_current_page(cx);
+            } else {
+                self.loading_more_local = true;
+                self.send_page_request(loaded, batch);
+                cx.notify();
+            }
+            return;
+        }
+
+        // 2. 本地已见底，但远端服务器仍有更早历史邮件：发起增量拉取。
+        if self.current_view_has_more_remote() && !self.loading_more_remote {
+            self.loading_more_remote = true;
+            self.loaded_limit = loaded + batch;
+            let target_folder = match self.current_view {
+                CurrentView::UnifiedInbox => UNIFIED_INBOX_FOLDER_ID,
+                CurrentView::AccountFolder => self.selected_folder_id,
+                _ => return,
+            };
+            self.status_line = SharedString::from("正在预加载更早的邮件...");
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::LoadOlderMessages {
+                    folder_id: target_folder,
+                    limit: batch,
+                });
+            }
+            cx.notify();
+        }
     }
 
     pub(crate) fn account_email_for(&self, account_id: u32) -> &str {
@@ -1964,7 +2082,7 @@ impl HylkiApp {
     pub(crate) fn set_list_filter(&mut self, filter: ListFilter, cx: &mut Context<Self>) {
         if self.list_filter != filter {
             self.list_filter = filter;
-            self.page_offset = 0;
+            self.reset_list_pagination();
             self.reload_current_page(cx);
         } else {
             cx.notify();
@@ -2204,7 +2322,7 @@ impl HylkiApp {
             self.auto_sync_deadline = None;
         }
         if page_size_changed {
-            self.page_offset = 0;
+            self.reset_list_pagination();
             self.reload_current_page(cx);
         }
         self.status_line = SharedString::from("偏好设置已保存");

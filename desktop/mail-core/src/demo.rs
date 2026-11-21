@@ -50,6 +50,7 @@ impl DemoStore {
                 path: "INBOX".to_string(),
                 unread_count: 128,
                 total_count: DEMO_INBOX_TOTAL,
+                has_more_remote: false,
             },
             FolderSummary {
                 id: DEMO_SENT_ID,
@@ -58,6 +59,7 @@ impl DemoStore {
                 path: "Sent".to_string(),
                 unread_count: 0,
                 total_count: 12,
+                has_more_remote: false,
             },
             FolderSummary {
                 id: DEMO_DRAFTS_ID,
@@ -66,6 +68,7 @@ impl DemoStore {
                 path: "Drafts".to_string(),
                 unread_count: 0,
                 total_count: 3,
+                has_more_remote: false,
             },
             FolderSummary {
                 id: DEMO_ARCHIVE_ID,
@@ -74,6 +77,7 @@ impl DemoStore {
                 path: "Archive".to_string(),
                 unread_count: 0,
                 total_count: 24,
+                has_more_remote: false,
             },
         ];
 

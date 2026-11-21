@@ -86,18 +86,33 @@ fn map_graph_folder_name(raw: &str) -> (String, bool) {
 }
 
 /// Fetch recent message headers from a Graph folder.
+/// Returns `(items, next_link)` where `next_link` is Graph's `@odata.nextLink` when more pages exist.
 pub fn fetch_folder_headers(
     access_token: &str,
     folder_graph_id: &str,
-) -> Result<Vec<(CachedHeaderInput, String)>, String> {
+) -> Result<(Vec<(CachedHeaderInput, String)>, Option<String>), String> {
     let encoded_folder = urlencoding_segment(folder_graph_id);
     let url = format!(
         "{GRAPH_BASE}/mailFolders/{encoded_folder}/messages?\
          $top=100&$orderby=receivedDateTime%20desc&\
          $select=id,subject,from,toRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId"
     );
+    fetch_headers_from_url(access_token, &url)
+}
 
-    let resp = ureq::get(&url)
+/// Fetch the next page of message headers from a Graph `@odata.nextLink` URL.
+pub fn fetch_folder_headers_next(
+    access_token: &str,
+    next_link_url: &str,
+) -> Result<(Vec<(CachedHeaderInput, String)>, Option<String>), String> {
+    fetch_headers_from_url(access_token, next_link_url)
+}
+
+fn fetch_headers_from_url(
+    access_token: &str,
+    url: &str,
+) -> Result<(Vec<(CachedHeaderInput, String)>, Option<String>), String> {
+    let resp = ureq::get(url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .call()
         .map_err(format_graph_error)?;
@@ -105,6 +120,12 @@ pub fn fetch_folder_headers(
     let json: serde_json::Value = resp
         .into_json()
         .map_err(|e| format!("解析 Graph 邮件列表失败: {e}"))?;
+
+    let next_link = json["@odata.nextLink"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
 
     let mut items = Vec::new();
     if let Some(arr) = json["value"].as_array() {
@@ -174,7 +195,7 @@ pub fn fetch_folder_headers(
         }
     }
 
-    Ok(items)
+    Ok((items, next_link))
 }
 
 /// Fetch message body and file attachments via Microsoft Graph.

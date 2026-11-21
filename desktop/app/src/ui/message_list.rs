@@ -14,13 +14,13 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{ContextMenu, ContextMenuExt, DropdownMenu, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Disableable, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    SharedString, Stateful, StatefulInteractiveElement, Styled,
+    div, px, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
 };
 use hylki_mail_core::{LocalDraft, MessageSummary};
 
@@ -170,6 +170,7 @@ fn message_row(
 
     let row = h_flex()
         .id(("msg", msg_id))
+        .flex_shrink_0()
         .h(px(if compact {
             COMPACT_ROW_HEIGHT
         } else {
@@ -413,20 +414,20 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             .collect()
     };
 
-    let (start, end, total, has_prev, has_next) = if drafts_view {
-        (0usize, draft_rows.len(), draft_rows.len(), false, false)
+    let loaded_count = if drafts_view {
+        draft_rows.len()
     } else {
-        let start = if app.current_page.items.is_empty() {
-            0
-        } else {
-            app.current_page.offset + 1
-        };
-        let end = app.current_page.offset + app.current_page.items.len();
-        let total = app.current_page.total;
-        let has_prev = app.page_offset > 0;
-        let has_next = app.page_offset + app.prefs.page_size < total;
-        (start, end, total, has_prev, has_next)
+        app.current_page.items.len()
     };
+    let total = if drafts_view {
+        draft_rows.len()
+    } else {
+        app.current_page.total
+    };
+    let has_more_local = !drafts_view && loaded_count < total;
+    let has_more_remote = !drafts_view && app.current_view_has_more_remote();
+    let has_more = has_more_local || has_more_remote;
+    let is_loading_more = !drafts_view && (app.loading_more_local || app.loading_more_remote);
 
     let has_visible_rows = if drafts_view {
         !draft_rows.is_empty()
@@ -442,8 +443,10 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         }
     } else if total == 0 {
         "暂无邮件".to_string()
+    } else if has_more_remote {
+        format!("{total}+")
     } else {
-        format!("{start}-{end} / {total}")
+        total.to_string()
     };
 
     // 空态文案：草稿 / 常规筛选无结果。
@@ -493,8 +496,6 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             })
     };
 
-    let show_pagination = has_prev || has_next;
-
     v_flex()
         .w(px(LIST_WIDTH))
         .h_full()
@@ -519,7 +520,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             s.set_value("", window, cx);
                         });
                         this.search_query = String::new();
-                        this.page_offset = 0;
+                        this.reset_list_pagination();
                         this.reload_current_page(cx);
                     }
                 }))
@@ -543,86 +544,117 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .min_w_0()
                         .child(Input::new(&app.search_input)),
                 )
-                .child(div().flex_shrink_0().text_xs().text_color(muted_fg).child(
-                    SharedString::from(if drafts_view || total == 0 {
-                        count_text.clone()
-                    } else {
-                        total.to_string()
-                    }),
-                ))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(SharedString::from(count_text)),
+                )
                 .when(is_unified_list, |el| el.child(filter_menu_button)),
         )
-        // 列表（滚动）。
+        // 列表（滚到底部自动预加载下一批 100 条）。
         .child(
             div()
-                .id("message-list-scroll")
+                .relative()
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scrollbar()
-                .py_1()
-                .when(drafts_view, |el| el.children(draft_rows))
-                .when(!drafts_view, |el| el.children(filtered_rows))
-                .when(!has_visible_rows, |el| {
-                    el.child(
-                        v_flex()
-                            .flex_1()
-                            .items_center()
-                            .justify_center()
-                            .gap_1()
-                            .pt_8()
-                            .child(
-                                Icon::new(empty_icon)
-                                    .with_size(px(28.0))
-                                    .text_color(muted_fg),
-                            )
-                            .child(div().text_sm().text_color(muted_fg).child(empty_title))
-                            .when(!empty_hint.is_empty(), |el| {
-                                el.child(div().text_xs().text_color(muted_fg).child(empty_hint))
-                            }),
-                    )
-                }),
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.maybe_preload_more(cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .id("message-list-scroll")
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .track_scroll(&app.list_scroll_handle)
+                        .on_scroll(cx.listener(|this, _, _, cx| {
+                            this.maybe_preload_more(cx);
+                        }))
+                        .child(
+                            v_flex()
+                                .flex_none()
+                                .w_full()
+                                .h_auto()
+                                .min_h_full()
+                                .py_1()
+                                .when(drafts_view, |el| el.children(draft_rows))
+                                .when(!drafts_view, |el| el.children(filtered_rows))
+                                .when(!has_visible_rows, |el| {
+                                    el.child(
+                                        v_flex()
+                                            .flex_1()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap_1()
+                                            .pt_8()
+                                            .child(
+                                                Icon::new(empty_icon)
+                                                    .with_size(px(28.0))
+                                                    .text_color(muted_fg),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(muted_fg)
+                                                    .child(empty_title),
+                                            )
+                                            .when(!empty_hint.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(muted_fg)
+                                                        .child(empty_hint),
+                                                )
+                                            }),
+                                    )
+                                })
+                                .when(!drafts_view && has_visible_rows, |el| {
+                                    el.child(
+                                        h_flex()
+                                            .h(px(40.0))
+                                            .flex_shrink_0()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(is_loading_more, |f| {
+                                                f.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(muted_fg)
+                                                        .child("正在加载更多邮件..."),
+                                                )
+                                            })
+                                            .when(!is_loading_more && has_more, |f| {
+                                                f.child(
+                                                    Button::new("list-load-more")
+                                                        .ghost()
+                                                        .compact()
+                                                        .label("加载更多邮件")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.trigger_load_more(cx);
+                                                        })),
+                                                )
+                                            })
+                                            .when(!is_loading_more && !has_more, |f| {
+                                                f.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(muted_fg)
+                                                        .child(SharedString::from(format!(
+                                                            "已加载全部 {total} 封邮件"
+                                                        ))),
+                                                )
+                                            }),
+                                    )
+                                }),
+                        ),
+                )
+                .child(Scrollbar::vertical(&app.list_scroll_handle)),
         )
-        // 底部轻量分页条：仅在总数超过一页时显示。
-        .when(show_pagination, |el| {
-            el.child(
-                h_flex()
-                    .h(px(34.0))
-                    .flex_shrink_0()
-                    .px_2()
-                    .gap_1()
-                    .items_center()
-                    .justify_between()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        Button::new("list-prev-page")
-                            .ghost()
-                            .compact()
-                            .icon(IconName::ChevronLeft)
-                            .label("上一页")
-                            .disabled(!has_prev)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.prev_page(cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(SharedString::from(count_text)),
-                    )
-                    .child(
-                        Button::new("list-next-page")
-                            .ghost()
-                            .compact()
-                            .icon(IconName::ChevronRight)
-                            .label("下一页")
-                            .disabled(!has_next)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.next_page(cx);
-                            })),
-                    ),
-            )
-        })
         .into_any_element()
 }

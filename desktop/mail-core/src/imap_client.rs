@@ -124,35 +124,13 @@ pub async fn fetch_folders(
     Ok(folders)
 }
 
-/// Fetch recent message headers and flags for `folder_path`.
-/// Returns `(uid_validity, headers, live_uids)`.
-pub async fn fetch_folder_headers(
-    account: &AccountConfig,
-    password: &str,
-    folder_path: &str,
-) -> Result<(u32, Vec<CachedHeaderInput>, Vec<u32>), String> {
-    let mut session = connect_imap(account, password).await?;
-    let mailbox = session
-        .select(folder_path)
-        .await
-        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
-
-    let uid_validity = mailbox.uid_validity.unwrap_or(1);
-    let uids_set = session
-        .uid_search("ALL")
-        .await
-        .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
-
-    let mut live_uids: Vec<u32> = uids_set.into_iter().collect();
-    live_uids.sort_unstable();
-
-    if live_uids.is_empty() {
-        let _ = session.logout().await;
-        return Ok((uid_validity, Vec::new(), Vec::new()));
+async fn fetch_headers_for_uids(
+    session: &mut ImapSession,
+    target_uids: &[u32],
+) -> Result<Vec<CachedHeaderInput>, String> {
+    if target_uids.is_empty() {
+        return Ok(Vec::new());
     }
-
-    let start_idx = live_uids.len().saturating_sub(MAX_INITIAL_FETCH);
-    let target_uids = &live_uids[start_idx..];
     let uid_list = target_uids
         .iter()
         .map(|u| u.to_string())
@@ -189,9 +167,86 @@ pub async fn fetch_folder_headers(
         ));
     }
     drop(fetches);
+    Ok(headers)
+}
+
+/// Fetch recent message headers and flags for `folder_path`.
+/// Returns `(uid_validity, headers, live_uids)`.
+pub async fn fetch_folder_headers(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+) -> Result<(u32, Vec<CachedHeaderInput>, Vec<u32>), String> {
+    let mut session = connect_imap(account, password).await?;
+    let mailbox = session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    let uid_validity = mailbox.uid_validity.unwrap_or(1);
+    let uids_set = session
+        .uid_search("ALL")
+        .await
+        .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
+
+    let mut live_uids: Vec<u32> = uids_set.into_iter().collect();
+    live_uids.sort_unstable();
+
+    if live_uids.is_empty() {
+        let _ = session.logout().await;
+        return Ok((uid_validity, Vec::new(), Vec::new()));
+    }
+
+    let start_idx = live_uids.len().saturating_sub(MAX_INITIAL_FETCH);
+    let target_uids = &live_uids[start_idx..];
+    let headers = fetch_headers_for_uids(&mut session, target_uids).await?;
     let _ = session.logout().await;
 
     Ok((uid_validity, headers, live_uids))
+}
+
+/// Fetch up to `limit` older message headers with `uid < before_uid` for `folder_path`.
+/// Returns `(uid_validity, headers, live_uids, has_more_older)`.
+pub async fn fetch_older_folder_headers(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    before_uid: u32,
+    limit: usize,
+) -> Result<(u32, Vec<CachedHeaderInput>, Vec<u32>, bool), String> {
+    let mut session = connect_imap(account, password).await?;
+    let mailbox = session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    let uid_validity = mailbox.uid_validity.unwrap_or(1);
+    let uids_set = session
+        .uid_search("ALL")
+        .await
+        .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
+
+    let mut live_uids: Vec<u32> = uids_set.into_iter().collect();
+    live_uids.sort_unstable();
+
+    let older_uids: Vec<u32> = live_uids
+        .iter()
+        .copied()
+        .filter(|&u| u < before_uid)
+        .collect();
+    if older_uids.is_empty() {
+        let _ = session.logout().await;
+        return Ok((uid_validity, Vec::new(), live_uids, false));
+    }
+
+    let batch = limit.max(1);
+    let start_idx = older_uids.len().saturating_sub(batch);
+    let target_uids = &older_uids[start_idx..];
+    let has_more = start_idx > 0;
+    let headers = fetch_headers_for_uids(&mut session, target_uids).await?;
+    let _ = session.logout().await;
+
+    Ok((uid_validity, headers, live_uids, has_more))
 }
 
 /// Fetch full RFC 822 message body and attachments for `uid` in `folder_path`.

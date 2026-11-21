@@ -224,6 +224,9 @@ impl CacheStore {
         self.ensure_column("drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
         // HTML 正文（迭代 3）：旧库无列时补充，历史数据视为 NULL。
         self.ensure_column("messages", "body_html", "TEXT")?;
+        // 历史邮件增量预加载游标：标记服务端是否仍有更早邮件及 Graph nextLink。
+        self.ensure_column("folders", "has_more_remote", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("folders", "remote_next_link", "TEXT NOT NULL DEFAULT ''")?;
         Ok(())
     }
 
@@ -306,7 +309,7 @@ impl CacheStore {
             .conn
             .prepare(
                 "
-                SELECT id, account_id, name, path, unread_count, total_count
+                SELECT id, account_id, name, path, unread_count, total_count, has_more_remote
                 FROM folders
                 WHERE account_id = ?1
                 ORDER BY CASE WHEN UPPER(path) = 'INBOX' OR is_inbox = 1 THEN 0 ELSE 1 END, id ASC
@@ -323,12 +326,94 @@ impl CacheStore {
                     path: row.get(3)?,
                     unread_count: row.get::<_, u32>(4)?,
                     total_count: row.get::<_, i64>(5)?.max(0) as usize,
+                    has_more_remote: row.get::<_, i32>(6)? != 0,
                 })
             })
             .map_err(|e| format!("读取文件夹列表失败: {e}"))?;
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析文件夹行失败: {e}"))
+    }
+
+    /// Return `(account_id, path, has_more_remote, remote_next_link, min_cached_uid, cached_count)`
+    /// for `folder_id` to drive incremental older-message fetching.
+    pub fn folder_remote_cursor(
+        &self,
+        folder_id: u32,
+    ) -> Result<Option<(u32, String, bool, String, Option<u32>, usize)>, String> {
+        self.conn
+            .query_row(
+                "
+                SELECT
+                    f.account_id,
+                    f.path,
+                    f.has_more_remote,
+                    f.remote_next_link,
+                    (SELECT MIN(m.uid) FROM messages m WHERE m.folder_id = f.id),
+                    (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id)
+                FROM folders f
+                WHERE f.id = ?1
+                ",
+                params![folder_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)? != 0,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<u32>>(4)?,
+                        row.get::<_, i64>(5)?.max(0) as usize,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("读取文件夹增量游标失败: {e}"))
+    }
+
+    /// Return `(folder_id, account_id, path)` for all inbox folders that still have older remote mail.
+    pub fn list_inbox_folders_with_more_remote(&self) -> Result<Vec<(u32, u32, String)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, account_id, path
+                FROM folders
+                WHERE (UPPER(path) = 'INBOX' OR is_inbox = 1) AND has_more_remote = 1
+                ORDER BY id ASC
+                ",
+            )
+            .map_err(|e| format!("查询待加载历史邮件的收件箱失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("遍历待加载历史邮件的收件箱失败: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析待加载历史邮件的收件箱失败: {e}"))
+    }
+
+    /// Persist whether `folder_id` has more older remote messages and its Graph `@odata.nextLink`.
+    pub fn set_folder_remote_cursor(
+        &self,
+        folder_id: u32,
+        has_more_remote: bool,
+        remote_next_link: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "
+                UPDATE folders
+                SET has_more_remote = ?1, remote_next_link = ?2
+                WHERE id = ?3
+                ",
+                params![has_more_remote as i32, remote_next_link, folder_id],
+            )
+            .map_err(|e| format!("更新文件夹远程游标失败: {e}"))?;
+        Ok(())
     }
 
     /// Look up folder path and stored UIDVALIDITY for `folder_id`.
@@ -2780,5 +2865,87 @@ mod tests {
         assert_eq!(thread.len(), 2);
         assert_eq!(thread[0].sender, "Alice <a@test>");
         assert_eq!(thread[1].sender, "Bob <b@test>");
+    }
+
+    #[test]
+    fn remote_cursor_and_incremental_older_batch_preserve_cached_history() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[
+                    RemoteFolder {
+                        name: "收件箱".to_string(),
+                        path: "INBOX".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "已发送".to_string(),
+                        path: "Sent".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        let inbox = folders[0].id;
+        assert!(!folders[0].has_more_remote);
+
+        // 首次拉取最新一批（UID 101..=102），服务端还有更早的 1..=100。
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                1,
+                &[sample_header(101, "较新邮件1"), sample_header(102, "最新邮件2")],
+                Some(&[50, 51, 101, 102]),
+            )
+            .unwrap();
+        cache
+            .set_folder_remote_cursor(inbox, true, "https://graph.example/next?skip=100")
+            .unwrap();
+
+        let (acc_id, path, has_more, next_link, min_uid, count) =
+            cache.folder_remote_cursor(inbox).unwrap().unwrap();
+        assert_eq!(acc_id, 1);
+        assert_eq!(path, "INBOX");
+        assert!(has_more);
+        assert_eq!(next_link, "https://graph.example/next?skip=100");
+        assert_eq!(min_uid, Some(101));
+        assert_eq!(count, 2);
+
+        let pending_inboxes = cache.list_inbox_folders_with_more_remote().unwrap();
+        assert_eq!(pending_inboxes.len(), 1);
+        assert_eq!(pending_inboxes[0].0, inbox);
+
+        // 预加载更早一批（UID 50..=51），随后再执行 Graph 式不带 prune 的顶部刷新，历史邮件不得丢失。
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                1,
+                &[sample_header(50, "更早邮件1"), sample_header(51, "更早邮件2")],
+                Some(&[50, 51, 101, 102]),
+            )
+            .unwrap();
+        cache.set_folder_remote_cursor(inbox, false, "").unwrap();
+
+        // 模拟后续增量同步最新一批（prune = None），已预加载的 50/51 仍应保留。
+        cache
+            .commit_folder_headers(1, inbox, 1, &[sample_header(103, "新到达邮件")], None)
+            .unwrap();
+
+        let (_, _, has_more_after, next_after, min_uid_after, count_after) =
+            cache.folder_remote_cursor(inbox).unwrap().unwrap();
+        assert!(!has_more_after);
+        assert!(next_after.is_empty());
+        assert_eq!(min_uid_after, Some(50));
+        assert_eq!(count_after, 5);
+        assert!(cache.list_inbox_folders_with_more_remote().unwrap().is_empty());
+
+        let reloaded = cache.list_folders(1).unwrap();
+        assert!(!reloaded[0].has_more_remote);
+        assert_eq!(reloaded[0].total_count, 5);
     }
 }
