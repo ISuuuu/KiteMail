@@ -39,6 +39,28 @@ pub enum PaletteCommand {
     ToggleTheme,
     /// 跳转到指定账号的指定文件夹。
     GoFolder { account_id: u32, folder_id: u32 },
+    /// 跳转到「已加星标」统一视图。
+    GoStarred,
+    /// 跳转到「已发送」统一视图。
+    GoSent,
+    /// 跳转到「草稿箱」视图。
+    GoDrafts,
+    /// 跳转到「归档」统一视图。
+    GoArchive,
+    /// 打开联系人视图。
+    OpenContacts,
+    /// 打开附件总览视图。
+    OpenGallery,
+    /// 回复当前选中邮件（无选中时不注入）。
+    ReplySelected,
+    /// 归档当前选中邮件（无选中时不注入）。
+    ArchiveSelected,
+    /// 删除当前选中邮件（无选中时不注入）。
+    DeleteSelected,
+    /// 当前选中邮件标为未读（无选中时不注入）。
+    MarkUnreadSelected,
+    /// 切换当前选中邮件星标（无选中时不注入）。
+    ToggleStarSelected,
 }
 
 impl PaletteCommand {
@@ -52,6 +74,17 @@ impl PaletteCommand {
             PaletteCommand::OpenPreferences => "打开偏好设置",
             PaletteCommand::ToggleTheme => "切换亮暗主题",
             PaletteCommand::GoFolder { .. } => "跳转到文件夹",
+            PaletteCommand::GoStarred => "跳转到已加星标",
+            PaletteCommand::GoSent => "跳转到已发送",
+            PaletteCommand::GoDrafts => "跳转到草稿箱",
+            PaletteCommand::GoArchive => "跳转到归档",
+            PaletteCommand::OpenContacts => "打开联系人",
+            PaletteCommand::OpenGallery => "打开附件总览",
+            PaletteCommand::ReplySelected => "回复当前邮件",
+            PaletteCommand::ArchiveSelected => "归档当前邮件",
+            PaletteCommand::DeleteSelected => "删除当前邮件",
+            PaletteCommand::MarkUnreadSelected => "标当前邮件为未读",
+            PaletteCommand::ToggleStarSelected => "切换当前邮件星标",
         }
     }
 
@@ -68,6 +101,20 @@ impl PaletteCommand {
         matches!(self, PaletteCommand::GoFolder { .. })
     }
 
+    /// 是否为视图跳转类导航（`>` 前缀过滤时与文件夹一并排除，
+    /// 对齐原版命令面板 `action: false` 的 go-to 语义）。
+    pub fn is_view(&self) -> bool {
+        matches!(
+            self,
+            PaletteCommand::GoStarred
+                | PaletteCommand::GoSent
+                | PaletteCommand::GoDrafts
+                | PaletteCommand::GoArchive
+                | PaletteCommand::OpenContacts
+                | PaletteCommand::OpenGallery
+        )
+    }
+
     /// 命令图标。
     fn icon(self) -> IconName {
         match self {
@@ -78,6 +125,17 @@ impl PaletteCommand {
             PaletteCommand::OpenPreferences => IconName::Settings2,
             PaletteCommand::ToggleTheme => IconName::Moon,
             PaletteCommand::GoFolder { .. } => IconName::Folder,
+            PaletteCommand::GoStarred => IconName::Star,
+            PaletteCommand::GoSent => IconName::Send,
+            PaletteCommand::GoDrafts => IconName::FilePen,
+            PaletteCommand::GoArchive => IconName::Archive,
+            PaletteCommand::OpenContacts => IconName::CircleUser,
+            PaletteCommand::OpenGallery => IconName::Paperclip,
+            PaletteCommand::ReplySelected => IconName::Reply,
+            PaletteCommand::ArchiveSelected => IconName::Archive,
+            PaletteCommand::DeleteSelected => IconName::Trash,
+            PaletteCommand::MarkUnreadSelected => IconName::Mail,
+            PaletteCommand::ToggleStarSelected => IconName::Star,
         }
     }
 
@@ -117,10 +175,12 @@ pub struct CommandPaletteState {
 impl EventEmitter<CommandPaletteEvent> for CommandPaletteState {}
 
 impl CommandPaletteState {
+    /// `actions_only` 为 true 时预填 `>`（Ctrl+Shift+K 入口，仅筛选操作命令）。
     pub fn new(
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
         commands: Vec<PaletteCommand>,
+        actions_only: bool,
     ) -> Self {
         let search_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("输入命令、文件夹或 > 仅筛选操作...")
@@ -140,11 +200,19 @@ impl CommandPaletteState {
             },
         )
         .detach();
+        // Ctrl+Shift+K 入口预填 `>`，与原版「actions only」语义一致。
+        if actions_only {
+            search_input.update(cx, |state, cx| state.set_value(">", window, cx));
+        }
         // 打开面板即聚焦搜索框，保证键盘输入与 ↑ / ↓ / Esc 可用。
         search_input.update(cx, |state, cx| state.focus(window, cx));
         Self {
             search_input,
-            query: String::new(),
+            query: if actions_only {
+                ">".to_string()
+            } else {
+                String::new()
+            },
             commands,
             folder_names: Vec::new(),
             selected: 0,
@@ -226,7 +294,7 @@ fn filter_commands(
     commands
         .iter()
         .copied()
-        .filter(|command| !actions_only || !command.is_folder())
+        .filter(|command| !actions_only || (!command.is_folder() && !command.is_view()))
         .filter(|command| {
             keyword.is_empty() || {
                 let name = match command {
@@ -284,6 +352,8 @@ impl Render for CommandPaletteState {
                     .unwrap_or_else(|| {
                         SharedString::from(if command.is_folder() {
                             "文件夹"
+                        } else if command.is_view() {
+                            "视图"
                         } else {
                             "操作"
                         })
@@ -590,5 +660,57 @@ mod tests {
                 folder_id: 7
             }]
         );
+    }
+
+    /// 含视图跳转与「对当前邮件操作」命令的扩充命令集（阶段二）。
+    fn extended_commands() -> Vec<PaletteCommand> {
+        let mut commands = all_commands();
+        commands.push(PaletteCommand::GoStarred);
+        commands.push(PaletteCommand::GoSent);
+        commands.push(PaletteCommand::GoDrafts);
+        commands.push(PaletteCommand::GoArchive);
+        commands.push(PaletteCommand::OpenContacts);
+        commands.push(PaletteCommand::OpenGallery);
+        commands.push(PaletteCommand::ReplySelected);
+        commands.push(PaletteCommand::ArchiveSelected);
+        commands.push(PaletteCommand::DeleteSelected);
+        commands.push(PaletteCommand::MarkUnreadSelected);
+        commands.push(PaletteCommand::ToggleStarSelected);
+        commands
+    }
+
+    #[test]
+    fn gt_prefix_excludes_view_navigation_but_keeps_message_actions() {
+        // `>` 仅操作：视图跳转（GoStarred / OpenContacts 等）与文件夹一并排除，
+        // 对当前邮件的操作保留（对齐原版 action: true / go-to 语义）。
+        let result = filter_commands(&extended_commands(), ">", &[]);
+        assert!(result.contains(&PaletteCommand::ReplySelected));
+        assert!(result.contains(&PaletteCommand::ToggleStarSelected));
+        assert!(result.iter().all(|c| !c.is_folder() && !c.is_view()));
+
+        // 无 `>` 时视图跳转与联系人 / 附件入口正常参与匹配。
+        assert!(filter_commands(&extended_commands(), "联系人", &[])
+            .contains(&PaletteCommand::OpenContacts));
+        assert!(filter_commands(&extended_commands(), "已加星标", &[])
+            .contains(&PaletteCommand::GoStarred));
+        assert!(filter_commands(&extended_commands(), "回复", &[])
+            .contains(&PaletteCommand::ReplySelected));
+    }
+
+    #[test]
+    fn message_action_commands_are_labeled_for_selection() {
+        assert_eq!(PaletteCommand::ReplySelected.label(), "回复当前邮件");
+        assert_eq!(PaletteCommand::ArchiveSelected.label(), "归档当前邮件");
+        assert_eq!(PaletteCommand::DeleteSelected.label(), "删除当前邮件");
+        assert_eq!(
+            PaletteCommand::MarkUnreadSelected.label(),
+            "标当前邮件为未读"
+        );
+        assert_eq!(
+            PaletteCommand::ToggleStarSelected.label(),
+            "切换当前邮件星标"
+        );
+        assert!(!PaletteCommand::ReplySelected.is_view());
+        assert!(PaletteCommand::OpenGallery.is_view());
     }
 }

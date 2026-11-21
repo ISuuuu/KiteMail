@@ -22,8 +22,9 @@ use hylki_mail_core::config;
 
 use crate::app::{
     CloseOverlay, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose, OpenCommandPalette,
-    OpenPreferences, QuitApp, RefreshAllAccounts, SelectNextMessage, SelectPrevMessage,
-    SendCompose, ZoomIn, ZoomOut, ZoomReset,
+    OpenCommandPaletteActions, OpenPreferences, OpenShortcutsWindow, QuitApp, RefreshAllAccounts,
+    SelectNextMessage, SelectPrevMessage, SendCompose, ToggleAccountsList, ToggleFullscreen,
+    ZoomIn, ZoomOut, ZoomReset,
 };
 
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
@@ -178,6 +179,8 @@ fn main() {
             cx.bind_keys(vec![
                 KeyBinding::new("ctrl-n", NewCompose, None),
                 KeyBinding::new("ctrl-k", OpenCommandPalette, None),
+                // Ctrl+Shift+K：命令面板预填 `>`，仅筛选操作命令（对齐原版）。
+                KeyBinding::new("ctrl-shift-k", OpenCommandPaletteActions, None),
                 KeyBinding::new("ctrl-f", FocusSearch, None),
                 // `/` 亦展开中栏搜索栏（输入框聚焦时按键被输入框消费，不会误触）。
                 KeyBinding::new("/", FocusSearch, None),
@@ -194,6 +197,15 @@ fn main() {
                 KeyBinding::new("down", SelectNextMessage, None),
                 KeyBinding::new("up", SelectPrevMessage, None),
                 KeyBinding::new("escape", CloseOverlay, None),
+                // 阶段二主菜单动作：显示/隐藏账号列表、全屏、快捷键帮助。
+                KeyBinding::new("ctrl-shift-a", ToggleAccountsList, None),
+                KeyBinding::new("f11", ToggleFullscreen, None),
+                // F1 与 `?` 都绑：Windows 上 Shift+/ 实际产生 `?` 键（gpui 会
+                // 清除 shift 修饰），而部分布局/平台仍按 shift-/ 上报（原版
+                // 同样对两种写法都注册兜底）。
+                KeyBinding::new("f1", OpenShortcutsWindow, None),
+                KeyBinding::new("shift-/", OpenShortcutsWindow, None),
+                KeyBinding::new("?", OpenShortcutsWindow, None),
             ]);
 
             let (win_w, win_h) = resolve_window_size(&prefs);

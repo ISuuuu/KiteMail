@@ -347,6 +347,84 @@ pub async fn set_flag(
     Ok(())
 }
 
+/// Batch-mark every message in `folder_path` as `\Seen` on the server:
+/// `UID SEARCH ALL` gathers the full uid set, then chunked
+/// `UID STORE +FLAGS.SILENT (\Seen)` keeps each command line short.
+pub async fn mark_folder_all_read(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+    let uids_set = session
+        .uid_search("ALL")
+        .await
+        .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
+    let mut uids: Vec<u32> = uids_set.into_iter().collect();
+    uids.sort_unstable();
+    for chunk in uids.chunks(500) {
+        let set = chunk
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stores = session
+            .uid_store(&set, "+FLAGS.SILENT (\\Seen)")
+            .await
+            .map_err(|e| format!("批量标记已读失败: {e}"))?;
+        while stores.next().await.is_some() {}
+    }
+    let _ = session.logout().await;
+    Ok(())
+}
+
+/// Empty `folder_path` on the server (Trash / Junk): every message is marked
+/// `\Deleted` via chunked `UID STORE`, then one `EXPUNGE` removes them all.
+pub async fn empty_folder(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+    let uids_set = session
+        .uid_search("ALL")
+        .await
+        .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
+    let mut uids: Vec<u32> = uids_set.into_iter().collect();
+    uids.sort_unstable();
+    for chunk in uids.chunks(500) {
+        let set = chunk
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stores = session
+            .uid_store(&set, "+FLAGS.SILENT (\\Deleted)")
+            .await
+            .map_err(|e| format!("批量标记删除失败: {e}"))?;
+        while stores.next().await.is_some() {}
+    }
+    if !uids.is_empty() {
+        {
+            let mut expunged = std::pin::pin!(session
+                .expunge()
+                .await
+                .map_err(|e| format!("执行 EXPUNGE 失败: {e}"))?);
+            while expunged.as_mut().next().await.is_some() {}
+        }
+    }
+    let _ = session.logout().await;
+    Ok(())
+}
+
 /// Move a message to another mailbox via `UID MOVE` (RFC 6851).
 pub async fn move_message(
     account: &AccountConfig,
