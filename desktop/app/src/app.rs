@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{h_flex, v_flex};
@@ -200,7 +201,10 @@ actions!(
         QuitApp,
         DeleteSelectedMessage,
         SelectNextMessage,
-        SelectPrevMessage
+        SelectPrevMessage,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset
     ]
 );
 
@@ -326,6 +330,8 @@ pub(crate) struct HylkiApp {
     pub(crate) system_dark_mode: bool,
     /// 左栏是否隐藏（中栏顶部开关）。
     pub(crate) sidebar_hidden: bool,
+    /// 中栏搜索栏是否展开（对齐原版：顶栏常驻 🔍 图标，点按或 Ctrl+F 展开）。
+    pub(crate) search_open: bool,
     /// 列表排序方式（6 种，默认最新优先）。
     pub(crate) list_sort: MessageSort,
     /// 多条件快捷筛选（仅未读 / 仅星标 / 含附件 / 今天）。
@@ -611,7 +617,13 @@ impl HylkiApp {
             }
             let initial_collapsed = selected_message
                 .as_ref()
-                .map(|d| compute_default_collapsed_cards(d, prefs.thread_newest_first, prefs.fold_older_messages))
+                .map(|d| {
+                    compute_default_collapsed_cards(
+                        d,
+                        prefs.thread_newest_first,
+                        prefs.fold_older_messages,
+                    )
+                })
                 .unwrap_or_default();
             let mut folders_by_account = BTreeMap::new();
             folders_by_account.insert(1, demo_store.folders.clone());
@@ -682,6 +694,7 @@ impl HylkiApp {
                 dark_mode: initial_dark_mode,
                 system_dark_mode,
                 sidebar_hidden: false,
+                search_open: false,
                 list_sort: MessageSort::DateNewest,
                 quick_filters: QuickFilterSet::default(),
                 search_scope: SearchScope::ThisFolder,
@@ -838,6 +851,7 @@ impl HylkiApp {
             dark_mode: initial_dark_mode,
             system_dark_mode,
             sidebar_hidden: false,
+            search_open: false,
             list_sort: MessageSort::DateNewest,
             quick_filters: QuickFilterSet::default(),
             search_scope: SearchScope::ThisFolder,
@@ -1336,11 +1350,7 @@ impl HylkiApp {
     }
 
     /// 顶栏最小化按钮动作：偏好 `minimize_to_tray` 为 true 时隐藏到托盘，否则常规最小化。
-    pub(crate) fn minimize_window_or_tray(
-        &mut self,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn minimize_window_or_tray(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         self.save_window_geometry(window);
         if self.prefs.minimize_to_tray {
             if let Some(ref tray) = self.tray {
@@ -2228,8 +2238,7 @@ impl HylkiApp {
             "\n\n------------------ 转发邮件 ------------------\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
             detail.sender, detail.date_display, detail.subject, detail.body_text
         );
-        let body_with_sig =
-            append_signature(&quoted, &self.account_signature(detail.account_id));
+        let body_with_sig = append_signature(&quoted, &self.account_signature(detail.account_id));
 
         self.compose_account_id = detail.account_id;
         self.compose_draft_id = None;
@@ -2293,8 +2302,7 @@ impl HylkiApp {
             "\n\n------------------ 原始邮件 ------------------\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
             detail.sender, detail.date_display, detail.subject, detail.body_text
         );
-        let body_with_sig =
-            append_signature(&quoted, &self.account_signature(detail.account_id));
+        let body_with_sig = append_signature(&quoted, &self.account_signature(detail.account_id));
 
         self.compose_account_id = detail.account_id;
         self.compose_draft_id = None;
@@ -2468,7 +2476,11 @@ impl HylkiApp {
     }
 
     /// 选择目标目录并批量导出指定附件列表（重名自动追加 `(1)` 后缀）。
-    pub(crate) fn save_all_attachments(&mut self, attachment_ids: Vec<u32>, cx: &mut Context<Self>) {
+    pub(crate) fn save_all_attachments(
+        &mut self,
+        attachment_ids: Vec<u32>,
+        cx: &mut Context<Self>,
+    ) {
         if attachment_ids.is_empty() {
             return;
         }
@@ -2893,16 +2905,12 @@ impl HylkiApp {
             return false;
         }
         match self.current_view {
-            CurrentView::UnifiedInbox => self
-                .folders_by_account
-                .values()
-                .flatten()
-                .any(|f| {
-                    (f.path.eq_ignore_ascii_case("INBOX")
-                        || f.name.eq_ignore_ascii_case("INBOX")
-                        || f.name == "收件箱")
-                        && f.has_more_remote
-                }),
+            CurrentView::UnifiedInbox => self.folders_by_account.values().flatten().any(|f| {
+                (f.path.eq_ignore_ascii_case("INBOX")
+                    || f.name.eq_ignore_ascii_case("INBOX")
+                    || f.name == "收件箱")
+                    && f.has_more_remote
+            }),
             CurrentView::AccountFolder => self
                 .folders_by_account
                 .values()
@@ -3630,12 +3638,10 @@ impl HylkiApp {
         match self.right_mode {
             RightPaneMode::Compose => {
                 let p = theme::current(cx);
-                let title = if self.compose_in_reply_to.is_empty() {
-                    "写新邮件"
-                } else {
-                    "回复邮件"
-                };
-                let win_controls = window_controls::render_window_controls("compose-wc", window, cx);
+                let win_controls =
+                    window_controls::render_window_controls("compose-wc", window, cx);
+                // 写信页唯一标题栏（B-8：合并进 48px 顶栏，compose.rs 不再画第二层标题）：
+                // 左侧「取消 / 存草稿」，中间拖拽区，右侧「附件 / 发送」，复用现有动作。
                 v_flex()
                     .flex_1()
                     .min_w_0()
@@ -3645,18 +3651,51 @@ impl HylkiApp {
                         h_flex()
                             .h(px(window_controls::HEADER_HEIGHT))
                             .flex_shrink_0()
-                            .pl_4()
+                            .px_2()
+                            .gap_1()
                             .items_center()
                             .border_b_1()
                             .border_color(p.border)
                             .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                    .text_color(p.text_muted)
-                                    .child(title),
+                                Button::new("compose-bar-cancel")
+                                    .ghost()
+                                    .compact()
+                                    .label("取消")
+                                    .tooltip("放弃当前邮件（Esc）")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.request_close_compose(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compose-bar-save-draft")
+                                    .ghost()
+                                    .compact()
+                                    .label("存草稿")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_local_draft(cx);
+                                    })),
                             )
                             .child(window_controls::drag_spacer())
+                            .child(
+                                Button::new("compose-bar-attach")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::Paperclip)
+                                    .label("附件")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.pick_attachments(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compose-bar-send")
+                                    .primary()
+                                    .compact()
+                                    .label("发送")
+                                    .tooltip("发送（Ctrl+Enter）")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.send_compose(cx);
+                                    })),
+                            )
                             .child(win_controls),
                     )
                     .child(compose::render(self, cx))
@@ -3676,7 +3715,8 @@ impl Render for HylkiApp {
         let muted_fg = p.text_muted;
 
         let sidebar_el = if self.sidebar_hidden {
-            None
+            // 折叠为 80px 图标窄轨（对齐原版 rail），不再整体移除左栏。
+            Some(sidebar::render_collapsed(self, cx))
         } else {
             Some(sidebar::render(self, cx))
         };
@@ -3865,12 +3905,14 @@ impl Render for HylkiApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                // 仅三栏视图且无浮层时聚焦中栏搜索框。
+                // 仅三栏视图且无浮层时展开并聚焦中栏搜索栏（Ctrl+F / `/`）。
                 if this.main_view == MainContentView::Mail && this.active_modal == ActiveModal::None
                 {
+                    this.search_open = true;
                     this.search_input.update(cx, |state, cx| {
                         state.focus(window, cx);
                     });
+                    cx.notify();
                 }
             }))
             .on_action(cx.listener(|this, _: &RefreshAllAccounts, _window, cx| {
@@ -3923,6 +3965,34 @@ impl Render for HylkiApp {
                     && !this.is_text_input_focused(window, cx)
                 {
                     this.select_adjacent_message(-1, cx);
+                }
+            }))
+            // 阅读器缩放快捷键（Ctrl+= / Ctrl+- / Ctrl+0，复用现有持久化路径）。
+            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    this.adjust_reader_zoom(10, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    this.adjust_reader_zoom(-10, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ZoomReset, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    this.set_reader_zoom(100, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
@@ -4181,10 +4251,7 @@ pub(crate) fn apply_contact_completion(current: &str, contact: &KnownContact) ->
     } else {
         format!("{} <{}>", contact.name.trim(), contact.email)
     };
-    let mut parts: Vec<String> = current
-        .split(',')
-        .map(|p| p.trim().to_string())
-        .collect();
+    let mut parts: Vec<String> = current.split(',').map(|p| p.trim().to_string()).collect();
     if !parts.is_empty() {
         parts.pop();
     }
@@ -4291,16 +4358,25 @@ mod tests {
         let mut prefs = AppPreferences::default();
 
         let b1 = Bounds::new(point(px(10.0), px(20.0)), size(px(1400.0), px(860.0)));
-        assert!(capture_window_geometry(&mut prefs, WindowBounds::Windowed(b1)));
+        assert!(capture_window_geometry(
+            &mut prefs,
+            WindowBounds::Windowed(b1)
+        ));
         assert_eq!(prefs.window_width, Some(1400.0));
         assert_eq!(prefs.window_height, Some(860.0));
         assert!(!prefs.window_maximized);
 
         // 相同尺寸再次保存应返回 false。
-        assert!(!capture_window_geometry(&mut prefs, WindowBounds::Windowed(b1)));
+        assert!(!capture_window_geometry(
+            &mut prefs,
+            WindowBounds::Windowed(b1)
+        ));
 
         // 最大化状态：更新 window_maximized 且保留 restore bounds。
-        assert!(capture_window_geometry(&mut prefs, WindowBounds::Maximized(b1)));
+        assert!(capture_window_geometry(
+            &mut prefs,
+            WindowBounds::Maximized(b1)
+        ));
         assert!(prefs.window_maximized);
         assert_eq!(prefs.window_width, Some(1400.0));
         assert_eq!(prefs.window_height, Some(860.0));
@@ -4362,7 +4438,10 @@ mod tests {
     fn append_signature_inserts_standard_separator() {
         assert_eq!(append_signature("hello", ""), "hello");
         assert_eq!(append_signature("hello", "   \n "), "hello");
-        assert_eq!(append_signature("", "张三\n研发部"), "\n\n-- \n张三\n研发部");
+        assert_eq!(
+            append_signature("", "张三\n研发部"),
+            "\n\n-- \n张三\n研发部"
+        );
         assert_eq!(
             append_signature("\n\n--- 原始邮件 ---\n正文\n", "Best,\nAlice  "),
             "\n\n--- 原始邮件 ---\n正文\n\n-- \nBest,\nAlice"
@@ -4427,7 +4506,8 @@ mod tests {
         assert_eq!(many.len(), 5);
 
         // 排除前面已经填过的联系人
-        let after_first = filter_contact_suggestions("林晓明 <xiaoming@example.com>, xiao", &contacts, 5);
+        let after_first =
+            filter_contact_suggestions("林晓明 <xiaoming@example.com>, xiao", &contacts, 5);
         assert!(after_first.is_empty());
 
         // 中文姓名匹配 + 补全追加逗号

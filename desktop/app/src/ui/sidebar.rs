@@ -13,7 +13,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
@@ -174,7 +174,8 @@ fn account_section(
                     &display_name,
                     &email,
                     28.0,
-                    account_unread,
+                    // 展开时「收件箱」行已有未读胶囊，头像角标去重；窄轨模式始终显示角标。
+                    if expanded { 0 } else { account_unread },
                     accent,
                     sidebar_bg,
                 ))
@@ -309,7 +310,6 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .iter()
         .filter(|i| matches!(i.status, OutboxStatus::Uncertain | OutboxStatus::Failed))
         .count() as u32;
-    let dark = app.dark_mode;
     let demo_mode = app.demo_mode;
     let current_view = app.current_view;
     // 统一视图行选中态由 `current_view` 决定（演示模式同样映射）。
@@ -357,77 +357,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .collect();
 
     // 菜单按钮的弹出菜单（账号管理 / 切换亮暗主题 / 偏好设置 / 命令面板 / 退出）。
-    let menu_button = {
-        let entity = cx.entity();
-        let entity_for_theme = entity.clone();
-        let entity_for_prefs = entity.clone();
-        let entity_for_palette = entity.clone();
-        let entity_for_quit = entity.clone();
-        Button::new("sb-menu")
-            .ghost()
-            .compact()
-            .icon(IconName::Menu)
-            .dropdown_menu(move |menu, _, _| {
-                let entity = entity.clone();
-                let entity_for_theme = entity_for_theme.clone();
-                let entity_for_prefs = entity_for_prefs.clone();
-                let entity_for_palette = entity_for_palette.clone();
-                let entity_for_quit = entity_for_quit.clone();
-                menu.item(
-                    // 演示模式下账号管理不可用（无 worker 账号可编辑）。
-                    PopupMenuItem::new("账号管理")
-                        .icon(Icon::new(IconName::Settings))
-                        .disabled(demo_mode)
-                        .on_click(move |_, _, cx| {
-                            entity.update(cx, |app, cx| {
-                                app.open_account_manager(cx);
-                            });
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new(if dark {
-                        "切换亮色主题"
-                    } else {
-                        "切换暗色主题"
-                    })
-                    .icon(Icon::new(if dark { IconName::Sun } else { IconName::Moon }))
-                    .on_click(move |_, _, cx| {
-                        entity_for_theme.update(cx, |app, cx| {
-                            app.toggle_theme(cx);
-                        });
-                    }),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new("偏好设置")
-                        .icon(Icon::new(IconName::Settings2))
-                        .on_click(move |_, window, cx| {
-                            entity_for_prefs.update(cx, |app, cx| {
-                                app.open_preferences(window, cx);
-                            });
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("命令面板  Ctrl+K")
-                        .icon(Icon::new(IconName::Command))
-                        .on_click(move |_, window, cx| {
-                            entity_for_palette.update(cx, |app, cx| {
-                                app.open_command_palette(window, cx);
-                            });
-                        }),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new("退出 Hylki")
-                        .icon(Icon::new(IconName::LogOut))
-                        .on_click(move |_, _, cx| {
-                            entity_for_quit.update(cx, |app, cx| {
-                                app.quit_app(cx);
-                            });
-                        }),
-                )
-            })
-    };
+    let menu_button = main_menu_button(app, cx);
 
     v_flex()
         .w(px(SIDEBAR_WIDTH))
@@ -493,13 +423,11 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     })),
             ),
         )
-        // 可滚动主体：统一导航区 + 账号分组 + 草稿 / 发件箱。
+        // 统一导航固定区（对齐原版 pinned_box 三段式）：置于滚动区上方，
+        // 账号多时统一收件箱等入口不会被滚走。
         .child(
             v_flex()
-                .id("sidebar-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scrollbar()
+                .flex_shrink_0()
                 .px_2()
                 .gap_0p5()
                 .child(
@@ -643,7 +571,20 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 )
                             })
                     }))
-                })
+                }),
+        )
+        // 细分隔线：固定导航区与账号树之间。
+        .child(div().mx_2().my_1().h(px(1.0)).bg(border))
+        // 可滚动主体：账号分组树（含空账号提示）。
+        .child(
+            v_flex()
+                .id("sidebar-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .px_2()
+                .py_1()
+                .gap_0p5()
                 .when(app.accounts.is_empty(), |el| {
                     el.child(
                         div()
@@ -690,6 +631,277 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_gallery(window, cx);
                     })),
+                ),
+        )
+        .into_any_element()
+}
+
+/// 主菜单按钮（宽栏顶栏与窄轨共用）：账号管理 / 切换亮暗主题 / 偏好设置 / 命令面板 / 退出。
+fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElement {
+    let dark = app.dark_mode;
+    let demo_mode = app.demo_mode;
+    let entity = cx.entity();
+    let entity_for_theme = entity.clone();
+    let entity_for_prefs = entity.clone();
+    let entity_for_palette = entity.clone();
+    let entity_for_quit = entity.clone();
+    Button::new("sb-menu")
+        .ghost()
+        .compact()
+        .icon(IconName::Menu)
+        .dropdown_menu(move |menu, _, _| {
+            let entity = entity.clone();
+            let entity_for_theme = entity_for_theme.clone();
+            let entity_for_prefs = entity_for_prefs.clone();
+            let entity_for_palette = entity_for_palette.clone();
+            let entity_for_quit = entity_for_quit.clone();
+            menu.item(
+                // 演示模式下账号管理不可用（无 worker 账号可编辑）。
+                PopupMenuItem::new("账号管理")
+                    .icon(Icon::new(IconName::Settings))
+                    .disabled(demo_mode)
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |app, cx| {
+                            app.open_account_manager(cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(if dark {
+                    "切换亮色主题"
+                } else {
+                    "切换暗色主题"
+                })
+                .icon(Icon::new(if dark { IconName::Sun } else { IconName::Moon }))
+                .on_click(move |_, _, cx| {
+                    entity_for_theme.update(cx, |app, cx| {
+                        app.toggle_theme(cx);
+                    });
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("偏好设置")
+                    .icon(Icon::new(IconName::Settings2))
+                    .on_click(move |_, window, cx| {
+                        entity_for_prefs.update(cx, |app, cx| {
+                            app.open_preferences(window, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("命令面板  Ctrl+K")
+                    .icon(Icon::new(IconName::Command))
+                    .on_click(move |_, window, cx| {
+                        entity_for_palette.update(cx, |app, cx| {
+                            app.open_command_palette(window, cx);
+                        });
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("退出 Hylki")
+                    .icon(Icon::new(IconName::LogOut))
+                    .on_click(move |_, _, cx| {
+                        entity_for_quit.update(cx, |app, cx| {
+                            app.quit_app(cx);
+                        });
+                    }),
+            )
+        })
+}
+
+/// 折叠窄轨宽度（对齐原版 `SIDEBAR_RAIL_WIDTH` = 80px）。
+const RAIL_WIDTH: f32 = 80.0;
+
+/// 左栏折叠窄轨（`sidebar_hidden` 时替代宽栏，对齐原版图标窄轨）：
+/// - 顶部固定：主菜单 + 刷新；下方写邮件图标按钮（触发现有写信动作）。
+/// - 固定统一收件箱图标按钮，右上角迷你角标显示全账号未读总数。
+/// - 中部滚动区：各账号圆形头像（28px，右上角该账号未读数角标始终显示），
+///   点击恢复宽栏并展开该账号分组。
+/// - 底部固定：联系人 / 附件入口。
+/// - 无账号（欢迎向导阶段）时仅显示固定按钮（账号区为空即降级）。
+pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
+    // 避坑清单第 4 条：render 开头先把语义色 Copy 出来。
+    let p = theme::current(cx);
+    let (sidebar_bg, border, accent, accent_fg) = (p.sidebar, p.border, p.accent, p.accent_fg);
+    let demo_mode = app.demo_mode;
+    let unified_unread = app.unified_unread_count();
+    let is_unified_selected = app.current_view == CurrentView::UnifiedInbox;
+
+    v_flex()
+        .w(px(RAIL_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .bg(sidebar_bg)
+        .border_r_1()
+        .border_color(border)
+        // 顶部固定：主菜单 + 刷新（与宽栏 48px 顶栏同高）。
+        .child(
+            h_flex()
+                .h(px(HEADER_HEIGHT))
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .gap_0p5()
+                .child(main_menu_button(app, cx))
+                .child(
+                    Button::new("rail-refresh")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::RefreshCw)
+                        .tooltip(if demo_mode {
+                            "刷新演示数据"
+                        } else {
+                            "同步所有账号"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_all(cx);
+                        })),
+                ),
+        )
+        // 写邮件图标按钮（触发现有 NewCompose 写信动作）。
+        .child(
+            div().px_3().pb_2().flex_shrink_0().child(
+                Button::new("rail-compose")
+                    .primary()
+                    .icon(IconName::Plus)
+                    .tooltip("写邮件")
+                    .rounded(px(8.0))
+                    .h(px(38.0))
+                    .w_full()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_new_compose(window, cx);
+                    })),
+            ),
+        )
+        // 统一收件箱图标按钮 + 右上角全账号未读迷你角标（固定不随账号区滚动）。
+        .child(
+            h_flex().flex_shrink_0().justify_center().pb_2().child(
+                div()
+                    .relative()
+                    .child(
+                        Button::new("rail-unified")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Inbox)
+                            .tooltip("统一收件箱")
+                            .selected(is_unified_selected)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.select_unified_view(CurrentView::UnifiedInbox, cx);
+                            })),
+                    )
+                    .when(unified_unread > 0, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top(px(-4.0))
+                                .right(px(-6.0))
+                                .rounded_full()
+                                .min_w(px(16.0))
+                                .h(px(16.0))
+                                .bg(accent)
+                                .border_1()
+                                .border_color(sidebar_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .px_0p5()
+                                .text_size(px(10.0))
+                                .text_color(accent_fg)
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .child(SharedString::from(if unified_unread > 99 {
+                                    "99+".to_string()
+                                } else {
+                                    unified_unread.to_string()
+                                })),
+                        )
+                    }),
+            ),
+        )
+        // 账号头像滚动区（窄轨模式头像右上角未读角标始终显示）。
+        .child(
+            v_flex()
+                .id("rail-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .items_center()
+                .py_1()
+                .gap_1()
+                .children(app.accounts.iter().map(|acc| {
+                    let acc_id = acc.id;
+                    let display_name = if acc.display_name.is_empty() {
+                        acc.email.clone()
+                    } else {
+                        acc.display_name.clone()
+                    };
+                    let account_unread: u32 = app
+                        .folders_by_account
+                        .get(&acc.id)
+                        .map(|folders| {
+                            folders
+                                .iter()
+                                .filter(|f| {
+                                    f.path.eq_ignore_ascii_case("INBOX")
+                                        || f.name.contains("收件箱")
+                                })
+                                .map(|f| f.unread_count)
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    div()
+                        .id(("rail-acc", acc_id))
+                        .cursor_pointer()
+                        .p(px(2.0))
+                        .rounded(px(8.0))
+                        .hover(|s| s.bg(p.accent_soft()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // 点击头像恢复宽栏并展开该账号分组。
+                            this.sidebar_hidden = false;
+                            this.collapsed_accounts.remove(&acc_id);
+                            cx.notify();
+                        }))
+                        .child(avatar::account_avatar(
+                            &display_name,
+                            &acc.email,
+                            28.0,
+                            account_unread,
+                            accent,
+                            sidebar_bg,
+                        ))
+                })),
+        )
+        // 底部固定：联系人 / 附件图标入口（现有入口的窄轨形态）。
+        .child(
+            v_flex()
+                .flex_shrink_0()
+                .py_2()
+                .items_center()
+                .gap_1()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    Button::new("rail-contacts")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::CircleUser)
+                        .tooltip("联系人")
+                        .selected(app.main_view == MainContentView::Contacts)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_contacts(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("rail-attachments")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Paperclip)
+                        .tooltip("附件")
+                        .selected(app.main_view == MainContentView::Gallery)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_gallery(window, cx);
+                        })),
                 ),
         )
         .into_any_element()

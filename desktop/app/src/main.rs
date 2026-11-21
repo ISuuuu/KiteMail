@@ -23,7 +23,7 @@ use hylki_mail_core::config;
 use crate::app::{
     CloseOverlay, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose, OpenCommandPalette,
     OpenPreferences, QuitApp, RefreshAllAccounts, SelectNextMessage, SelectPrevMessage,
-    SendCompose,
+    SendCompose, ZoomIn, ZoomOut, ZoomReset,
 };
 
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
@@ -179,11 +179,17 @@ fn main() {
                 KeyBinding::new("ctrl-n", NewCompose, None),
                 KeyBinding::new("ctrl-k", OpenCommandPalette, None),
                 KeyBinding::new("ctrl-f", FocusSearch, None),
+                // `/` 亦展开中栏搜索栏（输入框聚焦时按键被输入框消费，不会误触）。
+                KeyBinding::new("/", FocusSearch, None),
                 KeyBinding::new("ctrl-r", RefreshAllAccounts, None),
                 KeyBinding::new("f5", RefreshAllAccounts, None),
                 KeyBinding::new("ctrl-enter", SendCompose, None),
                 KeyBinding::new("ctrl-,", OpenPreferences, None),
                 KeyBinding::new("ctrl-q", QuitApp, None),
+                // 阅读器正文字号缩放（Ctrl+= 放大 / Ctrl+- 缩小 / Ctrl+0 重置）。
+                KeyBinding::new("ctrl-=", ZoomIn, None),
+                KeyBinding::new("ctrl--", ZoomOut, None),
+                KeyBinding::new("ctrl-0", ZoomReset, None),
                 KeyBinding::new("delete", DeleteSelectedMessage, None),
                 KeyBinding::new("down", SelectNextMessage, None),
                 KeyBinding::new("up", SelectPrevMessage, None),
