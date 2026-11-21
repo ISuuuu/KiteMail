@@ -32,14 +32,15 @@ use hylki_mail_core::demo::{
 };
 use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
-    ComposeDraft, FolderSummary, LocalDraft, MailPage, MailRequest, MessageDetail, MessageFilter,
-    MessageSort, MessageSummary, OutboxItem, QuickFilterSet, SearchScope, UnifiedView, WorkerEvent,
+    contacts_io, ComposeDraft, FolderSummary, LocalDraft, MailPage, MailRequest, MessageDetail,
+    MessageFilter, MessageSort, MessageSummary, OutboxItem, QuickFilterSet, SearchScope,
+    UnifiedView, UserContact, WorkerEvent,
 };
 
 use crate::theme;
 use crate::tray::{self, TrayCommand, TrayHandle};
 use crate::ui::command_palette::{CommandPaletteEvent, CommandPaletteState, PaletteCommand};
-use crate::ui::contacts::{ContactsEvent, ContactsState};
+use crate::ui::contacts::{ContactExportKind, ContactsEvent, ContactsState};
 use crate::ui::gallery::{GalleryEvent, GalleryState};
 use crate::ui::preferences::{PreferencesEvent, PreferencesState};
 use crate::ui::{accounts, compose, message_list, reader, sidebar, welcome, window_controls};
@@ -185,7 +186,6 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
         guide: "阿里企业邮指引：请使用完整企业邮箱地址作为用户名；如开启了三方客户端安全密码，请在网页端生成专用密码。",
     },
 ];
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RightPaneMode {
     Reader,
@@ -480,6 +480,16 @@ pub(crate) struct HylkiApp {
     pub(crate) pending_forward_msg_id: Option<u32>,
     /// 当前触发联系人自动补全的地址框。
     pub(crate) compose_autocomplete_field: Option<ComposeAddressField>,
+    /// F-4 草稿自动保存：防抖代际（每次输入变更 +1，旧定时器醒来后失效）。
+    compose_autosave_generation: u64,
+    /// F-4 自上次落库以来写信内容有变更（变更事件仅由真实编辑触发）。
+    compose_autosave_dirty: bool,
+    /// F-4 自动保存请求已发出（`DraftSaved` 回执到达后显示提示并绑定草稿 ID）。
+    compose_autosave_pending: bool,
+    /// F-4 当前草稿是否由自动保存静默创建（「放弃」时连同该草稿删除）。
+    compose_autosaved_new: bool,
+    /// F-4 最近一次自动保存时刻（写信页常驻小字「草稿已自动保存 HH:MM」）。
+    pub(crate) compose_autosaved_at: Option<SharedString>,
     /// 已知联系人本地缓存（供写信收件人自动补全）。
     pub(crate) known_contacts: Vec<KnownContact>,
     /// 撤销发送（5 秒缓冲）状态。
@@ -580,6 +590,10 @@ pub(crate) struct HylkiApp {
     gallery_query: String,
     /// 联系人当前搜索词（同上）。
     contacts_query: String,
+    /// F-6 图片预览等待字节回传的附件 ID（`AttachmentBytesFetched` 时匹配）。
+    gallery_preview_pending: Option<u32>,
+    /// F-7 退订横幅待确认的邮件 ID（横幅内二次确认；切换邮件时清除）。
+    pub(crate) pending_unsubscribe: Option<u32>,
     /// 后台自动刷新到期时刻（`None` 表示待重算；demo 模式不轮询）。
     auto_sync_deadline: Option<Instant>,
     /// Windows 系统托盘句柄（退出时显式销毁图标避免残留）。
@@ -725,6 +739,7 @@ impl HylkiApp {
         cx.subscribe(&compose_to, |this, _input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.compose_autocomplete_field = Some(ComposeAddressField::To);
+                this.schedule_draft_autosave(cx);
                 cx.notify();
             }
         })
@@ -732,6 +747,7 @@ impl HylkiApp {
         cx.subscribe(&compose_cc, |this, _input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.compose_autocomplete_field = Some(ComposeAddressField::Cc);
+                this.schedule_draft_autosave(cx);
                 cx.notify();
             }
         })
@@ -739,6 +755,7 @@ impl HylkiApp {
         cx.subscribe(&compose_bcc, |this, _input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.compose_autocomplete_field = Some(ComposeAddressField::Bcc);
+                this.schedule_draft_autosave(cx);
                 cx.notify();
             }
         })
@@ -751,6 +768,21 @@ impl HylkiApp {
                 .auto_grow(10, 24)
                 .placeholder("在此输入多行中文正文，支持保存草稿、附件与持久化发件...")
         });
+        // F-4：主题 / 正文变更同样重置 5 秒防抖自动保存定时器。
+        cx.subscribe(&compose_subject, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.schedule_draft_autosave(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&compose_body, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.schedule_draft_autosave(cx);
+                cx.notify();
+            }
+        })
+        .detach();
 
         let first_cfg = existing_accounts.first().cloned().unwrap_or_default();
         let editing_account_id = existing_accounts.first().map(|c| c.id);
@@ -907,6 +939,11 @@ impl HylkiApp {
                 compose_confirm_discard: false,
                 pending_forward_msg_id: None,
                 compose_autocomplete_field: None,
+                compose_autosave_generation: 0,
+                compose_autosave_dirty: false,
+                compose_autosave_pending: false,
+                compose_autosaved_new: false,
+                compose_autosaved_at: None,
                 known_contacts: demo_contacts,
                 pending_send: None,
                 next_send_token: 1,
@@ -967,6 +1004,8 @@ impl HylkiApp {
                 gallery_items: Vec::new(),
                 gallery_query: String::new(),
                 contacts_query: String::new(),
+                gallery_preview_pending: None,
+                pending_unsubscribe: None,
                 auto_sync_deadline: None,
                 tray,
                 window_handle,
@@ -1079,6 +1118,11 @@ impl HylkiApp {
             compose_confirm_discard: false,
             pending_forward_msg_id: None,
             compose_autocomplete_field: None,
+            compose_autosave_generation: 0,
+            compose_autosave_dirty: false,
+            compose_autosave_pending: false,
+            compose_autosaved_new: false,
+            compose_autosaved_at: None,
             known_contacts: Vec::new(),
             pending_send: None,
             next_send_token: 1,
@@ -1139,6 +1183,8 @@ impl HylkiApp {
             gallery_items: Vec::new(),
             gallery_query: String::new(),
             contacts_query: String::new(),
+            gallery_preview_pending: None,
+            pending_unsubscribe: None,
             auto_sync_deadline: None,
             tray,
             window_handle,
@@ -1482,6 +1528,47 @@ impl HylkiApp {
                             state.set_contacts(items);
                             cx.notify();
                         });
+                    }
+                }
+                // F-4：草稿落库回执——绑定新分配的本地草稿 ID，自动保存时显示提示。
+                WorkerEvent::DraftSaved { draft_id } => {
+                    if self.right_mode == RightPaneMode::Compose && draft_id > 0 {
+                        if self.compose_draft_id.is_none() {
+                            self.compose_draft_id = Some(draft_id);
+                            if self.compose_autosave_pending {
+                                self.compose_autosaved_new = true;
+                            }
+                        }
+                        if self.compose_autosave_pending {
+                            let now = chrono::Local::now().format("%H:%M").to_string();
+                            self.compose_autosaved_at = Some(SharedString::from(now));
+                        }
+                    }
+                    self.compose_autosave_pending = false;
+                    cx.notify();
+                }
+                // F-5：批量导入回执（`KnownContactsLoaded` 已先行刷新列表）。
+                WorkerEvent::ContactsImported { added, skipped } => {
+                    self.status_line = SharedString::from(format!(
+                        "联系人导入完成：新增 {added} 个，跳过 {skipped} 个（重复或无效）"
+                    ));
+                    cx.notify();
+                }
+                // F-6：附件总览图片预览字节到达（仅等待中的附件生效）。
+                WorkerEvent::AttachmentBytesFetched {
+                    attachment_id,
+                    filename,
+                    mime_type,
+                    bytes,
+                } => {
+                    if self.gallery_preview_pending == Some(attachment_id) {
+                        self.gallery_preview_pending = None;
+                        if let Some(ref g) = self.gallery {
+                            g.update(cx, |state, cx| {
+                                state.set_preview_image(&filename, &mime_type, bytes);
+                                cx.notify();
+                            });
+                        }
                     }
                 }
             }
@@ -1990,6 +2077,8 @@ impl HylkiApp {
             self.collapsed_thread_cards.remove(&detail.id);
         } else {
             self.raw_source_message_ids.clear();
+            // F-7：切换会话时清除未确认的退订横幅。
+            self.pending_unsubscribe = None;
             self.collapsed_thread_cards = compute_default_collapsed_cards(
                 &detail,
                 self.prefs.thread_newest_first,
@@ -2807,6 +2896,7 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
+        self.begin_compose_autosave_tracking();
         let initial_body = append_signature("", &self.account_signature(self.compose_account_id));
         self.compose_to
             .update(cx, |s, cx| s.set_value("", window, cx));
@@ -2822,6 +2912,68 @@ impl HylkiApp {
         self.right_mode = RightPaneMode::Compose;
         self.ensure_contacts_loaded();
         cx.notify();
+    }
+
+    // ---- F-4 写信草稿 5 秒防抖自动保存 ----
+
+    /// 进入写信页（新写信 / 回复 / 转发 / 打开草稿）时重置自动保存跟踪。
+    fn begin_compose_autosave_tracking(&mut self) {
+        self.compose_autosave_generation += 1;
+        self.compose_autosave_dirty = false;
+        self.compose_autosave_pending = false;
+        self.compose_autosaved_new = false;
+        self.compose_autosaved_at = None;
+    }
+
+    /// 离开写信流程（发送 / 取消 / 存草稿退出）时清除挂起的自动保存。
+    fn cancel_draft_autosave(&mut self) {
+        self.compose_autosave_generation += 1;
+        self.compose_autosave_dirty = false;
+        self.compose_autosave_pending = false;
+    }
+
+    /// 内容变更后重置 5 秒防抖定时器：代际号 +1 使旧定时器醒来后失效，
+    /// 5 秒内无新输入才真正执行静默保存（demo 模式无本地草稿库，跳过）。
+    pub(crate) fn schedule_draft_autosave(&mut self, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            return;
+        }
+        self.compose_autosave_dirty = true;
+        self.compose_autosave_generation += 1;
+        let generation = self.compose_autosave_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(5)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.compose_autosave_generation == generation
+                    && app.compose_autosave_dirty
+                    && app.right_mode == RightPaneMode::Compose
+                {
+                    app.autosave_draft_now(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 立即执行一次静默草稿保存（`AutosaveLocalDraft`，不回发状态行）。
+    fn autosave_draft_now(&mut self, cx: &mut Context<Self>) {
+        self.compose_autosave_dirty = false;
+        self.compose_autosave_pending = true;
+        let draft = LocalDraft {
+            id: self.compose_draft_id.unwrap_or(0),
+            account_id: self.compose_account_id,
+            to_addr: self.compose_to.read(cx).value().to_string(),
+            cc_addr: self.compose_cc.read(cx).value().to_string(),
+            bcc_addr: self.compose_bcc.read(cx).value().to_string(),
+            subject: self.compose_subject.read(cx).value().to_string(),
+            body_text: self.compose_body.read(cx).value().to_string(),
+            in_reply_to: self.compose_in_reply_to.clone(),
+            attachment_paths: self.compose_attachments.clone(),
+            updated_at: 0,
+        };
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::AutosaveLocalDraft { draft });
+        }
     }
 
     pub(crate) fn start_reply(
@@ -2874,6 +3026,7 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         self.pending_forward_msg_id = Some(detail.id);
         self.compose_autocomplete_field = None;
+        self.begin_compose_autosave_tracking();
         self.compose_to
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.clear_compose_cc_bcc(window, cx);
@@ -2938,6 +3091,7 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
+        self.begin_compose_autosave_tracking();
         self.compose_to
             .update(cx, |s, cx| s.set_value(to.to_string(), window, cx));
         self.clear_compose_cc_bcc(window, cx);
@@ -2979,7 +3133,18 @@ impl HylkiApp {
     }
 
     /// 放弃当前写信内容并返回阅读态。
+    /// F-4：若该草稿此前由自动保存静默创建，则连同删除（避免留下孤儿草稿）。
     pub(crate) fn discard_compose(&mut self, cx: &mut Context<Self>) {
+        self.cancel_draft_autosave();
+        if self.compose_autosaved_new {
+            if let Some(draft_id) = self.compose_draft_id.take() {
+                if let Some(ref w) = self.worker {
+                    w.send(MailRequest::DeleteLocalDraft { draft_id });
+                }
+            }
+            self.compose_autosaved_new = false;
+            self.compose_autosaved_at = None;
+        }
         self.compose_confirm_discard = false;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
@@ -2989,6 +3154,7 @@ impl HylkiApp {
 
     /// 保存为草稿并退出写信页。
     pub(crate) fn save_draft_and_close_compose(&mut self, cx: &mut Context<Self>) {
+        self.cancel_draft_autosave();
         self.save_local_draft(cx);
         self.compose_confirm_discard = false;
         self.pending_forward_msg_id = None;
@@ -3036,6 +3202,7 @@ impl HylkiApp {
         self.compose_draft_id = Some(draft.id);
         self.compose_in_reply_to = draft.in_reply_to.clone();
         self.compose_attachments = draft.attachment_paths.clone();
+        self.begin_compose_autosave_tracking();
         self.compose_to
             .update(cx, |s, cx| s.set_value(draft.to_addr.clone(), window, cx));
         self.compose_cc
@@ -3084,6 +3251,8 @@ impl HylkiApp {
                     self.compose_attachments.push(p);
                 }
             }
+            // F-4：附件变化也属于写信内容变更，重置自动保存定时器。
+            self.schedule_draft_autosave(cx);
             cx.notify();
         }
     }
@@ -3176,6 +3345,11 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         self.compose_autocomplete_field = None;
         self.pending_forward_msg_id = None;
+        // F-4：发送即清除挂起的自动保存（草稿由发送流程删除，不再落库）。
+        self.cancel_draft_autosave();
+        self.compose_autosaved_new = false;
+        self.compose_autosaved_at = None;
+        self.pending_unsubscribe = None;
         self.right_mode = RightPaneMode::Reader;
         self.error_banner = None;
         self.status_line = SharedString::from("邮件将在 5 秒后发出，可随时点击「撤销发送」");
@@ -3260,6 +3434,7 @@ impl HylkiApp {
         self.compose_draft_id = pending.local_draft_id;
         self.compose_in_reply_to = pending.draft.in_reply_to;
         self.compose_attachments = pending.draft.attachment_paths;
+        self.begin_compose_autosave_tracking();
         self.compose_show_cc_bcc =
             !pending.draft.cc.trim().is_empty() || !pending.draft.bcc.trim().is_empty();
         self.compose_to
@@ -4113,6 +4288,10 @@ impl HylkiApp {
                     GalleryEvent::LocateMessage(message_id) => {
                         this.locate_gallery_message(*message_id, cx);
                     }
+                    // F-6：图片附件预览——读取本地缓存的附件字节后回填浮层。
+                    GalleryEvent::PreviewImage(attachment_id) => {
+                        this.fetch_gallery_preview(*attachment_id, cx);
+                    }
                 },
             );
             self.gallery = Some(entity);
@@ -4182,6 +4361,79 @@ impl HylkiApp {
         cx.notify();
     }
 
+    // ---- F-6 附件总览图片预览 ----
+
+    /// 网格 / 列表中的图片附件点击预览：请求读取本地缓存的附件字节。
+    /// demo 模式无真实字节，直接以占位浮层展示。
+    pub(crate) fn fetch_gallery_preview(&mut self, attachment_id: u32, cx: &mut Context<Self>) {
+        self.gallery_preview_pending = Some(attachment_id);
+        if self.demo_mode {
+            if let Some(ref g) = self.gallery {
+                g.update(cx, |state, cx| {
+                    state.set_preview_unavailable();
+                    cx.notify();
+                });
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::FetchAttachmentBytes { attachment_id });
+        }
+        cx.notify();
+    }
+
+    // ---- F-7 一键退订 ----
+
+    /// 退订横幅「退订」按钮：进入卡内二次确认（对齐原版 confirm 流程）。
+    pub(crate) fn request_unsubscribe(&mut self, message_id: u32, cx: &mut Context<Self>) {
+        self.pending_unsubscribe = Some(message_id);
+        cx.notify();
+    }
+
+    /// 退订确认条「取消」。
+    pub(crate) fn cancel_unsubscribe(&mut self, cx: &mut Context<Self>) {
+        self.pending_unsubscribe = None;
+        cx.notify();
+    }
+
+    /// 确认退订：one-click 句柄直接 POST（原版行为）；https 打开浏览器；
+    /// mailto 交给系统处理（gpui open_url 走系统 shell，可唤起默认邮件客户端）。
+    pub(crate) fn confirm_unsubscribe(&mut self, _message_id: u32, cx: &mut Context<Self>) {
+        self.pending_unsubscribe = None;
+        let Some(detail) = self.selected_message.as_ref() else {
+            return;
+        };
+        let Some(ref url) = detail.unsubscribe_url else {
+            return;
+        };
+        let lower = url.to_ascii_lowercase();
+        if detail.unsubscribe_one_click && lower.starts_with("https://") {
+            if self.demo_mode {
+                self.status_line =
+                    SharedString::from("演示模式：已模拟发送一键退订请求（不访问网络）");
+                cx.notify();
+                return;
+            }
+            if let Some(ref w) = self.worker {
+                self.status_line = SharedString::from("正在发送一键退订请求...");
+                w.send(MailRequest::UnsubscribeOneClick { url: url.clone() });
+            }
+        } else if lower.starts_with("http://") || lower.starts_with("https://") {
+            self.status_line = SharedString::from("已在浏览器打开退订页面");
+            cx.open_url(url);
+        } else if lower.starts_with("mailto:") {
+            // gpui open_url 经系统 shell 打开，mailto 唤起默认邮件客户端。
+            self.status_line = SharedString::from("已调用系统邮件客户端发送退订邮件");
+            cx.open_url(url);
+        } else {
+            self.error_banner = Some(SharedString::from(
+                "该退订地址不受支持（仅支持 http/https/mailto）",
+            ));
+        }
+        cx.notify();
+    }
+
     /// 联系人数据请求（进入视图 / 搜索词变化时触发；demo 模式直接聚合模拟发件人）。
     fn request_known_contacts(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
@@ -4220,10 +4472,36 @@ impl HylkiApp {
                     ContactsEvent::ComposeTo(email) => {
                         this.compose_to_contact(email.clone(), window, cx);
                     }
+                    ContactsEvent::SaveContact {
+                        id,
+                        email,
+                        display_name,
+                        notes,
+                    } => {
+                        this.save_user_contact(
+                            *id,
+                            email.clone(),
+                            display_name.clone(),
+                            notes.clone(),
+                            cx,
+                        );
+                    }
+                    ContactsEvent::DeleteContact(contact_id) => {
+                        this.delete_user_contact(*contact_id, cx);
+                    }
+                    ContactsEvent::ImportContacts => {
+                        this.import_contacts_file(cx);
+                    }
+                    ContactsEvent::ExportContacts { kind, items } => {
+                        this.export_contacts(*kind, items.clone(), cx);
+                    }
                 },
             );
             self.contacts = Some(entity);
             self.contacts_sub = Some(sub);
+        }
+        if let Some(ref c) = self.contacts {
+            c.update(cx, |state, _cx| state.set_demo_mode(self.demo_mode));
         }
         self.main_view = MainContentView::Contacts;
         self.request_known_contacts(cx);
@@ -4236,6 +4514,158 @@ impl HylkiApp {
         self.start_new_compose(window, cx);
         self.compose_to
             .update(cx, |state, cx| state.set_value(email, window, cx));
+        cx.notify();
+    }
+
+    // ---- F-5 用户联系人 CRUD 与导入 / 导出 ----
+
+    /// 保存用户联系人（新建或编辑；去重校验已在联系人页完成）。
+    fn save_user_contact(
+        &mut self,
+        id: Option<u32>,
+        email: String,
+        display_name: String,
+        notes: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            self.status_line = SharedString::from("演示模式下不支持修改联系人数据库");
+            cx.notify();
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::SaveUserContact {
+                contact: UserContact {
+                    id: id.unwrap_or(0),
+                    email,
+                    display_name,
+                    notes,
+                },
+            });
+        }
+        cx.notify();
+    }
+
+    /// 删除用户联系人（仅自定义联系人可删，`contact_id` 为行 ID）。
+    fn delete_user_contact(&mut self, contact_id: u32, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            self.status_line = SharedString::from("演示模式下不支持删除联系人");
+            cx.notify();
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::DeleteUserContact { contact_id });
+        }
+        cx.notify();
+    }
+
+    /// 联系人导入：rfd 选择 .vcf / .csv 文件，按内容特征识别格式解析后批量入库。
+    fn import_contacts_file(&mut self, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            self.status_line = SharedString::from("演示模式下不支持导入联系人");
+            cx.notify();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("联系人文件 (vCard / CSV)", &["vcf", "csv"])
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                self.error_banner = Some(SharedString::from(format!("读取联系人文件失败: {e}")));
+                cx.notify();
+                return;
+            }
+        };
+        // 按扩展名或内容特征（BEGIN:VCARD）识别格式；解析失败的行被跳过。
+        let contacts = if contacts_io::looks_like_vcard(&path, &text) {
+            contacts_io::parse_vcards(&text)
+        } else {
+            contacts_io::parse_csv_contacts(&text)
+        };
+        if contacts.is_empty() {
+            self.status_line =
+                SharedString::from("未在文件中找到带邮箱的联系人（支持 vCard 与 CSV）");
+            cx.notify();
+            return;
+        }
+        let count = contacts.len();
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from(format!("正在导入 {count} 个联系人..."));
+            w.send(MailRequest::ImportUserContacts { contacts });
+        }
+        cx.notify();
+    }
+
+    /// 联系人导出：把联系人页当前列表写入 vCard / CSV 文件（demo 模式同样可用）。
+    fn export_contacts(
+        &mut self,
+        kind: ContactExportKind,
+        items: Vec<KnownContact>,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, filter, default_name, content) = match kind {
+            ContactExportKind::Vcard => (
+                "导出 vCard 联系人",
+                ("vCard 文件", &["vcf"][..]),
+                "contacts.vcf",
+                contacts_io::export_vcards(
+                    &items
+                        .iter()
+                        .map(|c| UserContact {
+                            id: c.id,
+                            email: c.email.clone(),
+                            display_name: c.name.clone(),
+                            notes: c.notes.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            ContactExportKind::Csv => (
+                "导出 CSV 联系人",
+                ("CSV 文件", &["csv"][..]),
+                "contacts.csv",
+                contacts_io::export_csv(
+                    &items
+                        .iter()
+                        .map(|c| UserContact {
+                            id: c.id,
+                            email: c.email.clone(),
+                            display_name: c.name.clone(),
+                            notes: c.notes.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        };
+        if items.is_empty() {
+            self.status_line = SharedString::from("暂无可导出的联系人");
+            cx.notify();
+            return;
+        }
+        let Some(dest) = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter(filter.0, filter.1)
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&dest, content) {
+            Ok(()) => {
+                self.status_line = SharedString::from(format!(
+                    "已导出 {} 个联系人至 {}",
+                    items.len(),
+                    dest.display()
+                ));
+            }
+            Err(e) => {
+                self.error_banner = Some(SharedString::from(format!("写入联系人文件失败: {e}")));
+            }
+        }
         cx.notify();
     }
 
@@ -6396,6 +6826,8 @@ mod tests {
             attachments: Vec::new(),
             // 降序：3 最新，2 当前，1 最早。
             thread_messages: vec![make_tm(3), make_tm(2), make_tm(1)],
+            unsubscribe_url: None,
+            unsubscribe_one_click: false,
         };
 
         let folded_desc = compute_default_collapsed_cards(&detail, true, true);
@@ -6437,36 +6869,43 @@ mod tests {
                 name: "林晓明".to_string(),
                 email: "xiaoming@example.com".to_string(),
                 message_count: 10,
+                ..KnownContact::default()
             },
             KnownContact {
                 name: "陈思远".to_string(),
                 email: "siyuan@example.org".to_string(),
                 message_count: 8,
+                ..KnownContact::default()
             },
             KnownContact {
                 name: String::new(),
                 email: "alice@example.com".to_string(),
                 message_count: 6,
+                ..KnownContact::default()
             },
             KnownContact {
                 name: "Bob".to_string(),
                 email: "bob@example.com".to_string(),
                 message_count: 5,
+                ..KnownContact::default()
             },
             KnownContact {
                 name: "Carol".to_string(),
                 email: "carol@example.com".to_string(),
                 message_count: 4,
+                ..KnownContact::default()
             },
             KnownContact {
                 name: "Dave".to_string(),
                 email: "dave@example.com".to_string(),
                 message_count: 3,
+                ..KnownContact::default()
             },
             KnownContact {
                 name: "Eve".to_string(),
                 email: "eve@example.com".to_string(),
                 message_count: 2,
+                ..KnownContact::default()
             },
         ];
 
@@ -6653,6 +7092,8 @@ mod tests {
             flagged: false,
             attachments: Vec::new(),
             thread_messages: Vec::new(),
+            unsubscribe_url: None,
+            unsubscribe_one_click: false,
         };
         let bytes = compose_demo_eml(&detail);
         let text = String::from_utf8(bytes).unwrap();

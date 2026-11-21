@@ -509,7 +509,11 @@ impl DemoStore {
                 });
             }
             MessageSort::UnreadFirst => {
-                items.sort_by(|a, b| b.unread.cmp(&a.unread).then_with(|| b.date_ts.cmp(&a.date_ts)));
+                items.sort_by(|a, b| {
+                    b.unread
+                        .cmp(&a.unread)
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
             }
             MessageSort::StarredFirst => {
                 items.sort_by(|a, b| {
@@ -545,6 +549,7 @@ impl DemoStore {
                         sender: m.sender.clone(),
                         subject: m.subject.clone(),
                         date_display: m.date_display.clone(),
+                        date_ts: m.date_ts,
                     },
                     CachedAttachment {
                         id: m.id * 10 + 2,
@@ -556,6 +561,7 @@ impl DemoStore {
                         sender: m.sender.clone(),
                         subject: m.subject.clone(),
                         date_display: m.date_display.clone(),
+                        date_ts: m.date_ts,
                     },
                 ]
             })
@@ -597,10 +603,22 @@ impl DemoStore {
         }
         let mut items: Vec<KnownContact> = counts
             .into_iter()
-            .map(|(email, (name, message_count))| KnownContact {
-                name,
-                email,
-                message_count,
+            .map(|(email, (name, message_count))| {
+                // F-5：演示数据中把「产品设计组」标注为自定义联系人（带备注与
+                // 来源徽标，CRUD 按钮在演示模式下禁用）。
+                let (id, notes, custom) = if email == "design@hylki.example" {
+                    (1u32, "产品设计组通讯录（演示）".to_string(), true)
+                } else {
+                    (0u32, String::new(), false)
+                };
+                KnownContact {
+                    name,
+                    email,
+                    message_count,
+                    id,
+                    notes,
+                    custom,
+                }
             })
             .filter(|c| {
                 q.is_empty()
@@ -608,9 +626,11 @@ impl DemoStore {
                     || c.email.to_lowercase().contains(&q)
             })
             .collect();
+        // 与 cache 合并排序一致：自定义联系人优先，其余按往来邮件数降序。
         items.sort_by(|a, b| {
-            b.message_count
-                .cmp(&a.message_count)
+            b.custom
+                .cmp(&a.custom)
+                .then_with(|| b.message_count.cmp(&a.message_count))
                 .then_with(|| a.name.cmp(&b.name))
         });
         items.into_iter().skip(offset).take(limit).collect()
@@ -754,6 +774,17 @@ impl DemoStore {
             _ => Vec::new(),
         };
 
+        // F-7：演示邮件 #2 携带 `List-Unsubscribe` / `List-Unsubscribe-Post`
+        // 头样例，用于在 --demo 模式下展示一键退订横幅。
+        let (unsubscribe_url, unsubscribe_one_click) = if summary.id == 2 {
+            (
+                Some("https://lists.hylki.example/unsubscribe?id=demo".to_string()),
+                true,
+            )
+        } else {
+            (None, false)
+        };
+
         Some(MessageDetail {
             id: summary.id,
             account_id: 1,
@@ -770,6 +801,8 @@ impl DemoStore {
             flagged: summary.flagged,
             attachments,
             thread_messages,
+            unsubscribe_url,
+            unsubscribe_one_click,
         })
     }
 }
@@ -815,6 +848,14 @@ mod tests {
 
         let contacts = store.list_known_contacts("", 0, 50);
         assert!(!contacts.is_empty());
-        assert!(contacts[0].message_count >= contacts.last().unwrap().message_count);
+        // F-5：自定义联系人排在最前；聚合联系人按往来邮件数降序。
+        let aggregated: Vec<_> = contacts.iter().filter(|c| !c.custom).collect();
+        assert!(!aggregated.is_empty());
+        assert!(aggregated
+            .windows(2)
+            .all(|w| w[0].message_count >= w[1].message_count));
+        if contacts[0].custom {
+            assert!(contacts.iter().skip_while(|c| c.custom).all(|c| !c.custom));
+        }
     }
 }

@@ -6,9 +6,10 @@
 //! - 附件芯片条：圆角胶囊标签（📎 文件名 (大小 KB) ×，点击移除）。
 //! - 正文编辑区：`TextareaState` 多行编辑器，`flex-1` 撑满剩余高度。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea};
-use gpui_kit::component::{h_flex, v_flex, Selectable};
+use gpui_kit::component::{h_flex, v_flex, Icon, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton,
@@ -68,6 +69,8 @@ fn attachment_chip(idx: usize, path: &str, cx: &mut Context<HylkiApp>) -> Button
         .on_click(cx.listener(move |this, _, _, cx| {
             if idx < this.compose_attachments.len() {
                 this.compose_attachments.remove(idx);
+                // F-4：附件变化属于写信内容变更，重置自动保存定时器。
+                this.schedule_draft_autosave(cx);
                 cx.notify();
             }
         }))
@@ -337,6 +340,26 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 })
                 .child(header_row("主题", &app.compose_subject, &p)),
         )
+        // F-4：草稿自动保存常驻小字提示（右对齐，自动保存成功后出现）。
+        .when_some(app.compose_autosaved_at.clone(), |el, saved_at| {
+            el.child(
+                h_flex()
+                    .justify_end()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Check)
+                            .with_size(px(12.0))
+                            .text_color(muted_fg),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(SharedString::from(format!("草稿已自动保存 {saved_at}"))),
+                    ),
+            )
+        })
         // 附件芯片条。
         .when(!app.compose_attachments.is_empty(), |el| {
             el.child(h_flex().gap_2().flex_wrap().children(attachment_chips))

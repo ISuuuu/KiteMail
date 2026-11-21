@@ -6,6 +6,7 @@ license.workspace = true
 description = "Native Windows GPUI client for Hylki"
 
 [dependencies]
+chrono = { workspace = true }
 gpui-kit = { workspace = true }
 hylki-mail-core = { path = "../mail-core" }
 rfd = { workspace = true }

@@ -187,7 +187,9 @@ async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<M
                                 let _ = secrets::save_oauth_refresh_token(account.id, new_rt);
                             }
                             let exp = Instant::now()
-                                + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
+                                + Duration::from_secs(
+                                    refreshed.expires_in_secs.saturating_sub(120),
+                                );
                             cached_imap_token = Some((refreshed.access_token.clone(), exp));
                             Some(refreshed.access_token)
                         } else {
@@ -228,10 +230,7 @@ async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<M
     }
 }
 
-async fn run_graph_fast_poll_fallback(
-    account: &AccountConfig,
-    req_tx: &mpsc::Sender<MailRequest>,
-) {
+async fn run_graph_fast_poll_fallback(account: &AccountConfig, req_tx: &mpsc::Sender<MailRequest>) {
     let mut cached_graph_token: Option<(String, Instant)> = None;
     let mut last_inbox_sig: Option<(u32, usize)> = None;
 
@@ -246,10 +245,9 @@ async fn run_graph_fast_poll_fallback(
                     return;
                 };
                 let cid = account.oauth_client_id.clone();
-                let Ok(Ok(refreshed)) = tokio::task::spawn_blocking(move || {
-                    oauth::refresh_microsoft_token(&cid, &rt)
-                })
-                .await
+                let Ok(Ok(refreshed)) =
+                    tokio::task::spawn_blocking(move || oauth::refresh_microsoft_token(&cid, &rt))
+                        .await
                 else {
                     return;
                 };
@@ -667,12 +665,14 @@ async fn handle_request(
             };
 
             match fetch_res {
-                Ok((body_text, body_html, attachments)) => {
+                Ok(fetched) => {
                     if let Err(e) = cache.store_message_body_with_html(
                         message_id,
-                        &body_text,
-                        body_html.as_deref(),
-                        &attachments,
+                        &fetched.body_text,
+                        fetched.body_html.as_deref(),
+                        &fetched.attachments,
+                        fetched.unsubscribe_url.as_deref(),
+                        fetched.unsubscribe_one_click,
                     ) {
                         let _ = evt_tx.send(WorkerEvent::Error {
                             account_id: Some(account_id),
@@ -995,6 +995,127 @@ async fn handle_request(
             }
         }
 
+        // F-4 草稿自动保存：静默变体，不回发状态行（避免打字期间状态栏抖动），
+        // 仅回发草稿列表与 `DraftSaved`（携带本地草稿 ID 供写信页绑定）。
+        MailRequest::AutosaveLocalDraft { mut draft } => {
+            draft.updated_at = chrono::Utc::now().timestamp();
+            match cache.upsert_draft(&draft) {
+                Ok(draft_id) => {
+                    if let Ok(drafts) = cache.list_drafts() {
+                        let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
+                    }
+                    let _ = evt_tx.send(WorkerEvent::DraftSaved { draft_id });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(draft.account_id),
+                        message: format!("自动保存草稿失败: {e}"),
+                    });
+                }
+            }
+        }
+
+        // F-5 用户联系人：写库后统一回发合并后的联系人列表（含聚合结果）。
+        MailRequest::SaveUserContact { contact } => match cache.upsert_user_contact(&contact) {
+            Ok(_) => {
+                let items = cache.list_known_contacts("", 0, 500).unwrap_or_default();
+                let _ = evt_tx.send(WorkerEvent::KnownContactsLoaded { items });
+                let _ = evt_tx.send(WorkerEvent::Status {
+                    account_id: None,
+                    text: "联系人已保存".to_string(),
+                });
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: e,
+                });
+            }
+        },
+
+        MailRequest::DeleteUserContact { contact_id } => {
+            match cache.delete_user_contact(contact_id) {
+                Ok(_) => {
+                    let items = cache.list_known_contacts("", 0, 500).unwrap_or_default();
+                    let _ = evt_tx.send(WorkerEvent::KnownContactsLoaded { items });
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: None,
+                        text: "联系人已删除".to_string(),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        MailRequest::ImportUserContacts { contacts } => {
+            match cache.import_user_contacts(&contacts) {
+                Ok((added, skipped)) => {
+                    let items = cache.list_known_contacts("", 0, 500).unwrap_or_default();
+                    let _ = evt_tx.send(WorkerEvent::KnownContactsLoaded { items });
+                    let _ = evt_tx.send(WorkerEvent::ContactsImported { added, skipped });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        // F-6 附件总览图片预览：读取本地缓存的附件字节（仅图片附件点击时抓取）。
+        MailRequest::FetchAttachmentBytes { attachment_id } => {
+            match cache.get_attachment_bytes(attachment_id) {
+                Ok(Some((filename, mime_type, bytes))) => {
+                    let _ = evt_tx.send(WorkerEvent::AttachmentBytesFetched {
+                        attachment_id,
+                        filename,
+                        mime_type,
+                        bytes,
+                    });
+                }
+                Ok(None) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: "本地缓存中未找到该附件".to_string(),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        // F-7 RFC 8058 一键退订：POST `List-Unsubscribe=One-Click` 表单体；
+        // 重定向不跟随（重定向后的 200 不代表退订成功，对齐原版 #284）。
+        MailRequest::UnsubscribeOneClick { url } => {
+            let result = tokio::task::spawn_blocking(move || unsubscribe_one_click_post(&url))
+                .await
+                .unwrap_or_else(|e| Err(format!("退订任务异常: {e}")));
+            match result {
+                Ok(()) => {
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: None,
+                        text: "退订请求已发送成功".to_string(),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: format!("一键退订失败: {e}"),
+                    });
+                }
+            }
+        }
+
         MailRequest::ArchiveMessage {
             account_id,
             message_id,
@@ -1153,10 +1274,8 @@ async fn handle_request(
                         .into_iter()
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
-                    let _ = evt_tx.send(WorkerEvent::ForwardAttachmentsExported {
-                        message_id,
-                        paths,
-                    });
+                    let _ =
+                        evt_tx.send(WorkerEvent::ForwardAttachmentsExported { message_id, paths });
                 }
                 Err(e) => {
                     let _ = evt_tx.send(WorkerEvent::Error {
@@ -1171,7 +1290,7 @@ async fn handle_request(
             attachment_id,
             dest_path,
         } => match cache.get_attachment_bytes(attachment_id) {
-            Ok(Some((_name, bytes))) => match std::fs::write(&dest_path, bytes) {
+            Ok(Some((_name, _mime, bytes))) => match std::fs::write(&dest_path, bytes) {
                 Ok(()) => {
                     let _ = evt_tx.send(WorkerEvent::AttachmentSaved { path: dest_path });
                 }
@@ -1210,7 +1329,7 @@ async fn handle_request(
             let mut saved_count = 0usize;
             for att_id in attachment_ids {
                 match cache.get_attachment_bytes(att_id) {
-                    Ok(Some((name, bytes))) => {
+                    Ok(Some((name, _mime, bytes))) => {
                         let dest_path = crate::cache::unique_attachment_path(&dest_dir, &name);
                         match std::fs::write(&dest_path, bytes) {
                             Ok(()) => saved_count += 1,
@@ -1240,10 +1359,12 @@ async fn handle_request(
         MailRequest::SaveLocalDraft { mut draft } => {
             draft.updated_at = chrono::Utc::now().timestamp();
             match cache.upsert_draft(&draft) {
-                Ok(_) => {
+                Ok(draft_id) => {
                     if let Ok(drafts) = cache.list_drafts() {
                         let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
                     }
+                    // F-4：写信页据此绑定新分配的本地草稿 ID。
+                    let _ = evt_tx.send(WorkerEvent::DraftSaved { draft_id });
                     let _ = evt_tx.send(WorkerEvent::Status {
                         account_id: Some(draft.account_id),
                         text: "草稿已保存至本地".to_string(),
@@ -1324,9 +1445,8 @@ async fn handle_request(
                 UnifiedView::Sent => {
                     cache.list_sent_messages_with_options(&query, effective, sort, offset, limit)
                 }
-                UnifiedView::Archive => {
-                    cache.list_archived_messages_with_options(&query, effective, sort, offset, limit)
-                }
+                UnifiedView::Archive => cache
+                    .list_archived_messages_with_options(&query, effective, sort, offset, limit),
             };
             match result {
                 Ok(page) => {
@@ -2147,6 +2267,35 @@ fn merge_filter_options(
             quick_filters.starred = true;
             quick_filters
         }
+    }
+}
+
+/// F-7 RFC 8058 一键退订 POST（阻塞，须在后台线程执行）：
+/// 以 `application/x-www-form-urlencoded` 提交 `List-Unsubscribe=One-Click`，
+/// 仅 2xx 视为退订成功（对齐原版 `unsubscribe::action::one_click_post`）。
+fn unsubscribe_one_click_post(url: &str) -> Result<(), String> {
+    if !url
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("https://")
+    {
+        return Err("退订句柄不是 https 地址，无法执行一键退订".to_string());
+    }
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let status = match agent
+        .post(url)
+        .set("User-Agent", "Hylki/0.1")
+        .timeout(std::time::Duration::from_secs(20))
+        .send_form(&[("List-Unsubscribe", "One-Click")])
+    {
+        Ok(resp) => resp.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => return Err(e.to_string()),
+    };
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!("退订服务器返回 HTTP {status}"))
     }
 }
 

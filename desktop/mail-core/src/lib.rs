@@ -3,6 +3,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod contacts_io;
 pub mod demo;
 pub mod graph_client;
 pub mod imap_client;
@@ -13,11 +14,12 @@ pub mod smtp_client;
 pub mod worker;
 
 pub use search_query::SearchQuery;
-
 use serde::{Deserialize, Serialize};
 
-use crate::cache::{CachedAttachment, KnownContact};
-use crate::config::AccountConfig;
+use crate::{
+    cache::{CachedAttachment, CachedAttachmentInput, KnownContact},
+    config::AccountConfig,
+};
 
 /// Summary of a configured mail account shown in the left sidebar.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +136,34 @@ pub struct MessageDetail {
     /// Chronological messages belonging to the same conversation thread (empty or 1 item for standalone mails).
     #[serde(default)]
     pub thread_messages: Vec<ThreadMessage>,
+    /// F-7 一键退订：`List-Unsubscribe` 头中的第一个可执行地址
+    /// （http/https/mailto），正文抓取时随头解析并存入缓存；无该头时为 `None`。
+    #[serde(default)]
+    pub unsubscribe_url: Option<String>,
+    /// F-7 一键退订：是否携带 `List-Unsubscribe-Post: List-Unsubscribe=One-Click`
+    /// （RFC 8058），此时可静默 POST 而无需打开浏览器。
+    #[serde(default)]
+    pub unsubscribe_one_click: bool,
+}
+
+/// 一次完整正文抓取（IMAP `RFC822` / Graph 消息）解析出的载荷；
+/// 退订头在抓取时一并读出并随正文落库（对齐原版「正文抓取时读句柄」）。
+#[derive(Clone, Debug, Default)]
+pub struct FetchedMessageBody {
+    pub body_text: String,
+    pub body_html: Option<String>,
+    pub attachments: Vec<CachedAttachmentInput>,
+    pub unsubscribe_url: Option<String>,
+    pub unsubscribe_one_click: bool,
+}
+
+/// 用户手动维护的联系人（`user_contacts` 表行）；`id == 0` 表示待插入的新联系人。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserContact {
+    pub id: u32,
+    pub email: String,
+    pub display_name: String,
+    pub notes: String,
 }
 
 /// Persisted local compose draft recoverable across restarts.
@@ -571,6 +601,31 @@ pub enum MailRequest {
         folder_id: u32,
         folder_path: String,
     },
+    /// F-4 草稿自动保存：静默变体（不回发「草稿已保存」状态行，仅回发
+    /// `DraftsUpdated` 与 `DraftSaved`，避免打字期间状态栏抖动）。
+    AutosaveLocalDraft {
+        draft: LocalDraft,
+    },
+    /// F-5 用户联系人写入（`id == 0` 插入，其余按 id 更新；邮箱唯一冲突报错）。
+    SaveUserContact {
+        contact: UserContact,
+    },
+    /// F-5 删除用户联系人（仅 `user_contacts` 表中的自定义联系人可删）。
+    DeleteUserContact {
+        contact_id: u32,
+    },
+    /// F-5 批量导入用户联系人（按邮箱去重，已存在的跳过）。
+    ImportUserContacts {
+        contacts: Vec<UserContact>,
+    },
+    /// F-6 附件总览图片预览：读取本地缓存的附件字节。
+    FetchAttachmentBytes {
+        attachment_id: u32,
+    },
+    /// F-7 一键退订（RFC 8058）：对 https 句柄 POST `List-Unsubscribe=One-Click`。
+    UnsubscribeOneClick {
+        url: String,
+    },
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.
@@ -673,6 +728,23 @@ pub enum WorkerEvent {
     /// Aggregated known contacts were loaded for the contacts view.
     KnownContactsLoaded {
         items: Vec<KnownContact>,
+    },
+    /// F-4 草稿落库完成（含新增分配的本地 ID；写信页据此绑定 `compose_draft_id`
+    /// 并在自动保存后显示「草稿已自动保存 HH:MM」）。
+    DraftSaved {
+        draft_id: u32,
+    },
+    /// F-5 批量导入结果（`skipped` 为因邮箱重复被跳过的条数）。
+    ContactsImported {
+        added: usize,
+        skipped: usize,
+    },
+    /// F-6 附件总览图片预览所需的附件字节（仅图片附件点击时抓取）。
+    AttachmentBytesFetched {
+        attachment_id: u32,
+        filename: String,
+        mime_type: String,
+        bytes: Vec<u8>,
     },
     /// Result of fetching an older batch of messages from the remote server.
     OlderMessagesLoaded {

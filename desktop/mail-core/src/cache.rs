@@ -10,7 +10,7 @@ use crate::search_query::SearchQuery;
 use crate::{
     start_of_today_ts, AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail,
     MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet,
-    ThreadMessage,
+    ThreadMessage, UserContact,
 };
 
 /// Remote folder metadata returned by IMAP LIST/STATUS.
@@ -60,14 +60,28 @@ pub struct CachedAttachment {
     pub sender: String,
     pub subject: String,
     pub date_display: String,
+    /// F-6 表头日期排序用的 Unix 时间戳（`date_display` 字符串排序无法跨年比较）。
+    #[serde(default)]
+    pub date_ts: i64,
 }
 
 /// Contact aggregated from cached senders/recipients for the contacts view.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `custom == true` 的行来自 `user_contacts` 表（用户手动维护，可编辑 / 删除），
+/// 其余为已同步邮件自动聚合的结果（只读展示）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownContact {
     pub name: String,
     pub email: String,
     pub message_count: usize,
+    /// 自定义联系人行 ID（聚合联系人恒为 0）。
+    #[serde(default)]
+    pub id: u32,
+    /// 自定义联系人备注（聚合联系人为空）。
+    #[serde(default)]
+    pub notes: String,
+    /// 是否为用户自定义联系人（列表中标注来源徽标并开放编辑 / 删除）。
+    #[serde(default)]
+    pub custom: bool,
 }
 
 /// SQL predicate matching every account's Sent folder by friendly name or raw path.
@@ -174,6 +188,63 @@ pub fn sanitize_filename(name: &str) -> String {
     } else {
         safe
     }
+}
+
+/// F-7：从 `List-Unsubscribe` 头的值中提取第一个可执行的退订地址。
+///
+/// 按 RFC 2369 该头携带一个或多个 `<uri>`；真实邮件常有不带尖括号的写法，
+/// 因此先取 `<...>` 段，取不到再按空白 / 逗号拆分裸值。只接受
+/// `http://` / `https://` / `mailto:` 开头的地址，命中第一个即返回。
+pub fn extract_unsubscribe_url(header_value: &str) -> Option<String> {
+    let value = header_value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut candidates: Vec<&str> = Vec::new();
+    let mut rest = value;
+    while let Some(open) = rest.find('<') {
+        let after_open = &rest[open + 1..];
+        match after_open.find('>') {
+            Some(close) => {
+                candidates.push(after_open[..close].trim());
+                rest = &after_open[close + 1..];
+            }
+            None => {
+                // 缺少右尖括号：把剩余内容当作一个候选后结束。
+                candidates.push(after_open.trim());
+                break;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        candidates = value
+            .split([',', ';', ' ', '\t'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    candidates
+        .into_iter()
+        .map(|c| c.trim_end_matches(',').trim())
+        .find(|c| {
+            c.to_ascii_lowercase().starts_with("https://")
+                || c.to_ascii_lowercase().starts_with("http://")
+                || c.to_ascii_lowercase().starts_with("mailto:")
+        })
+        .map(str::to_string)
+}
+
+/// F-7：判断 `List-Unsubscribe-Post` 头是否为 RFC 8058 规定的
+/// `List-Unsubscribe=One-Click`（比较忽略大小写、空白与引号）。
+pub fn is_one_click_post(header_value: &str) -> bool {
+    header_value
+        .trim()
+        .trim_matches('"')
+        .split([',', ';'])
+        .any(|part| {
+            let compact: String = part.chars().filter(|c| !c.is_whitespace()).collect();
+            compact.eq_ignore_ascii_case("List-Unsubscribe=One-Click")
+        })
 }
 
 /// Compute a non-colliding file path in `dir` for `filename`, appending `(1)`, `(2)`, ...
@@ -350,6 +421,30 @@ impl CacheStore {
         // RFC 会话线程关联头（In-Reply-To / References 或 Graph conversationId）。
         self.ensure_column("messages", "in_reply_to", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("messages", "references_header", "TEXT NOT NULL DEFAULT ''")?;
+        // F-7 一键退订：`List-Unsubscribe` 第一个可执行地址与 RFC 8058 one-click
+        // 标记（正文抓取时随头解析写入；旧库补列，历史数据视为无退订头）。
+        self.ensure_column("messages", "list_unsubscribe", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column(
+            "messages",
+            "list_unsubscribe_post",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // F-5 用户手动维护的联系人（与邮件聚合联系人合并展示；新增表对旧库无侵入，
+        // `CREATE TABLE IF NOT EXISTS` 即完成迁移）。
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS user_contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                ",
+            )
+            .map_err(|e| format!("初始化用户联系人表失败: {e}"))?;
         self.conn
             .execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_account_msgid ON messages(account_id, message_id)",
@@ -398,7 +493,10 @@ impl CacheStore {
             .unwrap_or(0);
         if schema_version < 1 {
             self.conn
-                .execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')", [])
+                .execute(
+                    "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
+                    [],
+                )
                 .map_err(|e| format!("重建 FTS5 全文索引失败: {e}"))?;
             self.conn
                 .execute("PRAGMA user_version = 1", [])
@@ -1481,7 +1579,8 @@ impl CacheStore {
             .query_row(
                 "
                 SELECT m.id, m.account_id, m.folder_id, m.uid, m.message_id, m.sender, m.recipients,
-                       m.subject, m.date_display, m.body_text, m.body_html, m.flagged, f.path
+                       m.subject, m.date_display, m.body_text, m.body_html, m.flagged, f.path,
+                       m.list_unsubscribe, m.list_unsubscribe_post
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE m.id = ?1
@@ -1490,6 +1589,7 @@ impl CacheStore {
                 |row| {
                     let body: Option<String> = row.get(9)?;
                     let body_html: Option<String> = row.get(10)?;
+                    let unsub: String = row.get(13)?;
                     Ok((
                         row.get::<_, u32>(0)?,
                         row.get::<_, u32>(1)?,
@@ -1504,6 +1604,8 @@ impl CacheStore {
                         body_html,
                         row.get::<_, i32>(11)? != 0,
                         row.get::<_, String>(12)?,
+                        (!unsub.trim().is_empty()).then_some(unsub),
+                        row.get::<_, i32>(14)? != 0,
                     ))
                 },
             )
@@ -1524,6 +1626,8 @@ impl CacheStore {
             body_html,
             flagged,
             folder_path,
+            unsubscribe_url,
+            unsubscribe_one_click,
         )) = row
         else {
             return Ok(None);
@@ -1551,6 +1655,8 @@ impl CacheStore {
             flagged,
             attachments,
             thread_messages,
+            unsubscribe_url,
+            unsubscribe_one_click,
         };
         Ok(Some((detail, uid, body_loaded)))
     }
@@ -1931,16 +2037,19 @@ impl CacheStore {
         body_text: &str,
         attachments: &[CachedAttachmentInput],
     ) -> Result<(), String> {
-        self.store_message_body_with_html(message_id, body_text, None, attachments)
+        self.store_message_body_with_html(message_id, body_text, None, attachments, None, false)
     }
 
-    /// Save fetched message plain text, optional HTML body, and attachments in one transaction.
+    /// Save fetched message plain text, optional HTML body, attachments, and the
+    /// `List-Unsubscribe` handles parsed from the raw headers (F-7) in one transaction.
     pub fn store_message_body_with_html(
         &mut self,
         message_id: u32,
         body_text: &str,
         body_html: Option<&str>,
         attachments: &[CachedAttachmentInput],
+        unsubscribe_url: Option<&str>,
+        unsubscribe_one_click: bool,
     ) -> Result<(), String> {
         let tx = self
             .conn
@@ -1952,10 +2061,19 @@ impl CacheStore {
             UPDATE messages
             SET body_text = ?1,
                 body_html = ?2,
-                has_attachment = CASE WHEN ?3 > 0 THEN 1 ELSE has_attachment END
+                has_attachment = CASE WHEN ?3 > 0 THEN 1 ELSE has_attachment END,
+                list_unsubscribe = ?5,
+                list_unsubscribe_post = ?6
             WHERE id = ?4
             ",
-            params![body_text, body_html, attachments.len() as i64, message_id],
+            params![
+                body_text,
+                body_html,
+                attachments.len() as i64,
+                message_id,
+                unsubscribe_url.unwrap_or_default(),
+                unsubscribe_one_click as i64,
+            ],
         )
         .map_err(|e| format!("保存邮件正文失败: {e}"))?;
 
@@ -2042,7 +2160,7 @@ impl CacheStore {
                 .prepare(
                     "
                     SELECT a.id, a.message_id, m.account_id, a.filename, a.mime_type, a.size_bytes,
-                           m.sender, m.subject, m.date_display
+                           m.sender, m.subject, m.date_display, m.date_ts
                     FROM attachments a
                     JOIN messages m ON m.id = a.message_id
                     ORDER BY m.date_ts DESC, a.id ASC
@@ -2063,7 +2181,7 @@ impl CacheStore {
                 .prepare(
                     "
                     SELECT a.id, a.message_id, m.account_id, a.filename, a.mime_type, a.size_bytes,
-                           m.sender, m.subject, m.date_display
+                           m.sender, m.subject, m.date_display, m.date_ts
                     FROM attachments a
                     JOIN messages m ON m.id = a.message_id
                     WHERE (a.filename LIKE ?1 OR m.sender LIKE ?1 OR m.subject LIKE ?1)
@@ -2085,9 +2203,10 @@ impl CacheStore {
         Ok(rows)
     }
 
-    /// Aggregate known contacts from cached senders/recipients, deduplicated by
-    /// e-mail address, filtered by `query` against name / e-mail, ranked by
-    /// message count in descending order.
+    /// Aggregate known contacts from cached senders/recipients, merged with the
+    /// user-maintained `user_contacts` table (F-5)：自定义联系人排在最前并带
+    /// `custom` 标记（往来邮件数沿用聚合统计，无记录则为 0），其余按邮件数
+    /// 降序。按 `query` 对姓名 / 邮箱过滤，邮箱去重（小写键）。
     pub fn list_known_contacts(
         &self,
         query: &str,
@@ -2143,7 +2262,37 @@ impl CacheStore {
                 name: names.get(&key).cloned().unwrap_or_default(),
                 email: emails.get(&key).cloned().unwrap_or(key.clone()),
                 message_count,
+                ..KnownContact::default()
             })
+            .collect();
+
+        // F-5：叠加用户自定义联系人（邮箱冲突时覆盖聚合行的姓名 / 备注）。
+        for user in self.list_user_contacts()? {
+            let key = user.email.trim().to_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(existing) = contacts.iter_mut().find(|c| c.email.to_lowercase() == key) {
+                existing.id = user.id;
+                existing.notes = user.notes;
+                existing.custom = true;
+                if !user.display_name.trim().is_empty() {
+                    existing.name = user.display_name;
+                }
+            } else {
+                contacts.push(KnownContact {
+                    name: user.display_name,
+                    email: user.email,
+                    message_count: 0,
+                    id: user.id,
+                    notes: user.notes,
+                    custom: true,
+                });
+            }
+        }
+
+        let mut contacts: Vec<KnownContact> = contacts
+            .into_iter()
             .filter(|c| {
                 trimmed.is_empty()
                     || c.name.to_lowercase().contains(&trimmed)
@@ -2151,13 +2300,136 @@ impl CacheStore {
             })
             .collect();
 
-        // Rank by message count (descending) with a stable e-mail tie-break.
+        // 自定义联系人优先，其余按往来邮件数降序（平局按邮箱稳定次序）。
         contacts.sort_by(|a, b| {
-            b.message_count
-                .cmp(&a.message_count)
+            b.custom
+                .cmp(&a.custom)
+                .then_with(|| b.message_count.cmp(&a.message_count))
                 .then_with(|| a.email.cmp(&b.email))
         });
         Ok(contacts.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// List every user-maintained contact (F-5)，按创建顺序返回。
+    pub fn list_user_contacts(&self) -> Result<Vec<UserContact>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, email, display_name, notes
+                FROM user_contacts
+                ORDER BY id ASC
+                ",
+            )
+            .map_err(|e| format!("查询用户联系人失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UserContact {
+                    id: row.get::<_, i64>(0)? as u32,
+                    email: row.get(1)?,
+                    display_name: row.get(2)?,
+                    notes: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("读取用户联系人失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析用户联系人失败: {e}"))?;
+        Ok(rows)
+    }
+
+    /// Insert or update a user-maintained contact (F-5)。`id == 0` 插入；
+    /// 插入时邮箱唯一冲突报错，更新时不得改与其他行冲突的邮箱。
+    pub fn upsert_user_contact(&mut self, contact: &UserContact) -> Result<u32, String> {
+        let email = contact.email.trim().to_string();
+        if !email.contains('@') {
+            return Err("邮箱地址不合法".to_string());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let display_name = contact.display_name.trim().to_string();
+        let notes = contact.notes.clone();
+        if contact.id == 0 {
+            self.conn
+                .execute(
+                    "
+                    INSERT INTO user_contacts (email, display_name, notes, created_at, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?4)
+                    ",
+                    params![email, display_name, notes, now],
+                )
+                .map_err(|e| {
+                    if format!("{e}").contains("UNIQUE") {
+                        format!("已存在邮箱为 {email} 的联系人")
+                    } else {
+                        format!("保存联系人失败: {e}")
+                    }
+                })?;
+            Ok(self.conn.last_insert_rowid() as u32)
+        } else {
+            self.conn
+                .execute(
+                    "
+                    UPDATE user_contacts
+                    SET email = ?1, display_name = ?2, notes = ?3, updated_at = ?4
+                    WHERE id = ?5
+                    ",
+                    params![email, display_name, notes, now, contact.id],
+                )
+                .map_err(|e| {
+                    if format!("{e}").contains("UNIQUE") {
+                        format!("已存在邮箱为 {email} 的联系人")
+                    } else {
+                        format!("更新联系人失败: {e}")
+                    }
+                })?;
+            Ok(contact.id)
+        }
+    }
+
+    /// Delete a user-maintained contact by row ID (F-5)。返回是否存在对应行。
+    pub fn delete_user_contact(&mut self, contact_id: u32) -> Result<bool, String> {
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM user_contacts WHERE id = ?1",
+                params![contact_id],
+            )
+            .map_err(|e| format!("删除联系人失败: {e}"))?;
+        Ok(affected > 0)
+    }
+
+    /// Bulk-import user contacts (F-5)：按邮箱去重（`INSERT OR IGNORE`），
+    /// 返回 `(新增, 跳过)` 计数。
+    pub fn import_user_contacts(
+        &mut self,
+        contacts: &[UserContact],
+    ) -> Result<(usize, usize), String> {
+        let now = chrono::Utc::now().timestamp();
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for contact in contacts {
+            let email = contact.email.trim().to_string();
+            if !email.contains('@') {
+                skipped += 1;
+                continue;
+            }
+            let affected = self
+                .conn
+                .execute(
+                    "
+                    INSERT OR IGNORE INTO user_contacts
+                        (email, display_name, notes, created_at, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?4)
+                    ",
+                    params![email, contact.display_name.trim(), contact.notes, now],
+                )
+                .map_err(|e| format!("导入联系人失败: {e}"))?;
+            if affected > 0 {
+                added += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        Ok((added, skipped))
     }
 
     /// Find the account's Archive folder `(folder_id, path)` using the same
@@ -2235,16 +2507,22 @@ impl CacheStore {
         Ok(Some(folder_id))
     }
 
-    /// Read raw attachment bytes from local cache.
+    /// Read raw attachment bytes (with filename and MIME type) from local cache.
     pub fn get_attachment_bytes(
         &self,
         attachment_id: u32,
-    ) -> Result<Option<(String, Vec<u8>)>, String> {
+    ) -> Result<Option<(String, String, Vec<u8>)>, String> {
         self.conn
             .query_row(
-                "SELECT filename, content FROM attachments WHERE id = ?1",
+                "SELECT filename, mime_type, content FROM attachments WHERE id = ?1",
                 params![attachment_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| format!("读取附件内容失败: {e}"))
@@ -2669,6 +2947,7 @@ fn map_attachment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedAttachm
         sender: row.get(6)?,
         subject: row.get(7)?,
         date_display: row.get(8)?,
+        date_ts: row.get(9)?,
     })
 }
 
@@ -3941,18 +4220,8 @@ mod tests {
             .unwrap();
 
         let inbox_page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
-        let reply2_id = inbox_page
-            .items
-            .iter()
-            .find(|m| m.uid == 12)
-            .unwrap()
-            .id;
-        let root_inbox_id = inbox_page
-            .items
-            .iter()
-            .find(|m| m.uid == 10)
-            .unwrap()
-            .id;
+        let reply2_id = inbox_page.items.iter().find(|m| m.uid == 12).unwrap().id;
+        let root_inbox_id = inbox_page.items.iter().find(|m| m.uid == 10).unwrap().id;
 
         // 降序：reply2 (3000) -> reply1 (2000) -> root (1000)，且 Trash 副本被去重。
         let desc = cache
@@ -4581,6 +4850,253 @@ mod tests {
             .find(|m| m.subject == "Re: 项目排期讨论")
             .unwrap();
         assert_eq!(with_recipients.recipients, "team@example.com");
+    }
+
+    #[test]
+    fn extract_unsubscribe_url_picks_first_supported_handle() {
+        // 标准写法：https 优先于 mailto（按出现顺序取第一个可执行项）。
+        assert_eq!(
+            extract_unsubscribe_url(
+                "<https://lists.example.com/unsub?id=1>, <mailto:leave@lists.example.com>"
+            ),
+            Some("https://lists.example.com/unsub?id=1".to_string())
+        );
+        // 只有 mailto。
+        assert_eq!(
+            extract_unsubscribe_url("<mailto:leave@lists.example.com?subject=unsubscribe>"),
+            Some("mailto:leave@lists.example.com?subject=unsubscribe".to_string())
+        );
+        // 无尖括号（Amazon SES 等变体）。
+        assert_eq!(
+            extract_unsubscribe_url("https://unsub.example.com/u?a=b"),
+            Some("https://unsub.example.com/u?a=b".to_string())
+        );
+        // 大小写不敏感的协议头 + 空白。
+        assert_eq!(
+            extract_unsubscribe_url("  HTTPS://Unsub.Example.com/x  "),
+            Some("HTTPS://Unsub.Example.com/x".to_string())
+        );
+        // 非法 / 空值不产生 URL；ftp 等不支持的协议被跳过。
+        assert_eq!(extract_unsubscribe_url(""), None);
+        assert_eq!(extract_unsubscribe_url("<ftp://example.com/x>"), None);
+        assert_eq!(
+            extract_unsubscribe_url("<ftp://example.com/x>, <mailto:leave@x.example>"),
+            Some("mailto:leave@x.example".to_string())
+        );
+    }
+
+    #[test]
+    fn is_one_click_post_matches_rfc8058_value() {
+        assert!(is_one_click_post("List-Unsubscribe=One-Click"));
+        assert!(is_one_click_post(" list-unsubscribe = one-click "));
+        assert!(is_one_click_post("\"List-Unsubscribe=One-Click\""));
+        assert!(!is_one_click_post("List-Unsubscribe=Two-Click"));
+        assert!(!is_one_click_post(""));
+    }
+
+    #[test]
+    fn user_contacts_crud_and_merge_with_aggregated_contacts() {
+        let mut store = CacheStore::open_in_memory().unwrap();
+        store
+            .sync_folders(1, &[folder("收件箱", "INBOX"), folder("已发送", "Sent")])
+            .unwrap();
+        let inbox_id = store.find_inbox_folder(1).unwrap().unwrap().0;
+        store
+            .commit_folder_headers(
+                1,
+                inbox_id,
+                1,
+                &[
+                    sample_header(1, "季度会议通知"),
+                    sample_header(2, "会议纪要"),
+                ],
+                None,
+            )
+            .unwrap();
+
+        // 插入两个自定义联系人（其一与聚合联系人同邮箱）。
+        let id_new = store
+            .upsert_user_contact(&UserContact {
+                id: 0,
+                email: "custom@example.com".to_string(),
+                display_name: "自定义联系人".to_string(),
+                notes: "备注 A".to_string(),
+            })
+            .unwrap();
+        assert!(id_new > 0);
+        let alice_email = "alice@example.com".to_string();
+        let id_alice = store
+            .upsert_user_contact(&UserContact {
+                id: 0,
+                email: alice_email.clone(),
+                display_name: "Alice 手工版".to_string(),
+                notes: String::new(),
+            })
+            .unwrap();
+
+        // 邮箱唯一约束：重复插入报错。
+        assert!(store
+            .upsert_user_contact(&UserContact {
+                id: 0,
+                email: alice_email.clone(),
+                display_name: "重复".to_string(),
+                notes: String::new(),
+            })
+            .is_err());
+
+        let contacts = store.list_known_contacts("", 0, 50).unwrap();
+        let custom = contacts.iter().filter(|c| c.custom).count();
+        assert_eq!(custom, 2);
+        // 自定义联系人排在最前。
+        assert!(contacts[0].custom && contacts[1].custom);
+        let merged = contacts
+            .iter()
+            .find(|c| c.email == alice_email)
+            .expect("聚合邮箱应与自定义联系人合并");
+        assert_eq!(merged.id, id_alice);
+        assert_eq!(merged.name, "Alice 手工版");
+        // 聚合往来计数保留。
+        assert!(merged.message_count >= 2);
+        let pure_custom = contacts
+            .iter()
+            .find(|c| c.email == "custom@example.com")
+            .unwrap();
+        assert_eq!(pure_custom.notes, "备注 A");
+        assert_eq!(pure_custom.message_count, 0);
+
+        // 更新 / 删除。
+        let updated = store
+            .upsert_user_contact(&UserContact {
+                id: id_new,
+                email: "custom@example.com".to_string(),
+                display_name: "改名".to_string(),
+                notes: String::new(),
+            })
+            .unwrap();
+        assert_eq!(updated, id_new);
+        let renamed = store.list_user_contacts().unwrap();
+        assert_eq!(renamed.len(), 2);
+        assert_eq!(
+            renamed
+                .iter()
+                .find(|c| c.id == id_new)
+                .unwrap()
+                .display_name,
+            "改名"
+        );
+        assert!(store.delete_user_contact(id_new).unwrap());
+        assert!(!store.delete_user_contact(id_new).unwrap());
+
+        // 批量导入：按邮箱去重。
+        let (added, skipped) = store
+            .import_user_contacts(&[
+                UserContact {
+                    id: 0,
+                    email: "alice@example.com".to_string(),
+                    display_name: String::new(),
+                    notes: String::new(),
+                },
+                UserContact {
+                    id: 0,
+                    email: "batch1@example.com".to_string(),
+                    display_name: "批量一".to_string(),
+                    notes: String::new(),
+                },
+                UserContact {
+                    id: 0,
+                    email: "not-an-email".to_string(),
+                    display_name: String::new(),
+                    notes: String::new(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn store_message_body_persists_unsubscribe_headers() {
+        let mut store = CacheStore::open_in_memory().unwrap();
+        store.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let inbox_id = store.find_inbox_folder(1).unwrap().unwrap().0;
+        store
+            .commit_folder_headers(1, inbox_id, 1, &[sample_header(1, "周刊")], None)
+            .unwrap();
+        let msg_id = store.list_messages_page(inbox_id, "", 0, 10).unwrap().items[0].id;
+        store
+            .store_message_body_with_html(
+                msg_id,
+                "正文",
+                None,
+                &[],
+                Some("https://lists.example.com/unsub"),
+                true,
+            )
+            .unwrap();
+        let (detail, _, _) = store.get_message_detail(msg_id).unwrap().unwrap();
+        assert_eq!(
+            detail.unsubscribe_url.as_deref(),
+            Some("https://lists.example.com/unsub")
+        );
+        assert!(detail.unsubscribe_one_click);
+    }
+
+    #[test]
+    fn open_old_database_keeps_drafts_and_creates_user_contacts() {
+        // 模拟旧版本库：只含 drafts 表（无 user_contacts / list_unsubscribe 列），
+        // 打开时补表补列且历史数据保留（迁移兼容）。
+        let dir = std::env::temp_dir().join(format!(
+            "hylki-migrate-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("cache.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE drafts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    to_addr TEXT NOT NULL,
+                    cc_addr TEXT NOT NULL DEFAULT '',
+                    bcc_addr TEXT NOT NULL DEFAULT '',
+                    subject TEXT NOT NULL,
+                    body_text TEXT NOT NULL,
+                    in_reply_to TEXT NOT NULL DEFAULT '',
+                    attachment_paths_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO drafts (account_id, to_addr, subject, body_text, updated_at)
+                VALUES (1, 'old@example.com', '旧草稿', '旧内容', 123);
+                ",
+            )
+            .unwrap();
+        }
+        let mut store = CacheStore::open(&db_path).unwrap();
+        // 旧草稿仍在（旧库无 cc/bcc 列，补列后历史数据视为空串）。
+        let drafts = store.list_drafts().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].subject, "旧草稿");
+        // 新表可用。
+        let id = store
+            .upsert_user_contact(&UserContact {
+                id: 0,
+                email: "new@example.com".to_string(),
+                display_name: "新联系人".to_string(),
+                notes: String::new(),
+            })
+            .unwrap();
+        assert!(id > 0);
+        drop(store);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(dir.join("cache.db-wal"));
+        let _ = std::fs::remove_file(dir.join("cache.db-shm"));
+        let _ = std::fs::remove_dir(&dir);
     }
 }
 
