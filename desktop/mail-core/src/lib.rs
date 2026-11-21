@@ -13,6 +13,7 @@ pub mod worker;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::{CachedAttachment, KnownContact};
 use crate::config::AccountConfig;
 
 /// Summary of a configured mail account shown in the left sidebar.
@@ -168,6 +169,14 @@ pub struct OutboxItem {
     pub last_error: String,
 }
 
+/// Unified cross-account views backed by dedicated cache queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnifiedView {
+    Starred,
+    Sent,
+    Archive,
+}
+
 /// Commands sent from the GPUI frontend to the mail worker.
 #[derive(Clone, Debug)]
 pub enum MailRequest {
@@ -254,6 +263,22 @@ pub enum MailRequest {
         account_id: u32,
         outbox_id: u32,
     },
+    LoadUnifiedView {
+        view: UnifiedView,
+        query: String,
+        offset: usize,
+        limit: usize,
+    },
+    ListCachedAttachments {
+        query: String,
+        offset: usize,
+        limit: usize,
+    },
+    ListKnownContacts {
+        query: String,
+        offset: usize,
+        limit: usize,
+    },
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.
@@ -300,6 +325,19 @@ pub enum WorkerEvent {
     MessageDeleted {
         account_id: u32,
         message_id: u32,
+    },
+    /// A page of one unified view (starred / sent / archive) was loaded.
+    UnifiedViewLoaded {
+        view: UnifiedView,
+        page: MailPage,
+    },
+    /// A page of cached attachments was loaded for the gallery view.
+    CachedAttachmentsLoaded {
+        items: Vec<CachedAttachment>,
+    },
+    /// Aggregated known contacts were loaded for the contacts view.
+    KnownContactsLoaded {
+        items: Vec<KnownContact>,
     },
     Status {
         account_id: Option<u32>,

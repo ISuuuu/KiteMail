@@ -522,6 +522,11 @@ impl HylkiApp {
                     // Backend receipt for archive/delete; the accompanying
                     // FoldersLoaded event already refreshes folder counters.
                 }
+                WorkerEvent::UnifiedViewLoaded { .. }
+                | WorkerEvent::CachedAttachmentsLoaded { .. }
+                | WorkerEvent::KnownContactsLoaded { .. } => {
+                    // TODO(phase2/3): wire unified views, gallery and contacts.
+                }
             }
         }
         cx.notify();

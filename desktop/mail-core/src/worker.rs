@@ -10,7 +10,8 @@ use crate::config::{self, AccountConfig, AuthBackend};
 use crate::secrets::{self, AccountSecrets};
 use crate::smtp_client::SendOutcome;
 use crate::{
-    graph_client, imap_client, oauth, smtp_client, MailRequest, OutboxStatus, WorkerEvent,
+    graph_client, imap_client, oauth, smtp_client, MailRequest, OutboxStatus, UnifiedView,
+    WorkerEvent,
 };
 
 type TokenCache = HashMap<u32, (String, Instant)>;
@@ -649,6 +650,62 @@ async fn handle_request(
         } => {
             send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
         }
+
+        MailRequest::LoadUnifiedView {
+            view,
+            query,
+            offset,
+            limit,
+        } => {
+            let result = match view {
+                UnifiedView::Starred => cache.list_starred_messages(&query, offset, limit),
+                UnifiedView::Sent => cache.list_sent_messages(&query, offset, limit),
+                UnifiedView::Archive => cache.list_archived_messages(&query, offset, limit),
+            };
+            match result {
+                Ok(page) => {
+                    let _ = evt_tx.send(WorkerEvent::UnifiedViewLoaded { view, page });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        MailRequest::ListCachedAttachments {
+            query,
+            offset,
+            limit,
+        } => match cache.list_cached_attachments(&query, offset, limit) {
+            Ok(items) => {
+                let _ = evt_tx.send(WorkerEvent::CachedAttachmentsLoaded { items });
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: e,
+                });
+            }
+        },
+
+        MailRequest::ListKnownContacts {
+            query,
+            offset,
+            limit,
+        } => match cache.list_known_contacts(&query, offset, limit) {
+            Ok(items) => {
+                let _ = evt_tx.send(WorkerEvent::KnownContactsLoaded { items });
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: e,
+                });
+            }
+        },
     }
 }
 
