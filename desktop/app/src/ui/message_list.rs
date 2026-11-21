@@ -28,16 +28,17 @@ use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, WindowControlArea,
+    ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
+    WindowControlArea,
 };
 use hylki_mail_core::{date_group_label, LocalDraft, MessageSort, MessageSummary, SearchScope};
 
-use crate::app::{CurrentView, HylkiApp, PendingRowAction};
+use crate::app::{CurrentView, HylkiApp, PendingRowAction, ReaderPosition, RightPaneMode};
 use crate::theme;
-use crate::ui::avatar;
+use crate::ui::{avatar, window_controls};
 
-/// 中栏宽度（方案文档：340 ~ 380px）。
-const LIST_WIDTH: f32 = 360.0;
+/// 中栏默认宽度（方案文档：340 ~ 380px；L-2 起可拖拽调整并持久化到偏好）。
+pub(crate) const LIST_WIDTH: f32 = 360.0;
 /// 顶部栏高度（与左栏 / 右栏统一为 48px）。
 const HEADER_HEIGHT: f32 = 48.0;
 /// 列表行高度。
@@ -350,8 +351,9 @@ fn message_row(
     } else {
         sender_email
     };
-    // 偏好「列表密度」：紧凑模式行高约 64px 且隐藏摘要行（方案文档五.2）。
-    let compact = app.prefs.compact_list;
+    // 偏好「列表密度」：紧凑模式行高约 64px 且隐藏摘要行（方案文档五.2）；
+    // L-2：列表拖宽 ≥600px 时自动切换单行表格模式（对齐原版 LIST_WIDE_ON，迟滞在 app.rs）。
+    let compact = app.prefs.compact_list || app.list_wide;
 
     let row = h_flex()
         .id(("msg", msg_id))
@@ -572,7 +574,11 @@ fn message_row(
 }
 
 /// 渲染中栏。
-pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
+pub(crate) fn render(
+    app: &HylkiApp,
+    window: &Window,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 出来。
     let p = theme::current(cx);
     let (surface, border, muted_fg) = (p.surface, p.border, p.text_muted);
@@ -835,9 +841,15 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let search_open = app.search_open;
     // 搜索栏行显示条件：点 🔍 / Ctrl+F 展开时，或已有搜索词时（保持范围胶囊可见）。
     let show_search_bar = search_open || has_search_query;
+    // L-6：阅读器在下方 / 关闭时列表顶栏即窗口顶栏（对齐原版 controls_in_list），
+    // 需在此承载 Windows 窗口控制按钮（阅读器右侧时由阅读器顶栏承载）。
+    let controls_in_list = !app.focus_mode
+        && app.right_mode != RightPaneMode::Welcome
+        && app.reader_position != ReaderPosition::Right;
 
+    // 宽度由外层容器决定（L-2：可拖拽 / Hidden 模式占满），列表本体填满容器。
     v_flex()
-        .w(px(LIST_WIDTH))
+        .w_full()
         .h_full()
         .flex_shrink_0()
         .bg(surface)
@@ -895,7 +907,14 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 .child(SharedString::from(count_text)),
                         ),
                 )
-                .when(is_unified_list, |el| el.child(filter_menu_button)),
+                .when(is_unified_list, |el| el.child(filter_menu_button))
+                // L-6：阅读器不在右侧（下方 / 关闭）时本顶栏即窗口顶栏，承载
+                // Windows 窗口控制按钮；拖拽热区由中间计数区的 WindowControlArea 补足。
+                .when(controls_in_list, |el| {
+                    el.child(window_controls::render_window_controls(
+                        "list-wc", window, cx,
+                    ))
+                }),
         )
         // 搜索栏行（顶栏下方）：搜索框 + 范围切换胶囊（当前视图 / 全部文件夹）
         // + 服务端搜索按钮；Esc 清空并收起，Enter 触发服务端在线搜索。
