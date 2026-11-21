@@ -189,6 +189,10 @@ impl CurrentView {
 
 // 全局快捷键动作（方案文档五.3）；键绑定注册在 main.rs，
 // 动作监听挂在根节点 render 上。
+//
+// F-1 阶段三：`Reply*` / `ViewMessageSource` 为 Ctrl 组合键动作（不受单键偏好
+// 控制）；`SingleKey*` 前缀为单键动作，on_action 守卫里统一检查
+// `prefs.single_key_shortcuts`（偏好设置「常规」页可关闭）。
 actions!(
     hylki,
     [
@@ -210,7 +214,26 @@ actions!(
         ZoomReset,
         ToggleFullscreen,
         ToggleAccountsList,
-        OpenShortcutsWindow
+        OpenShortcutsWindow,
+        // ---- F-1 阶段三：组合键（始终生效）----
+        ReplyCurrent,
+        ReplyAllCurrent,
+        ViewMessageSource,
+        // ---- F-1 阶段三：单键（受 single_key_shortcuts 偏好控制）----
+        SingleKeyNextMessage,
+        SingleKeyPrevMessage,
+        SingleKeyReply,
+        SingleKeyReplyAll,
+        SingleKeyForward,
+        SingleKeyArchive,
+        SingleKeyDelete,
+        SingleKeyMarkSpam,
+        SingleKeyToggleStar,
+        SingleKeyToggleRead,
+        SingleKeyCompose,
+        SingleKeyBackToList,
+        SingleKeyNextCard,
+        SingleKeyPrevCard
     ]
 );
 
@@ -4191,7 +4214,7 @@ impl HylkiApp {
         self.close_modal(cx);
     }
 
-    /// 刷新全部（侧栏刷新按钮 / 命令面板 / Ctrl+R 共用）。
+    /// 刷新全部（侧栏刷新按钮 / 命令面板 / F5 共用；阶段三起 Ctrl+R 改为回复）。
     pub(crate) fn refresh_all(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
             self.reload_current_page(cx);
@@ -4307,6 +4330,39 @@ impl HylkiApp {
             &msg.folder_path,
             cx,
         );
+    }
+
+    /// F-1：会话内步进下一张 (`delta = 1`) / 上一张 (`delta = -1`) 卡片（单键 w / b）。
+    ///
+    /// 复用现有选择路径：把选中锚点切到目标卡片并加载其正文——`set_selected_message`
+    /// 的同会话分支会自动展开目标折叠卡片，阅读器的 is_current 高亮随锚点移动。
+    /// 不做程序化滚动：阅读器滚动容器没有逐卡片锚点（如需可后续加 ScrollHandle）。
+    /// 单卡 / 空会话时无邻卡，no-op。
+    fn step_thread_card(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(detail) = self.selected_message.clone() else {
+            return;
+        };
+        let cards = &detail.thread_messages;
+        let current_idx = cards.iter().position(|tm| tm.id == detail.id);
+        let Some(next_idx) = next_adjacent_index(current_idx, cards.len(), delta) else {
+            return;
+        };
+        let card = &cards[next_idx];
+        // 卡片未读态优先取当前列表行；不在列表中则不触发已读标记（传 false）。
+        let unread = self
+            .current_page
+            .items
+            .iter()
+            .find(|m| m.id == card.id)
+            .map(|m| m.unread)
+            .unwrap_or(false);
+        let uid = if card.uid > 0 { card.uid } else { detail.uid };
+        let folder_path = if card.folder_path.is_empty() {
+            detail.folder_path.clone()
+        } else {
+            card.folder_path.clone()
+        };
+        self.select_message(detail.account_id, card.id, uid, unread, &folder_path, cx);
     }
 
     // ---- 右栏渲染（阅读态 / 写信 / 账号管理 / 欢迎页由 ui:: 渲染）----
@@ -4793,6 +4849,215 @@ impl Render for HylkiApp {
                     this.set_reader_zoom(100, cx);
                 }
             }))
+            // ---- F-1 阶段三：组合键动作（始终生效，不受单键偏好控制）----
+            // Ctrl+R 回复当前邮件（原 RefreshAllAccounts 语义移除，刷新仅保留 F5）。
+            .on_action(cx.listener(|this, _: &ReplyCurrent, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    if let Some(detail) = this.selected_message.clone() {
+                        this.start_reply(&detail, window, cx);
+                    }
+                }
+            }))
+            // Ctrl+Shift+R 回复全部。
+            .on_action(cx.listener(|this, _: &ReplyAllCurrent, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    if let Some(detail) = this.selected_message.clone() {
+                        this.start_reply_all(&detail, window, cx);
+                    }
+                }
+            }))
+            // Ctrl+U 查看原文（再按返回正文，复用 toggle_raw_source 的切换语义）。
+            .on_action(cx.listener(|this, _: &ViewMessageSource, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    if let Some(detail) = this.selected_message.clone() {
+                        this.toggle_raw_source(detail.id, cx);
+                    }
+                }
+            }))
+            // ---- F-1 阶段三：单键动作（single_key_guard_allows 含偏好开关检查）----
+            .on_action(cx.listener(|this, _: &SingleKeyNextMessage, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    this.select_adjacent_message(1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyPrevMessage, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    this.select_adjacent_message(-1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyReply, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    if let Some(detail) = this.selected_message.clone() {
+                        this.start_reply(&detail, window, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyReplyAll, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    if let Some(detail) = this.selected_message.clone() {
+                        this.start_reply_all(&detail, window, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyForward, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    if let Some(detail) = this.selected_message.clone() {
+                        this.start_forward(&detail, window, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyArchive, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    this.archive_selected(cx);
+                }
+            }))
+            // d / Backspace 删除：多选时走批量删除（与 DeleteSelectedMessage 一致）。
+            .on_action(cx.listener(|this, _: &SingleKeyDelete, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    if this.selected_message_ids.len() > 1 {
+                        this.batch_delete(cx);
+                    } else {
+                        this.delete_selected(cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyMarkSpam, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    this.mark_spam_selected(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyToggleStar, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    if let Some(detail) = this.selected_message.clone() {
+                        this.toggle_flagged(&detail, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyToggleRead, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    this.toggle_message_seen(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyCompose, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    this.start_new_compose(window, cx);
+                }
+            }))
+            // u 返回列表：清空选中锚点，阅读态回到「选择一封邮件查看正文」空态。
+            .on_action(cx.listener(|this, _: &SingleKeyBackToList, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    if this.selected_message.take().is_some() {
+                        cx.notify();
+                    }
+                }
+            }))
+            // w / b 会话内下一张 / 上一张卡片。
+            .on_action(cx.listener(|this, _: &SingleKeyNextCard, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    this.step_thread_card(1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SingleKeyPrevCard, window, cx| {
+                if single_key_guard_allows(
+                    this.active_modal,
+                    this.main_view,
+                    this.right_mode,
+                    this.is_text_input_focused(window, cx),
+                    this.prefs.single_key_shortcuts,
+                ) {
+                    this.step_thread_card(-1, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
                 // Esc 优先级：关闭浮层 > 清空文件夹确认 > 写信退出确认 > 撤销发送 > 取消多选。
                 if this.active_modal != ActiveModal::None {
@@ -4971,17 +5236,18 @@ impl Render for HylkiApp {
     }
 }
 
-/// 快捷键速查分组数据（键位 + 说明）。文案结构对齐原版
-/// `docs/KEYBOARD_SHORTCUTS.md`：其中部分单键导航（j/k/r/a 等）要到
-/// 阶段三才实现，此处先按原版文档完整展示，阶段三再校准。
+/// 快捷键速查分组数据（键位 + 说明）。F-1 阶段三起与 main.rs bind_keys /
+/// on_action 实际生效的绑定逐条对应；未实现的键（l / h / x 等）不列出，
+/// 避免「写了但不生效」的误导。
 const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "移动",
         &[
             ("下一条邮件", "j / ↓"),
             ("上一条邮件", "k / ↑"),
-            ("打开选中的邮件", "l / →"),
-            ("返回邮件列表", "h / ← / u"),
+            ("返回邮件列表", "u"),
+            ("会话内下一张卡片", "w"),
+            ("会话内上一张卡片", "b"),
             ("搜索", "/"),
             ("写邮件", "c"),
             ("本清单", "?"),
@@ -4992,14 +5258,13 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
         "对邮件的操作",
         &[
             ("回复", "r"),
-            ("回复全部", "Shift+R"),
+            ("回复全部", "R"),
             ("转发", "f"),
             ("归档", "a"),
-            ("删除", "d / Delete"),
+            ("删除", "d / Backspace / Delete"),
             ("标记为垃圾邮件", "!"),
             ("加星标 / 取消星标", "s"),
             ("已读 / 未读切换", "m"),
-            ("选中该行（批量操作）", "x"),
         ],
     ),
     (
@@ -5008,11 +5273,14 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("写新邮件", "Ctrl+N"),
             ("命令面板", "Ctrl+K"),
             ("命令面板（仅操作）", "Ctrl+Shift+K"),
-            ("检查新邮件", "Ctrl+R / F5"),
+            ("回复当前邮件", "Ctrl+R"),
+            ("回复全部", "Ctrl+Shift+R"),
+            ("查看邮件原文", "Ctrl+U"),
+            ("检查新邮件", "F5"),
             ("搜索邮件列表", "Ctrl+F"),
             ("显示 / 隐藏侧栏账号列表", "Ctrl+Shift+A"),
             ("全屏切换", "F11"),
-            ("本清单", "F1 / Ctrl+?"),
+            ("本清单", "F1 / ?"),
             ("打开偏好设置", "Ctrl+,"),
             ("退出 Hylki", "Ctrl+Q"),
             ("关闭浮层 / 返回", "Esc"),
@@ -5111,7 +5379,7 @@ fn shortcuts_modal(p: &theme::HylkiPalette, cx: &mut Context<HylkiApp>) -> gpui_
                 .border_color(border)
                 .text_xs()
                 .text_color(muted_fg)
-                .child("部分单键快捷键将在后续版本启用；完整清单以原版文档 KEYBOARD_SHORTCUTS.md 为准。"),
+                .child("单键快捷键可在 偏好设置 → 常规 → 「启用单键快捷键」关闭；关闭后上表单键（j / k / r / a 等）停用，Ctrl 组合键与 Delete / F5 不受影响。"),
         )
         .into_any_element()
 }
@@ -5468,6 +5736,25 @@ pub(crate) fn is_sent_folder(name: &str, path: &str) -> bool {
     name == "已发送" || path.to_ascii_uppercase().contains("SENT")
 }
 
+/// F-1：单键快捷键动作的共用守卫（纯函数，便于单测）。
+///
+/// 条件对齐 `DeleteSelectedMessage` 的既有守卫（Mail 阅读态 + 无浮层 +
+/// 非文本输入聚焦），并额外要求单键开关开启。Ctrl 组合键动作不走此守卫
+/// （不受单键偏好控制）。
+fn single_key_guard_allows(
+    active_modal: ActiveModal,
+    main_view: MainContentView,
+    right_mode: RightPaneMode,
+    text_input_focused: bool,
+    single_key_enabled: bool,
+) -> bool {
+    active_modal == ActiveModal::None
+        && main_view == MainContentView::Mail
+        && right_mode == RightPaneMode::Reader
+        && !text_input_focused
+        && single_key_enabled
+}
+
 /// B-2：演示模式合成 .eml 内容（信头 + 正文；非严格 RFC，仅用于演示导出链路）。
 pub(crate) fn compose_demo_eml(detail: &MessageDetail) -> Vec<u8> {
     let eml = format!(
@@ -5741,6 +6028,48 @@ mod tests {
         assert_eq!(next_index_after_removal(1, 2), Some(0));
         assert_eq!(next_index_after_removal(2, 5), Some(3));
         assert_eq!(next_index_after_removal(4, 5), Some(3));
+    }
+
+    /// F-1：单键动作共用守卫（Mail 阅读态 + 无浮层 + 非文本输入 + 偏好开关）。
+    #[test]
+    fn single_key_guard_requires_mail_reader_no_modal_and_pref() {
+        let ok = |text_input_focused, single_key_enabled| {
+            single_key_guard_allows(
+                ActiveModal::None,
+                MainContentView::Mail,
+                RightPaneMode::Reader,
+                text_input_focused,
+                single_key_enabled,
+            )
+        };
+        // 成功路径：阅读态、无浮层、无输入焦点、开关开启。
+        assert!(ok(false, true));
+        // 关闭单键偏好后不生效。
+        assert!(!ok(false, false));
+        // 文本输入聚焦（搜索框 / 写信输入）时不生效。
+        assert!(!ok(true, true));
+        // 浮层打开 / 非阅读态 / 非邮件视图均不生效。
+        assert!(!single_key_guard_allows(
+            ActiveModal::Preferences,
+            MainContentView::Mail,
+            RightPaneMode::Reader,
+            false,
+            true
+        ));
+        assert!(!single_key_guard_allows(
+            ActiveModal::None,
+            MainContentView::Mail,
+            RightPaneMode::Compose,
+            false,
+            true
+        ));
+        assert!(!single_key_guard_allows(
+            ActiveModal::None,
+            MainContentView::Contacts,
+            RightPaneMode::Reader,
+            false,
+            true
+        ));
     }
 
     /// B-2：Trash / Junk 文件夹判定（对齐 cache.rs 匹配规则）。
