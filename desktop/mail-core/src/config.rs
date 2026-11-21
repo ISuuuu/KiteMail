@@ -87,6 +87,9 @@ pub struct AppPreferences {
     pub auto_sync_minutes: u32,
     /// Block remote images in HTML mail bodies.
     pub block_remote_images: bool,
+    /// View opened at startup: `"unified"` (unified inbox) or `"last"`
+    /// (the folder selected in the previous session).
+    pub default_view: String,
 }
 
 impl Default for AppPreferences {
@@ -98,6 +101,7 @@ impl Default for AppPreferences {
             page_size: 100,
             auto_sync_minutes: 5,
             block_remote_images: true,
+            default_view: "unified".to_string(),
         }
     }
 }
