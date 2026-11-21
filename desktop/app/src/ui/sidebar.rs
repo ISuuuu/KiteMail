@@ -8,11 +8,11 @@
 //!   右侧单账号刷新按钮 + 折叠箭头；展开列出各文件夹。
 //! - 底部固定区：联系人、附件入口。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
-use gpui_kit::component::IconName;
 use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -365,7 +365,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 )
                 .item(
                     PopupMenuItem::new("命令面板  Ctrl+K")
-                        .icon(Icon::new(IconName::SquareTerminal))
+                        .icon(Icon::new(IconName::Command))
                         .on_click(move |_, window, cx| {
                             entity_for_palette.update(cx, |app, cx| {
                                 app.open_command_palette(window, cx);
@@ -470,7 +470,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .child(
                     nav_row(
                         "nav-sent",
-                        IconName::Redo2,
+                        IconName::Send,
                         "已发送",
                         None,
                         is_sent_selected,
@@ -485,7 +485,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .child(
                     nav_row(
                         "nav-drafts",
-                        IconName::FileText,
+                        IconName::FilePen,
                         "草稿箱",
                         Some((drafts_count, false)),
                         is_drafts_selected,
@@ -498,7 +498,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .child(
                     nav_row(
                         "nav-archive",
-                        IconName::FolderClosed,
+                        IconName::Archive,
                         "归档",
                         None,
                         is_archive_selected,
@@ -622,7 +622,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             .cursor_pointer()
                             .hover(|s| s.bg(p.accent_soft()))
                             .child(
-                                Icon::new(IconName::FileText)
+                                Icon::new(IconName::FilePen)
                                     .with_size(px(14.0))
                                     .text_color(muted_fg),
                             )
@@ -666,7 +666,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .child(
                     nav_row(
                         "nav-attachments",
-                        IconName::FileText,
+                        IconName::Paperclip,
                         "附件",
                         None,
                         app.main_view == MainContentView::Gallery,

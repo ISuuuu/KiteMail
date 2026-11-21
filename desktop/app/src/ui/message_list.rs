@@ -12,12 +12,12 @@
 //! - 本地草稿视图（真实账号）：从本地草稿合成列表行，点击进入写信编辑。
 //! - 演示模式下不支持星标视图：空列表 + 提示（DemoStore 无星标查询）。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{ContextMenu, ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
-use gpui_kit::component::IconName;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -262,7 +262,7 @@ fn message_row(
                                 })
                                 .when(msg.has_attachment, |icons| {
                                     icons.child(
-                                        Icon::new(IconName::FileText)
+                                        Icon::new(IconName::Paperclip)
                                             .with_size(px(13.0))
                                             .text_color(if is_selected {
                                                 p.accent_fg
@@ -435,7 +435,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         )
     } else if drafts_view {
         (
-            IconName::FileText,
+            IconName::FilePen,
             "暂无本地草稿",
             "在写信面板点击「存草稿」后显示在这里",
         )

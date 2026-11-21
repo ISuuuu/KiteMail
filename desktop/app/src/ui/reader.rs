@@ -6,14 +6,14 @@
 //! - 卡片式正文（外层滚动、内边距 12px 24px 24px）：`surface_raised`
 //!   圆角 12px、1px border、内边距 20px；卡片头部：34x34 头像 +
 //!   发件人姓名与 <邮箱> + 「收件人」胶囊 + 右侧时间；正文行高 1.6；
-//!   附件条：横向圆角附件小卡片（文件图标 + 文件名 + 大小 + 「保存」，
+//!   附件条：横向圆角附件小卡片（附件图标 + 文件名 + 大小 + 「保存」，
 //!   接现有 SaveAttachment + rfd 流程）。
 //! - 空状态：居中淡色邮箱图标 + 「选择一封邮件查看正文」。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
-use gpui_kit::component::IconName;
 use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -54,7 +54,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             .justify_center()
             .gap_2()
             .child(
-                Icon::new(IconName::Inbox)
+                Icon::new(IconName::Mail)
                     .with_size(px(36.0))
                     .text_color(muted_fg),
             )
@@ -94,7 +94,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .border_color(border)
                 .bg(canvas)
                 .child(
-                    Icon::new(IconName::FileText)
+                    Icon::new(IconName::Paperclip)
                         .with_size(px(14.0))
                         .text_color(muted_fg),
                 )
@@ -115,7 +115,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     Button::new(("save-att", att_id))
                         .ghost()
                         .compact()
-                        .icon(IconName::ArrowDown)
+                        .icon(IconName::Download)
                         .tooltip("保存附件")
                         .on_click(cx.listener(move |this, _, _, _| {
                             this.save_attachment(att_id, &filename);
@@ -150,20 +150,20 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .gap_1()
                         .items_center()
                         .child(
-                            action_button("reader-reply", IconName::Undo, "回复").on_click(
+                            action_button("reader-reply", IconName::Reply, "回复").on_click(
                                 cx.listener(move |this, _, window, cx| {
                                     this.start_reply(&reply_detail, window, cx);
                                 }),
                             ),
                         )
                         .child(
-                            action_button("reader-reply-all", IconName::Undo2, "回复全部")
+                            action_button("reader-reply-all", IconName::ReplyAll, "回复全部")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.start_reply_all(&reply_all_detail, window, cx);
                                 })),
                         )
                         .child(
-                            action_button("reader-forward", IconName::Redo, "转发").on_click(
+                            action_button("reader-forward", IconName::Forward, "转发").on_click(
                                 cx.listener(move |this, _, window, cx| {
                                     this.start_forward(&forward_detail, window, cx);
                                 }),
@@ -187,13 +187,13 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         // 演示模式不支持服务端移动，隐藏这两个入口。
                         .when(!app.demo_mode, |el| {
                             el.child(
-                                action_button("reader-archive", IconName::FolderClosed, "归档")
+                                action_button("reader-archive", IconName::Archive, "归档")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.archive_selected(cx);
                                     })),
                             )
                             .child(
-                                action_button("reader-delete", IconName::Delete, "删除").on_click(
+                                action_button("reader-delete", IconName::Trash, "删除").on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.delete_selected(cx);
                                     }),
