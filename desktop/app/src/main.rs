@@ -24,7 +24,7 @@ use crate::app::{
     CloseOverlay, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose, OpenCommandPalette,
     OpenCommandPaletteActions, OpenPreferences, OpenShortcutsWindow, QuitApp, RefreshAllAccounts,
     SelectNextMessage, SelectPrevMessage, SendCompose, ToggleAccountsList, ToggleFullscreen,
-    ZoomIn, ZoomOut, ZoomReset,
+    UndoLastMove, ZoomIn, ZoomOut, ZoomReset,
 };
 
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
@@ -194,6 +194,8 @@ fn main() {
                 KeyBinding::new("ctrl--", ZoomOut, None),
                 KeyBinding::new("ctrl-0", ZoomReset, None),
                 KeyBinding::new("delete", DeleteSelectedMessage, None),
+                // F-3：撤销最近一次移动 / 删除 / 归档（状态栏轻量撤销条的快捷键）。
+                KeyBinding::new("ctrl-z", UndoLastMove, None),
                 KeyBinding::new("down", SelectNextMessage, None),
                 KeyBinding::new("up", SelectPrevMessage, None),
                 KeyBinding::new("escape", CloseOverlay, None),

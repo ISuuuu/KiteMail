@@ -5,7 +5,8 @@
 //!   + 20px 粗体主题。
 //! - 卡片式正文（外层滚动、内边距 12px 24px 24px）：`surface_raised`
 //!   圆角 12px、1px border、微阴影、内边距 20px；卡片头部：34x34 头像 +
-//!   发件人姓名与 <邮箱> + 真实收件人胶囊 + 右侧时间 + `...` 更多操作菜单；
+//!   发件人姓名与 <邮箱> + 真实收件人胶囊 + 右侧时间 + `...` 更多操作菜单
+//!   （B-2：标为未读 / 星标切换 / 归档 / 删除 / 导出为 .eml / 复制正文 / 查看原文）；
 //!   正文行高 1.6；附件条：横向圆角附件小卡片（接 SaveAttachment + rfd）。
 //! - 空状态：居中淡色邮箱图标 + 「选择一封邮件查看正文」。
 
@@ -104,14 +105,21 @@ fn format_raw_source(
     out
 }
 
-/// 为单张会话卡片构造独立的 `...` 更多操作菜单（回复 / 回复全部 / 转发 / 复制正文 / 查看原文）。
+/// 为单张会话卡片构造独立的 `...` 更多操作菜单（B-2：回复 / 回复全部 / 转发 /
+/// 标为未读 / 星标切换 / 归档 / 删除 / 导出 .eml / 复制正文 / 查看原文）。
 fn build_card_more_menu(
     card_detail: MessageDetail,
     show_raw_source: bool,
+    demo_mode: bool,
+    eml_exporting: bool,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
     let entity = cx.entity();
     let msg_id = card_detail.id;
+    let account_id = card_detail.account_id;
+    let uid = card_detail.uid;
+    let folder_path = card_detail.folder_path.clone();
+    let card_flagged = card_detail.flagged;
     let body_for_copy = card_detail.body_text.clone();
     let reply_detail = card_detail.clone();
     let reply_all_detail = card_detail.clone();
@@ -126,56 +134,134 @@ fn build_card_more_menu(
             let e_reply = entity.clone();
             let e_reply_all = entity.clone();
             let e_forward = entity.clone();
+            let e_seen = entity.clone();
+            let e_flag = entity.clone();
+            let e_archive = entity.clone();
+            let e_delete = entity.clone();
+            let e_eml = entity.clone();
             let e_copy = entity.clone();
             let e_raw = entity.clone();
             let d_reply = reply_detail.clone();
             let d_reply_all = reply_all_detail.clone();
             let d_forward = forward_detail.clone();
             let copy_text = body_for_copy.clone();
-            menu.item(
-                PopupMenuItem::new("回复")
-                    .icon(Icon::new(IconName::Reply))
-                    .on_click(move |_, window, cx| {
-                        let d = d_reply.clone();
-                        e_reply.update(cx, |this, cx| this.start_reply(&d, window, cx));
-                    }),
-            )
-            .item(
-                PopupMenuItem::new("回复全部")
-                    .icon(Icon::new(IconName::ReplyAll))
-                    .on_click(move |_, window, cx| {
-                        let d = d_reply_all.clone();
-                        e_reply_all.update(cx, |this, cx| this.start_reply_all(&d, window, cx));
-                    }),
-            )
-            .item(
-                PopupMenuItem::new("转发")
-                    .icon(Icon::new(IconName::Forward))
-                    .on_click(move |_, window, cx| {
-                        let d = d_forward.clone();
-                        e_forward.update(cx, |this, cx| this.start_forward(&d, window, cx));
-                    }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new("复制邮件正文")
-                    .icon(Icon::new(IconName::Copy))
+            let folder_seen = folder_path.clone();
+            let folder_flag = folder_path.clone();
+            let folder_eml = folder_path.clone();
+            let mut menu = menu
+                .item(
+                    PopupMenuItem::new("回复")
+                        .icon(Icon::new(IconName::Reply))
+                        .on_click(move |_, window, cx| {
+                            let d = d_reply.clone();
+                            e_reply.update(cx, |this, cx| this.start_reply(&d, window, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("回复全部")
+                        .icon(Icon::new(IconName::ReplyAll))
+                        .on_click(move |_, window, cx| {
+                            let d = d_reply_all.clone();
+                            e_reply_all.update(cx, |this, cx| this.start_reply_all(&d, window, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("转发")
+                        .icon(Icon::new(IconName::Forward))
+                        .on_click(move |_, window, cx| {
+                            let d = d_forward.clone();
+                            e_forward.update(cx, |this, cx| this.start_forward(&d, window, cx));
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("标为未读")
+                        .icon(Icon::new(IconName::Mail))
+                        .on_click(move |_, _, cx| {
+                            let p = folder_seen.clone();
+                            e_seen.update(cx, |this, cx| {
+                                this.set_row_seen(account_id, msg_id, uid, p, false, cx);
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(if card_flagged {
+                        "取消星标"
+                    } else {
+                        "加星标"
+                    })
+                    .icon(if card_flagged {
+                        Icon::new(IconName::Star)
+                    } else {
+                        Icon::new(IconName::StarFill)
+                    })
                     .on_click(move |_, _, cx| {
-                        let text = copy_text.clone();
-                        e_copy.update(cx, |this, cx| this.copy_text_to_clipboard(text, cx));
+                        let p = folder_flag.clone();
+                        e_flag.update(cx, |this, cx| {
+                            this.set_row_flagged(account_id, msg_id, uid, p, !card_flagged, cx);
+                        });
                     }),
-            )
-            .item(
-                PopupMenuItem::new(if show_raw_source {
-                    "返回正文"
-                } else {
-                    "查看邮件原文"
-                })
-                .icon(Icon::new(IconName::FileCode))
-                .on_click(move |_, _, cx| {
-                    e_raw.update(cx, |this, cx| this.toggle_raw_source(msg_id, cx));
-                }),
-            )
+                );
+            // 归档 / 删除为服务端移动，演示模式隐藏（与列表行菜单惯例一致）。
+            if !demo_mode {
+                menu = menu
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("归档")
+                            .icon(Icon::new(IconName::Archive))
+                            .on_click(move |_, _, cx| {
+                                e_archive.update(cx, |this, cx| {
+                                    this.archive_message(account_id, msg_id, cx);
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("删除")
+                            .icon(Icon::new(IconName::Trash))
+                            .on_click(move |_, _, cx| {
+                                e_delete.update(cx, |this, cx| {
+                                    this.delete_message(account_id, msg_id, cx);
+                                });
+                            }),
+                    );
+            }
+            menu = menu
+                .separator()
+                .item(
+                    PopupMenuItem::new(if eml_exporting {
+                        "导出中..."
+                    } else {
+                        "导出为 .eml"
+                    })
+                    .disabled(eml_exporting)
+                    .icon(Icon::new(IconName::Download))
+                    .on_click(move |_, _, cx| {
+                        let p = folder_eml.clone();
+                        e_eml.update(cx, |this, cx| {
+                            this.request_export_eml(account_id, msg_id, uid, p, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("复制邮件正文")
+                        .icon(Icon::new(IconName::Copy))
+                        .on_click(move |_, _, cx| {
+                            let text = copy_text.clone();
+                            e_copy.update(cx, |this, cx| this.copy_text_to_clipboard(text, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(if show_raw_source {
+                        "返回正文"
+                    } else {
+                        "查看邮件原文"
+                    })
+                    .icon(Icon::new(IconName::FileCode))
+                    .on_click(move |_, _, cx| {
+                        e_raw.update(cx, |this, cx| this.toggle_raw_source(msg_id, cx));
+                    }),
+                );
+            menu
         })
         .into_any_element()
 }
@@ -699,8 +785,13 @@ pub(crate) fn render(
                     id: tm.id,
                     account_id: detail.account_id,
                     folder_id: detail.folder_id,
-                    folder_path: detail.folder_path.clone(),
-                    uid: detail.uid,
+                    // 卡片自身的 UID / 文件夹（旧缓存数据缺省时回落锚点值）。
+                    folder_path: if tm.folder_path.is_empty() {
+                        detail.folder_path.clone()
+                    } else {
+                        tm.folder_path.clone()
+                    },
+                    uid: if tm.uid > 0 { tm.uid } else { detail.uid },
                     rfc_message_id: tm.rfc_message_id.clone(),
                     sender: tm.sender.clone(),
                     recipients: tm.recipients.clone(),
@@ -712,7 +803,14 @@ pub(crate) fn render(
                     attachments: tm.attachments.clone(),
                     thread_messages: Vec::new(),
                 };
-                let menu = build_card_more_menu(card_detail, show_raw_source, cx);
+                let eml_exporting = app.pending_eml_export == Some(tm.id);
+                let menu = build_card_more_menu(
+                    card_detail,
+                    show_raw_source,
+                    app.demo_mode,
+                    eml_exporting,
+                    cx,
+                );
                 render_message_card(
                     detail.account_id,
                     tm.id,
@@ -743,7 +841,14 @@ pub(crate) fn render(
         let block_remote = app.prefs.block_remote_images
             && !app.allowed_remote_image_ids.contains(&detail.id)
             && !app.prefs.is_remote_sender_allowed(&detail.sender);
-        let menu = build_card_more_menu(detail.clone(), show_raw_source, cx);
+        let eml_exporting = app.pending_eml_export == Some(detail.id);
+        let menu = build_card_more_menu(
+            detail.clone(),
+            show_raw_source,
+            app.demo_mode,
+            eml_exporting,
+            cx,
+        );
         vec![render_message_card(
             detail.account_id,
             detail.id,

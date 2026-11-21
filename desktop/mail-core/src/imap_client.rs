@@ -316,6 +316,40 @@ pub async fn fetch_message_body(
     Ok((body_text, body_html, attachments))
 }
 
+/// Fetch the complete raw RFC 822 bytes for `uid` in `folder_path` via
+/// `UID FETCH (BODY.PEEK[])` — PEEK 不改变服务器端 `\Seen` 标记（.eml 导出后端）。
+pub async fn fetch_raw_message(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+) -> Result<Vec<u8>, String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    let mut fetches = session
+        .uid_fetch(uid.to_string(), "(BODY.PEEK[])")
+        .await
+        .map_err(|e| format!("拉取邮件原文失败 (UID {uid}): {e}"))?;
+
+    let mut raw_body: Option<Vec<u8>> = None;
+    while let Some(fetch_res) = fetches.next().await {
+        if let Ok(fetch) = fetch_res {
+            if let Some(body) = fetch.body() {
+                raw_body = Some(body.to_vec());
+                break;
+            }
+        }
+    }
+    drop(fetches);
+    let _ = session.logout().await;
+
+    raw_body.ok_or_else(|| format!("服务器未返回 UID {uid} 的原始邮件内容"))
+}
+
 /// Add or remove `\Seen` or `\Flagged` on the server for `uid`.
 pub async fn set_flag(
     account: &AccountConfig,
@@ -445,6 +479,42 @@ pub async fn move_message(
         .uid_mv(uid.to_string(), dest_folder)
         .await
         .map_err(|e| format!("移动邮件到 {dest_folder} 失败: {e}"))?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+/// F-3 撤销：在 `current_folder` 中按 RFC Message-ID 头检索邮件并 `UID MOVE`
+/// 移回 `original_folder`（移动 / 删除后的邮件已不在本地缓存，需服务端检索定位）。
+pub async fn undo_move_by_message_id(
+    account: &AccountConfig,
+    password: &str,
+    current_folder: &str,
+    rfc_message_id: &str,
+    original_folder: &str,
+) -> Result<(), String> {
+    let id = rfc_message_id.trim();
+    if id.is_empty() {
+        return Err("缺少 Message-ID，无法撤销移动".to_string());
+    }
+    let mut session = connect_imap(account, password).await?;
+    session
+        .select(current_folder)
+        .await
+        .map_err(|e| format!("打开文件夹 {current_folder} 失败: {e}"))?;
+    let query = format!("HEADER Message-ID \"{}\"", escape_imap_search_arg(id));
+    let uids = session
+        .uid_search(&query)
+        .await
+        .map_err(|e| format!("检索邮件 Message-ID 失败: {e}"))?;
+    // 多个命中时取最新（最大 UID），避免旧副本干扰。
+    let uid = uids
+        .into_iter()
+        .max()
+        .ok_or_else(|| "在当前文件夹中未找到该邮件，无法撤销移动".to_string())?;
+    session
+        .uid_mv(uid.to_string(), original_folder)
+        .await
+        .map_err(|e| format!("移动邮件回 {original_folder} 失败: {e}"))?;
     let _ = session.logout().await;
     Ok(())
 }

@@ -5,10 +5,15 @@
 //!   外边距 2px 6px、内边距 13px 8px 13px 10px、圆角 12px（对齐 Linux 原版样式）；
 //!   左侧 36x36 圆形头像 + 固定 10px 宽未读蓝点占位（保证已读/未读文字严格左对齐）；
 //!   右侧三行（发件人 / 主题 / 摘要 + 多账号胶囊），未读加粗；
+//!   第 1 行时间旁为会话计数胶囊（B-4，仅会话邮件数 > 1 时显示，对齐原版 .thread-chip）；
+//!   已发送 / 草稿视图第 1 行显示「致：收件人」（B-6）；
 //!   选中态整行半透明 accent 底（悬停加深），复刻 Linux 原版列表行样式。
 //! - 底部轻量分页条：仅当存在上一页 / 下一页时显示。
-//! - 邮件行右键菜单：标记已读/未读、加星/取消星标、归档、删除
-//!   （演示模式仅保留本地的已读 / 星标两项，归档 / 删除隐藏）；
+//! - 邮件行右键菜单（B-2）：回复 / 回复全部 / 转发、标记已读/未读、加星/取消星标、
+//!   归档、标记为垃圾邮件、移动到子菜单、删除、复制邮件正文、查看邮件原文、导出为 .eml
+//!   （演示模式保留本地的已读 / 星标 / 回复 / 复制 / 原文 / 导出项，服务端移动类隐藏）；
+//!   回收站 / 垃圾邮件文件夹中「标记为垃圾邮件」替换为「非垃圾邮件（移回收件箱）」+
+//!   「移回收件箱」（对齐原版 message_row / card_menu 语义）；
 //!   草稿视图行右键为「打开草稿 / 删除草稿」。
 
 use std::collections::HashSet;
@@ -27,7 +32,7 @@ use gpui_kit::{
 };
 use hylki_mail_core::{date_group_label, LocalDraft, MessageSort, MessageSummary, SearchScope};
 
-use crate::app::{CurrentView, HylkiApp};
+use crate::app::{CurrentView, HylkiApp, PendingRowAction};
 use crate::theme;
 use crate::ui::avatar;
 
@@ -40,15 +45,20 @@ const ROW_HEIGHT: f32 = 82.0;
 /// 紧凑列表行高（偏好 compact_list，隐藏摘要行，方案文档五.2）。
 const COMPACT_ROW_HEIGHT: f32 = 64.0;
 
-/// 邮件行右键菜单（方案文档五.3）。
+/// 邮件行右键菜单（方案文档五.3 + B-2）。
 ///
 /// `draft` 为 `Some` 时该行是本地草稿行，菜单切换为「打开草稿 / 删除草稿」。
+/// `in_trash_or_junk` 时「标记为垃圾邮件」替换为恢复到收件箱的两项（对齐原版）。
+#[allow(clippy::too_many_arguments)]
 fn row_context_menu(
     row: Stateful<Div>,
     msg: &MessageSummary,
     draft: Option<LocalDraft>,
     account_folders: Vec<(String, String)>,
     demo_mode: bool,
+    exporting_eml: bool,
+    in_trash_or_junk: bool,
+    inbox_path: Option<String>,
     cx: &mut Context<HylkiApp>,
 ) -> ContextMenu<Stateful<Div>> {
     let entity = cx.entity();
@@ -81,12 +91,70 @@ fn row_context_menu(
         let entity_for_spam = entity.clone();
         let entity_for_move = entity.clone();
         let entity_for_delete = entity.clone();
+        let entity_for_reply = entity.clone();
+        let entity_for_reply_all = entity.clone();
+        let entity_for_forward = entity.clone();
+        let entity_for_copy = entity.clone();
+        let entity_for_source = entity.clone();
+        let entity_for_eml = entity.clone();
         // 内层 on_click 为 move 闭包，需逐项克隆（外层 builder 是 Fn，可多次调用）。
         let folder_path_for_seen = folder_path.clone();
         let folder_path_for_flag = folder_path.clone();
+        let folder_path_for_reply = folder_path.clone();
+        let folder_path_for_reply_all = folder_path.clone();
+        let folder_path_for_forward = folder_path.clone();
+        let folder_path_for_copy = folder_path.clone();
+        let folder_path_for_source = folder_path.clone();
+        let folder_path_for_eml = folder_path.clone();
         let current_folder_path = folder_path.clone();
         let folders_for_move = account_folders.clone();
+        // B-2 顶部：回复 / 回复全部 / 转发（正文未就绪时挂起动作，加载后执行）。
         let mut menu = menu
+            .item(PopupMenuItem::new("回复").on_click(move |_, window, cx| {
+                entity_for_reply.update(cx, |this, cx| {
+                    this.begin_row_action(
+                        PendingRowAction::Reply,
+                        account_id,
+                        message_id,
+                        uid,
+                        unread,
+                        &folder_path_for_reply,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .item(
+                PopupMenuItem::new("回复全部").on_click(move |_, window, cx| {
+                    entity_for_reply_all.update(cx, |this, cx| {
+                        this.begin_row_action(
+                            PendingRowAction::ReplyAll,
+                            account_id,
+                            message_id,
+                            uid,
+                            unread,
+                            &folder_path_for_reply_all,
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+            )
+            .item(PopupMenuItem::new("转发").on_click(move |_, window, cx| {
+                entity_for_forward.update(cx, |this, cx| {
+                    this.begin_row_action(
+                        PendingRowAction::Forward,
+                        account_id,
+                        message_id,
+                        uid,
+                        unread,
+                        &folder_path_for_forward,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .separator()
             .item(
                 PopupMenuItem::new(if unread {
                     "标记为已读"
@@ -122,7 +190,8 @@ fn row_context_menu(
                     },
                 ),
             );
-        // 演示模式仅支持本地 seen / flagged 两项；归档 / 标垃圾 / 移动 / 删除仅真实账号可用。
+        // 演示模式仅支持本地 seen / flagged / 回复 / 复制 / 原文 / 导出项；
+        // 归档 / 标垃圾 / 移动 / 删除仅真实账号可用。
         if !demo_mode {
             menu = menu
                 .separator()
@@ -130,15 +199,35 @@ fn row_context_menu(
                     entity_for_archive.update(cx, |this, cx| {
                         this.archive_message(account_id, message_id, cx);
                     });
-                }))
-                .item(
+                }));
+            // B-2：回收站 / 垃圾邮件文件夹中把「标记为垃圾邮件」替换为恢复到收件箱两项。
+            if in_trash_or_junk {
+                let inbox_target = inbox_path.clone().unwrap_or_else(|| "INBOX".to_string());
+                let inbox_for_not_spam = inbox_target.clone();
+                menu = menu
+                    .item(PopupMenuItem::new("非垃圾邮件（移回收件箱）").on_click(
+                        move |_, _, cx| {
+                            let p = inbox_for_not_spam.clone();
+                            entity_for_spam.update(cx, |this, cx| {
+                                this.move_message(account_id, message_id, p, cx);
+                            });
+                        },
+                    ))
+                    .item(PopupMenuItem::new("移回收件箱").on_click(move |_, _, cx| {
+                        let p = inbox_target.clone();
+                        entity_for_move.update(cx, |this, cx| {
+                            this.move_message(account_id, message_id, p, cx);
+                        });
+                    }));
+            } else {
+                menu = menu.item(
                     PopupMenuItem::new("标记为垃圾邮件").on_click(move |_, _, cx| {
                         entity_for_spam.update(cx, |this, cx| {
                             this.mark_spam_message(account_id, message_id, cx);
                         });
                     }),
-                )
-                .submenu("移动到文件夹...", window, cx, move |mut sub, _, _| {
+                );
+                menu = menu.submenu("移动到文件夹...", window, cx, move |mut sub, _, _| {
                     if folders_for_move.is_empty() {
                         sub = sub.item(PopupMenuItem::new("暂无可用文件夹").disabled(true));
                         return sub;
@@ -160,13 +249,63 @@ fn row_context_menu(
                         );
                     }
                     sub
-                })
-                .item(PopupMenuItem::new("删除").on_click(move |_, _, cx| {
-                    entity_for_delete.update(cx, |this, cx| {
-                        this.delete_message(account_id, message_id, cx);
-                    });
-                }));
+                });
+            }
+            menu = menu.item(PopupMenuItem::new("删除").on_click(move |_, _, cx| {
+                entity_for_delete.update(cx, |this, cx| {
+                    this.delete_message(account_id, message_id, cx);
+                });
+            }));
         }
+        // B-2 底部：复制正文 / 查看原文 / 导出 .eml（导出进行中禁用重复点击）。
+        menu = menu
+            .separator()
+            .item(
+                PopupMenuItem::new("复制邮件正文").on_click(move |_, window, cx| {
+                    entity_for_copy.update(cx, |this, cx| {
+                        this.begin_row_action(
+                            PendingRowAction::CopyBody,
+                            account_id,
+                            message_id,
+                            uid,
+                            unread,
+                            &folder_path_for_copy,
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+            )
+            .item(
+                PopupMenuItem::new("查看邮件原文").on_click(move |_, window, cx| {
+                    entity_for_source.update(cx, |this, cx| {
+                        this.begin_row_action(
+                            PendingRowAction::ViewSource,
+                            account_id,
+                            message_id,
+                            uid,
+                            unread,
+                            &folder_path_for_source,
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+            )
+            .item(
+                PopupMenuItem::new(if exporting_eml {
+                    "导出中..."
+                } else {
+                    "导出为 .eml"
+                })
+                .disabled(exporting_eml)
+                .on_click(move |_, _, cx| {
+                    let p = folder_path_for_eml.clone();
+                    entity_for_eml.update(cx, |this, cx| {
+                        this.request_export_eml(account_id, message_id, uid, p, cx);
+                    });
+                }),
+            );
         menu
     })
 }
@@ -191,6 +330,14 @@ fn message_row(
         msg.sender.clone()
     } else {
         sender_name
+    };
+    // B-6：已发送 / 草稿视图第 1 行显示「致：收件人」（多个收件人由 truncate 截断）。
+    let show_recipients = app.list_view_shows_recipients();
+    let recipients_text = msg.recipients.trim();
+    let first_line = if show_recipients && !recipients_text.is_empty() {
+        format!("致：{recipients_text}")
+    } else {
+        display_name.clone()
     };
     let acc_email = if show_account_tag {
         app.account_email_for(account_id).to_string()
@@ -293,14 +440,15 @@ fn message_row(
                                 .min_w_0()
                                 .text_sm()
                                 .truncate()
-                                // 发件人字重层次（原版 .message-sender：已读 / 未读加粗）。
+                                // 发件人字重层次（原版 .message-sender：已读 / 未读加粗）；
+                                // 已发送 / 草稿视图显示「致：收件人」（B-6）。
                                 .font_weight(if unread {
                                     gpui_kit::FontWeight::BOLD
                                 } else {
                                     gpui_kit::FontWeight::MEDIUM
                                 })
                                 .text_color(p.text)
-                                .child(SharedString::from(display_name)),
+                                .child(SharedString::from(first_line)),
                         )
                         .child(
                             h_flex()
@@ -326,7 +474,26 @@ fn message_row(
                                         .text_xs()
                                         .text_color(p.text_muted)
                                         .child(SharedString::from(msg.date_display.clone())),
-                                ),
+                                )
+                                // B-4 会话计数胶囊（对齐原版 .thread-chip：仅 >1 封往来时显示，
+                                // 紧凑圆角、10px 粗体、主题色弱底）。
+                                .when(msg.thread_count > 1, |icons| {
+                                    icons.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px(px(7.0))
+                                            .py(px(2.0))
+                                            .rounded_full()
+                                            .bg(p.accent_soft())
+                                            .text_size(px(10.0))
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                            .text_color(p.accent)
+                                            .child(SharedString::from(format!(
+                                                "{} ▸",
+                                                msg.thread_count
+                                            ))),
+                                    )
+                                }),
                         ),
                 )
                 // 第 2 行：主题（未读加粗；已读 85% 透明度，复刻原版 .message-subject 层次）。
@@ -339,11 +506,7 @@ fn message_row(
                         } else {
                             gpui_kit::FontWeight::NORMAL
                         })
-                        .text_color(if unread {
-                            p.text
-                        } else {
-                            p.text.opacity(0.85)
-                        })
+                        .text_color(if unread { p.text } else { p.text.opacity(0.85) })
                         .child(SharedString::from(msg.subject.clone())),
                 )
                 // 第 3 行：摘要 + 多账号小胶囊标签；紧凑密度下隐藏。
@@ -391,7 +554,21 @@ fn message_row(
                 .collect()
         })
         .unwrap_or_default();
-    row_context_menu(row, msg, draft, account_folders, app.demo_mode, cx)
+    // B-2：导出进行中状态与回收站 / 垃圾邮件文件夹语义。
+    let exporting_eml = app.pending_eml_export == Some(msg.id);
+    let in_trash_or_junk = app.folder_is_trash_or_junk(account_id, msg.folder_id);
+    let inbox_path = app.inbox_folder_path(account_id);
+    row_context_menu(
+        row,
+        msg,
+        draft,
+        account_folders,
+        app.demo_mode,
+        exporting_eml,
+        in_trash_or_junk,
+        inbox_path,
+        cx,
+    )
 }
 
 /// 渲染中栏。

@@ -143,6 +143,8 @@ impl DemoStore {
                 unread: *unread,
                 flagged: idx == 0,
                 has_attachment: *has_attachment,
+                recipients: String::new(),
+                thread_count: Self::demo_thread_count(id),
             });
         }
 
@@ -173,6 +175,8 @@ impl DemoStore {
                 unread: idx < 128,
                 flagged: idx < 30 && idx % 7 == 0,
                 has_attachment: idx % 9 == 0,
+                recipients: String::new(),
+                thread_count: Self::demo_thread_count(id),
             });
         }
 
@@ -193,6 +197,9 @@ impl DemoStore {
                     unread: false,
                     flagged: false,
                     has_attachment: i % 3 == 0,
+                    // B-6：已发送视图列表行显示「致：收件人」。
+                    recipients: format!("收件人 #{i:02} <to{i:02}@example.com>"),
+                    thread_count: Self::demo_thread_count(id),
                 }
             })
             .collect();
@@ -214,6 +221,13 @@ impl DemoStore {
                     unread: false,
                     flagged: false,
                     has_attachment: false,
+                    // B-6：草稿视图显示收件人（首条有收件人，其余留空回落显示发件人）。
+                    recipients: if i == 0 {
+                        "王五 <wangwu@example.com>".to_string()
+                    } else {
+                        String::new()
+                    },
+                    thread_count: Self::demo_thread_count(id),
                 }
             })
             .collect();
@@ -235,6 +249,8 @@ impl DemoStore {
                     unread: false,
                     flagged: false,
                     has_attachment: false,
+                    recipients: String::new(),
+                    thread_count: Self::demo_thread_count(id),
                 }
             })
             .collect();
@@ -256,6 +272,16 @@ impl DemoStore {
             DEMO_DRAFTS_ID => &self.draft_messages,
             DEMO_ARCHIVE_ID => &self.archive_messages,
             _ => &[],
+        }
+    }
+
+    /// B-4：演示模式会话计数（与 `get_message_detail` 的多封往来会话样例保持一致：
+    /// 邮件 #1 与 #3 各有 2 封往来，其余为独立邮件）。
+    fn demo_thread_count(id: u32) -> u32 {
+        if id == 1 || id == 3 {
+            2
+        } else {
+            1
         }
     }
 
@@ -674,6 +700,8 @@ impl DemoStore {
                     body_loaded: true,
                     flagged: summary.flagged,
                     attachments: attachments.clone(),
+                    uid: summary.uid,
+                    folder_path: folder_path.clone(),
                 },
                 ThreadMessage {
                     id: 90_001,
@@ -687,6 +715,8 @@ impl DemoStore {
                     body_loaded: true,
                     flagged: false,
                     attachments: Vec::new(),
+                    uid: 90_001,
+                    folder_path: folder_path.clone(),
                 },
             ],
             3 => vec![
@@ -702,6 +732,8 @@ impl DemoStore {
                     body_loaded: true,
                     flagged: summary.flagged,
                     attachments: attachments.clone(),
+                    uid: summary.uid,
+                    folder_path: folder_path.clone(),
                 },
                 ThreadMessage {
                     id: 90_002,
@@ -715,6 +747,8 @@ impl DemoStore {
                     body_loaded: true,
                     flagged: false,
                     attachments: Vec::new(),
+                    uid: 90_002,
+                    folder_path: folder_path.clone(),
                 },
             ],
             _ => Vec::new(),

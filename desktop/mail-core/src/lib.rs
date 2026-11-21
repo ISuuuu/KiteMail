@@ -72,6 +72,12 @@ pub struct MessageSummary {
     pub unread: bool,
     pub flagged: bool,
     pub has_attachment: bool,
+    /// 收件人（B-6：已发送 / 草稿视图列表行显示「致：…」）。
+    #[serde(default)]
+    pub recipients: String,
+    /// 同一会话（按归一化主题聚合）的邮件总数，`> 1` 时列表行显示计数胶囊（B-4）。
+    #[serde(default)]
+    pub thread_count: u32,
 }
 
 /// Cached attachment metadata shown in the reading pane.
@@ -100,6 +106,11 @@ pub struct ThreadMessage {
     pub body_loaded: bool,
     pub flagged: bool,
     pub attachments: Vec<AttachmentMeta>,
+    /// 该会话卡片的 IMAP UID 与所在文件夹（供卡片 `...` 菜单的标记 / 导出操作）。
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub folder_path: String,
 }
 
 /// Full message payload shown in the reading pane.
@@ -442,6 +453,14 @@ pub enum MailRequest {
         account_id: u32,
         message_id: u32,
     },
+    /// Fetch the complete raw RFC 822 message bytes for .eml export
+    /// (IMAP `UID FETCH (BODY.PEEK[])` / Graph `/$value`).
+    FetchRawMessage {
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        folder_path: String,
+    },
     SetSeen {
         account_id: u32,
         folder_path: String,
@@ -468,6 +487,15 @@ pub enum MailRequest {
         account_id: u32,
         message_id: u32,
         target_folder_path: String,
+    },
+    /// F-3 撤销移动 / 删除 / 归档：在 `current_folder_path` 中按 RFC Message-ID
+    /// 定位邮件并移回 `original_folder_path`（邮件已不在本地缓存，需服务端检索）。
+    UndoMessageMove {
+        account_id: u32,
+        message_id: u32,
+        rfc_message_id: String,
+        current_folder_path: String,
+        original_folder_path: String,
     },
     MarkSpam {
         account_id: u32,
@@ -564,6 +592,11 @@ pub enum WorkerEvent {
     },
     MessagesPageLoaded(MailPage),
     MessageBodyLoaded(MessageDetail),
+    /// Complete raw MIME bytes fetched for one message (.eml export).
+    RawMessageFetched {
+        message_id: u32,
+        bytes: Vec<u8>,
+    },
     DraftsUpdated {
         drafts: Vec<LocalDraft>,
     },
@@ -584,15 +617,21 @@ pub enum WorkerEvent {
     },
     /// A message was moved to the account's archive folder on the server and
     /// removed from the local cache; the UI should refresh its lists.
+    /// `dest_folder_path` / `rfc_message_id` 供撤销使用；`dest_folder_path` 为空
+    /// 表示无法定位邮件（不提供撤销）。
     MessageArchived {
         account_id: u32,
         message_id: u32,
+        dest_folder_path: String,
+        rfc_message_id: String,
     },
     /// A message was moved to the account's trash folder (or permanently
     /// deleted) on the server and removed from the local cache.
     MessageDeleted {
         account_id: u32,
         message_id: u32,
+        dest_folder_path: String,
+        rfc_message_id: String,
     },
     /// A page of cross-folder local search results was loaded.
     AllFoldersSearchLoaded(MailPage),
@@ -607,12 +646,15 @@ pub enum WorkerEvent {
         account_id: u32,
         message_id: u32,
         target_folder_path: String,
+        rfc_message_id: String,
     },
     /// A message was moved to the account's spam/junk folder on the server and
     /// removed from the old folder's local cache.
     MessageMarkedSpam {
         account_id: u32,
         message_id: u32,
+        dest_folder_path: String,
+        rfc_message_id: String,
     },
     /// Cached attachments of a forwarded message were exported to a temp directory.
     ForwardAttachmentsExported {
