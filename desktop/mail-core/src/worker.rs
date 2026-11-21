@@ -393,7 +393,10 @@ async fn handle_request(
             account_id,
             message_id,
         } => {
-            let Ok(Some((detail, uid, body_loaded))) = cache.get_message_detail(message_id) else {
+            let newest_first = pref_thread_newest_first(data_dir);
+            let Ok(Some((detail, uid, body_loaded))) =
+                cache.get_message_detail_ordered(message_id, newest_first)
+            else {
                 return;
             };
             if body_loaded {
@@ -459,7 +462,9 @@ async fn handle_request(
                         });
                         return;
                     }
-                    if let Ok(Some((updated, _, _))) = cache.get_message_detail(message_id) {
+                    if let Ok(Some((updated, _, _))) =
+                        cache.get_message_detail_ordered(message_id, newest_first)
+                    {
                         let _ = evt_tx.send(WorkerEvent::MessageBodyLoaded(updated));
                     }
                 }
@@ -534,7 +539,10 @@ async fn handle_request(
             flagged,
         } => {
             let _ = cache.set_message_flagged(message_id, flagged);
-            if let Ok(Some((updated, _, _))) = cache.get_message_detail(message_id) {
+            let newest_first = pref_thread_newest_first(data_dir);
+            if let Ok(Some((updated, _, _))) =
+                cache.get_message_detail_ordered(message_id, newest_first)
+            {
                 let _ = evt_tx.send(WorkerEvent::MessageBodyLoaded(updated));
             }
             if let Ok(account) = load_account_config(data_dir, account_id) {
@@ -637,6 +645,47 @@ async fn handle_request(
                 });
             }
         },
+
+        MailRequest::SaveAllAttachments {
+            attachment_ids,
+            dest_dir,
+        } => {
+            if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: format!("创建附件导出目录失败: {e}"),
+                });
+                return;
+            }
+            let mut saved_count = 0usize;
+            for att_id in attachment_ids {
+                match cache.get_attachment_bytes(att_id) {
+                    Ok(Some((name, bytes))) => {
+                        let dest_path = crate::cache::unique_attachment_path(&dest_dir, &name);
+                        match std::fs::write(&dest_path, bytes) {
+                            Ok(()) => saved_count += 1,
+                            Err(e) => {
+                                let _ = evt_tx.send(WorkerEvent::Error {
+                                    account_id: None,
+                                    message: format!("保存附件 {} 失败: {e}", name),
+                                });
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = evt_tx.send(WorkerEvent::Error {
+                            account_id: None,
+                            message: e,
+                        });
+                    }
+                }
+            }
+            let _ = evt_tx.send(WorkerEvent::AttachmentsSaved {
+                count: saved_count,
+                dest_dir,
+            });
+        }
 
         MailRequest::SaveLocalDraft { mut draft } => {
             draft.updated_at = chrono::Utc::now().timestamp();
@@ -1088,6 +1137,12 @@ fn pref_page_size(data_dir: &PathBuf) -> usize {
     config::load_preferences_in(data_dir)
         .map(|p| p.page_size)
         .unwrap_or(100)
+}
+
+fn pref_thread_newest_first(data_dir: &PathBuf) -> bool {
+    config::load_preferences_in(data_dir)
+        .map(|p| p.thread_newest_first)
+        .unwrap_or(true)
 }
 
 async fn sync_folder_inner(

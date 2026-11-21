@@ -507,6 +507,8 @@ fn parse_header_bytes(
         return CachedHeaderInput {
             uid,
             message_id: String::new(),
+            in_reply_to: String::new(),
+            references_header: String::new(),
             sender: "(未知发件人)".to_string(),
             recipients: String::new(),
             subject: "(无法解析标题)".to_string(),
@@ -543,6 +545,8 @@ fn parse_header_bytes(
         .to_string();
 
     let message_id = msg.message_id().unwrap_or_default().to_string();
+    let in_reply_to = header_value_to_ids(msg.in_reply_to());
+    let references_header = header_value_to_ids(msg.references());
 
     let (date_ts, date_display) = match msg.date() {
         Some(dt) => {
@@ -566,6 +570,8 @@ fn parse_header_bytes(
     CachedHeaderInput {
         uid,
         message_id,
+        in_reply_to,
+        references_header,
         sender,
         recipients,
         subject,
@@ -575,6 +581,19 @@ fn parse_header_bytes(
         unread,
         flagged,
         has_attachment,
+    }
+}
+
+fn header_value_to_ids(val: &mail_parser::HeaderValue<'_>) -> String {
+    match val {
+        mail_parser::HeaderValue::Text(s) => s.trim().to_string(),
+        mail_parser::HeaderValue::TextList(list) => list
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
     }
 }
 

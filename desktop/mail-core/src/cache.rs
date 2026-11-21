@@ -1,6 +1,7 @@
 //! SQLite local cache for folders, message headers/bodies, attachments, and outbox journal.
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,8 @@ pub struct RemoteFolder {
 pub struct CachedHeaderInput {
     pub uid: u32,
     pub message_id: String,
+    pub in_reply_to: String,
+    pub references_header: String,
     pub sender: String,
     pub recipients: String,
     pub subject: String,
@@ -112,6 +115,94 @@ pub fn normalize_thread_subject(subject: &str) -> String {
     s.trim().to_lowercase()
 }
 
+/// Extract normalized RFC Message-ID tokens (without angle brackets, lowercased)
+/// from `Message-ID`, `In-Reply-To`, `References`, or Graph `conversationId` headers.
+pub fn extract_rfc_message_ids(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    let mut rest = trimmed;
+    while let Some(open) = rest.find('<') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('>') else {
+            break;
+        };
+        let token = after_open[..close].trim().to_ascii_lowercase();
+        if !token.is_empty() && !ids.contains(&token) {
+            ids.push(token);
+        }
+        rest = &after_open[close + 1..];
+    }
+    if ids.is_empty() {
+        for part in trimmed.split_whitespace() {
+            let token = part
+                .trim_matches(|c| c == '<' || c == '>' || c == ',' || c == ';')
+                .trim()
+                .to_ascii_lowercase();
+            if !token.is_empty() && !ids.contains(&token) {
+                ids.push(token);
+            }
+        }
+    }
+    ids
+}
+
+/// Check whether a folder's friendly name or raw path represents a Trash/Deleted folder.
+fn is_trash_folder(name: &str, path: &str) -> bool {
+    let upper_path = path.to_ascii_uppercase();
+    name == "已删除" || upper_path.contains("TRASH") || upper_path.contains("DELETED")
+}
+
+/// Compute a non-colliding file path in `dir` for `filename`, appending `(1)`, `(2)`, ...
+/// before the file extension when a file with the same name already exists.
+pub fn unique_attachment_path(dir: &Path, filename: &str) -> PathBuf {
+    let base = Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("attachment.bin");
+    let safe_name: String = base
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    let safe_name = if safe_name.trim_matches('.').is_empty() {
+        "attachment.bin".to_string()
+    } else {
+        safe_name
+    };
+
+    let candidate = dir.join(&safe_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let path_obj = Path::new(&safe_name);
+    let stem = path_obj
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&safe_name);
+    let ext = path_obj.extension().and_then(|e| e.to_str());
+
+    let mut idx = 1usize;
+    loop {
+        let numbered = match ext {
+            Some(e) if !e.is_empty() => format!("{stem} ({idx}).{e}"),
+            _ => format!("{stem} ({idx})"),
+        };
+        let next = dir.join(numbered);
+        if !next.exists() {
+            return next;
+        }
+        idx += 1;
+    }
+}
+
 /// Persistent SQLite mail cache.
 pub struct CacheStore {
     conn: Connection,
@@ -166,6 +257,8 @@ impl CacheStore {
                     uid INTEGER NOT NULL,
                     remote_id TEXT NOT NULL DEFAULT '',
                     message_id TEXT NOT NULL DEFAULT '',
+                    in_reply_to TEXT NOT NULL DEFAULT '',
+                    references_header TEXT NOT NULL DEFAULT '',
                     sender TEXT NOT NULL,
                     recipients TEXT NOT NULL DEFAULT '',
                     subject TEXT NOT NULL,
@@ -233,6 +326,15 @@ impl CacheStore {
         // 历史邮件增量预加载游标：标记服务端是否仍有更早邮件及 Graph nextLink。
         self.ensure_column("folders", "has_more_remote", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("folders", "remote_next_link", "TEXT NOT NULL DEFAULT ''")?;
+        // RFC 会话线程关联头（In-Reply-To / References 或 Graph conversationId）。
+        self.ensure_column("messages", "in_reply_to", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("messages", "references_header", "TEXT NOT NULL DEFAULT ''")?;
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_account_msgid ON messages(account_id, message_id)",
+                [],
+            )
+            .map_err(|e| format!("创建会话索引失败: {e}"))?;
         // FTS5 全文索引：覆盖主题、发件人、收件人、摘要与正文，由触发器自动维护。
         self.conn
             .execute_batch(
@@ -557,16 +659,24 @@ impl CacheStore {
             tx.execute(
                 "
                 INSERT INTO messages (
-                    account_id, folder_id, uid, remote_id, message_id, sender, recipients,
-                    subject, preview, date_ts, date_display, unread, flagged, has_attachment
+                    account_id, folder_id, uid, remote_id, message_id, in_reply_to, references_header,
+                    sender, recipients, subject, preview, date_ts, date_display, unread, flagged, has_attachment
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                 ON CONFLICT(folder_id, uid) DO UPDATE SET
                     remote_id = CASE
                         WHEN excluded.remote_id = '' THEN messages.remote_id
                         ELSE excluded.remote_id
                     END,
                     message_id = excluded.message_id,
+                    in_reply_to = CASE
+                        WHEN excluded.in_reply_to = '' THEN messages.in_reply_to
+                        ELSE excluded.in_reply_to
+                    END,
+                    references_header = CASE
+                        WHEN excluded.references_header = '' THEN messages.references_header
+                        ELSE excluded.references_header
+                    END,
                     sender = excluded.sender,
                     recipients = excluded.recipients,
                     subject = excluded.subject,
@@ -586,6 +696,8 @@ impl CacheStore {
                     item.uid,
                     remote_id,
                     item.message_id,
+                    item.in_reply_to,
+                    item.references_header,
                     item.sender,
                     item.recipients,
                     item.subject,
@@ -1249,10 +1361,20 @@ impl CacheStore {
         })
     }
 
-    /// Return cached message detail and whether its body has already been downloaded.
+    /// Return cached message detail (default newest-first thread order) and whether its body has already been downloaded.
     pub fn get_message_detail(
         &self,
         message_id: u32,
+    ) -> Result<Option<(MessageDetail, u32, bool)>, String> {
+        self.get_message_detail_ordered(message_id, true)
+    }
+
+    /// Return cached message detail with explicit thread ordering (`newest_first`)
+    /// and whether its body has already been downloaded.
+    pub fn get_message_detail_ordered(
+        &self,
+        message_id: u32,
+        newest_first: bool,
     ) -> Result<Option<(MessageDetail, u32, bool)>, String> {
         let row = self
             .conn
@@ -1311,7 +1433,7 @@ impl CacheStore {
         let body_loaded = body_opt.is_some();
         let body_text = body_opt.unwrap_or_default();
         let thread_messages = self
-            .list_thread_messages(account_id, &subject)
+            .list_thread_messages(account_id, id, &subject, newest_first)
             .unwrap_or_default();
         let detail = MessageDetail {
             id,
@@ -1353,82 +1475,320 @@ impl CacheStore {
             .map_err(|e| format!("查找已发送文件夹失败: {e}"))
     }
 
-    /// Aggregate chronological messages in the same account whose normalized subject
-    /// matches `subject` (up to 20 messages).
+    /// Aggregate messages belonging to the same conversation thread for `account_id`:
+    /// 1. Prefer RFC threading via `message_id` / `in_reply_to` / `references_header`
+    ///    (including Graph `conversationId` stored in `references_header`).
+    /// 2. Fall back to `normalize_thread_subject(subject)` when no RFC reply headers link
+    ///    multiple messages.
+    /// 3. Deduplicate cross-folder copies sharing `(message_id, sender, date_ts)`,
+    ///    preferring the anchor message > anchor folder > non-Trash folder.
+    /// 4. Order by `newest_first` (`true` = `date_ts DESC, uid DESC`, `false` = `date_ts ASC, uid ASC`).
     pub fn list_thread_messages(
         &self,
         account_id: u32,
+        message_id: u32,
         subject: &str,
+        newest_first: bool,
     ) -> Result<Vec<ThreadMessage>, String> {
-        let key = normalize_thread_subject(subject);
-        if key.is_empty() {
-            return Ok(Vec::new());
+        struct RawRow {
+            id: u32,
+            folder_id: u32,
+            folder_name: String,
+            folder_path: String,
+            uid: u32,
+            rfc_message_id: String,
+            in_reply_to: String,
+            references_header: String,
+            sender: String,
+            recipients: String,
+            subject: String,
+            date_ts: i64,
+            date_display: String,
+            body_opt: Option<String>,
+            body_html: Option<String>,
+            preview: String,
+            flagged: bool,
         }
-        let pattern = format!("%{key}%");
-        let mut stmt = self
-            .conn
-            .prepare(
-                "
-                SELECT id, sender, recipients, subject, date_display, body_text, body_html, preview, flagged
-                FROM messages
-                WHERE account_id = ?1 AND LOWER(subject) LIKE ?2
-                ORDER BY date_ts ASC, uid ASC
-                LIMIT 40
-                ",
-            )
-            .map_err(|e| format!("准备会话查询失败: {e}"))?;
 
-        let raw_rows = stmt
-            .query_map(params![account_id, pattern], |row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, i32>(8)? != 0,
+        // 1. Inspect the anchor message (if provided) for folder & RFC thread headers.
+        let anchor_info: Option<(u32, String, String, String)> = if message_id != 0 {
+            self.conn
+                .query_row(
+                    "
+                    SELECT folder_id, message_id, in_reply_to, references_header
+                    FROM messages
+                    WHERE id = ?1 AND account_id = ?2
+                    ",
+                    params![message_id, account_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, u32>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| format!("查询会话锚点邮件失败: {e}"))?
+        } else {
+            None
+        };
+
+        let anchor_folder_id = anchor_info.as_ref().map(|(fid, _, _, _)| *fid);
+        let mut seed_ids: HashSet<String> = HashSet::new();
+        let mut anchor_has_reply_headers = false;
+        if let Some((_, ref mid, ref irt, ref refs)) = anchor_info {
+            for tok in extract_rfc_message_ids(mid) {
+                seed_ids.insert(tok);
+            }
+            let irt_ids = extract_rfc_message_ids(irt);
+            let ref_ids = extract_rfc_message_ids(refs);
+            if !irt_ids.is_empty() || !ref_ids.is_empty() {
+                anchor_has_reply_headers = true;
+            }
+            for tok in irt_ids.into_iter().chain(ref_ids) {
+                seed_ids.insert(tok);
+            }
+        }
+
+        // 2. Try RFC header-based transitive grouping first.
+        let mut matched_ids: HashSet<u32> = HashSet::new();
+        if !seed_ids.is_empty() {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT id, message_id, in_reply_to, references_header
+                    FROM messages
+                    WHERE account_id = ?1
+                      AND (message_id != '' OR in_reply_to != '' OR references_header != '')
+                    ",
+                )
+                .map_err(|e| format!("准备 RFC 会话索引查询失败: {e}"))?;
+            let candidates: Vec<(u32, Vec<String>)> = stmt
+                .query_map(params![account_id], |row| {
+                    let id: u32 = row.get(0)?;
+                    let mid: String = row.get(1)?;
+                    let irt: String = row.get(2)?;
+                    let refs: String = row.get(3)?;
+                    let mut ids = extract_rfc_message_ids(&mid);
+                    ids.extend(extract_rfc_message_ids(&irt));
+                    ids.extend(extract_rfc_message_ids(&refs));
+                    Ok((id, ids))
+                })
+                .map_err(|e| format!("执行 RFC 会话索引查询失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析 RFC 会话索引失败: {e}"))?;
+
+            let mut thread_ids = seed_ids;
+            for _ in 0..8 {
+                let mut changed = false;
+                for (cid, cids) in &candidates {
+                    if cids.iter().any(|t| thread_ids.contains(t)) {
+                        if matched_ids.insert(*cid) {
+                            changed = true;
+                        }
+                        for t in cids {
+                            if thread_ids.insert(t.clone()) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            if message_id != 0 && anchor_info.is_some() {
+                matched_ids.insert(message_id);
+            }
+        }
+
+        // 3. Load candidate rows either from RFC matches or from subject fallback.
+        let use_rfc = matched_ids.len() >= 2 || (anchor_has_reply_headers && !matched_ids.is_empty());
+
+        let mut raw_rows: Vec<RawRow> = Vec::new();
+        if use_rfc {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT m.id, m.folder_id, f.name, f.path, m.uid, m.message_id,
+                           m.in_reply_to, m.references_header, m.sender, m.recipients,
+                           m.subject, m.date_ts, m.date_display, m.body_text, m.body_html,
+                           m.preview, m.flagged
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    WHERE m.id = ?1
+                    ",
+                )
+                .map_err(|e| format!("准备 RFC 会话详情查询失败: {e}"))?;
+            for cid in matched_ids {
+                if let Some(row) = stmt
+                    .query_row(params![cid], |row| {
+                        Ok(RawRow {
+                            id: row.get(0)?,
+                            folder_id: row.get(1)?,
+                            folder_name: row.get(2)?,
+                            folder_path: row.get(3)?,
+                            uid: row.get(4)?,
+                            rfc_message_id: row.get(5)?,
+                            in_reply_to: row.get(6)?,
+                            references_header: row.get(7)?,
+                            sender: row.get(8)?,
+                            recipients: row.get(9)?,
+                            subject: row.get(10)?,
+                            date_ts: row.get(11)?,
+                            date_display: row.get(12)?,
+                            body_opt: row.get(13)?,
+                            body_html: row.get(14)?,
+                            preview: row.get(15)?,
+                            flagged: row.get::<_, i32>(16)? != 0,
+                        })
+                    })
+                    .optional()
+                    .map_err(|e| format!("读取 RFC 会话行失败: {e}"))?
+                {
+                    let _ = (&row.in_reply_to, &row.references_header);
+                    raw_rows.push(row);
+                }
+            }
+        } else {
+            let key = normalize_thread_subject(subject);
+            if key.is_empty() {
+                return Ok(Vec::new());
+            }
+            let pattern = format!("%{key}%");
+            let order_sql = if newest_first {
+                "m.date_ts DESC, m.uid DESC"
+            } else {
+                "m.date_ts ASC, m.uid ASC"
+            };
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "
+                    SELECT m.id, m.folder_id, f.name, f.path, m.uid, m.message_id,
+                           m.in_reply_to, m.references_header, m.sender, m.recipients,
+                           m.subject, m.date_ts, m.date_display, m.body_text, m.body_html,
+                           m.preview, m.flagged
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    WHERE m.account_id = ?1 AND LOWER(m.subject) LIKE ?2
+                    ORDER BY {order_sql}
+                    LIMIT 60
+                    "
                 ))
-            })
-            .map_err(|e| format!("执行会话查询失败: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("解析会话结果失败: {e}"))?;
+                .map_err(|e| format!("准备会话查询失败: {e}"))?;
 
-        let mut out = Vec::new();
-        for (
-            id,
-            sender,
-            recipients,
-            row_subject,
-            date_display,
-            body_opt,
-            body_html,
-            preview,
-            flagged,
-        ) in raw_rows
-        {
-            if normalize_thread_subject(&row_subject) != key {
+            let rows = stmt
+                .query_map(params![account_id, pattern], |row| {
+                    Ok(RawRow {
+                        id: row.get(0)?,
+                        folder_id: row.get(1)?,
+                        folder_name: row.get(2)?,
+                        folder_path: row.get(3)?,
+                        uid: row.get(4)?,
+                        rfc_message_id: row.get(5)?,
+                        in_reply_to: row.get(6)?,
+                        references_header: row.get(7)?,
+                        sender: row.get(8)?,
+                        recipients: row.get(9)?,
+                        subject: row.get(10)?,
+                        date_ts: row.get(11)?,
+                        date_display: row.get(12)?,
+                        body_opt: row.get(13)?,
+                        body_html: row.get(14)?,
+                        preview: row.get(15)?,
+                        flagged: row.get::<_, i32>(16)? != 0,
+                    })
+                })
+                .map_err(|e| format!("执行会话查询失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析会话结果失败: {e}"))?;
+
+            for row in rows {
+                if normalize_thread_subject(&row.subject) == key {
+                    let _ = (&row.in_reply_to, &row.references_header);
+                    raw_rows.push(row);
+                }
+            }
+        }
+
+        // 4. Deduplicate cross-folder copies with same (message_id, sender, date_ts),
+        //    preferring anchor message > anchor folder > non-Trash folder > Trash folder.
+        let copy_priority = |r: &RawRow| -> u8 {
+            if message_id != 0 && r.id == message_id {
+                3
+            } else if anchor_folder_id == Some(r.folder_id) {
+                2
+            } else if !is_trash_folder(&r.folder_name, &r.folder_path) {
+                1
+            } else {
+                0
+            }
+        };
+
+        let mut deduped: Vec<RawRow> = Vec::with_capacity(raw_rows.len());
+        let mut by_key: HashMap<(String, String, i64), usize> = HashMap::new();
+        for row in raw_rows {
+            let norm_mid = extract_rfc_message_ids(&row.rfc_message_id)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            if norm_mid.is_empty() {
+                deduped.push(row);
                 continue;
             }
-            let body_loaded = body_opt.is_some();
-            let body_text = body_opt.unwrap_or(preview);
-            let attachments = self.list_attachments(id).unwrap_or_default();
+            let key = (norm_mid, row.sender.clone(), row.date_ts);
+            if let Some(&existing_idx) = by_key.get(&key) {
+                if copy_priority(&row) > copy_priority(&deduped[existing_idx]) {
+                    deduped[existing_idx] = row;
+                }
+            } else {
+                let idx = deduped.len();
+                deduped.push(row);
+                by_key.insert(key, idx);
+            }
+        }
+
+        // 5. Sort by requested direction.
+        if newest_first {
+            deduped.sort_by(|a, b| {
+                b.date_ts
+                    .cmp(&a.date_ts)
+                    .then_with(|| b.uid.cmp(&a.uid))
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+        } else {
+            deduped.sort_by(|a, b| {
+                a.date_ts
+                    .cmp(&b.date_ts)
+                    .then_with(|| a.uid.cmp(&b.uid))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
+        deduped.truncate(40);
+
+        let mut out = Vec::with_capacity(deduped.len());
+        for row in deduped {
+            let body_loaded = row.body_opt.is_some();
+            let body_text = row.body_opt.unwrap_or(row.preview);
+            let attachments = self.list_attachments(row.id).unwrap_or_default();
             out.push(ThreadMessage {
-                id,
-                sender,
-                recipients,
-                date_display,
+                id: row.id,
+                rfc_message_id: row.rfc_message_id,
+                subject: row.subject,
+                sender: row.sender,
+                recipients: row.recipients,
+                date_display: row.date_display,
                 body_text,
-                body_html,
+                body_html: row.body_html,
                 body_loaded,
-                flagged,
+                flagged: row.flagged,
                 attachments,
             });
-            if out.len() >= 20 {
-                break;
-            }
         }
         Ok(out)
     }
@@ -2114,6 +2474,8 @@ mod tests {
         CachedHeaderInput {
             uid,
             message_id: format!("<msg-{uid}@example.com>"),
+            in_reply_to: String::new(),
+            references_header: String::new(),
             sender: "Alice <alice@example.com>".to_string(),
             recipients: "bob@example.com".to_string(),
             subject: subject.to_string(),
@@ -2148,6 +2510,8 @@ mod tests {
         CachedHeaderInput {
             uid,
             message_id: format!("<msg-{uid}@example.com>"),
+            in_reply_to: String::new(),
+            references_header: String::new(),
             sender: sender.to_string(),
             recipients: recipients.to_string(),
             subject: subject.to_string(),
@@ -3087,6 +3451,8 @@ mod tests {
                     CachedHeaderInput {
                         uid: 1,
                         message_id: "<1@test>".to_string(),
+                        in_reply_to: String::new(),
+                        references_header: String::new(),
                         sender: "Alice <a@test>".to_string(),
                         recipients: "me@test".to_string(),
                         subject: "未读且星标".to_string(),
@@ -3100,6 +3466,8 @@ mod tests {
                     CachedHeaderInput {
                         uid: 2,
                         message_id: "<2@test>".to_string(),
+                        in_reply_to: String::new(),
+                        references_header: String::new(),
                         sender: "Bob <b@test>".to_string(),
                         recipients: "me@test".to_string(),
                         subject: "仅未读".to_string(),
@@ -3113,6 +3481,8 @@ mod tests {
                     CachedHeaderInput {
                         uid: 3,
                         message_id: "<3@test>".to_string(),
+                        in_reply_to: String::new(),
+                        references_header: String::new(),
                         sender: "Carol <c@test>".to_string(),
                         recipients: "me@test".to_string(),
                         subject: "已读星标".to_string(),
@@ -3190,6 +3560,8 @@ mod tests {
                     CachedHeaderInput {
                         uid: 1,
                         message_id: "<m1@test>".to_string(),
+                        in_reply_to: String::new(),
+                        references_header: String::new(),
                         sender: "Alice <a@test>".to_string(),
                         recipients: "me@test".to_string(),
                         subject: "Q3 Roadmap".to_string(),
@@ -3203,6 +3575,8 @@ mod tests {
                     CachedHeaderInput {
                         uid: 2,
                         message_id: "<m2@test>".to_string(),
+                        in_reply_to: String::new(),
+                        references_header: String::new(),
                         sender: "Bob <b@test>".to_string(),
                         recipients: "me@test".to_string(),
                         subject: "Re: Q3 Roadmap".to_string(),
@@ -3218,10 +3592,201 @@ mod tests {
             )
             .unwrap();
 
-        let thread = cache.list_thread_messages(1, "Re: Q3 Roadmap").unwrap();
-        assert_eq!(thread.len(), 2);
-        assert_eq!(thread[0].sender, "Alice <a@test>");
-        assert_eq!(thread[1].sender, "Bob <b@test>");
+        let page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let latest_id = page.items[0].id;
+
+        // 默认降序（newest_first = true）：最新回复在最前。
+        let desc = cache
+            .list_thread_messages(1, latest_id, "Re: Q3 Roadmap", true)
+            .unwrap();
+        assert_eq!(desc.len(), 2);
+        assert_eq!(desc[0].sender, "Bob <b@test>");
+        assert_eq!(desc[1].sender, "Alice <a@test>");
+
+        // 升序（newest_first = false）：最早邮件在最前。
+        let asc = cache
+            .list_thread_messages(1, latest_id, "Re: Q3 Roadmap", false)
+            .unwrap();
+        assert_eq!(asc.len(), 2);
+        assert_eq!(asc[0].sender, "Alice <a@test>");
+        assert_eq!(asc[1].sender, "Bob <b@test>");
+    }
+
+    #[test]
+    fn rfc_threading_links_different_subjects_and_dedupes_cross_folder_copies() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[
+                    folder("收件箱", "INBOX"),
+                    folder("已发送", "Sent"),
+                    folder("已删除", "Trash"),
+                ],
+            )
+            .unwrap();
+        let inbox = folders.iter().find(|f| f.path == "INBOX").unwrap().id;
+        let sent = folders.iter().find(|f| f.path == "Sent").unwrap().id;
+        let trash = folders.iter().find(|f| f.path == "Trash").unwrap().id;
+
+        // A 在 INBOX，B 在 Sent（改了主题但通过 In-Reply-To 关联 A），C 在 INBOX（通过 References 关联 A/B）。
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                1,
+                &[
+                    CachedHeaderInput {
+                        uid: 10,
+                        message_id: "<root@example.com>".to_string(),
+                        in_reply_to: String::new(),
+                        references_header: String::new(),
+                        sender: "Alice <alice@example.com>".to_string(),
+                        recipients: "me@example.com".to_string(),
+                        subject: "原始需求讨论".to_string(),
+                        preview: "第一封".to_string(),
+                        date_ts: 1000,
+                        date_display: "09:00".to_string(),
+                        unread: false,
+                        flagged: false,
+                        has_attachment: false,
+                    },
+                    CachedHeaderInput {
+                        uid: 12,
+                        message_id: "<reply2@example.com>".to_string(),
+                        in_reply_to: "<reply1@example.com>".to_string(),
+                        references_header: "<root@example.com> <reply1@example.com>".to_string(),
+                        sender: "Alice <alice@example.com>".to_string(),
+                        recipients: "me@example.com".to_string(),
+                        subject: "全新主题名（依然同线程）".to_string(),
+                        preview: "第三封".to_string(),
+                        date_ts: 3000,
+                        date_display: "11:00".to_string(),
+                        unread: true,
+                        flagged: false,
+                        has_attachment: false,
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+
+        cache
+            .commit_folder_headers(
+                1,
+                sent,
+                2,
+                &[CachedHeaderInput {
+                    uid: 20,
+                    message_id: "<reply1@example.com>".to_string(),
+                    in_reply_to: "<root@example.com>".to_string(),
+                    references_header: "<root@example.com>".to_string(),
+                    sender: "Me <me@example.com>".to_string(),
+                    recipients: "alice@example.com".to_string(),
+                    subject: "改过标题的回复".to_string(),
+                    preview: "第二封".to_string(),
+                    date_ts: 2000,
+                    date_display: "10:00".to_string(),
+                    unread: false,
+                    flagged: false,
+                    has_attachment: false,
+                }],
+                None,
+            )
+            .unwrap();
+
+        // 在 Trash 中放一份与 INBOX root 相同的重复副本（同 message_id + sender + date_ts）。
+        cache
+            .commit_folder_headers(
+                1,
+                trash,
+                3,
+                &[CachedHeaderInput {
+                    uid: 99,
+                    message_id: "<root@example.com>".to_string(),
+                    in_reply_to: String::new(),
+                    references_header: String::new(),
+                    sender: "Alice <alice@example.com>".to_string(),
+                    recipients: "me@example.com".to_string(),
+                    subject: "原始需求讨论".to_string(),
+                    preview: "回收站副本".to_string(),
+                    date_ts: 1000,
+                    date_display: "09:00".to_string(),
+                    unread: false,
+                    flagged: false,
+                    has_attachment: false,
+                }],
+                None,
+            )
+            .unwrap();
+
+        let inbox_page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let reply2_id = inbox_page
+            .items
+            .iter()
+            .find(|m| m.uid == 12)
+            .unwrap()
+            .id;
+        let root_inbox_id = inbox_page
+            .items
+            .iter()
+            .find(|m| m.uid == 10)
+            .unwrap()
+            .id;
+
+        // 降序：reply2 (3000) -> reply1 (2000) -> root (1000)，且 Trash 副本被去重。
+        let desc = cache
+            .list_thread_messages(1, reply2_id, "全新主题名（依然同线程）", true)
+            .unwrap();
+        assert_eq!(desc.len(), 3);
+        assert_eq!(desc[0].rfc_message_id, "<reply2@example.com>");
+        assert_eq!(desc[1].rfc_message_id, "<reply1@example.com>");
+        assert_eq!(desc[2].rfc_message_id, "<root@example.com>");
+        assert_eq!(
+            desc[2].id, root_inbox_id,
+            "跨文件夹去重应优先保留当前文件夹/非 Trash 副本"
+        );
+
+        // 升序：root -> reply1 -> reply2。
+        let asc = cache
+            .list_thread_messages(1, reply2_id, "全新主题名（依然同线程）", false)
+            .unwrap();
+        assert_eq!(asc.len(), 3);
+        assert_eq!(asc[0].rfc_message_id, "<root@example.com>");
+        assert_eq!(asc[1].rfc_message_id, "<reply1@example.com>");
+        assert_eq!(asc[2].rfc_message_id, "<reply2@example.com>");
+
+        // get_message_detail 默认使用降序。
+        let (detail, _, _) = cache.get_message_detail(reply2_id).unwrap().unwrap();
+        assert_eq!(detail.thread_messages.len(), 3);
+        assert_eq!(detail.thread_messages[0].id, reply2_id);
+    }
+
+    #[test]
+    fn unique_attachment_path_appends_incrementing_suffix_on_collision() {
+        let dir = std::env::temp_dir().join(format!("hylki-att-collision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let p0 = unique_attachment_path(&dir, "report.pdf");
+        assert_eq!(p0, dir.join("report.pdf"));
+        std::fs::write(&p0, b"first").unwrap();
+
+        let p1 = unique_attachment_path(&dir, "report.pdf");
+        assert_eq!(p1, dir.join("report (1).pdf"));
+        std::fs::write(&p1, b"second").unwrap();
+
+        let p2 = unique_attachment_path(&dir, "report.pdf");
+        assert_eq!(p2, dir.join("report (2).pdf"));
+
+        // 无扩展名文件也能正确追加后缀。
+        let no_ext0 = unique_attachment_path(&dir, "README");
+        assert_eq!(no_ext0, dir.join("README"));
+        std::fs::write(&no_ext0, b"readme").unwrap();
+        let no_ext1 = unique_attachment_path(&dir, "README");
+        assert_eq!(no_ext1, dir.join("README (1)"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
