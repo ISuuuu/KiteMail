@@ -185,32 +185,6 @@ impl CurrentView {
     }
 }
 
-/// 中栏列表客户端过滤（对当前页数据）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ListFilter {
-    All,
-    Unread,
-    Starred,
-}
-
-impl ListFilter {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::All => "全部",
-            Self::Unread => "仅未读",
-            Self::Starred => "仅星标",
-        }
-    }
-
-    pub(crate) fn to_mail_filter(self) -> MessageFilter {
-        match self {
-            Self::All => MessageFilter::All,
-            Self::Unread => MessageFilter::Unread,
-            Self::Starred => MessageFilter::Starred,
-        }
-    }
-}
-
 // 全局快捷键动作（方案文档五.3）；键绑定注册在 main.rs，
 // 动作监听挂在根节点 render 上。
 actions!(
@@ -352,8 +326,6 @@ pub(crate) struct HylkiApp {
     pub(crate) system_dark_mode: bool,
     /// 左栏是否隐藏（中栏顶部开关）。
     pub(crate) sidebar_hidden: bool,
-    /// 中栏列表客户端过滤（向后兼容单选枚举）。
-    pub(crate) list_filter: ListFilter,
     /// 列表排序方式（6 种，默认最新优先）。
     pub(crate) list_sort: MessageSort,
     /// 多条件快捷筛选（仅未读 / 仅星标 / 含附件 / 今天）。
@@ -710,7 +682,6 @@ impl HylkiApp {
                 dark_mode: initial_dark_mode,
                 system_dark_mode,
                 sidebar_hidden: false,
-                list_filter: ListFilter::All,
                 list_sort: MessageSort::DateNewest,
                 quick_filters: QuickFilterSet::default(),
                 search_scope: SearchScope::ThisFolder,
@@ -867,7 +838,6 @@ impl HylkiApp {
             dark_mode: initial_dark_mode,
             system_dark_mode,
             sidebar_hidden: false,
-            list_filter: ListFilter::All,
             list_sort: MessageSort::DateNewest,
             quick_filters: QuickFilterSet::default(),
             search_scope: SearchScope::ThisFolder,
@@ -3051,18 +3021,6 @@ impl HylkiApp {
         cx.notify();
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set_list_filter(&mut self, filter: ListFilter, cx: &mut Context<Self>) {
-        if self.list_filter != filter {
-            self.list_filter = filter;
-            self.quick_filters = QuickFilterSet::from_message_filter(filter.to_mail_filter());
-            self.reset_list_pagination();
-            self.reload_current_page(cx);
-        } else {
-            cx.notify();
-        }
-    }
-
     pub(crate) fn set_list_sort(&mut self, sort: MessageSort, cx: &mut Context<Self>) {
         if self.list_sort != sort {
             self.list_sort = sort;
@@ -3099,7 +3057,6 @@ impl HylkiApp {
 
     pub(crate) fn clear_quick_filters(&mut self, cx: &mut Context<Self>) {
         self.quick_filters.clear();
-        self.list_filter = ListFilter::All;
         self.reset_list_pagination();
         self.reload_current_page(cx);
     }
@@ -4279,13 +4236,6 @@ mod tests {
         let (name, email) = split_sender(" 张三 <zhang@exmail.qq.com> ");
         assert_eq!(name, "张三");
         assert_eq!(email, "zhang@exmail.qq.com");
-    }
-
-    #[test]
-    fn list_filter_labels_are_visible() {
-        assert_eq!(ListFilter::All.label(), "全部");
-        assert_eq!(ListFilter::Unread.label(), "仅未读");
-        assert_eq!(ListFilter::Starred.label(), "仅星标");
     }
 
     #[test]
