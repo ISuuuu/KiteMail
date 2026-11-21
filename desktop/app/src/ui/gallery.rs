@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-// TODO(phase3-wire): integrate into HylkiApp.
 //! 附件总览页（方案文档第三节页面 7）：
 //! - 顶部栏：附件图标 + 标题 + 搜索框（即时过滤，变更发 [`GalleryEvent::QueryChanged`]）
 //!   + 账号筛选下拉（变更发 [`GalleryEvent::AccountFilterChanged`]）。
@@ -48,7 +46,7 @@ pub enum GalleryEvent {
     LocateMessage(u32),
 }
 
-/// 附件总览视图状态（独立 Entity，phase3 接线）。
+/// 附件总览视图状态（独立 Entity，由 HylkiApp 挂载）。
 pub struct GalleryState {
     search_input: gpui_kit::Entity<InputState>,
     /// 当前搜索词（客户端过滤 + 供集成者展示）。

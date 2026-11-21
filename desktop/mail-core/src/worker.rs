@@ -708,6 +708,21 @@ async fn handle_request(
                 });
             }
         },
+
+        MailRequest::ClearBodyCaches => match cache.clear_message_bodies() {
+            Ok(_) => {
+                let _ = evt_tx.send(WorkerEvent::Status {
+                    account_id: None,
+                    text: "正文缓存已清理".to_string(),
+                });
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: e,
+                });
+            }
+        },
     }
 }
 

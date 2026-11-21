@@ -18,9 +18,8 @@
 use gpui_kit::component::{Theme, ThemeColor, ThemeMode};
 use gpui_kit::{black, rgb, white, App, Global, Hsla};
 
-/// 内置主题列表（id, 显示名）。本轮仅 "default" 被安装；
-// TODO(phase3): 偏好设置页（preferences.rs）读取该列表渲染色板选择器。
-#[allow(dead_code)]
+/// 内置主题列表（id, 显示名）；偏好设置页（preferences.rs）读取该列表
+/// 渲染色板选择器，持久化的 theme_id 经 [`static_theme_id`] 归一化。
 pub const THEME_LIST: &[(&str, &str)] = &[
     ("default", "经典蓝"),
     ("rose", "玫瑰"),
@@ -281,11 +280,15 @@ pub fn palette_for(theme_id: &str, dark: bool) -> HylkiPalette {
 /// 当前会话的主题状态（全局）。
 pub struct HylkiThemeState {
     pub palette: HylkiPalette,
-    // TODO(phase3): 偏好设置持久化（preferences.toml）读写这两个字段。
-    #[allow(dead_code)]
-    pub theme_id: &'static str,
-    #[allow(dead_code)]
-    pub dark: bool,
+}
+
+/// 把持久化的 theme_id 归一化为内置列表里的 `&'static str`（未知回落经典蓝）。
+pub fn static_theme_id(id: &str) -> &'static str {
+    THEME_LIST
+        .iter()
+        .find(|(known, _)| *known == id)
+        .map(|(known, _)| *known)
+        .unwrap_or("default")
 }
 
 impl Global for HylkiThemeState {}
@@ -313,11 +316,7 @@ pub fn apply(theme_id: &'static str, dark: bool, cx: &mut App) {
     Theme::change(mode, None, cx);
     let colors = theme_color_for(palette, dark);
     Theme::update(cx, |theme| theme.colors = colors);
-    cx.set_global(HylkiThemeState {
-        palette,
-        theme_id,
-        dark,
-    });
+    cx.set_global(HylkiThemeState { palette });
 }
 
 /// 由语义色板构造 gpui-kit `ThemeColor`，使 Button / Input / Popover 等

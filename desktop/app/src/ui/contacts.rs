@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-// TODO(phase3-wire): integrate into HylkiApp.
 //! 联系人页（方案文档第三节页面 7）：
 //! - 左栏：搜索框（变更发 [`ContactsEvent::QueryChanged`]）+ 联系人列表
 //!   （姓名 + 邮箱 + 往来邮件数胶囊，按邮件数降序展示）。
@@ -38,7 +36,7 @@ pub enum ContactsEvent {
     ComposeTo(String),
 }
 
-/// 联系人视图状态（独立 Entity，phase3 接线）。
+/// 联系人视图状态（独立 Entity，由 HylkiApp 挂载）。
 pub struct ContactsState {
     search_input: gpui_kit::Entity<InputState>,
     /// 当前搜索词。

@@ -939,6 +939,33 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Clear all cached message bodies and attachment blobs while keeping
+    /// message headers (sender / subject / preview / flags) intact.
+    /// Returns the number of messages whose cached body was dropped.
+    pub fn clear_message_bodies(&mut self) -> Result<usize, String> {
+        let cleared: usize = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE body_text IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as usize)
+            .map_err(|e| format!("统计已缓存正文数失败: {e}"))?;
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("开启正文缓存清理事务失败: {e}"))?;
+        tx.execute("UPDATE messages SET body_text = NULL", [])
+            .map_err(|e| format!("清空邮件正文缓存失败: {e}"))?;
+        tx.execute("DELETE FROM attachments", [])
+            .map_err(|e| format!("清空附件缓存失败: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("提交正文缓存清理事务失败: {e}"))?;
+        Ok(cleared)
+    }
+
     /// Look up the Graph remote string ID for `message_id`.
     pub fn get_message_remote_id(&self, message_id: u32) -> Result<Option<String>, String> {
         self.conn
@@ -2276,6 +2303,84 @@ mod tests {
         let paged = cache.list_known_contacts("", 1, 1).unwrap();
         assert_eq!(paged.len(), 1);
         assert_eq!(paged[0].email, "bob@b.com");
+    }
+
+    /// 阶段 3：清理正文缓存——正文与附件 BLOB 清空，头信息保留。
+    #[test]
+    fn clear_message_bodies_keeps_headers_and_clears_attachments() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let folders = cache
+            .sync_folders(1, &[folder("收件箱", "INBOX"), folder("归档", "Archive")])
+            .unwrap();
+        let inbox = folders.iter().find(|f| f.path == "INBOX").unwrap().id;
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                10,
+                &[
+                    sample_header(1, "带正文与附件"),
+                    sample_header(2, "仅邮件头"),
+                ],
+                None,
+            )
+            .unwrap();
+        let page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        // 列表按日期排序，按主题定位避免依赖行序。
+        let with_body_id = page
+            .items
+            .iter()
+            .find(|m| m.subject == "带正文与附件")
+            .unwrap()
+            .id;
+        let header_only_id = page
+            .items
+            .iter()
+            .find(|m| m.subject == "仅邮件头")
+            .unwrap()
+            .id;
+
+        cache
+            .store_message_body(
+                with_body_id,
+                "这是邮件正文",
+                &[CachedAttachmentInput {
+                    filename: "report.pdf".to_string(),
+                    mime_type: "application/pdf".to_string(),
+                    content: vec![9, 9, 9],
+                }],
+            )
+            .unwrap();
+
+        // 清理前：正文已缓存。
+        let (_, _, body_loaded) = cache.get_message_detail(with_body_id).unwrap().unwrap();
+        assert!(body_loaded);
+        assert_eq!(cache.list_cached_attachments("", 0, 10).unwrap().len(), 1);
+
+        let cleared = cache.clear_message_bodies().unwrap();
+        assert_eq!(cleared, 1);
+        // 重复清理应返回 0。
+        assert_eq!(cache.clear_message_bodies().unwrap(), 0);
+
+        // 正文清空（body_loaded = false，下次 LoadMessageBody 会重新拉取），
+        // 附件 BLOB 清空，头信息（发件人 / 主题 / 摘要 / 标记）保留。
+        let (detail, _, body_loaded) = cache.get_message_detail(with_body_id).unwrap().unwrap();
+        assert!(!body_loaded);
+        assert!(detail.body_text.is_empty());
+        assert!(detail.attachments.is_empty());
+        assert_eq!(detail.subject, "带正文与附件");
+        assert!(cache.list_cached_attachments("", 0, 10).unwrap().is_empty());
+
+        let (_, _, header_body_loaded) = cache.get_message_detail(header_only_id).unwrap().unwrap();
+        assert!(!header_body_loaded);
+
+        // 头信息仍可被统一收件箱列出（顺序按日期，不做顺序断言）。
+        let unified = cache.list_unified_inbox("", 0, 10).unwrap();
+        assert_eq!(unified.total, 2);
+        let subjects: Vec<&str> = unified.items.iter().map(|m| m.subject.as_str()).collect();
+        assert!(subjects.contains(&"带正文与附件"));
+        assert!(subjects.contains(&"仅邮件头"));
     }
 
     #[test]

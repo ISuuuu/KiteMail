@@ -2,7 +2,8 @@
 //! - 顶部栏 48px：侧栏折叠开关 + 搜索框（即时过滤，Esc 清空）+ 列表计数。
 //! - 次级工具条 34px：筛选切换（全部 / 仅未读 / 仅星标，对当前页客户端过滤）
 //!   + 上一页 / 下一页分页按钮（沿用现有分页逻辑）。
-//! - 邮件列表行：行高约 82px、水平内边距 12px、外边距 4px 8px、圆角 10px；
+//! - 邮件列表行：行高约 82px（偏好 compact_list 紧凑密度为 64px 且隐藏摘要行）、
+//!   水平内边距 12px、外边距 4px 8px、圆角 10px；
 //!   左侧 36x36 圆形头像 + 7px 蓝色未读圆点；右侧三行（发件人 / 主题 /
 //!   摘要），未读加粗；选中态整行 accent 蓝底白字。
 //! - 邮件行右键菜单：标记已读/未读、加星/取消星标、归档、删除
@@ -25,7 +26,7 @@ use gpui_kit::{
 };
 use hylki_mail_core::{LocalDraft, MessageSummary};
 
-use crate::app::{CurrentView, HylkiApp, ListFilter, PAGE_SIZE};
+use crate::app::{CurrentView, HylkiApp, ListFilter};
 use crate::theme;
 use crate::ui::avatar;
 
@@ -37,6 +38,8 @@ const HEADER_HEIGHT: f32 = 48.0;
 const TOOLBAR_HEIGHT: f32 = 34.0;
 /// 列表行高度。
 const ROW_HEIGHT: f32 = 82.0;
+/// 紧凑列表行高（偏好 compact_list，隐藏摘要行，方案文档五.2）。
+const COMPACT_ROW_HEIGHT: f32 = 64.0;
 
 /// 邮件行右键菜单（方案文档五.3）。
 ///
@@ -166,10 +169,16 @@ fn message_row(
     } else {
         sender_email
     };
+    // 偏好「列表密度」：紧凑模式行高约 64px 且隐藏摘要行（方案文档五.2）。
+    let compact = app.prefs.compact_list;
 
     let row = h_flex()
         .id(("msg", msg_id))
-        .h(px(ROW_HEIGHT))
+        .h(px(if compact {
+            COMPACT_ROW_HEIGHT
+        } else {
+            ROW_HEIGHT
+        }))
         .mx_2()
         .my_1()
         .px_3()
@@ -287,21 +296,24 @@ fn message_row(
                         .text_color(if is_selected { p.accent_fg } else { p.text })
                         .child(SharedString::from(msg.subject.clone())),
                 )
-                // 第 3 行：两行以内摘要（行高裁剪由固定行高 + overflow_hidden 完成）。
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(if is_selected {
-                            p.accent_fg
-                        } else {
-                            p.text_muted
-                        })
-                        .child(SharedString::from(if acc_email.is_empty() {
-                            msg.preview.clone()
-                        } else {
-                            format!("[{acc_email}] {}", msg.preview)
-                        })),
-                ),
+                // 第 3 行：两行以内摘要（行高裁剪由固定行高 + overflow_hidden 完成）；
+                // 紧凑密度下隐藏（阶段 3 偏好 compact_list）。
+                .when(!compact, |row| {
+                    row.child(
+                        div()
+                            .text_xs()
+                            .text_color(if is_selected {
+                                p.accent_fg
+                            } else {
+                                p.text_muted
+                            })
+                            .child(SharedString::from(if acc_email.is_empty() {
+                                msg.preview.clone()
+                            } else {
+                                format!("[{acc_email}] {}", msg.preview)
+                            })),
+                    )
+                }),
         );
 
     row_context_menu(row, msg, draft, app.demo_mode, cx)
@@ -383,7 +395,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         let end = app.current_page.offset + app.current_page.items.len();
         let total = app.current_page.total;
         let has_prev = app.page_offset > 0;
-        let has_next = app.page_offset + PAGE_SIZE < total;
+        let has_next = app.page_offset + app.prefs.page_size < total;
         (start, end, total, has_prev, has_next)
     };
 

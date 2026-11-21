@@ -1,6 +1,6 @@
 //! 左栏（方案文档第三节 1.1）：
 //! - 顶部栏 48px：刷新按钮 + 居中 `Hylki` 粗体标题 + 菜单按钮
-//!   （账号管理 / 切换亮暗主题 / 偏好设置与命令面板——后者本轮渲染但禁用）。
+//!   （账号管理 / 切换亮暗主题 / 偏好设置 / 命令面板 Ctrl+K）。
 //! - 全宽蓝色「写邮件」按钮（38px 高、圆角 8px、accent 色）。
 //! - 统一导航区（34px 高、圆角 8、左图标 + 名称 + 右侧未读数胶囊）：
 //!   收件箱 / 已加星标 / 已发送 / 草稿箱 / 归档 / 发件箱待处理。
@@ -21,7 +21,7 @@ use gpui_kit::{
 };
 use hylki_mail_core::{MailRequest, OutboxItem, OutboxStatus};
 
-use crate::app::{CurrentView, HylkiApp};
+use crate::app::{CurrentView, HylkiApp, MainContentView};
 use crate::theme;
 use crate::ui::avatar;
 
@@ -314,10 +314,12 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         })
         .collect();
 
-    // 菜单按钮的弹出菜单（账号管理 / 切换亮暗主题 / 禁用的偏好设置与命令面板）。
+    // 菜单按钮的弹出菜单（账号管理 / 切换亮暗主题 / 偏好设置 / 命令面板）。
     let menu_button = {
         let entity = cx.entity();
         let entity_for_theme = entity.clone();
+        let entity_for_prefs = entity.clone();
+        let entity_for_palette = entity.clone();
         Button::new("sb-menu")
             .ghost()
             .compact()
@@ -325,6 +327,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             .dropdown_menu(move |menu, _, _| {
                 let entity = entity.clone();
                 let entity_for_theme = entity_for_theme.clone();
+                let entity_for_prefs = entity_for_prefs.clone();
+                let entity_for_palette = entity_for_palette.clone();
                 menu.item(
                     // 演示模式下账号管理不可用（无 worker 账号可编辑）。
                     PopupMenuItem::new("账号管理")
@@ -350,10 +354,24 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     }),
                 )
                 .separator()
-                // TODO(phase3): 偏好设置页（preferences.rs）落地后接线。
-                .item(PopupMenuItem::new("偏好设置").disabled(true))
-                // TODO(phase3): Ctrl+K 命令面板（command_palette.rs）落地后接线。
-                .item(PopupMenuItem::new("命令面板  Ctrl+K").disabled(true))
+                .item(
+                    PopupMenuItem::new("偏好设置")
+                        .icon(Icon::new(IconName::Settings2))
+                        .on_click(move |_, window, cx| {
+                            entity_for_prefs.update(cx, |app, cx| {
+                                app.open_preferences(window, cx);
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("命令面板  Ctrl+K")
+                        .icon(Icon::new(IconName::SquareTerminal))
+                        .on_click(move |_, window, cx| {
+                            entity_for_palette.update(cx, |app, cx| {
+                                app.open_command_palette(window, cx);
+                            });
+                        }),
+                )
             })
     };
 
@@ -384,16 +402,9 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             "同步所有账号"
                         })
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if this.demo_mode {
-                                this.reload_current_page(cx);
-                                return;
-                            }
-                            if let Some(ref w) = this.worker {
-                                this.error_banner = None;
-                                this.status_line = SharedString::from("正在独立刷新所有账号...");
-                                w.send(MailRequest::SyncAllAccounts);
-                                cx.notify();
-                            }
+                            // 演示模式刷新演示数据；真实账号同步所有账号（阶段 3 起
+                            // 与命令面板 / Ctrl+R 共用 refresh_all）。
+                            this.refresh_all(cx);
                         })),
                 )
                 .child(
@@ -638,29 +649,32 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .gap_0p5()
                 .border_t_1()
                 .border_color(border)
-                // TODO(phase3): 联系人页（contacts.rs）落地后切换视图。
+                // 联系人 / 附件总览主内容视图入口（阶段 3，保留左栏切换）。
                 .child(
                     nav_row(
                         "nav-contacts",
                         IconName::CircleUser,
                         "联系人",
                         None,
-                        false,
+                        app.main_view == MainContentView::Contacts,
                         &p,
                     )
-                    .on_click(cx.listener(|_, _, _, _| {})),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_contacts(window, cx);
+                    })),
                 )
-                // TODO(phase3): 附件总览页（gallery.rs）落地后切换视图。
                 .child(
                     nav_row(
                         "nav-attachments",
                         IconName::FileText,
                         "附件",
                         None,
-                        false,
+                        app.main_view == MainContentView::Gallery,
                         &p,
                     )
-                    .on_click(cx.listener(|_, _, _, _| {})),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_gallery(window, cx);
+                    })),
                 ),
         )
         .into_any_element()

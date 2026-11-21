@@ -291,6 +291,8 @@ pub enum MailRequest {
         offset: usize,
         limit: usize,
     },
+    /// Clear all cached message bodies (headers and accounts are kept).
+    ClearBodyCaches,
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.

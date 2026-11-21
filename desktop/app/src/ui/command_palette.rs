@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-// TODO(phase3-wire): integrate into HylkiApp.
 //! 命令面板（方案文档第三节页面 6）：
 //! - 居中悬浮卡片 560x440（阴影 + 圆角 12px），带半透明遮罩，
 //!   点击遮罩或按 Esc 发 [`CommandPaletteEvent::Closed`]。
@@ -102,7 +100,7 @@ pub enum CommandPaletteEvent {
     Closed,
 }
 
-/// 命令面板视图状态（独立 Entity，phase3 接线；通常作为浮层挂载）。
+/// 命令面板视图状态（独立 Entity，由 HylkiApp 作为浮层挂载）。
 pub struct CommandPaletteState {
     search_input: gpui_kit::Entity<InputState>,
     /// 当前搜索词（含可能的 `>` 前缀）。
@@ -175,6 +173,8 @@ impl CommandPaletteState {
     }
 
     /// 命令是否匹配当前搜索词（空词匹配全部）。
+    /// 过滤主链路使用独立的 [`filter_commands`]，此方法保留单命令语义。
+    #[allow(dead_code)]
     fn command_matches(&self, command: &PaletteCommand, query: &str) -> bool {
         let name = self.display_name(command).to_lowercase();
         name.contains(&query.to_lowercase())

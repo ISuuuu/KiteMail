@@ -90,6 +90,14 @@ pub struct AppPreferences {
     /// View opened at startup: `"unified"` (unified inbox) or `"last"`
     /// (the folder selected in the previous session).
     pub default_view: String,
+    /// Last browsed unified view (`"unified"` / `"starred"` / `"sent"` /
+    /// `"drafts"` / `"archive"`); restored when `default_view == "last"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_view: Option<String>,
+    /// Last browsed account folder `(account_id, folder_id)`; restored when
+    /// `default_view == "last"` and takes precedence over [`Self::last_view`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_folder: Option<(u32, u32)>,
 }
 
 impl Default for AppPreferences {
@@ -102,6 +110,8 @@ impl Default for AppPreferences {
             auto_sync_minutes: 5,
             block_remote_images: true,
             default_view: "unified".to_string(),
+            last_view: None,
+            last_folder: None,
         }
     }
 }
@@ -256,6 +266,8 @@ mod tests {
             auto_sync_minutes: 0,
             block_remote_images: false,
             default_view: "last".to_string(),
+            last_view: None,
+            last_folder: None,
         };
         save_preferences_in(&base, &prefs).expect("save should succeed");
         let loaded = load_preferences_in(&base).expect("load should succeed");
@@ -289,6 +301,38 @@ mod tests {
         assert_eq!(loaded.page_size, 100);
         assert_eq!(loaded.auto_sync_minutes, 5);
         assert!(loaded.block_remote_images);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 阶段 3：last_view / last_folder 字段往返 + 旧文件缺字段兼容。
+    #[test]
+    fn preferences_last_view_and_folder_roundtrip() {
+        let base = std::env::temp_dir().join("hylki test 偏好上次视图");
+        let _ = fs::remove_dir_all(&base);
+
+        // 旧格式文件（无 last_view / last_folder 字段）加载后为 None。
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            preferences_file_in(&base),
+            "theme_id = 'default'\ndefault_view = 'last'\n",
+        )
+        .expect("write legacy prefs");
+        let legacy = load_preferences_in(&base).expect("load legacy file");
+        assert_eq!(legacy.last_view, None);
+        assert_eq!(legacy.last_folder, None);
+
+        // 往返：同时持久化 last_view 与 last_folder。
+        let prefs = AppPreferences {
+            last_view: Some("sent".to_string()),
+            last_folder: Some((3, 17)),
+            ..AppPreferences::default()
+        };
+        save_preferences_in(&base, &prefs).expect("save should succeed");
+        let loaded = load_preferences_in(&base).expect("load should succeed");
+        assert_eq!(loaded.last_view.as_deref(), Some("sent"));
+        assert_eq!(loaded.last_folder, Some((3, 17)));
+        assert_eq!(loaded, prefs);
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-// TODO(phase3-wire): integrate into HylkiApp.
 //! 偏好设置页（方案文档第三节页面 5 + 第五节 2）：
 //! - 左分类 180px：常规 / 外观 / 阅读 / 数据与存储（可点击切换）。
 //! - 右设置卡片 max-width 600px：
@@ -87,7 +85,7 @@ pub enum PreferencesEvent {
     ClearBodyCache,
 }
 
-/// 偏好设置视图状态（独立 Entity，phase3 接线）。
+/// 偏好设置视图状态（独立 Entity，由 HylkiApp 挂载）。
 pub struct PreferencesState {
     /// 内部持有的偏好副本（每次改动后整体发出）。
     prefs: AppPreferences,
@@ -124,7 +122,9 @@ impl PreferencesState {
         self.outbox = outbox;
     }
 
-    /// 当前偏好副本（供集成者在收到 Changed 前读取）。
+    /// 当前偏好副本（供集成者在收到 Changed 前读取；当前集成链路由
+    /// HylkiApp 持有偏好权威副本，此 getter 保留作组件语义）。
+    #[allow(dead_code)]
     pub fn preferences(&self) -> &AppPreferences {
         &self.prefs
     }
@@ -179,7 +179,8 @@ impl PreferencesState {
     }
 }
 
-/// 亮暗模式选项标签。
+/// 亮暗模式选项标签（渲染走 option_pills 内联文案；此助手仅单元测试引用）。
+#[allow(dead_code)]
 fn dark_mode_label(dark: Option<bool>) -> &'static str {
     match dark {
         Some(false) => "亮色",
@@ -188,7 +189,8 @@ fn dark_mode_label(dark: Option<bool>) -> &'static str {
     }
 }
 
-/// 启动视图选项标签。
+/// 启动视图选项标签（同上，仅单元测试引用）。
+#[allow(dead_code)]
 fn default_view_label(view: &str) -> &'static str {
     match view {
         "last" => "上次文件夹",
@@ -196,7 +198,8 @@ fn default_view_label(view: &str) -> &'static str {
     }
 }
 
-/// 自动刷新间隔选项标签。
+/// 自动刷新间隔选项标签（同上，仅单元测试引用）。
+#[allow(dead_code)]
 fn sync_interval_label(minutes: u32) -> &'static str {
     match minutes {
         5 => "5 分钟",
