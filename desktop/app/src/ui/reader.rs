@@ -820,6 +820,8 @@ pub(crate) fn render(
                                 } else {
                                     IconName::Star
                                 })
+                                // 激活（已加星标）时统一用琥珀金星标色。
+                                .when(flagged, |btn| btn.text_color(theme::star_gold()))
                                 .tooltip(if flagged { "取消星标" } else { "加星标" })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.toggle_flagged(&star_detail, cx);

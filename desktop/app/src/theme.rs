@@ -61,6 +61,14 @@ impl HylkiPalette {
     }
 }
 
+/// 星标琥珀金十六进制值（与亮暗主题无关，对齐 Linux 原版 `#e5a50a`）。
+pub(crate) const STAR_GOLD: u32 = 0xe5_a5_0a;
+
+/// 星标琥珀金 [`Hsla`]（`rgb()` 转换非常量求值，故以函数提供便捷访问）。
+pub(crate) fn star_gold() -> Hsla {
+    Hsla::from(rgb(STAR_GOLD))
+}
+
 /// 每套色板的十六进制语义值（亮 / 暗）。
 #[derive(Clone, Copy)]
 struct PaletteHex {
@@ -455,5 +463,13 @@ mod tests {
     fn accent_soft_keeps_alpha() {
         let p = palette_for("default", false);
         assert!(p.accent_soft().a < p.accent.a);
+    }
+
+    #[test]
+    fn star_gold_is_theme_independent_amber() {
+        // #e5a50a → Rgba(229/255, 165/255, 10/255)。
+        let gold = star_gold();
+        assert!(approx(Hsla::from(rgb(0xe5a50a)), gold));
+        assert!(gold.a == 1.0);
     }
 }

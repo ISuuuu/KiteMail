@@ -2,9 +2,10 @@
 //! - 顶部栏 48px（与左栏、右栏严格齐平）：侧栏折叠开关 + 搜索框（即时过滤，Esc 清空）
 //!   + 列表计数 + 筛选下拉按钮（全部 / 仅未读 / 仅星标）。
 //! - 邮件列表行：行高约 82px（偏好 compact_list 紧凑密度为 64px 且隐藏摘要行）、
-//!   水平内边距 12px、外边距 2px 8px、圆角 10px；
-//!   左侧 36x36 圆形头像 + 固定 8px 宽未读蓝点占位（保证已读/未读文字严格左对齐）；
-//!   右侧三行（发件人 / 主题 / 摘要 + 多账号胶囊），未读加粗；选中态整行 accent 蓝底白字。
+//!   外边距 2px 6px、内边距 13px 8px 13px 10px、圆角 12px（对齐 Linux 原版样式）；
+//!   左侧 36x36 圆形头像 + 固定 10px 宽未读蓝点占位（保证已读/未读文字严格左对齐）；
+//!   右侧三行（发件人 / 主题 / 摘要 + 多账号胶囊），未读加粗；
+//!   选中态整行半透明 accent 底（悬停加深），复刻 Linux 原版列表行样式。
 //! - 底部轻量分页条：仅当存在上一页 / 下一页时显示。
 //! - 邮件行右键菜单：标记已读/未读、加星/取消星标、归档、删除
 //!   （演示模式仅保留本地的已读 / 星标两项，归档 / 删除隐藏）；
@@ -211,23 +212,28 @@ fn message_row(
         } else {
             ROW_HEIGHT
         }))
-        .mx_2()
-        .my_0p5()
-        .px_3()
-        .py_2()
+        // 外边距 / 内边距 / 圆角对齐 Linux 原版（margin 2px 6px、padding 13 8 13 10、radius 12px）。
+        .mx(px(6.0))
+        .my(px(2.0))
+        .pt(px(13.0))
+        .pr(px(8.0))
+        .pb(px(13.0))
+        .pl(px(10.0))
         .gap_2()
         .items_start()
-        .rounded(px(10.0))
+        .rounded(px(12.0))
         .cursor_pointer()
         .overflow_hidden()
+        // 悬停：选中行加深半透明 accent；未选中行用中性微灰（原版 alpha(currentColor, 0.05)）。
         .hover(move |s| {
             if is_selected {
-                s.bg(p.accent)
+                s.bg(p.accent.opacity(0.50))
             } else {
-                s.bg(p.accent_soft())
+                s.bg(p.text.opacity(0.05))
             }
         })
-        .when(is_selected, |row| row.bg(p.accent))
+        // 选中行：半透明 accent 底（贴近原版失焦 alpha(@accent_bg_color, 0.3)）。
+        .when(is_selected, |row| row.bg(p.accent.opacity(0.35)))
         .on_click({
             let draft = draft.clone();
             cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| match draft.as_ref() {
@@ -243,7 +249,7 @@ fn message_row(
                 }
             })
         })
-        // 左侧：36x36 圆形头像 + 固定 8px 宽未读圆点占位（确保已读/未读文字严格左对齐）。
+        // 左侧：36x36 圆形头像 + 固定 10px 宽未读圆点占位（确保已读/未读文字严格左对齐）。
         .child(
             h_flex()
                 .flex_shrink_0()
@@ -253,19 +259,14 @@ fn message_row(
                 .child(avatar::avatar(&display_name, &avatar_key, 36.0))
                 .child(
                     div()
-                        .w(px(8.0))
-                        .h(px(8.0))
+                        .w(px(10.0))
+                        .h(px(10.0))
                         .flex()
                         .items_center()
                         .justify_center()
                         .when(unread, |dot| {
-                            dot.child(
-                                div()
-                                    .w(px(7.0))
-                                    .h(px(7.0))
-                                    .rounded_full()
-                                    .bg(if is_selected { p.accent_fg } else { p.accent }),
-                            )
+                            // 未读圆点 10x10（原版 .unread-dot），选中态保持 accent 色不变。
+                            dot.child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(p.accent))
                         }),
                 ),
         )
@@ -288,12 +289,13 @@ fn message_row(
                                 .min_w_0()
                                 .text_sm()
                                 .truncate()
+                                // 发件人字重层次（原版 .message-sender：已读 / 未读加粗）。
                                 .font_weight(if unread {
                                     gpui_kit::FontWeight::BOLD
                                 } else {
-                                    gpui_kit::FontWeight::NORMAL
+                                    gpui_kit::FontWeight::MEDIUM
                                 })
-                                .text_color(if is_selected { p.accent_fg } else { p.text })
+                                .text_color(p.text)
                                 .child(SharedString::from(display_name)),
                         )
                         .child(
@@ -305,37 +307,25 @@ fn message_row(
                                     icons.child(
                                         Icon::new(IconName::StarFill)
                                             .with_size(px(13.0))
-                                            .text_color(if is_selected {
-                                                p.accent_fg
-                                            } else {
-                                                gpui_kit::yellow()
-                                            }),
+                                            .text_color(theme::star_gold()),
                                     )
                                 })
                                 .when(msg.has_attachment, |icons| {
                                     icons.child(
                                         Icon::new(IconName::Paperclip)
                                             .with_size(px(13.0))
-                                            .text_color(if is_selected {
-                                                p.accent_fg
-                                            } else {
-                                                p.text_muted
-                                            }),
+                                            .text_color(p.text_muted),
                                     )
                                 })
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(if is_selected {
-                                            p.accent_fg
-                                        } else {
-                                            p.text_muted
-                                        })
+                                        .text_color(p.text_muted)
                                         .child(SharedString::from(msg.date_display.clone())),
                                 ),
                         ),
                 )
-                // 第 2 行：主题（未读加粗）。
+                // 第 2 行：主题（未读加粗；已读 85% 透明度，复刻原版 .message-subject 层次）。
                 .child(
                     div()
                         .text_sm()
@@ -345,7 +335,11 @@ fn message_row(
                         } else {
                             gpui_kit::FontWeight::NORMAL
                         })
-                        .text_color(if is_selected { p.accent_fg } else { p.text })
+                        .text_color(if unread {
+                            p.text
+                        } else {
+                            p.text.opacity(0.85)
+                        })
                         .child(SharedString::from(msg.subject.clone())),
                 )
                 // 第 3 行：摘要 + 多账号小胶囊标签；紧凑密度下隐藏。
@@ -361,11 +355,8 @@ fn message_row(
                                     .min_w_0()
                                     .text_xs()
                                     .truncate()
-                                    .text_color(if is_selected {
-                                        p.accent_fg.opacity(0.88)
-                                    } else {
-                                        p.text_muted
-                                    })
+                                    // 摘要 50% 透明度（原版 .message-preview）。
+                                    .text_color(p.text.opacity(0.5))
                                     .child(SharedString::from(msg.preview.clone())),
                             )
                             .when(!acc_email.is_empty(), |el| {
@@ -378,16 +369,8 @@ fn message_row(
                                         .py_0p5()
                                         .rounded_full()
                                         .text_size(px(10.0))
-                                        .bg(if is_selected {
-                                            p.accent_fg.opacity(0.22)
-                                        } else {
-                                            p.accent_soft()
-                                        })
-                                        .text_color(if is_selected {
-                                            p.accent_fg
-                                        } else {
-                                            p.accent
-                                        })
+                                        .bg(p.accent_soft())
+                                        .text_color(p.accent)
                                         .child(SharedString::from(acc_email)),
                                 )
                             }),
