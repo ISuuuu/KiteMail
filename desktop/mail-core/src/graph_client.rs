@@ -276,6 +276,8 @@ pub fn move_message(
 pub fn send_message(
     access_token: &str,
     to_addr: &str,
+    cc_addrs: &str,
+    bcc_addrs: &str,
     subject: &str,
     body_text: &str,
     attachment_paths: &[String],
@@ -326,6 +328,15 @@ pub fn send_message(
         message_obj["attachments"] = serde_json::Value::Array(graph_attachments);
     }
 
+    let cc_recipients = graph_recipient_array(cc_addrs);
+    if !cc_recipients.is_empty() {
+        message_obj["ccRecipients"] = serde_json::Value::Array(cc_recipients);
+    }
+    let bcc_recipients = graph_recipient_array(bcc_addrs);
+    if !bcc_recipients.is_empty() {
+        message_obj["bccRecipients"] = serde_json::Value::Array(bcc_recipients);
+    }
+
     let payload = serde_json::json!({
         "message": message_obj,
         "saveToSentItems": true
@@ -371,6 +382,23 @@ fn extract_email_address(input: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+/// Build a Graph `ccRecipients` / `bccRecipients` array from a
+/// comma-separated address list, skipping parts without a usable address.
+fn graph_recipient_array(raw: &str) -> Vec<serde_json::Value> {
+    raw.split(',')
+        .filter_map(|part| {
+            let address = extract_email_address(part);
+            if address.is_empty() || !address.contains('@') {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "emailAddress": { "address": address }
+                }))
+            }
+        })
+        .collect()
 }
 
 fn urlencoding_segment(input: &str) -> String {

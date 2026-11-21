@@ -69,11 +69,29 @@ pub async fn verify_login(account: &AccountConfig, password: &str) -> Result<(),
     Ok(())
 }
 
+/// Parse a comma-separated address list into mailboxes; empty parts are skipped.
+fn parse_mailbox_list(raw: &str, label: &str) -> Result<Vec<Mailbox>, String> {
+    let mut mailboxes = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let mailbox: Mailbox = part
+            .parse()
+            .map_err(|e| format!("{label}地址格式无效 ({part}): {e}"))?;
+        mailboxes.push(mailbox);
+    }
+    Ok(mailboxes)
+}
+
 /// Build and send an email (with optional reply headers and file attachments).
 pub async fn send_message(
     account: &AccountConfig,
     password: &str,
     to_addr: &str,
+    cc_addrs: &str,
+    bcc_addrs: &str,
     subject: &str,
     body_text: &str,
     in_reply_to: &str,
@@ -92,11 +110,25 @@ pub async fn send_message(
         Ok(m) => m,
         Err(e) => return SendOutcome::Failed(format!("收件人地址格式无效: {e}")),
     };
+    let cc_mailboxes = match parse_mailbox_list(cc_addrs, "抄送") {
+        Ok(list) => list,
+        Err(e) => return SendOutcome::Failed(e),
+    };
+    let bcc_mailboxes = match parse_mailbox_list(bcc_addrs, "密送") {
+        Ok(list) => list,
+        Err(e) => return SendOutcome::Failed(e),
+    };
 
     let mut builder = Message::builder()
         .from(from_mailbox)
         .to(to_mailbox)
         .subject(subject);
+    for mailbox in cc_mailboxes {
+        builder = builder.cc(mailbox);
+    }
+    for mailbox in bcc_mailboxes {
+        builder = builder.bcc(mailbox);
+    }
 
     if !in_reply_to.trim().is_empty() {
         builder = builder

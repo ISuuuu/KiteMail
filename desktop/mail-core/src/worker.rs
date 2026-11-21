@@ -620,6 +620,8 @@ async fn handle_request(
             let outbox_id = match cache.enqueue_outbox(
                 account_id,
                 &draft.to,
+                &draft.cc,
+                &draft.bcc,
                 &draft.subject,
                 &draft.body,
                 &draft.in_reply_to,
@@ -1102,11 +1104,15 @@ async fn send_outbox_item(
         AuthBackend::MicrosoftGraphOAuth2 => match ensure_graph_token(tokens, &account).await {
             Ok(token) => {
                 let to_addr = item.to_addr.clone();
+                let cc_addrs = item.cc_addr.clone();
+                let bcc_addrs = item.bcc_addr.clone();
                 let subject = item.subject.clone();
                 let body = item.body_text.clone();
                 let atts = item.attachment_paths.clone();
                 tokio::task::spawn_blocking(move || {
-                    graph_client::send_message(&token, &to_addr, &subject, &body, &atts)
+                    graph_client::send_message(
+                        &token, &to_addr, &cc_addrs, &bcc_addrs, &subject, &body, &atts,
+                    )
                 })
                 .await
                 .unwrap_or_else(|e| SendOutcome::Uncertain(format!("Graph 发信任务异常: {e}")))
@@ -1127,6 +1133,8 @@ async fn send_outbox_item(
                     &account,
                     smtp_pwd,
                     &item.to_addr,
+                    &item.cc_addr,
+                    &item.bcc_addr,
                     &item.subject,
                     &item.body_text,
                     &item.in_reply_to,

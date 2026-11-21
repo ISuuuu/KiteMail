@@ -1,7 +1,11 @@
 //! 三栏 UI 模块：左栏 sidebar、中栏 message_list、右栏阅读态 reader、
-//! 头像 avatar。写信 / 账号设置本轮仍由 `app.rs` 渲染（迭代 2 再拆）。
+//! 写信/回复面板 compose、账号管理 accounts、首次启动欢迎向导 welcome、
+//! 头像 avatar。
 
+pub(crate) mod accounts;
 pub(crate) mod avatar;
+pub(crate) mod compose;
 pub(crate) mod message_list;
 pub(crate) mod reader;
 pub(crate) mod sidebar;
+pub(crate) mod welcome;
