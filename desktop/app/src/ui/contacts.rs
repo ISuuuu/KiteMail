@@ -110,14 +110,8 @@ fn contact_row(
     is_selected: bool,
     p: &crate::theme::HylkiPalette,
 ) -> Stateful<Div> {
-    let (text, muted_fg, accent, accent_fg, accent_soft, border) = (
-        p.text,
-        p.text_muted,
-        p.accent,
-        p.accent_fg,
-        p.accent_soft(),
-        p.border,
-    );
+    let (text, muted_fg, accent, accent_fg, accent_soft) =
+        (p.text, p.text_muted, p.accent, p.accent_fg, p.accent_soft());
     let count_text = contact.message_count.to_string();
     h_flex()
         .id(SharedString::from(format!("contact-{}", contact.email)))
@@ -129,10 +123,8 @@ fn contact_row(
         .rounded(px(8.0))
         .cursor_pointer()
         .hover(move |s| s.bg(accent_soft))
-        .when(is_selected, |row| {
-            row.bg(accent_soft).border_1().border_color(accent)
-        })
-        .when(!is_selected, |row| row.border_1().border_color(border))
+        // 选中联系人：实心 accent 底 + accent_fg 字，无常驻边框（复刻原版 row:selected）。
+        .when(is_selected, |row| row.bg(accent))
         .child(avatar::avatar(&contact.name, &contact.email, 32.0))
         .child(
             v_flex()
@@ -147,14 +139,15 @@ fn contact_row(
                         } else {
                             gpui_kit::FontWeight::MEDIUM
                         })
-                        .text_color(text)
+                        // 选中行整体使用 accent_fg 字（原版选中行全部前景取 accent 前景）。
+                        .text_color(if is_selected { accent_fg } else { text })
                         .truncate()
                         .child(SharedString::from(contact.name.clone())),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(muted_fg)
+                        .text_color(if is_selected { accent_fg } else { muted_fg })
                         .truncate()
                         .child(SharedString::from(contact.email.clone())),
                 ),
