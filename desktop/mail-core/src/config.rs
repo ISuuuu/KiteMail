@@ -255,6 +255,7 @@ mod tests {
             page_size: 50,
             auto_sync_minutes: 0,
             block_remote_images: false,
+            default_view: "last".to_string(),
         };
         save_preferences_in(&base, &prefs).expect("save should succeed");
         let loaded = load_preferences_in(&base).expect("load should succeed");
