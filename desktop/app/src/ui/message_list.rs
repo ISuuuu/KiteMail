@@ -20,7 +20,7 @@ use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, WindowControlArea,
 };
 use hylki_mail_core::{LocalDraft, MessageSummary};
 
@@ -545,11 +545,17 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .child(Input::new(&app.search_input)),
                 )
                 .child(
-                    div()
+                    h_flex()
                         .flex_shrink_0()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(SharedString::from(count_text)),
+                        .h_full()
+                        .items_center()
+                        .window_control_area(WindowControlArea::Drag)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(SharedString::from(count_text)),
+                        ),
                 )
                 .when(is_unified_list, |el| el.child(filter_menu_button)),
         )

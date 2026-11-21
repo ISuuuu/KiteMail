@@ -17,7 +17,7 @@ use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
-    StatefulInteractiveElement, Styled,
+    StatefulInteractiveElement, Styled, WindowControlArea,
 };
 use hylki_mail_core::{MailRequest, OutboxItem, OutboxStatus};
 
@@ -462,11 +462,19 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         })),
                 )
                 .child(
-                    div()
-                        .text_base()
-                        .font_weight(gpui_kit::FontWeight::BOLD)
-                        .text_color(text)
-                        .child("Hylki"),
+                    h_flex()
+                        .flex_1()
+                        .h_full()
+                        .items_center()
+                        .justify_center()
+                        .window_control_area(WindowControlArea::Drag)
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .text_color(text)
+                                .child("Hylki"),
+                        ),
                 )
                 .child(menu_button),
         )
@@ -645,54 +653,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             .child("尚未配置邮箱，请在右侧添加账号。"),
                     )
                 })
-                .children(account_sections)
-                // 草稿条目（沿用现有本地草稿展示逻辑）。
-                .when(!app.drafts.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .pt_1()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(SharedString::from(format!(
-                                "本地草稿（{}）",
-                                app.drafts.len()
-                            ))),
-                    )
-                    .children(app.drafts.iter().map(|draft| {
-                        let d = draft.clone();
-                        let title = if d.subject.trim().is_empty() {
-                            "(无主题草稿)".to_string()
-                        } else {
-                            d.subject.clone()
-                        };
-                        h_flex()
-                            .id(("draft", d.id))
-                            .pl(px(38.0))
-                            .pr_2()
-                            .h(px(NAV_ROW_HEIGHT))
-                            .gap_2()
-                            .items_center()
-                            .rounded(px(8.0))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(p.accent_soft()))
-                            .child(
-                                Icon::new(IconName::FilePen)
-                                    .with_size(px(14.0))
-                                    .text_color(muted_fg),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_xs()
-                                    .truncate()
-                                    .text_color(text)
-                                    .child(SharedString::from(title)),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_local_draft(&d, window, cx);
-                            }))
-                    }))
-                }),
+                .children(account_sections),
         )
         // 底部固定区：联系人 / 附件入口。
         .child(

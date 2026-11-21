@@ -8,14 +8,15 @@
 
 mod app;
 mod theme;
+mod tray;
 mod ui;
 
 use std::borrow::Cow;
 
 use gpui_kit::assets::AllAssets;
 use gpui_kit::{
-    px, size, AppContext, AssetSource, Bounds, KeyBinding, Result, SharedString, WindowBounds,
-    WindowOptions,
+    px, size, AppContext, AssetSource, Bounds, KeyBinding, Result, SharedString, TitlebarOptions,
+    WindowBounds, WindowOptions,
 };
 use hylki_mail_core::config;
 
@@ -26,8 +27,28 @@ use crate::app::{
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
 const WORDMARK_WHITE: &[u8] = include_bytes!("../../../data/welcome/wordmark-white.png");
 #[cfg(target_os = "windows")]
-const APP_ICON_PNG: &[u8] =
+pub(crate) const APP_ICON_PNG: &[u8] =
     include_bytes!("../../../data/icons/hicolor/256x256/apps/co.hyprlab.Hylki.png");
+#[cfg(not(target_os = "windows"))]
+pub(crate) const APP_ICON_PNG: &[u8] = &[];
+
+const DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
+const MIN_WINDOW_WIDTH: f32 = 640.0;
+const MIN_WINDOW_HEIGHT: f32 = 480.0;
+const MAX_WINDOW_WIDTH: f32 = 7680.0;
+const MAX_WINDOW_HEIGHT: f32 = 4320.0;
+
+/// 从持久化偏好解析初始窗口逻辑尺寸（异常/缺失值回落默认 1280x800）。
+fn resolve_window_size(prefs: &config::AppPreferences) -> (f32, f32) {
+    match (prefs.window_width, prefs.window_height) {
+        (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 => (
+            w.clamp(MIN_WINDOW_WIDTH, MAX_WINDOW_WIDTH),
+            h.clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT),
+        ),
+        _ => (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
+    }
+}
 
 /// 组合 GPUI Kit 完整 Lucide 图标库与 Hylki 内嵌欢迎页 Logo 资源。
 struct HylkiAssets;
@@ -160,21 +181,33 @@ fn main() {
                 KeyBinding::new("escape", CloseOverlay, None),
             ]);
 
+            let (win_w, win_h) = resolve_window_size(&prefs);
+            let centered = Bounds::centered(None, size(px(win_w), px(win_h)), cx);
+            let window_bounds = if prefs.window_maximized {
+                WindowBounds::Maximized(centered)
+            } else {
+                WindowBounds::Windowed(centered)
+            };
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1280.0), px(800.0)),
-                    cx,
-                ))),
+                window_bounds: Some(window_bounds),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Hylki".into()),
+                    appears_transparent: true,
+                    traffic_light_position: None,
+                }),
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, move |window, cx| {
-                cx.new(|cx| HylkiApp::new(demo_mode, prefs, window, cx))
-            })
-            .expect("failed to open Hylki Windows window");
+            let (_window_handle, app_entity) =
+                gpui_kit::open_window(options, cx, move |window, cx| {
+                    cx.new(|cx| HylkiApp::new(demo_mode, prefs, window, cx))
+                })
+                .expect("failed to open Hylki Windows window");
 
             #[cfg(target_os = "windows")]
             apply_window_icon();
+
+            let main_hwnd = tray::find_current_thread_main_hwnd();
+            app_entity.read(cx).attach_main_hwnd(main_hwnd);
         });
 }
 
@@ -217,6 +250,8 @@ mod tests {
             IconName::Paperclip,
             IconName::CircleUser,
             IconName::LogOut,
+            IconName::Minus,
+            IconName::Square,
             IconName::X,
         ] {
             let bytes = HylkiAssets
@@ -229,5 +264,57 @@ mod tests {
                 icon.path()
             );
         }
+    }
+
+    #[test]
+    fn resolve_window_size_uses_persisted_values_and_clamps_outliers() {
+        use super::{
+            resolve_window_size, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, MAX_WINDOW_HEIGHT,
+            MAX_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
+        };
+        use hylki_mail_core::config::AppPreferences;
+
+        let defaults = AppPreferences::default();
+        assert_eq!(
+            resolve_window_size(&defaults),
+            (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+        );
+
+        let custom = AppPreferences {
+            window_width: Some(1440.0),
+            window_height: Some(920.0),
+            ..Default::default()
+        };
+        assert_eq!(resolve_window_size(&custom), (1440.0, 920.0));
+
+        let tiny = AppPreferences {
+            window_width: Some(100.0),
+            window_height: Some(100.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_window_size(&tiny),
+            (MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        );
+
+        let huge = AppPreferences {
+            window_width: Some(99999.0),
+            window_height: Some(99999.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_window_size(&huge),
+            (MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT)
+        );
+
+        let invalid = AppPreferences {
+            window_width: Some(f32::NAN),
+            window_height: Some(800.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_window_size(&invalid),
+            (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+        );
     }
 }

@@ -17,9 +17,9 @@ use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    actions, black, div, point, px, AppContext, ClipboardItem, Context, Entity, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled,
-    Subscription, Window, WindowAppearance,
+    actions, black, div, point, px, AnyWindowHandle, AppContext, ClipboardItem, Context, Entity,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollHandle,
+    SharedString, Styled, Subscription, Window, WindowAppearance, WindowBounds,
 };
 use hylki_mail_core::cache::CachedAttachment;
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend, SecurityMode};
@@ -33,11 +33,12 @@ use hylki_mail_core::{
 };
 
 use crate::theme;
+use crate::tray::{self, TrayCommand, TrayHandle};
 use crate::ui::command_palette::{CommandPaletteEvent, CommandPaletteState, PaletteCommand};
 use crate::ui::contacts::{ContactsEvent, ContactsState};
 use crate::ui::gallery::{GalleryEvent, GalleryState};
 use crate::ui::preferences::{PreferencesEvent, PreferencesState};
-use crate::ui::{accounts, compose, message_list, reader, sidebar, welcome};
+use crate::ui::{accounts, compose, message_list, reader, sidebar, welcome, window_controls};
 
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
 
@@ -349,6 +350,12 @@ pub(crate) struct HylkiApp {
     contacts_query: String,
     /// 后台自动刷新到期时刻（`None` 表示待重算；demo 模式不轮询）。
     auto_sync_deadline: Option<Instant>,
+    /// Windows 系统托盘句柄（退出时显式销毁图标避免残留）。
+    tray: Option<Arc<TrayHandle>>,
+    /// 主窗口句柄（供托盘菜单触发写信 / 退出前保存窗口几何）。
+    window_handle: AnyWindowHandle,
+    /// 各账号最近一次收件箱未读数基线（首次加载只建基线不弹窗，后续增长才触发桌面通知）。
+    last_unread_by_account: BTreeMap<u32, u32>,
 }
 
 impl HylkiApp {
@@ -359,18 +366,63 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let demo_store = Arc::new(DemoStore::new());
+        let window_handle = window.window_handle();
+        let tray = TrayHandle::start(crate::APP_ICON_PNG).map(Arc::new);
         window.set_window_title("Hylki");
-        // 点右上角关闭按钮时按偏好默认最小化（不直接退出），真正退出由菜单「退出 Hylki」触发。
+        // 点右上角关闭按钮时先保存窗口尺寸，再按偏好隐藏到系统托盘（不直接退出），
+        // 真正退出由菜单或托盘右键「退出 Hylki」触发。
         let weak_self = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             if let Some(app) = weak_self.upgrade() {
-                if app.read(cx).prefs.close_to_minimize {
-                    window.minimize_window();
+                let should_hide = app.update(cx, |this, _| {
+                    this.save_window_geometry(window);
+                    this.prefs.close_to_minimize
+                });
+                if should_hide {
+                    let hidden = app
+                        .read(cx)
+                        .tray
+                        .as_ref()
+                        .is_some_and(|t| t.hide_main_window());
+                    if !hidden {
+                        window.minimize_window();
+                    }
                     return false;
                 }
+                app.read(cx).shutdown_tray();
             }
             true
         });
+
+        // 轮询 Windows 系统托盘命令，并在 minimize_to_tray 开启时将最小化窗口自动隐藏到托盘。
+        if let Some(ref tray_handle) = tray {
+            let weak_tray = Arc::downgrade(tray_handle);
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                let Some(tray_handle) = weak_tray.upgrade() else {
+                    break;
+                };
+                let cmds = tray_handle.drain_commands();
+                let minimized = tray_handle.is_main_window_minimized();
+                if cmds.is_empty() && !minimized {
+                    continue;
+                }
+                let res = this.update(cx, |app, cx| {
+                    if minimized && app.prefs.minimize_to_tray {
+                        tray_handle.hide_main_window();
+                    }
+                    for cmd in cmds {
+                        app.handle_tray_command(cmd, cx);
+                    }
+                });
+                if res.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
         let data_dir = config::data_dir();
         let existing_accounts = if demo_mode {
             Vec::new()
@@ -577,6 +629,9 @@ impl HylkiApp {
                 gallery_query: String::new(),
                 contacts_query: String::new(),
                 auto_sync_deadline: None,
+                tray,
+                window_handle,
+                last_unread_by_account: BTreeMap::new(),
             };
         }
 
@@ -710,6 +765,9 @@ impl HylkiApp {
             gallery_query: String::new(),
             contacts_query: String::new(),
             auto_sync_deadline: None,
+            tray,
+            window_handle,
+            last_unread_by_account: BTreeMap::new(),
         };
 
         // 启动视图非统一收件箱时立即请求对应列表（LoadAllCached 只覆盖收件箱）。
@@ -732,6 +790,11 @@ impl HylkiApp {
     }
 
     fn apply_worker_events(&mut self, events: Vec<WorkerEvent>, cx: &mut Context<Self>) {
+        let mut folders_updated = false;
+        let mut total_new_unread: u32 = 0;
+        let mut notify_account_id: Option<u32> = None;
+        let mut latest_unread_preview: Option<(String, String)> = None;
+
         for evt in events {
             match evt {
                 WorkerEvent::AccountVerified { ok, message } => {
@@ -759,6 +822,8 @@ impl HylkiApp {
                     self.accounts.retain(|a| a.id != account_id);
                     self.folders_by_account.remove(&account_id);
                     self.outbox_by_account.remove(&account_id);
+                    self.last_unread_by_account.remove(&account_id);
+                    folders_updated = true;
                     self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                     self.current_view = CurrentView::UnifiedInbox;
                     self.selected_message = None;
@@ -775,10 +840,42 @@ impl HylkiApp {
                     account_id,
                     folders,
                 } => {
+                    let inbox_unread: u32 = folders
+                        .iter()
+                        .filter(|f| {
+                            f.path.eq_ignore_ascii_case("INBOX") || f.name.contains("收件箱")
+                        })
+                        .map(|f| f.unread_count)
+                        .sum();
+                    let delta = detect_new_unread(
+                        &mut self.last_unread_by_account,
+                        account_id,
+                        inbox_unread,
+                    );
+                    if delta > 0 {
+                        total_new_unread = total_new_unread.saturating_add(delta);
+                        notify_account_id = Some(account_id);
+                    }
                     self.folders_by_account.insert(account_id, folders);
+                    folders_updated = true;
                 }
                 WorkerEvent::MessagesPageLoaded(page) => {
                     self.loading_more_local = false;
+                    if latest_unread_preview.is_none() {
+                        if let Some(msg) = page.items.iter().find(|m| m.unread) {
+                            let (name, email) = split_sender(&msg.sender);
+                            let from = if name.is_empty() {
+                                if email.is_empty() {
+                                    msg.sender.clone()
+                                } else {
+                                    email
+                                }
+                            } else {
+                                name
+                            };
+                            latest_unread_preview = Some((from, msg.subject.clone()));
+                        }
+                    }
                     // 仅当事件页与当前视图匹配时才采用；统一视图（星标/已发送/归档）
                     // 忽略文件夹级页面事件。
                     let page_matches = match self.current_view {
@@ -890,6 +987,27 @@ impl HylkiApp {
                             cx.notify();
                         });
                     }
+                }
+            }
+        }
+        if folders_updated {
+            if let Some(ref tray) = self.tray {
+                tray.set_tooltip(tray::format_tray_tooltip(self.unified_unread_count()));
+                if total_new_unread > 0 && self.prefs.desktop_notifications && !self.demo_mode {
+                    let account_label = notify_account_id
+                        .map(|id| self.account_email_for(id))
+                        .filter(|s| !s.is_empty());
+                    let (sender, subject) = match latest_unread_preview.as_ref() {
+                        Some((s, subj)) => (Some(s.as_str()), Some(subj.as_str())),
+                        None => (None, None),
+                    };
+                    let (title, body) = tray::format_new_mail_notification(
+                        total_new_unread,
+                        sender,
+                        subject,
+                        account_label,
+                    );
+                    tray.show_notification(&title, &body);
                 }
             }
         }
@@ -1014,8 +1132,86 @@ impl HylkiApp {
         }
     }
 
-    /// 彻底退出应用（菜单「退出 Hylki」入口）。
+    /// 关联 GPUI 主窗口 HWND 到系统托盘（用于隐藏/恢复主窗口）。
+    pub(crate) fn attach_main_hwnd(&self, hwnd: usize) {
+        if let Some(ref tray) = self.tray {
+            tray.set_main_hwnd(hwnd);
+        }
+    }
+
+    /// 销毁系统托盘图标（真正退出前调用，避免托盘残留幽灵图标）。
+    pub(crate) fn shutdown_tray(&self) {
+        if let Some(ref tray) = self.tray {
+            tray.shutdown();
+        }
+    }
+
+    /// 持久化当前窗口尺寸与最大化状态到 `preferences.toml`。
+    pub(crate) fn save_window_geometry(&mut self, window: &Window) {
+        if capture_window_geometry(&mut self.prefs, window.window_bounds()) {
+            let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
+        }
+    }
+
+    /// 顶栏最小化按钮动作：偏好 `minimize_to_tray` 为 true 时隐藏到托盘，否则常规最小化。
+    pub(crate) fn minimize_window_or_tray(
+        &mut self,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.save_window_geometry(window);
+        if self.prefs.minimize_to_tray {
+            if let Some(ref tray) = self.tray {
+                if tray.hide_main_window() {
+                    return;
+                }
+            }
+        }
+        window.minimize_window();
+    }
+
+    /// 消费 Windows 系统托盘菜单 / 左键单击事件。
+    fn handle_tray_command(&mut self, cmd: TrayCommand, cx: &mut Context<Self>) {
+        match cmd {
+            TrayCommand::ShowWindow => {
+                if let Some(ref tray) = self.tray {
+                    tray.show_main_window();
+                }
+            }
+            TrayCommand::NewCompose => {
+                if let Some(ref tray) = self.tray {
+                    tray.show_main_window();
+                }
+                let entity = cx.entity();
+                let _ = self.window_handle.update(cx, |_, window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.active_modal = ActiveModal::None;
+                        this.main_view = MainContentView::Mail;
+                        this.start_new_compose(window, cx);
+                    });
+                });
+            }
+            TrayCommand::SyncAll => {
+                self.refresh_all(cx);
+            }
+            TrayCommand::Quit => {
+                self.quit_app(cx);
+            }
+        }
+    }
+
+    /// 彻底退出应用（菜单「退出 Hylki」或托盘右键「退出 Hylki」入口）。
     pub(crate) fn quit_app(&mut self, cx: &mut Context<Self>) {
+        let mut bounds_snapshot = None;
+        let _ = self.window_handle.update(cx, |_, window, _| {
+            bounds_snapshot = Some(window.window_bounds());
+        });
+        if let Some(wb) = bounds_snapshot {
+            if capture_window_geometry(&mut self.prefs, wb) {
+                let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
+            }
+        }
+        self.shutdown_tray();
         cx.quit();
     }
 
@@ -2541,17 +2737,54 @@ impl HylkiApp {
 
     // ---- 右栏渲染（阅读态 / 写信 / 账号管理 / 欢迎页由 ui:: 渲染）----
 
-    fn render_right_pane(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_right_pane(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         match self.right_mode {
-            RightPaneMode::Compose => compose::render(self, cx),
-            RightPaneMode::Welcome => welcome::render(self, cx),
-            RightPaneMode::Reader => reader::render(self, cx),
+            RightPaneMode::Compose => {
+                let p = theme::current(cx);
+                let title = if self.compose_in_reply_to.is_empty() {
+                    "写新邮件"
+                } else {
+                    "回复邮件"
+                };
+                let win_controls = window_controls::render_window_controls("compose-wc", window, cx);
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .bg(p.canvas)
+                    .child(
+                        h_flex()
+                            .h(px(window_controls::HEADER_HEIGHT))
+                            .flex_shrink_0()
+                            .pl_4()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(p.border)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(p.text_muted)
+                                    .child(title),
+                            )
+                            .child(window_controls::drag_spacer())
+                            .child(win_controls),
+                    )
+                    .child(compose::render(self, cx))
+                    .into_any_element()
+            }
+            RightPaneMode::Welcome => welcome::render(self, window, cx),
+            RightPaneMode::Reader => reader::render(self, window, cx),
         }
     }
 }
 
 impl Render for HylkiApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 避坑清单第 4 条：先把语义色 Copy 成局部变量再构建 UI。
         let p = theme::current(cx);
         let border = p.border;
@@ -2568,7 +2801,7 @@ impl Render for HylkiApp {
         let body = match self.main_view {
             MainContentView::Mail => {
                 let list_el = message_list::render(self, cx);
-                let right_el = self.render_right_pane(cx);
+                let right_el = self.render_right_pane(window, cx);
                 h_flex()
                     .flex_1()
                     .min_h_0()
@@ -2577,8 +2810,25 @@ impl Render for HylkiApp {
                     .child(right_el)
             }
             MainContentView::Gallery => {
+                let win_controls =
+                    window_controls::render_window_controls("gallery-wc", window, cx);
                 let gallery_el = match self.gallery.clone() {
-                    Some(entity) => div().flex_1().min_h_0().child(entity).into_any_element(),
+                    Some(entity) => div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .h_full()
+                        .child(entity)
+                        .child(
+                            h_flex()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .h(px(window_controls::HEADER_HEIGHT))
+                                .items_center()
+                                .child(win_controls),
+                        )
+                        .into_any_element(),
                     None => div().flex_1().into_any_element(),
                 };
                 h_flex()
@@ -2588,8 +2838,27 @@ impl Render for HylkiApp {
                     .child(gallery_el)
             }
             MainContentView::Contacts => {
+                let win_controls =
+                    window_controls::render_window_controls("contacts-wc", window, cx);
                 let contacts_el = match self.contacts.clone() {
-                    Some(entity) => div().flex_1().min_h_0().child(entity).into_any_element(),
+                    Some(entity) => div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .h_full()
+                        .child(entity)
+                        .child(
+                            h_flex()
+                                .absolute()
+                                .top_0()
+                                .left(px(300.0))
+                                .right_0()
+                                .h(px(window_controls::HEADER_HEIGHT))
+                                .items_center()
+                                .child(window_controls::drag_spacer())
+                                .child(win_controls),
+                        )
+                        .into_any_element(),
                     None => div().flex_1().into_any_element(),
                 };
                 h_flex()
@@ -2767,6 +3036,44 @@ impl Render for HylkiApp {
     }
 }
 
+/// 检测单个账号的收件箱未读增长量：首次出现仅建立基线返回 0，避免启动加载误报通知。
+pub(crate) fn detect_new_unread(
+    prev_by_account: &mut BTreeMap<u32, u32>,
+    account_id: u32,
+    current_inbox_unread: u32,
+) -> u32 {
+    let delta = match prev_by_account.get(&account_id).copied() {
+        Some(prev) if current_inbox_unread > prev => current_inbox_unread - prev,
+        _ => 0,
+    };
+    prev_by_account.insert(account_id, current_inbox_unread);
+    delta
+}
+
+/// 将 GPUI `WindowBounds` 写入偏好中的窗口尺寸与最大化标记（忽略最小化时的退化尺寸）。
+pub(crate) fn capture_window_geometry(prefs: &mut AppPreferences, bounds: WindowBounds) -> bool {
+    let (maximized, rect) = match bounds {
+        WindowBounds::Windowed(b) => (false, b),
+        WindowBounds::Maximized(b) => (true, b),
+        WindowBounds::Fullscreen(b) => (prefs.window_maximized, b),
+    };
+    let w: f32 = rect.size.width.into();
+    let h: f32 = rect.size.height.into();
+    let mut changed = false;
+    if prefs.window_maximized != maximized {
+        prefs.window_maximized = maximized;
+        changed = true;
+    }
+    if w.is_finite() && h.is_finite() && w >= 320.0 && h >= 240.0 {
+        if prefs.window_width != Some(w) || prefs.window_height != Some(h) {
+            prefs.window_width = Some(w);
+            prefs.window_height = Some(h);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// 拆分发件人字段为 (显示名, 邮箱)：`"Marcus Chen <marcus@x>"` →
 /// `("Marcus Chen", "marcus@x")`；无尖括号时整体为显示名。
 pub(crate) fn split_sender(sender: &str) -> (String, String) {
@@ -2834,5 +3141,50 @@ mod tests {
         );
         assert_eq!(HylkiApp::current_view_from_last(Some("bogus")), None);
         assert_eq!(HylkiApp::current_view_from_last(None), None);
+    }
+
+    #[test]
+    fn detect_new_unread_skips_initial_load_and_reports_subsequent_growth() {
+        let mut baseline = BTreeMap::new();
+        // 首次启动加载缓存或初始同步：只记录基线，不触发新邮件通知。
+        assert_eq!(detect_new_unread(&mut baseline, 1, 10), 0);
+        // 未读数不变：不触发通知。
+        assert_eq!(detect_new_unread(&mut baseline, 1, 10), 0);
+        // 后台同步新增 3 封未读：返回增量 3。
+        assert_eq!(detect_new_unread(&mut baseline, 1, 13), 3);
+        // 用户阅读后未读下降：更新基线且不触发通知。
+        assert_eq!(detect_new_unread(&mut baseline, 1, 8), 0);
+        // 再次收到 1 封新邮件：基于最新基线 8 返回 1。
+        assert_eq!(detect_new_unread(&mut baseline, 1, 9), 1);
+    }
+
+    #[test]
+    fn capture_window_geometry_updates_windowed_and_maximized_states() {
+        use gpui_kit::{size, Bounds};
+        let mut prefs = AppPreferences::default();
+
+        let b1 = Bounds::new(point(px(10.0), px(20.0)), size(px(1400.0), px(860.0)));
+        assert!(capture_window_geometry(&mut prefs, WindowBounds::Windowed(b1)));
+        assert_eq!(prefs.window_width, Some(1400.0));
+        assert_eq!(prefs.window_height, Some(860.0));
+        assert!(!prefs.window_maximized);
+
+        // 相同尺寸再次保存应返回 false。
+        assert!(!capture_window_geometry(&mut prefs, WindowBounds::Windowed(b1)));
+
+        // 最大化状态：更新 window_maximized 且保留 restore bounds。
+        assert!(capture_window_geometry(&mut prefs, WindowBounds::Maximized(b1)));
+        assert!(prefs.window_maximized);
+        assert_eq!(prefs.window_width, Some(1400.0));
+        assert_eq!(prefs.window_height, Some(860.0));
+
+        // 最小化退化尺寸 (0x0) 不应覆盖已记录的有效宽高。
+        let degenerate = Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0)));
+        assert!(!capture_window_geometry(
+            &mut prefs,
+            WindowBounds::Maximized(degenerate)
+        ));
+        assert_eq!(prefs.window_width, Some(1400.0));
+        assert_eq!(prefs.window_height, Some(860.0));
     }
 }

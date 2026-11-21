@@ -71,7 +71,7 @@ struct AccountsFile {
 }
 
 /// User interface & sync preferences persisted in `preferences.toml`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppPreferences {
     /// Active theme identifier (e.g. `"default"`, `"rose"`).
@@ -87,8 +87,23 @@ pub struct AppPreferences {
     pub auto_sync_minutes: u32,
     /// Block remote images in HTML mail bodies.
     pub block_remote_images: bool,
-    /// Minimize the window instead of exiting when clicking the titlebar close button.
+    /// Hide the window to the system tray instead of exiting when clicking close.
     pub close_to_minimize: bool,
+    /// Hide the window to the system tray when minimizing.
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
+    /// Show desktop notifications when background sync finds new unread mail.
+    #[serde(default = "default_true")]
+    pub desktop_notifications: bool,
+    /// Persisted window width in logical pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_width: Option<f32>,
+    /// Persisted window height in logical pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_height: Option<f32>,
+    /// Whether the window was maximized when last closed/exited.
+    #[serde(default)]
+    pub window_maximized: bool,
     /// View opened at startup: `"unified"` (unified inbox) or `"last"`
     /// (the folder selected in the previous session).
     pub default_view: String,
@@ -102,6 +117,10 @@ pub struct AppPreferences {
     pub last_folder: Option<(u32, u32)>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
@@ -112,6 +131,11 @@ impl Default for AppPreferences {
             auto_sync_minutes: 5,
             block_remote_images: true,
             close_to_minimize: true,
+            minimize_to_tray: true,
+            desktop_notifications: true,
+            window_width: None,
+            window_height: None,
+            window_maximized: false,
             default_view: "unified".to_string(),
             last_view: None,
             last_folder: None,
@@ -269,6 +293,11 @@ mod tests {
             auto_sync_minutes: 0,
             block_remote_images: false,
             close_to_minimize: false,
+            minimize_to_tray: false,
+            desktop_notifications: false,
+            window_width: Some(1440.0),
+            window_height: Some(900.0),
+            window_maximized: true,
             default_view: "last".to_string(),
             last_view: None,
             last_folder: None,
@@ -337,6 +366,41 @@ mod tests {
         assert_eq!(loaded.last_view.as_deref(), Some("sent"));
         assert_eq!(loaded.last_folder, Some((3, 17)));
         assert_eq!(loaded, prefs);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preferences_tray_notifications_and_window_geometry_compat() {
+        let base = std::env::temp_dir().join("hylki test 托盘与窗口几何");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // 旧格式 TOML（缺少新字段）应自动填充向后兼容默认值。
+        fs::write(
+            preferences_file_in(&base),
+            "theme_id = 'default'\nclose_to_minimize = true\n",
+        )
+        .expect("write legacy prefs");
+        let legacy = load_preferences_in(&base).expect("load legacy file");
+        assert!(legacy.minimize_to_tray);
+        assert!(legacy.desktop_notifications);
+        assert_eq!(legacy.window_width, None);
+        assert_eq!(legacy.window_height, None);
+        assert!(!legacy.window_maximized);
+
+        // 完整往返保存与读取。
+        let custom = AppPreferences {
+            minimize_to_tray: false,
+            desktop_notifications: false,
+            window_width: Some(1520.0),
+            window_height: Some(920.0),
+            window_maximized: true,
+            ..AppPreferences::default()
+        };
+        save_preferences_in(&base, &custom).expect("save custom prefs");
+        let reloaded = load_preferences_in(&base).expect("reload custom prefs");
+        assert_eq!(reloaded, custom);
 
         let _ = fs::remove_dir_all(&base);
     }

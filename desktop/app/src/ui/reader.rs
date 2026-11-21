@@ -18,14 +18,14 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString, Styled,
+    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Window,
 };
 use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display};
 use hylki_mail_core::{AttachmentMeta, MailRequest, ThreadMessage};
 
 use crate::app::{split_sender, HylkiApp};
 use crate::theme;
-use crate::ui::avatar;
+use crate::ui::{avatar, window_controls};
 
 /// 顶部操作栏高度。
 const HEADER_HEIGHT: f32 = 48.0;
@@ -295,10 +295,15 @@ fn render_message_card(
         .into_any_element()
 }
 
-pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
+pub(crate) fn render(
+    app: &HylkiApp,
+    window: &Window,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 出来。
     let p = theme::current(cx);
     let (canvas, border, muted_fg, accent) = (p.canvas, p.border, p.text_muted, p.accent);
+    let win_controls = window_controls::render_window_controls("reader-wc", window, cx);
 
     let Some(detail) = app.selected_message.clone() else {
         return v_flex()
@@ -306,19 +311,33 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             .min_w_0()
             .h_full()
             .bg(canvas)
-            .items_center()
-            .justify_center()
-            .gap_2()
             .child(
-                Icon::new(IconName::Mail)
-                    .with_size(px(36.0))
-                    .text_color(muted_fg),
+                h_flex()
+                    .h(px(HEADER_HEIGHT))
+                    .flex_shrink_0()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(window_controls::drag_spacer())
+                    .child(win_controls),
             )
             .child(
-                div()
-                    .text_sm()
-                    .text_color(muted_fg)
-                    .child("选择一封邮件查看正文"),
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Mail)
+                            .with_size(px(36.0))
+                            .text_color(muted_fg),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .child("选择一封邮件查看正文"),
+                    ),
             )
             .into_any_element();
     };
@@ -464,15 +483,14 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .min_w_0()
         .h_full()
         .bg(canvas)
-        // 顶部操作栏 48px。
+        // 顶部操作栏 48px（空白区可拖拽窗口，最右侧为 Windows 原生窗口控制按钮）。
         .child(
             h_flex()
                 .h(px(HEADER_HEIGHT))
                 .flex_shrink_0()
-                .px_3()
+                .pl_3()
                 .gap_1()
                 .items_center()
-                .justify_between()
                 .border_b_1()
                 .border_color(border)
                 .child({
@@ -535,10 +553,12 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             )
                         })
                 })
+                .child(window_controls::drag_spacer())
                 // 右侧操作组：动态标记已读/未读 + HTML/纯文本切换 + 复制正文（严格放在 48px 顶栏内）。
                 .child(
                     h_flex()
                         .gap_1()
+                        .pr_1()
                         .items_center()
                         .when(has_any_html, |el| {
                             el.child(
@@ -585,7 +605,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 }),
                             ),
                         ),
-                ),
+                )
+                .child(win_controls),
         )
         // 标题区（16px 24px 8px）：账号胶囊 + 可选会话数胶囊 + 20px 粗体主题。
         .child(

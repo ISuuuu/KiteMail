@@ -18,7 +18,7 @@ use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, AppContext, Context, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    Render, SharedString, Stateful, StatefulInteractiveElement, Styled, WindowControlArea,
 };
 use hylki_mail_core::cache::CachedAttachment;
 
@@ -354,12 +354,20 @@ impl Render for GalleryState {
                             .child(Input::new(&self.search_input)),
                     )
                     .child(filter_button)
-                    .child(div().flex_1().text_xs().text_color(muted_fg).child(
-                        SharedString::from(format!(
-                            "共 {total} 个附件，当前显示 {} 个",
-                            visible.len()
-                        )),
-                    )),
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .h_full()
+                            .pr(px(144.0))
+                            .items_center()
+                            .window_control_area(WindowControlArea::Drag)
+                            .child(div().text_xs().text_color(muted_fg).child(
+                                SharedString::from(format!(
+                                    "共 {total} 个附件，当前显示 {} 个",
+                                    visible.len()
+                                )),
+                            )),
+                    ),
             )
             // 表头。
             .child(

@@ -75,7 +75,7 @@ impl PrefTab {
 }
 
 /// 偏好设置事件。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PreferencesEvent {
     /// 任一设置改动（携带完整新值，集成者负责应用与持久化）。
     Changed(AppPreferences),
@@ -408,6 +408,24 @@ impl Render for PreferencesState {
                             this.emit_changed(cx);
                         });
                     });
+                let entity_for_min_tray = cx.entity();
+                let min_to_tray_switch = Switch::new("pref-minimize-to-tray")
+                    .checked(prefs.minimize_to_tray)
+                    .on_click(move |checked, _, cx| {
+                        entity_for_min_tray.update(cx, |this, cx| {
+                            this.prefs.minimize_to_tray = *checked;
+                            this.emit_changed(cx);
+                        });
+                    });
+                let entity_for_notify = cx.entity();
+                let desktop_notify_switch = Switch::new("pref-desktop-notifications")
+                    .checked(prefs.desktop_notifications)
+                    .on_click(move |checked, _, cx| {
+                        entity_for_notify.update(cx, |this, cx| {
+                            this.prefs.desktop_notifications = *checked;
+                            this.emit_changed(cx);
+                        });
+                    });
                 setting_card(
                     "常规",
                     &p,
@@ -425,9 +443,21 @@ impl Render for PreferencesState {
                             &p,
                         ),
                         setting_row(
-                            "点击关闭按钮时最小化",
-                            Some("关闭窗口时最小化到任务栏，可在左上角菜单选择「退出 Hylki」"),
+                            "点击关闭按钮时最小化到托盘",
+                            Some("关闭窗口时隐藏到系统托盘，可在菜单或托盘右键选择「退出 Hylki」"),
                             close_minimize_switch,
+                            &p,
+                        ),
+                        setting_row(
+                            "最小化时隐藏到托盘",
+                            Some("最小化窗口时隐藏到系统托盘，不在任务栏保留图标"),
+                            min_to_tray_switch,
+                            &p,
+                        ),
+                        setting_row(
+                            "新邮件系统通知",
+                            Some("后台同步收到新未读邮件时通过系统托盘弹出桌面通知"),
+                            desktop_notify_switch,
                             &p,
                         ),
                     ],

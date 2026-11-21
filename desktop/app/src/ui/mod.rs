@@ -15,3 +15,4 @@ pub(crate) mod preferences;
 pub(crate) mod reader;
 pub(crate) mod sidebar;
 pub(crate) mod welcome;
+pub(crate) mod window_controls;
