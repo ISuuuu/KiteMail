@@ -75,6 +75,19 @@ pub struct AttachmentMeta {
     pub size_bytes: usize,
 }
 
+/// One message card within a conversation thread shown in the reading pane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadMessage {
+    pub id: u32,
+    pub sender: String,
+    pub recipients: String,
+    pub date_display: String,
+    pub body_text: String,
+    pub body_loaded: bool,
+    pub flagged: bool,
+    pub attachments: Vec<AttachmentMeta>,
+}
+
 /// Full message payload shown in the reading pane.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageDetail {
@@ -91,6 +104,9 @@ pub struct MessageDetail {
     pub body_text: String,
     pub flagged: bool,
     pub attachments: Vec<AttachmentMeta>,
+    /// Chronological messages belonging to the same conversation thread (empty or 1 item for standalone mails).
+    #[serde(default)]
+    pub thread_messages: Vec<ThreadMessage>,
 }
 
 /// Persisted local compose draft recoverable across restarts.

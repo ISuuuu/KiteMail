@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail, MessageFilter,
-    MessageSummary, OutboxItem, OutboxStatus,
+    MessageSummary, OutboxItem, OutboxStatus, ThreadMessage,
 };
 
 /// Remote folder metadata returned by IMAP LIST/STATUS.
@@ -74,6 +74,37 @@ const ARCHIVE_FOLDER_MATCH: &str = "(f.name = '归档' OR UPPER(f.path) LIKE '%A
 /// SQL predicate matching every account's Trash/Deleted folder by friendly name or raw path.
 const TRASH_FOLDER_MATCH: &str =
     "(f.name = '已删除' OR UPPER(f.path) LIKE '%TRASH%' OR UPPER(f.path) LIKE '%DELETED%')";
+
+/// Normalize a subject line for conversation grouping by stripping common
+/// reply/forward prefixes (`Re:`, `Fwd:`, `Fw:`, `回复:`, `转发:`).
+pub fn normalize_thread_subject(subject: &str) -> String {
+    let mut s = subject.trim();
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let stripped = if lower.starts_with("re:") {
+            Some(&s[3..])
+        } else if lower.starts_with("fwd:") {
+            Some(&s[4..])
+        } else if lower.starts_with("fw:") {
+            Some(&s[3..])
+        } else if let Some(rest) = s.strip_prefix("回复：") {
+            Some(rest)
+        } else if let Some(rest) = s.strip_prefix("回复:") {
+            Some(rest)
+        } else if let Some(rest) = s.strip_prefix("转发：") {
+            Some(rest)
+        } else if let Some(rest) = s.strip_prefix("转发:") {
+            Some(rest)
+        } else {
+            None
+        };
+        match stripped {
+            Some(rest) => s = rest.trim_start(),
+            None => break,
+        }
+    }
+    s.trim().to_lowercase()
+}
 
 /// Persistent SQLite mail cache.
 pub struct CacheStore {
@@ -832,6 +863,10 @@ impl CacheStore {
 
         let attachments = self.list_attachments(id)?;
         let body_loaded = body_opt.is_some();
+        let body_text = body_opt.unwrap_or_default();
+        let thread_messages = self
+            .list_thread_messages(account_id, &subject)
+            .unwrap_or_default();
         let detail = MessageDetail {
             id,
             account_id,
@@ -843,11 +878,101 @@ impl CacheStore {
             recipients,
             subject,
             date_display,
-            body_text: body_opt.unwrap_or_default(),
+            body_text,
             flagged,
             attachments,
+            thread_messages,
         };
         Ok(Some((detail, uid, body_loaded)))
+    }
+
+    /// Find the account's Sent folder `(folder_id, path)` if synced.
+    pub fn find_sent_folder(&self, account_id: u32) -> Result<Option<(u32, String)>, String> {
+        self.conn
+            .query_row(
+                &format!(
+                    "
+                    SELECT f.id, f.path
+                    FROM folders f
+                    WHERE f.account_id = ?1 AND {SENT_FOLDER_MATCH}
+                    ORDER BY f.id ASC
+                    LIMIT 1
+                    "
+                ),
+                params![account_id],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("查找已发送文件夹失败: {e}"))
+    }
+
+    /// Aggregate chronological messages in the same account whose normalized subject
+    /// matches `subject` (up to 20 messages).
+    pub fn list_thread_messages(
+        &self,
+        account_id: u32,
+        subject: &str,
+    ) -> Result<Vec<ThreadMessage>, String> {
+        let key = normalize_thread_subject(subject);
+        if key.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{key}%");
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, sender, recipients, subject, date_display, body_text, preview, flagged
+                FROM messages
+                WHERE account_id = ?1 AND LOWER(subject) LIKE ?2
+                ORDER BY date_ts ASC, uid ASC
+                LIMIT 40
+                ",
+            )
+            .map_err(|e| format!("准备会话查询失败: {e}"))?;
+
+        let raw_rows = stmt
+            .query_map(params![account_id, pattern], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i32>(7)? != 0,
+                ))
+            })
+            .map_err(|e| format!("执行会话查询失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析会话结果失败: {e}"))?;
+
+        let mut out = Vec::new();
+        for (id, sender, recipients, row_subject, date_display, body_opt, preview, flagged) in
+            raw_rows
+        {
+            if normalize_thread_subject(&row_subject) != key {
+                continue;
+            }
+            let body_loaded = body_opt.is_some();
+            let body_text = body_opt.unwrap_or(preview);
+            let attachments = self.list_attachments(id).unwrap_or_default();
+            out.push(ThreadMessage {
+                id,
+                sender,
+                recipients,
+                date_display,
+                body_text,
+                body_loaded,
+                flagged,
+                attachments,
+            });
+            if out.len() >= 20 {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     fn list_attachments(&self, message_id: u32) -> Result<Vec<AttachmentMeta>, String> {
@@ -2548,5 +2673,82 @@ mod tests {
             .unwrap();
         assert_eq!(unread_starred.total, 1);
         assert_eq!(unread_starred.items[0].subject, "未读且星标");
+    }
+
+    #[test]
+    fn thread_subject_normalization_and_grouping_work() {
+        assert_eq!(
+            normalize_thread_subject("Re: Fwd: 回复：Q3 Roadmap "),
+            "q3 roadmap"
+        );
+        assert_eq!(normalize_thread_subject("转发: 项目进度"), "项目进度");
+
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[
+                    RemoteFolder {
+                        name: "收件箱".to_string(),
+                        path: "INBOX".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "已发送".to_string(),
+                        path: "Sent".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        let inbox = folders[0].id;
+        assert_eq!(
+            cache.find_sent_folder(1).unwrap().map(|(_, p)| p),
+            Some("Sent".to_string())
+        );
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                1,
+                &[
+                    CachedHeaderInput {
+                        uid: 1,
+                        message_id: "<m1@test>".to_string(),
+                        sender: "Alice <a@test>".to_string(),
+                        recipients: "me@test".to_string(),
+                        subject: "Q3 Roadmap".to_string(),
+                        preview: "第一封".to_string(),
+                        date_ts: 100,
+                        date_display: "09:00".to_string(),
+                        unread: false,
+                        flagged: false,
+                        has_attachment: false,
+                    },
+                    CachedHeaderInput {
+                        uid: 2,
+                        message_id: "<m2@test>".to_string(),
+                        sender: "Bob <b@test>".to_string(),
+                        recipients: "me@test".to_string(),
+                        subject: "Re: Q3 Roadmap".to_string(),
+                        preview: "第二封回复".to_string(),
+                        date_ts: 200,
+                        date_display: "10:00".to_string(),
+                        unread: true,
+                        flagged: false,
+                        has_attachment: false,
+                    },
+                ],
+                Some(&[1, 2]),
+            )
+            .unwrap();
+
+        let thread = cache.list_thread_messages(1, "Re: Q3 Roadmap").unwrap();
+        assert_eq!(thread.len(), 2);
+        assert_eq!(thread[0].sender, "Alice <a@test>");
+        assert_eq!(thread[1].sender, "Bob <b@test>");
     }
 }

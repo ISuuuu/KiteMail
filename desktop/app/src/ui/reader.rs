@@ -20,6 +20,7 @@ use gpui_kit::{
     div, px, relative, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     Styled,
 };
+use hylki_mail_core::{AttachmentMeta, MailRequest, ThreadMessage};
 
 use crate::app::{split_sender, HylkiApp};
 use crate::theme;
@@ -53,6 +54,193 @@ fn recipient_summary(raw: &str) -> (String, String) {
     }
 }
 
+/// 渲染单张邮件正文卡片（既用于单封邮件，也用于会话线程中的多张叠放卡片）。
+#[allow(clippy::too_many_arguments)]
+fn render_message_card(
+    account_id: u32,
+    msg_id: u32,
+    sender: &str,
+    recipients: &str,
+    date_display: &str,
+    body_text: &str,
+    body_loaded: bool,
+    attachments: &[AttachmentMeta],
+    is_current: bool,
+    more_menu: Option<gpui_kit::AnyElement>,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let (canvas, border, muted_fg, accent) = (p.canvas, p.border, p.text_muted, p.accent);
+    let (sender_name, sender_email) = split_sender(sender);
+    let display_name = if sender_name.is_empty() {
+        sender.to_string()
+    } else {
+        sender_name
+    };
+    let (recipient_pill, recipient_list) = recipient_summary(recipients);
+
+    let attachment_rows: Vec<gpui_kit::AnyElement> = attachments
+        .iter()
+        .map(|att| {
+            let att_id = att.id;
+            let filename = att.filename.clone();
+            let size_kb = (att.size_bytes + 1023) / 1024;
+            h_flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(border)
+                .bg(canvas)
+                .child(
+                    Icon::new(IconName::Paperclip)
+                        .with_size(px(14.0))
+                        .text_color(muted_fg),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .max_w(px(240.0))
+                        .truncate()
+                        .child(SharedString::from(filename.clone())),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(SharedString::from(format!("{size_kb} KB"))),
+                )
+                .child(
+                    Button::new(("save-att", att_id))
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Download)
+                        .tooltip("保存附件")
+                        .on_click(cx.listener(move |this, _, _, _| {
+                            this.save_attachment(att_id, &filename);
+                        })),
+                )
+                .into_any_element()
+        })
+        .collect();
+
+    v_flex()
+        .bg(p.surface_raised)
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(if is_current {
+            accent.opacity(0.45)
+        } else {
+            border
+        })
+        .shadow_xs()
+        .p(px(20.0))
+        .gap_3()
+        .child(
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(avatar::avatar(&display_name, &sender_email, CARD_AVATAR))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui_kit::FontWeight::BOLD)
+                                        .text_color(p.text)
+                                        .truncate()
+                                        .child(SharedString::from(display_name)),
+                                )
+                                .when(!sender_email.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .truncate()
+                                            .child(SharedString::from(format!("<{sender_email}>"))),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_full()
+                                .bg(canvas)
+                                .border_1()
+                                .border_color(border)
+                                .text_color(muted_fg)
+                                .text_xs()
+                                .child(SharedString::from(recipient_pill)),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(SharedString::from(date_display.to_string())),
+                        )
+                        .children(more_menu),
+                )
+                .when(!recipient_list.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .pl(px(CARD_AVATAR + 8.0))
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .truncate()
+                            .child(SharedString::from(format!("收件人：{recipient_list}"))),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_sm()
+                .line_height(relative(1.6))
+                .text_color(if body_loaded { p.text } else { muted_fg })
+                .child(SharedString::from(body_text.to_string())),
+        )
+        .when(!body_loaded, |card| {
+            card.child(
+                h_flex().child(
+                    Button::new(("load-thread-body", msg_id))
+                        .outline()
+                        .compact()
+                        .label("加载完整正文")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(ref w) = this.worker {
+                                w.send(MailRequest::LoadMessageBody {
+                                    account_id,
+                                    message_id: msg_id,
+                                });
+                                cx.notify();
+                            }
+                        })),
+                ),
+            )
+        })
+        .when(!attachment_rows.is_empty(), |card| {
+            card.child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(border)
+                    .children(attachment_rows),
+            )
+        })
+        .into_any_element()
+}
+
 pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 出来。
     let p = theme::current(cx);
@@ -81,16 +269,10 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             .into_any_element();
     };
 
-    let (sender_name, sender_email) = split_sender(&detail.sender);
-    let display_name = if sender_name.is_empty() {
-        detail.sender.clone()
-    } else {
-        sender_name
-    };
     let owner_email = app.account_email_for(detail.account_id).to_string();
     let flagged = detail.flagged;
     let is_unread = app.selected_message_unread();
-    let (recipient_pill, recipient_list) = recipient_summary(&detail.recipients);
+    let thread_count = detail.thread_messages.len();
 
     // 卡片头部 `...` 更多操作菜单。
     let card_more_menu = {
@@ -159,56 +341,50 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         }),
                 )
             })
+            .into_any_element()
     };
 
-    // 附件条。
-    let attachment_rows: Vec<gpui_kit::AnyElement> = detail
-        .attachments
-        .iter()
-        .map(|att| {
-            let att_id = att.id;
-            let filename = att.filename.clone();
-            let size_kb = (att.size_bytes + 1023) / 1024;
-            h_flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(border)
-                .bg(canvas)
-                .child(
-                    Icon::new(IconName::Paperclip)
-                        .with_size(px(14.0))
-                        .text_color(muted_fg),
+    // 构造单卡或多线程叠放卡片列表。
+    let cards: Vec<gpui_kit::AnyElement> = if thread_count > 1 {
+        let mut more_menu = Some(card_more_menu);
+        detail
+            .thread_messages
+            .iter()
+            .map(|tm: &ThreadMessage| {
+                let is_current = tm.id == detail.id;
+                let menu = if is_current { more_menu.take() } else { None };
+                render_message_card(
+                    detail.account_id,
+                    tm.id,
+                    &tm.sender,
+                    &tm.recipients,
+                    &tm.date_display,
+                    &tm.body_text,
+                    tm.body_loaded,
+                    &tm.attachments,
+                    is_current,
+                    menu,
+                    &p,
+                    cx,
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .max_w(px(240.0))
-                        .truncate()
-                        .child(SharedString::from(filename.clone())),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(SharedString::from(format!("{size_kb} KB"))),
-                )
-                .child(
-                    Button::new(("save-att", att_id))
-                        .ghost()
-                        .compact()
-                        .icon(IconName::Download)
-                        .tooltip("保存附件")
-                        .on_click(cx.listener(move |this, _, _, _| {
-                            this.save_attachment(att_id, &filename);
-                        })),
-                )
-        })
-        .map(|row| row.into_any_element())
-        .collect();
+            })
+            .collect()
+    } else {
+        vec![render_message_card(
+            detail.account_id,
+            detail.id,
+            &detail.sender,
+            &detail.recipients,
+            &detail.date_display,
+            &detail.body_text,
+            true,
+            &detail.attachments,
+            false,
+            Some(card_more_menu),
+            &p,
+            cx,
+        )]
+    };
 
     v_flex()
         .flex_1()
@@ -318,7 +494,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         ),
                 ),
         )
-        // 标题区（16px 24px 8px）。
+        // 标题区（16px 24px 8px）：账号胶囊 + 可选会话数胶囊 + 20px 粗体主题。
         .child(
             v_flex()
                 .flex_shrink_0()
@@ -327,19 +503,40 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .px(px(24.0))
                 .pb(px(8.0))
                 .gap_1()
-                .when(!owner_email.is_empty(), |el| {
+                .when(!owner_email.is_empty() || thread_count > 1, |el| {
                     el.child(
-                        h_flex().child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_full()
-                                .bg(p.accent_soft())
-                                .text_color(accent)
-                                .text_xs()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .child(SharedString::from(owner_email)),
-                        ),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .when(!owner_email.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(p.accent_soft())
+                                        .text_color(accent)
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .child(SharedString::from(owner_email)),
+                                )
+                            })
+                            .when(thread_count > 1, |row| {
+                                row.child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(p.surface_raised)
+                                        .border_1()
+                                        .border_color(border)
+                                        .text_color(muted_fg)
+                                        .text_xs()
+                                        .child(SharedString::from(format!(
+                                            "{thread_count} 封往来会话"
+                                        ))),
+                                )
+                            }),
                     )
                 })
                 .child(
@@ -350,7 +547,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .child(SharedString::from(detail.subject.clone())),
                 ),
         )
-        // 卡片式正文（外层滚动，内边距 12px 24px 24px）。
+        // 卡片式正文（外层滚动，内边距 12px 24px 24px；多封会话纵向叠放）。
         .child(
             v_flex()
                 .id("reader-scroll")
@@ -360,110 +557,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .pt(px(12.0))
                 .px(px(24.0))
                 .pb(px(24.0))
-                .child(
-                    v_flex()
-                        .bg(p.surface_raised)
-                        .rounded(px(12.0))
-                        .border_1()
-                        .border_color(border)
-                        .shadow_xs()
-                        .p(px(20.0))
-                        .gap_3()
-                        // 卡片头部：34x34 头像 + 姓名 <邮箱> + 真实收件人胶囊 + 右侧时间 + 更多菜单。
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(avatar::avatar(
-                                            &display_name,
-                                            &sender_email,
-                                            CARD_AVATAR,
-                                        ))
-                                        .child(
-                                            v_flex()
-                                                .min_w_0()
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .font_weight(gpui_kit::FontWeight::BOLD)
-                                                        .text_color(p.text)
-                                                        .truncate()
-                                                        .child(SharedString::from(display_name)),
-                                                )
-                                                .when(!sender_email.is_empty(), |el| {
-                                                    el.child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(muted_fg)
-                                                            .truncate()
-                                                            .child(SharedString::from(format!(
-                                                                "<{sender_email}>"
-                                                            ))),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .px_2()
-                                                .py_0p5()
-                                                .rounded_full()
-                                                .bg(canvas)
-                                                .border_1()
-                                                .border_color(border)
-                                                .text_color(muted_fg)
-                                                .text_xs()
-                                                .child(SharedString::from(recipient_pill)),
-                                        )
-                                        .child(div().flex_1())
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .text_xs()
-                                                .text_color(muted_fg)
-                                                .child(SharedString::from(
-                                                    detail.date_display.clone(),
-                                                )),
-                                        )
-                                        .child(card_more_menu),
-                                )
-                                .when(!recipient_list.is_empty(), |el| {
-                                    el.child(
-                                        div()
-                                            .pl(px(CARD_AVATAR + 8.0))
-                                            .text_xs()
-                                            .text_color(muted_fg)
-                                            .truncate()
-                                            .child(SharedString::from(format!(
-                                                "收件人：{recipient_list}"
-                                            ))),
-                                    )
-                                }),
-                        )
-                        // 正文：行高 1.6。
-                        .child(
-                            div()
-                                .text_sm()
-                                .line_height(relative(1.6))
-                                .text_color(p.text)
-                                .child(SharedString::from(detail.body_text.clone())),
-                        )
-                        // 卡片底部附件条。
-                        .when(!detail.attachments.is_empty(), |card| {
-                            card.child(
-                                h_flex()
-                                    .gap_2()
-                                    .flex_wrap()
-                                    .pt_2()
-                                    .border_t_1()
-                                    .border_color(border)
-                                    .children(attachment_rows),
-                            )
-                        }),
-                ),
+                .gap_3()
+                .children(cards),
         )
         .into_any_element()
 }

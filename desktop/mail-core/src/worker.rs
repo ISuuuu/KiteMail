@@ -1128,7 +1128,7 @@ async fn send_outbox_item(
         });
     }
 
-    let outcome = match account.auth_backend {
+    let (outcome, sent_raw_rfc822, imap_password_for_sent) = match account.auth_backend {
         AuthBackend::MicrosoftGraphOAuth2 => match ensure_graph_token(tokens, &account).await {
             Ok(token) => {
                 let to_addr = item.to_addr.clone();
@@ -1137,15 +1137,16 @@ async fn send_outbox_item(
                 let subject = item.subject.clone();
                 let body = item.body_text.clone();
                 let atts = item.attachment_paths.clone();
-                tokio::task::spawn_blocking(move || {
+                let out = tokio::task::spawn_blocking(move || {
                     graph_client::send_message(
                         &token, &to_addr, &cc_addrs, &bcc_addrs, &subject, &body, &atts,
                     )
                 })
                 .await
-                .unwrap_or_else(|e| SendOutcome::Uncertain(format!("Graph 发信任务异常: {e}")))
+                .unwrap_or_else(|e| SendOutcome::Uncertain(format!("Graph 发信任务异常: {e}")));
+                (out, None, None)
             }
-            Err(e) => SendOutcome::Failed(e),
+            Err(e) => (SendOutcome::Failed(e), None, None),
         },
         AuthBackend::Password => match secrets::load_account_secrets(account_id) {
             Ok(secrets) => {
@@ -1157,7 +1158,7 @@ async fn send_outbox_item(
                 } else {
                     secrets.imap_password.as_str()
                 };
-                smtp_client::send_message(
+                let (out, raw) = smtp_client::send_message_with_raw(
                     &account,
                     smtp_pwd,
                     &item.to_addr,
@@ -1168,9 +1169,10 @@ async fn send_outbox_item(
                     &item.in_reply_to,
                     &item.attachment_paths,
                 )
-                .await
+                .await;
+                (out, raw, Some(secrets.imap_password))
             }
-            Err(e) => SendOutcome::Failed(e),
+            Err(e) => (SendOutcome::Failed(e), None, None),
         },
     };
 
@@ -1181,6 +1183,24 @@ async fn send_outbox_item(
                 account_id,
                 subject: item.subject,
             });
+            // 移植方案阶段 2：服务器确认接收后，保存已发副本属于独立操作；
+            // 若 APPEND 失败仅发温和状态提示，绝不将已发邮件标记为失败或重发。
+            if let (Some(raw), Some(imap_pwd)) = (sent_raw_rfc822, imap_password_for_sent) {
+                if let Ok(Some((_, sent_path))) = cache.find_sent_folder(account_id) {
+                    if let Err(e) =
+                        imap_client::append_sent_message(&account, &imap_pwd, &sent_path, &raw)
+                            .await
+                    {
+                        let _ = evt_tx.send(WorkerEvent::Status {
+                            account_id: Some(account_id),
+                            text: format!(
+                                "[{}] 邮件已发出，但保存已发副本失败：{e}",
+                                account.email
+                            ),
+                        });
+                    }
+                }
+            }
         }
         SendOutcome::Failed(err) => {
             let _ = cache.update_outbox_status(outbox_id, OutboxStatus::Failed, &err);

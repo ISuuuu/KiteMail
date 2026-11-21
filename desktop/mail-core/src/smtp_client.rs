@@ -97,6 +97,35 @@ pub async fn send_message(
     in_reply_to: &str,
     attachment_paths: &[String],
 ) -> SendOutcome {
+    send_message_with_raw(
+        account,
+        password,
+        to_addr,
+        cc_addrs,
+        bcc_addrs,
+        subject,
+        body_text,
+        in_reply_to,
+        attachment_paths,
+    )
+    .await
+    .0
+}
+
+/// Build and send an email, also returning the serialized RFC 822 bytes when accepted
+/// so the caller can independently append a Sent copy via IMAP.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_message_with_raw(
+    account: &AccountConfig,
+    password: &str,
+    to_addr: &str,
+    cc_addrs: &str,
+    bcc_addrs: &str,
+    subject: &str,
+    body_text: &str,
+    in_reply_to: &str,
+    attachment_paths: &[String],
+) -> (SendOutcome, Option<Vec<u8>>) {
     let from_str = if account.display_name.trim().is_empty() {
         account.email.clone()
     } else {
@@ -104,20 +133,25 @@ pub async fn send_message(
     };
     let from_mailbox: Mailbox = match from_str.parse() {
         Ok(m) => m,
-        Err(e) => return SendOutcome::Failed(format!("发件人地址格式无效: {e}")),
+        Err(e) => {
+            return (
+                SendOutcome::Failed(format!("发件人地址格式无效: {e}")),
+                None,
+            )
+        }
     };
     let to_mailboxes = match parse_mailbox_list(to_addr, "收件人") {
         Ok(list) if !list.is_empty() => list,
-        Ok(_) => return SendOutcome::Failed("收件人地址不能为空".to_string()),
-        Err(e) => return SendOutcome::Failed(e),
+        Ok(_) => return (SendOutcome::Failed("收件人地址不能为空".to_string()), None),
+        Err(e) => return (SendOutcome::Failed(e), None),
     };
     let cc_mailboxes = match parse_mailbox_list(cc_addrs, "抄送") {
         Ok(list) => list,
-        Err(e) => return SendOutcome::Failed(e),
+        Err(e) => return (SendOutcome::Failed(e), None),
     };
     let bcc_mailboxes = match parse_mailbox_list(bcc_addrs, "密送") {
         Ok(list) => list,
-        Err(e) => return SendOutcome::Failed(e),
+        Err(e) => return (SendOutcome::Failed(e), None),
     };
 
     let mut builder = Message::builder().from(from_mailbox).subject(subject);
@@ -151,7 +185,10 @@ pub async fn send_message(
             let bytes = match std::fs::read(path) {
                 Ok(b) => b,
                 Err(e) => {
-                    return SendOutcome::Failed(format!("读取附件失败 ({}): {e}", path.display()))
+                    return (
+                        SendOutcome::Failed(format!("读取附件失败 ({}): {e}", path.display())),
+                        None,
+                    )
                 }
             };
             let content_type = "application/octet-stream"
@@ -164,21 +201,30 @@ pub async fn send_message(
 
     let email = match message {
         Ok(m) => m,
-        Err(e) => return SendOutcome::Failed(format!("构建邮件 MIME 失败: {e}")),
+        Err(e) => {
+            return (
+                SendOutcome::Failed(format!("构建邮件 MIME 失败: {e}")),
+                None,
+            )
+        }
     };
+    let raw_rfc822 = email.formatted();
 
     let transport = match build_transport(account, password) {
         Ok(t) => t,
-        Err(e) => return SendOutcome::Failed(e),
+        Err(e) => return (SendOutcome::Failed(e), None),
     };
 
     match transport.send(email).await {
-        Ok(_) => SendOutcome::Accepted,
+        Ok(_) => (SendOutcome::Accepted, Some(raw_rfc822)),
         Err(e) => {
             if e.is_transient() || e.is_timeout() || e.is_client() {
-                SendOutcome::Uncertain(format!("发送结果待确认（传输未收到最终回执）: {e}"))
+                (
+                    SendOutcome::Uncertain(format!("发送结果待确认（传输未收到最终回执）: {e}")),
+                    None,
+                )
             } else {
-                SendOutcome::Failed(format!("SMTP 发送被拒绝: {e}"))
+                (SendOutcome::Failed(format!("SMTP 发送被拒绝: {e}")), None)
             }
         }
     }

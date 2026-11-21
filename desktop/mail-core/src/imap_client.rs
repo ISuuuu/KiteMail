@@ -342,6 +342,25 @@ pub async fn delete_message(
     Ok(())
 }
 
+/// Append a sent RFC 822 message copy to `sent_folder_path` as an independent post-send step.
+pub async fn append_sent_message(
+    account: &AccountConfig,
+    password: &str,
+    sent_folder_path: &str,
+    raw_rfc822: &[u8],
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    tokio::time::timeout(
+        IO_TIMEOUT,
+        session.append(sent_folder_path, Some("(\\Seen)"), None, raw_rfc822),
+    )
+    .await
+    .map_err(|_| format!("保存已发副本到 {sent_folder_path} 超时"))?
+    .map_err(|e| format!("保存已发副本到 {sent_folder_path} 失败: {e}"))?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
 fn parse_header_bytes(
     parser: &MessageParser,
     uid: u32,

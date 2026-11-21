@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::cache::{CachedAttachment, KnownContact};
 use crate::{
     AccountSummary, AttachmentMeta, FolderSummary, MailPage, MessageDetail, MessageFilter,
-    MessageSummary,
+    MessageSummary, ThreadMessage,
 };
 
 pub const DEMO_INBOX_ID: u32 = 1;
@@ -477,6 +477,55 @@ impl DemoStore {
         }
         .to_string();
 
+        // 为演示邮件 #1 与 #3 构造多封往来会话，便于在 --demo 直观体验线程卡片阅读。
+        let thread_messages = match summary.id {
+            1 => vec![
+                ThreadMessage {
+                    id: 90_001,
+                    sender: "陈思远 <siyuan@example.org>".to_string(),
+                    recipients: "林晓明 <xiaoming@example.com>, demo@hylki.example".to_string(),
+                    date_display: "13:10".to_string(),
+                    body_text: "我这边已经用 MSVC 工具链验证完 x86_64-pc-windows-msvc 独立工作区编译，依赖树完全隔离了 GTK 和 Wayland。".to_string(),
+                    body_loaded: true,
+                    flagged: false,
+                    attachments: Vec::new(),
+                },
+                ThreadMessage {
+                    id: summary.id,
+                    sender: summary.sender.clone(),
+                    recipients: "demo@hylki.example, 陈思远 <siyuan@example.org>".to_string(),
+                    date_display: summary.date_display.clone(),
+                    body_text: body_text.clone(),
+                    body_loaded: true,
+                    flagged: summary.flagged,
+                    attachments: attachments.clone(),
+                },
+            ],
+            3 => vec![
+                ThreadMessage {
+                    id: 90_002,
+                    sender: "林晓明 <xiaoming@example.com>".to_string(),
+                    recipients: "产品设计组 <design@hylki.example>".to_string(),
+                    date_display: "前天 16:40".to_string(),
+                    body_text: "请设计组同步一份三栏间距与亮/暗主题语义色板，我们按 48px 顶栏对齐。".to_string(),
+                    body_loaded: true,
+                    flagged: false,
+                    attachments: Vec::new(),
+                },
+                ThreadMessage {
+                    id: summary.id,
+                    sender: summary.sender.clone(),
+                    recipients: "demo@hylki.example".to_string(),
+                    date_display: summary.date_display.clone(),
+                    body_text: body_text.clone(),
+                    body_loaded: true,
+                    flagged: summary.flagged,
+                    attachments: attachments.clone(),
+                },
+            ],
+            _ => Vec::new(),
+        };
+
         Some(MessageDetail {
             id: summary.id,
             account_id: 1,
@@ -491,6 +540,7 @@ impl DemoStore {
             body_text,
             flagged: summary.flagged,
             attachments,
+            thread_messages,
         })
     }
 }
