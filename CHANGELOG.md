@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- **Fixed: Fetch the sender's key found nothing for many addresses** (#690,
+  by James Reilly). gpg asks only the keyserver it is set up with,
+  keyserver.ubuntu.com by default, which lacks many keys, and its WKD lookup
+  refuses a redirect to another host. edward-en@fsf.org fails both ways.
+  When gpg finds nothing, **Fetch the sender's key** and **Fetch by
+  address…** now ask the provider's WKD again through Hylki's own HTTPS
+  client, then keys.openpgp.org by address and by key id. A key found by
+  address keeps only the user ids for that address and has to name it. One
+  found by key id has to carry that id.
+
+- **New: a shorter right-click menu on messages** (#692). The menu of a
+  message in the list and of a card in the reader keeps replying, starring,
+  read state, tags and filing (Archive, Move To…, Snooze, Spam, Delete) on
+  its first page. **Create** holds Create Event…, Create Task…, Create
+  Filter from Message… and Add Sender to Contacts. **More** holds Edit as
+  New Message, Copy To…, View Source and Save as File…, and on a card the
+  two print entries. A card's **View** holds remote content, the sender's
+  fonts and colors, and Expand All and Collapse All. Translate stays on the
+  first page when a service is set up. In the Inbox the card menu went from
+  26 entries to 15, and the list's from 19 to 13.
+
+- **Fixed: no window when GNOME Online Accounts or the desktop portal does
+  not answer** (#691, reported by thopanX). Startup asked GNOME Online
+  Accounts for its accounts, and the date column asked the settings portal
+  for the clock format, on the main thread with no time limit. One that never
+  answered held the window from ever appearing, and every later launch timed
+  out handing off to that instance. GOA now has 5 seconds at startup, and its
+  accounts are left as they are without an answer. Portal calls give up
+  after 2 seconds and are not tried again for 5 minutes. A launch that finds
+  an instance that does not answer says so, with the command that ends it,
+  instead of waiting a second time.
+
 - **Fixed: "entity not found" opening a conversation in On This Computer**
   (#689, reported by samuel-edlmeier). With the empty Inbox left out of
   the folder list, the cache numbered the folders one off from the ids
