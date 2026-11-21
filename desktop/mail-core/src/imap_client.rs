@@ -355,6 +355,9 @@ pub async fn move_message(
     uid: u32,
     dest_folder: &str,
 ) -> Result<(), String> {
+    if dest_folder.trim().is_empty() {
+        return Err("目标文件夹路径不能为空".to_string());
+    }
     let mut session = connect_imap(account, password).await?;
     session
         .select(src_folder)

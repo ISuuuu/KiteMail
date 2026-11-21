@@ -196,6 +196,12 @@ async fn handle_request(
                 })
                 .unwrap_or_else(|| config::next_account_id(&existing));
 
+            let existing_signature = existing
+                .iter()
+                .find(|a| a.id == account_id)
+                .map(|a| a.signature.clone())
+                .unwrap_or_default();
+
             let account = AccountConfig {
                 id: account_id,
                 auth_backend: AuthBackend::MicrosoftGraphOAuth2,
@@ -211,6 +217,7 @@ async fn handle_request(
                 smtp_security: config::SecurityMode::StartTls,
                 smtp_username: result.email,
                 smtp_separate_credentials: false,
+                signature: existing_signature,
             };
 
             if let Err(e) = secrets::save_oauth_refresh_token(account_id, result.refresh_token) {
@@ -617,6 +624,61 @@ async fn handle_request(
             .await;
         }
 
+        MailRequest::MoveMessage {
+            account_id,
+            message_id,
+            target_folder_path,
+        } => {
+            move_message_inner(
+                data_dir,
+                cache,
+                tokens,
+                account_id,
+                message_id,
+                MoveTarget::Folder(target_folder_path),
+                evt_tx,
+            )
+            .await;
+        }
+
+        MailRequest::MarkSpam {
+            account_id,
+            message_id,
+        } => {
+            move_message_inner(
+                data_dir,
+                cache,
+                tokens,
+                account_id,
+                message_id,
+                MoveTarget::Spam,
+                evt_tx,
+            )
+            .await;
+        }
+
+        MailRequest::ExportForwardAttachments { message_id } => {
+            let dest_dir = std::env::temp_dir().join(format!("hylki-forward-{message_id}"));
+            match cache.export_message_attachments(message_id, &dest_dir) {
+                Ok(paths) => {
+                    let paths = paths
+                        .into_iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    let _ = evt_tx.send(WorkerEvent::ForwardAttachmentsExported {
+                        message_id,
+                        paths,
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: format!("导出转发附件失败: {e}"),
+                    });
+                }
+            }
+        }
+
         MailRequest::SaveAttachment {
             attachment_id,
             dest_path,
@@ -844,17 +906,20 @@ async fn handle_request(
     }
 }
 
-/// Destination folder role for server-side message moves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Destination folder role or explicit path for server-side message moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum MoveTarget {
     Archive,
     Trash,
+    Spam,
+    Folder(String),
 }
 
-/// Move a message to the account's archive or trash folder on the server,
-/// then drop it from the local cache and emit a completion event. Failures
-/// (missing account config, missing remote ID, no target folder, remote
-/// error) are reported through the regular error event channel.
+/// Move a message to the account's archive, trash, spam, or explicit target
+/// folder on the server, then drop it from the local cache and emit a
+/// completion event. Failures (missing account config, missing remote ID,
+/// no target folder, remote error) are reported through the regular error
+/// event channel.
 async fn move_message_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -867,7 +932,7 @@ async fn move_message_inner(
     let Some((detail, uid, _)) = cache.get_message_detail(message_id).ok().flatten() else {
         let _ = evt_tx.send(WorkerEvent::Error {
             account_id: Some(account_id),
-            message: "本地缓存中未找到该邮件，无法执行归档/删除".to_string(),
+            message: "本地缓存中未找到该邮件，无法移动或删除".to_string(),
         });
         return;
     };
@@ -879,9 +944,28 @@ async fn move_message_inner(
         return;
     };
 
+    if let MoveTarget::Folder(ref target_path) = target {
+        if target_path.trim().is_empty() {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: "目标文件夹路径不能为空".to_string(),
+            });
+            return;
+        }
+        if detail.folder_path == *target_path {
+            let _ = evt_tx.send(WorkerEvent::Status {
+                account_id: Some(account_id),
+                text: "邮件已在目标文件夹中".to_string(),
+            });
+            return;
+        }
+    }
+
     let op_name = match target {
         MoveTarget::Archive => "归档",
         MoveTarget::Trash => "删除",
+        MoveTarget::Spam => "标记为垃圾邮件",
+        MoveTarget::Folder(_) => "移动",
     };
 
     let res = match account.auth_backend {
@@ -893,14 +977,20 @@ async fn move_message_inner(
                 });
                 return;
             };
-            let dest_folder = match target {
+            let dest_folder = match &target {
                 // Graph accepts well-known folder names directly.
                 MoveTarget::Trash => Ok("deleteditems".to_string()),
+                MoveTarget::Spam => match cache.find_spam_folder(account_id) {
+                    Ok(Some((_, path))) => Ok(path),
+                    Ok(None) => Ok("junkemail".to_string()),
+                    Err(e) => Err(e),
+                },
                 MoveTarget::Archive => match cache.find_archive_folder(account_id) {
                     Ok(Some((_, path))) => Ok(path),
                     Ok(None) => Err("该账号没有归档文件夹，无法归档邮件".to_string()),
                     Err(e) => Err(e),
                 },
+                MoveTarget::Folder(path) => Ok(path.clone()),
             };
             match dest_folder {
                 Ok(dest) => match ensure_graph_token(tokens, &account).await {
@@ -915,7 +1005,7 @@ async fn move_message_inner(
             }
         }
         AuthBackend::Password => {
-            let dest_folder = match target {
+            let dest_folder = match &target {
                 MoveTarget::Archive => match cache.find_archive_folder(account_id) {
                     Ok(Some((_, path))) => Ok(Some(path)),
                     Ok(None) => Err("该账号没有归档文件夹，无法归档邮件".to_string()),
@@ -927,6 +1017,12 @@ async fn move_message_inner(
                     .ok()
                     .flatten()
                     .map(|(_, path)| path)),
+                MoveTarget::Spam => match cache.find_spam_folder(account_id) {
+                    Ok(Some((_, path))) => Ok(Some(path)),
+                    Ok(None) => Err("该账号没有垃圾邮件文件夹，无法标记为垃圾邮件".to_string()),
+                    Err(e) => Err(e),
+                },
+                MoveTarget::Folder(path) => Ok(Some(path.clone())),
             };
             match dest_folder {
                 Ok(Some(dest)) => match secrets::load_account_secrets(account_id) {
@@ -978,6 +1074,15 @@ async fn move_message_inner(
                 MoveTarget::Trash => WorkerEvent::MessageDeleted {
                     account_id,
                     message_id,
+                },
+                MoveTarget::Spam => WorkerEvent::MessageMarkedSpam {
+                    account_id,
+                    message_id,
+                },
+                MoveTarget::Folder(target_folder_path) => WorkerEvent::MessageMoved {
+                    account_id,
+                    message_id,
+                    target_folder_path,
                 },
             });
             let _ = evt_tx.send(WorkerEvent::Status {

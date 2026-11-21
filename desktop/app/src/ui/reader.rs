@@ -825,14 +825,72 @@ pub(crate) fn render(
                                     this.toggle_flagged(&star_detail, cx);
                                 })),
                         )
-                        // 迭代 2：归档 / 删除接线（IMAP MOVE / Graph move）；
-                        // 演示模式不支持服务端移动，隐藏这两个入口。
+                        // 迭代 2：归档 / 删除 / 标垃圾 / 移动到文件夹接线（IMAP MOVE / Graph move）；
+                        // 演示模式不支持服务端移动，隐藏这些入口。
                         .when(!app.demo_mode, |el| {
+                            let move_account_id = detail.account_id;
+                            let move_message_id = detail.id;
+                            let current_folder_path = detail.folder_path.clone();
+                            let account_folders: Vec<(String, String)> = app
+                                .folders_by_account
+                                .get(&move_account_id)
+                                .map(|list| {
+                                    list.iter()
+                                        .map(|f| (f.name.clone(), f.path.clone()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let move_entity = cx.entity();
                             el.child(
                                 action_button("reader-archive", IconName::Archive, "归档")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.archive_selected(cx);
                                     })),
+                            )
+                            .child(
+                                action_button("reader-spam", IconName::Ban, "标记为垃圾邮件")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mark_spam_selected(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("reader-move-to")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::FolderClosed)
+                                    .tooltip("移动到文件夹...")
+                                    .dropdown_menu(move |mut menu, _, _| {
+                                        if account_folders.is_empty() {
+                                            menu = menu.item(
+                                                PopupMenuItem::new("暂无可用文件夹").disabled(true),
+                                            );
+                                            return menu;
+                                        }
+                                        for (folder_name, folder_path) in &account_folders {
+                                            let is_current = *folder_path == current_folder_path;
+                                            let target_path = folder_path.clone();
+                                            let entity_for_item = move_entity.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(folder_name.clone())
+                                                    .disabled(is_current)
+                                                    .when(is_current, |item| {
+                                                        item.icon(Icon::new(IconName::Check))
+                                                    })
+                                                    .on_click(move |_, _, cx| {
+                                                        let path = target_path.clone();
+                                                        entity_for_item.update(cx, |this, cx| {
+                                                            this.move_message(
+                                                                move_account_id,
+                                                                move_message_id,
+                                                                path,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    }),
                             )
                             .child(
                                 action_button("reader-delete", IconName::Trash, "删除").on_click(

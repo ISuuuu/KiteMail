@@ -9,7 +9,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -538,7 +538,19 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 .flex_1(),
                             ),
                     )
-                }),
+                })
+                .child(labeled_field(
+                    "邮件签名（新建 / 回复 / 转发时自动插入正文末尾）",
+                    div()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(border)
+                        .bg(p.surface)
+                        .p_1()
+                        .child(Textarea::new(&app.cfg_signature))
+                        .into_any_element(),
+                    muted_fg,
+                )),
         )
         .when_some(app.cfg_feedback.as_ref(), |el, (ok, msg)| {
             el.child(

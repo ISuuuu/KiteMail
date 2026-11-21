@@ -18,10 +18,10 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     actions, black, div, point, px, AnyWindowHandle, AppContext, ClipboardItem, Context, Entity,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollHandle,
+    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollHandle,
     SharedString, Styled, Subscription, Window, WindowAppearance, WindowBounds,
 };
-use hylki_mail_core::cache::CachedAttachment;
+use hylki_mail_core::cache::{CachedAttachment, KnownContact};
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend, SecurityMode};
 use hylki_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_SENT_ID,
@@ -220,9 +220,33 @@ actions!(
         OpenCommandPalette,
         FocusSearch,
         RefreshAllAccounts,
-        CloseOverlay
+        CloseOverlay,
+        SendCompose,
+        OpenPreferences,
+        QuitApp,
+        DeleteSelectedMessage,
+        SelectNextMessage,
+        SelectPrevMessage
     ]
 );
+
+/// 写信页当前激活联系人自动补全的地址输入行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComposeAddressField {
+    To,
+    Cc,
+    Bcc,
+}
+
+/// 撤销发送（Undo Send）5 秒缓冲中的待投递邮件。
+#[derive(Clone, Debug)]
+pub(crate) struct PendingSend {
+    pub(crate) token: u64,
+    pub(crate) account_id: u32,
+    pub(crate) draft: ComposeDraft,
+    pub(crate) local_draft_id: Option<u32>,
+    pub(crate) remaining_secs: u8,
+}
 
 /// 主内容区路由（方案文档五.1）：`Mail` 默认三栏，`Gallery` 附件总览，
 /// `Contacts` 联系人（后两者保留左栏，中栏 + 右栏整体替换）。
@@ -262,6 +286,8 @@ pub(crate) struct HylkiApp {
     pub(crate) loading_more_remote: bool,
     pub(crate) current_page: MailPage,
     pub(crate) selected_message: Option<MessageDetail>,
+    /// Ctrl+点击多选的邮件 ID 集合。
+    pub(crate) selected_message_ids: HashSet<u32>,
     pub(crate) drafts: Vec<LocalDraft>,
     pub(crate) outbox_by_account: BTreeMap<u32, Vec<OutboxItem>>,
     pub(crate) right_mode: RightPaneMode,
@@ -280,6 +306,17 @@ pub(crate) struct HylkiApp {
     pub(crate) compose_body: Entity<TextareaState>,
     pub(crate) compose_in_reply_to: String,
     pub(crate) compose_attachments: Vec<String>,
+    /// 写信退出前未保存确认条显示状态。
+    pub(crate) compose_confirm_discard: bool,
+    /// 当前正在等待导出原附件的转发邮件 ID。
+    pub(crate) pending_forward_msg_id: Option<u32>,
+    /// 当前触发联系人自动补全的地址框。
+    pub(crate) compose_autocomplete_field: Option<ComposeAddressField>,
+    /// 已知联系人本地缓存（供写信收件人自动补全）。
+    pub(crate) known_contacts: Vec<KnownContact>,
+    /// 撤销发送（5 秒缓冲）状态。
+    pub(crate) pending_send: Option<PendingSend>,
+    next_send_token: u64,
 
     // Account configuration fields
     pub(crate) editing_account_id: Option<u32>,
@@ -299,6 +336,7 @@ pub(crate) struct HylkiApp {
     pub(crate) cfg_smtp_user: Entity<InputState>,
     pub(crate) cfg_smtp_pass: Entity<InputState>,
     pub(crate) cfg_oauth_client_id: Entity<InputState>,
+    pub(crate) cfg_signature: Entity<TextareaState>,
     pub(crate) cfg_auth_guide: Option<SharedString>,
     pub(crate) cfg_feedback: Option<(bool, SharedString)>,
 
@@ -481,6 +519,27 @@ impl HylkiApp {
         });
         let compose_bcc =
             cx.new(|cx| InputState::new(window, cx).placeholder("密送：bcc@example.com"));
+        cx.subscribe(&compose_to, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.compose_autocomplete_field = Some(ComposeAddressField::To);
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&compose_cc, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.compose_autocomplete_field = Some(ComposeAddressField::Cc);
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&compose_bcc, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.compose_autocomplete_field = Some(ComposeAddressField::Bcc);
+                cx.notify();
+            }
+        })
+        .detach();
         let compose_subject = cx.new(|cx| {
             InputState::new(window, cx).placeholder("主题：输入邮件主题（支持中文 IME）")
         });
@@ -548,6 +607,12 @@ impl HylkiApp {
                 .placeholder("可选：自定义 Microsoft Entra Client ID（留空使用内置）")
                 .default_value(first_cfg.oauth_client_id.clone())
         });
+        let cfg_signature = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(3, 6)
+                .placeholder("可选：邮件签名（写信 / 回复 / 转发时自动以 -- 分隔插入正文末尾）")
+                .default_value(first_cfg.signature.clone())
+        });
 
         let system_dark_mode = matches!(
             window.appearance(),
@@ -561,6 +626,7 @@ impl HylkiApp {
         }
 
         if demo_mode {
+            let demo_contacts = demo_store.list_known_contacts("", 0, 500);
             let current_page = demo_store.list_messages_page(DEMO_INBOX_ID, "", 0, prefs.page_size);
             let mut selected_message = current_page
                 .items
@@ -597,6 +663,7 @@ impl HylkiApp {
                 loading_more_remote: false,
                 current_page,
                 selected_message,
+                selected_message_ids: HashSet::new(),
                 drafts: Vec::new(),
                 outbox_by_account: BTreeMap::new(),
                 right_mode: RightPaneMode::Reader,
@@ -612,6 +679,12 @@ impl HylkiApp {
                 compose_body,
                 compose_in_reply_to: String::new(),
                 compose_attachments: Vec::new(),
+                compose_confirm_discard: false,
+                pending_forward_msg_id: None,
+                compose_autocomplete_field: None,
+                known_contacts: demo_contacts,
+                pending_send: None,
+                next_send_token: 1,
                 editing_account_id: Some(1),
                 pending_delete_account_id: None,
                 cfg_display_name,
@@ -628,6 +701,7 @@ impl HylkiApp {
                 cfg_smtp_user,
                 cfg_smtp_pass,
                 cfg_oauth_client_id,
+                cfg_signature,
                 cfg_auth_guide: None,
                 cfg_feedback: None,
                 status_line: SharedString::from("演示模式 (--demo)：已加载 10,000 封模拟邮件"),
@@ -673,6 +747,11 @@ impl HylkiApp {
         if let Some(ref w) = worker {
             if !existing_accounts.is_empty() {
                 w.send(MailRequest::LoadAllCached);
+                w.send(MailRequest::ListKnownContacts {
+                    query: String::new(),
+                    offset: 0,
+                    limit: 500,
+                });
                 w.send(MailRequest::SyncAllAccounts);
             }
             let weak_worker = Arc::downgrade(w);
@@ -736,6 +815,7 @@ impl HylkiApp {
                 items: Vec::new(),
             },
             selected_message: None,
+            selected_message_ids: HashSet::new(),
             drafts: Vec::new(),
             outbox_by_account: BTreeMap::new(),
             // 方案文档页面 2：启动且无账号（非 demo）时进入欢迎向导。
@@ -756,6 +836,12 @@ impl HylkiApp {
             compose_body,
             compose_in_reply_to: String::new(),
             compose_attachments: Vec::new(),
+            compose_confirm_discard: false,
+            pending_forward_msg_id: None,
+            compose_autocomplete_field: None,
+            known_contacts: Vec::new(),
+            pending_send: None,
+            next_send_token: 1,
             editing_account_id,
             pending_delete_account_id: None,
             cfg_display_name,
@@ -772,6 +858,7 @@ impl HylkiApp {
             cfg_smtp_user,
             cfg_smtp_pass,
             cfg_oauth_client_id,
+            cfg_signature,
             cfg_auth_guide: None,
             cfg_feedback: None,
             status_line,
@@ -1008,6 +1095,15 @@ impl HylkiApp {
                 | WorkerEvent::MessageDeleted {
                     account_id,
                     message_id,
+                }
+                | WorkerEvent::MessageMarkedSpam {
+                    account_id,
+                    message_id,
+                }
+                | WorkerEvent::MessageMoved {
+                    account_id,
+                    message_id,
+                    ..
                 } => {
                     // 后端回执：随事件先行到达的 FoldersLoaded 已刷新文件夹计数；
                     // 这里刷新当前列表并在阅读态显示该邮件时回到空态。
@@ -1028,6 +1124,21 @@ impl HylkiApp {
                         self.server_search_results = items;
                     }
                 }
+                WorkerEvent::ForwardAttachmentsExported { message_id, paths } => {
+                    if self.pending_forward_msg_id == Some(message_id) {
+                        let mut added = 0usize;
+                        for path in paths {
+                            if !self.compose_attachments.contains(&path) {
+                                self.compose_attachments.push(path);
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            self.status_line =
+                                SharedString::from(format!("已自动携带原邮件 {added} 个附件"));
+                        }
+                    }
+                }
                 WorkerEvent::UnifiedViewLoaded { view, page } => {
                     self.loading_more_local = false;
                     if self.current_view.unified() == Some(view) {
@@ -1044,6 +1155,9 @@ impl HylkiApp {
                     }
                 }
                 WorkerEvent::KnownContactsLoaded { items } => {
+                    if self.contacts_query.trim().is_empty() || self.known_contacts.is_empty() {
+                        self.known_contacts = items.clone();
+                    }
                     if let Some(ref c) = self.contacts {
                         c.update(cx, |state, cx| {
                             state.set_contacts(items);
@@ -1114,6 +1228,7 @@ impl HylkiApp {
         self.loaded_limit = self.prefs.page_size;
         self.loading_more_local = false;
         self.loading_more_remote = false;
+        self.selected_message_ids.clear();
         self.list_scroll_handle.set_offset(point(px(0.0), px(0.0)));
     }
 
@@ -1651,8 +1766,9 @@ impl HylkiApp {
 
     // ---- 迭代 2：归档 / 删除与列表行操作（方案文档五.3）----
 
-    /// 归档 / 删除完成后的公共收尾：清空正在显示的目标邮件并刷新当前列表。
+    /// 归档 / 删除 / 移动 / 标垃圾完成后的公共收尾：清空正在显示的目标邮件并刷新当前列表。
     fn after_message_moved(&mut self, account_id: u32, message_id: u32, cx: &mut Context<Self>) {
+        self.selected_message_ids.remove(&message_id);
         if self
             .selected_message
             .as_ref()
@@ -1677,6 +1793,14 @@ impl HylkiApp {
             return;
         };
         self.delete_message(detail.account_id, detail.id, cx);
+    }
+
+    /// 阅读态标记当前邮件为垃圾邮件（发 `MailRequest::MarkSpam`）。
+    pub(crate) fn mark_spam_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.selected_message.clone() else {
+            return;
+        };
+        self.mark_spam_message(detail.account_id, detail.id, cx);
     }
 
     /// 归档指定邮件（右键菜单入口）。
@@ -1716,6 +1840,203 @@ impl HylkiApp {
                 message_id,
             });
         }
+        cx.notify();
+    }
+
+    /// 标记指定邮件为垃圾邮件（移动到账号 Junk / Spam 文件夹）。
+    pub(crate) fn mark_spam_message(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from("正在标记为垃圾邮件...");
+            w.send(MailRequest::MarkSpam {
+                account_id,
+                message_id,
+            });
+        }
+        cx.notify();
+    }
+
+    /// 移动指定邮件到目标文件夹（顶栏下拉菜单 / 右键子菜单入口）。
+    pub(crate) fn move_message(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        target_folder_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from("正在移动邮件...");
+            w.send(MailRequest::MoveMessage {
+                account_id,
+                message_id,
+                target_folder_path,
+            });
+        }
+        cx.notify();
+    }
+
+    // ---- 多选与批量操作 ----
+
+    /// Ctrl+点击切换某封邮件的多选状态。
+    pub(crate) fn toggle_message_selection(&mut self, message_id: u32, cx: &mut Context<Self>) {
+        if self.selected_message_ids.is_empty() {
+            if let Some(sel) = self.selected_message.as_ref() {
+                if sel.id != message_id {
+                    self.selected_message_ids.insert(sel.id);
+                }
+            }
+        }
+        if !self.selected_message_ids.remove(&message_id) {
+            self.selected_message_ids.insert(message_id);
+        }
+        cx.notify();
+    }
+
+    /// 取消当前多选。
+    pub(crate) fn clear_message_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected_message_ids.clear();
+        cx.notify();
+    }
+
+    /// 批量将当前多选邮件标为已读。
+    pub(crate) fn batch_mark_read(&mut self, cx: &mut Context<Self>) {
+        let targets: Vec<MessageSummary> = self
+            .current_page
+            .items
+            .iter()
+            .filter(|m| self.selected_message_ids.contains(&m.id))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        for msg in &targets {
+            if let Some(item) = self.current_page.items.iter_mut().find(|m| m.id == msg.id) {
+                item.unread = false;
+            }
+            if !self.demo_mode {
+                if let Some(ref w) = self.worker {
+                    w.send(MailRequest::SetSeen {
+                        account_id: msg.account_id,
+                        folder_path: msg.folder_path.clone(),
+                        message_id: msg.id,
+                        uid: msg.uid,
+                        seen: true,
+                    });
+                }
+            }
+        }
+        self.status_line = SharedString::from(format!("已批量将 {} 封邮件标为已读", targets.len()));
+        self.selected_message_ids.clear();
+        cx.notify();
+    }
+
+    /// 批量加星标（若全部已加星则批量取消星标）。
+    pub(crate) fn batch_toggle_flagged(&mut self, cx: &mut Context<Self>) {
+        let targets: Vec<MessageSummary> = self
+            .current_page
+            .items
+            .iter()
+            .filter(|m| self.selected_message_ids.contains(&m.id))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let next_flagged = !targets.iter().all(|m| m.flagged);
+        for msg in &targets {
+            if let Some(item) = self.current_page.items.iter_mut().find(|m| m.id == msg.id) {
+                item.flagged = next_flagged;
+            }
+            if let Some(sel) = self.selected_message.as_mut() {
+                if sel.id == msg.id {
+                    sel.flagged = next_flagged;
+                }
+            }
+            if !self.demo_mode {
+                if let Some(ref w) = self.worker {
+                    w.send(MailRequest::SetFlagged {
+                        account_id: msg.account_id,
+                        folder_path: msg.folder_path.clone(),
+                        message_id: msg.id,
+                        uid: msg.uid,
+                        flagged: next_flagged,
+                    });
+                }
+            }
+        }
+        self.status_line = SharedString::from(if next_flagged {
+            format!("已批量为 {} 封邮件加星标", targets.len())
+        } else {
+            format!("已批量取消 {} 封邮件的星标", targets.len())
+        });
+        self.selected_message_ids.clear();
+        cx.notify();
+    }
+
+    /// 批量归档当前多选邮件。
+    pub(crate) fn batch_archive(&mut self, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            return;
+        }
+        let targets: Vec<(u32, u32)> = self
+            .current_page
+            .items
+            .iter()
+            .filter(|m| self.selected_message_ids.contains(&m.id))
+            .map(|m| (m.account_id, m.id))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            for (account_id, message_id) in &targets {
+                w.send(MailRequest::ArchiveMessage {
+                    account_id: *account_id,
+                    message_id: *message_id,
+                });
+            }
+        }
+        self.status_line = SharedString::from(format!("正在批量归档 {} 封邮件...", targets.len()));
+        self.selected_message_ids.clear();
+        cx.notify();
+    }
+
+    /// 批量删除当前多选邮件。
+    pub(crate) fn batch_delete(&mut self, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            return;
+        }
+        let targets: Vec<(u32, u32)> = self
+            .current_page
+            .items
+            .iter()
+            .filter(|m| self.selected_message_ids.contains(&m.id))
+            .map(|m| (m.account_id, m.id))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            for (account_id, message_id) in &targets {
+                w.send(MailRequest::DeleteMessage {
+                    account_id: *account_id,
+                    message_id: *message_id,
+                });
+            }
+        }
+        self.status_line = SharedString::from(format!("正在批量删除 {} 封邮件...", targets.len()));
+        self.selected_message_ids.clear();
         cx.notify();
     }
 
@@ -1848,12 +2169,38 @@ impl HylkiApp {
         cx.notify();
     }
 
+    /// 查询指定账号配置的邮件签名。
+    fn account_signature(&self, account_id: u32) -> String {
+        self.accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .map(|a| a.signature.clone())
+            .unwrap_or_default()
+    }
+
+    /// 确保写信自动补全有联系人缓存。
+    fn ensure_contacts_loaded(&self) {
+        if !self.demo_mode && self.known_contacts.is_empty() {
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::ListKnownContacts {
+                    query: String::new(),
+                    offset: 0,
+                    limit: 500,
+                });
+            }
+        }
+    }
+
     pub(crate) fn start_new_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.main_view = MainContentView::Mail;
         self.compose_account_id = self.accounts.first().map(|a| a.id).unwrap_or(1);
         self.compose_draft_id = None;
         self.compose_in_reply_to.clear();
         self.compose_attachments.clear();
+        self.compose_confirm_discard = false;
+        self.pending_forward_msg_id = None;
+        self.compose_autocomplete_field = None;
+        let initial_body = append_signature("", &self.account_signature(self.compose_account_id));
         self.compose_to
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.compose_cc
@@ -1864,8 +2211,9 @@ impl HylkiApp {
         self.compose_subject
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.compose_body
-            .update(cx, |s, cx| s.set_value("", window, cx));
+            .update(cx, |s, cx| s.set_value(initial_body, window, cx));
         self.right_mode = RightPaneMode::Compose;
+        self.ensure_contacts_loaded();
         cx.notify();
     }
 
@@ -1875,29 +2223,7 @@ impl HylkiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let reply_subject = if detail.subject.to_lowercase().starts_with("re:") {
-            detail.subject.clone()
-        } else {
-            format!("Re: {}", detail.subject)
-        };
-        let quoted = format!(
-            "\n\n------------------ 原始邮件 ------------------\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
-            detail.sender, detail.date_display, detail.subject, detail.body_text
-        );
-
-        self.compose_account_id = detail.account_id;
-        self.compose_draft_id = None;
-        self.compose_in_reply_to = detail.rfc_message_id.clone();
-        self.compose_attachments.clear();
-        self.compose_to
-            .update(cx, |s, cx| s.set_value(detail.sender.clone(), window, cx));
-        self.clear_compose_cc_bcc(window, cx);
-        self.compose_subject
-            .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
-        self.compose_body
-            .update(cx, |s, cx| s.set_value(quoted, window, cx));
-        self.right_mode = RightPaneMode::Compose;
-        cx.notify();
+        self.start_reply_with(detail, "Re:", &detail.sender, window, cx);
     }
 
     /// 回复全部：收件人 = 原发件人 + 原收件人（沿用现有写信状态，无新 API）。
@@ -1916,7 +2242,7 @@ impl HylkiApp {
         self.start_reply_with(detail, "Re:", &to, window, cx);
     }
 
-    /// 转发：主题加 Fwd: 前缀，正文引用原邮件，收件人留空（沿用现有写信状态）。
+    /// 转发：主题加 Fwd: 前缀，正文引用原邮件，收件人留空，并自动携带原邮件已缓存附件。
     pub(crate) fn start_forward(
         &mut self,
         detail: &MessageDetail,
@@ -1932,23 +2258,50 @@ impl HylkiApp {
             "\n\n------------------ 转发邮件 ------------------\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
             detail.sender, detail.date_display, detail.subject, detail.body_text
         );
+        let body_with_sig =
+            append_signature(&quoted, &self.account_signature(detail.account_id));
 
         self.compose_account_id = detail.account_id;
         self.compose_draft_id = None;
         self.compose_in_reply_to.clear();
         self.compose_attachments.clear();
+        self.compose_confirm_discard = false;
+        self.pending_forward_msg_id = Some(detail.id);
+        self.compose_autocomplete_field = None;
         self.compose_to
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(forward_subject, window, cx));
         self.compose_body
-            .update(cx, |s, cx| s.set_value(quoted, window, cx));
+            .update(cx, |s, cx| s.set_value(body_with_sig, window, cx));
         self.right_mode = RightPaneMode::Compose;
+        self.ensure_contacts_loaded();
+
+        if !detail.attachments.is_empty() {
+            if self.demo_mode {
+                let dest_dir = std::env::temp_dir().join(format!("hylki-forward-{}", detail.id));
+                if std::fs::create_dir_all(&dest_dir).is_ok() {
+                    for att in &detail.attachments {
+                        let path = dest_dir.join(&att.filename);
+                        if std::fs::write(&path, format!("Demo attachment: {}", att.filename))
+                            .is_ok()
+                        {
+                            self.compose_attachments
+                                .push(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            } else if let Some(ref w) = self.worker {
+                w.send(MailRequest::ExportForwardAttachments {
+                    message_id: detail.id,
+                });
+            }
+        }
         cx.notify();
     }
 
-    /// start_reply 的共用主体。
+    /// start_reply / start_reply_all 的共用主体。
     fn start_reply_with(
         &mut self,
         detail: &MessageDetail,
@@ -1970,19 +2323,92 @@ impl HylkiApp {
             "\n\n------------------ 原始邮件 ------------------\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
             detail.sender, detail.date_display, detail.subject, detail.body_text
         );
+        let body_with_sig =
+            append_signature(&quoted, &self.account_signature(detail.account_id));
 
         self.compose_account_id = detail.account_id;
         self.compose_draft_id = None;
         self.compose_in_reply_to = detail.rfc_message_id.clone();
         self.compose_attachments.clear();
+        self.compose_confirm_discard = false;
+        self.pending_forward_msg_id = None;
+        self.compose_autocomplete_field = None;
         self.compose_to
             .update(cx, |s, cx| s.set_value(to.to_string(), window, cx));
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
         self.compose_body
-            .update(cx, |s, cx| s.set_value(quoted, window, cx));
+            .update(cx, |s, cx| s.set_value(body_with_sig, window, cx));
         self.right_mode = RightPaneMode::Compose;
+        self.ensure_contacts_loaded();
+        cx.notify();
+    }
+
+    /// 判断当前写信表单是否存在未保存内容。
+    pub(crate) fn compose_has_unsaved_content(&self, cx: &Context<Self>) -> bool {
+        has_unsaved_compose_content(
+            self.compose_to.read(cx).value().as_ref(),
+            self.compose_cc.read(cx).value().as_ref(),
+            self.compose_bcc.read(cx).value().as_ref(),
+            self.compose_subject.read(cx).value().as_ref(),
+            self.compose_body.read(cx).value().as_ref(),
+            self.compose_attachments.len(),
+        )
+    }
+
+    /// 点击「取消」或按 Esc 尝试离开写信页：有内容时弹出内联确认条；
+    /// 已在确认态再次按 Esc 则继续编辑（与 Linux 一致）。
+    pub(crate) fn request_close_compose(&mut self, cx: &mut Context<Self>) {
+        if self.compose_confirm_discard {
+            self.compose_confirm_discard = false;
+            cx.notify();
+            return;
+        }
+        if self.compose_has_unsaved_content(cx) {
+            self.compose_confirm_discard = true;
+            cx.notify();
+        } else {
+            self.discard_compose(cx);
+        }
+    }
+
+    /// 放弃当前写信内容并返回阅读态。
+    pub(crate) fn discard_compose(&mut self, cx: &mut Context<Self>) {
+        self.compose_confirm_discard = false;
+        self.pending_forward_msg_id = None;
+        self.compose_autocomplete_field = None;
+        self.right_mode = RightPaneMode::Reader;
+        cx.notify();
+    }
+
+    /// 保存为草稿并退出写信页。
+    pub(crate) fn save_draft_and_close_compose(&mut self, cx: &mut Context<Self>) {
+        self.save_local_draft(cx);
+        self.compose_confirm_discard = false;
+        self.pending_forward_msg_id = None;
+        self.compose_autocomplete_field = None;
+        self.right_mode = RightPaneMode::Reader;
+        cx.notify();
+    }
+
+    /// 点击收件人联系人补全建议项：替换最后一段并追加逗号。
+    pub(crate) fn apply_contact_suggestion(
+        &mut self,
+        field: ComposeAddressField,
+        contact: &KnownContact,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match field {
+            ComposeAddressField::To => &self.compose_to,
+            ComposeAddressField::Cc => &self.compose_cc,
+            ComposeAddressField::Bcc => &self.compose_bcc,
+        };
+        let current = target.read(cx).value().to_string();
+        let next = apply_contact_completion(&current, contact);
+        target.update(cx, |s, cx| s.set_value(next, window, cx));
+        self.compose_autocomplete_field = None;
         cx.notify();
     }
 
@@ -2099,27 +2525,107 @@ impl HylkiApp {
 
     pub(crate) fn send_compose(&mut self, cx: &mut Context<Self>) {
         let to = self.compose_to.read(cx).value().to_string();
+        let cc = self.compose_cc.read(cx).value().to_string();
+        let bcc = self.compose_bcc.read(cx).value().to_string();
         let subject = self.compose_subject.read(cx).value().to_string();
         let body = self.compose_body.read(cx).value().to_string();
 
-        if self.demo_mode {
-            self.status_line = SharedString::from(format!(
-                "演示发件成功：收件人=\"{}\"，主题=\"{}\"，附件={} 个",
-                if to.is_empty() { "(未填写)" } else { &to },
-                if subject.is_empty() {
-                    "(无主题)"
-                } else {
-                    &subject
-                },
-                self.compose_attachments.len()
-            ));
-            self.right_mode = RightPaneMode::Reader;
+        if !self.demo_mode && self.accounts.is_empty() {
+            self.error_banner = Some(SharedString::from("请先配置并保存邮箱账号"));
+            cx.notify();
+            return;
+        }
+        if !self.demo_mode && to.trim().is_empty() {
+            self.error_banner = Some(SharedString::from("请填写收件人邮箱地址"));
             cx.notify();
             return;
         }
 
-        if self.accounts.is_empty() {
-            self.error_banner = Some(SharedString::from("请先配置并保存邮箱账号"));
+        // 若已有正在倒计时的待发邮件，先立即投递，避免覆盖丢信。
+        if let Some(prev) = self.pending_send.as_ref().map(|p| p.token) {
+            self.commit_pending_send(prev, cx);
+        }
+
+        let token = self.next_send_token;
+        self.next_send_token = self.next_send_token.wrapping_add(1).max(1);
+        let pending = PendingSend {
+            token,
+            account_id: self.compose_account_id,
+            draft: ComposeDraft {
+                to,
+                cc,
+                bcc,
+                subject,
+                body,
+                in_reply_to: self.compose_in_reply_to.clone(),
+                attachment_paths: self.compose_attachments.clone(),
+            },
+            local_draft_id: self.compose_draft_id,
+            remaining_secs: 5,
+        };
+        self.pending_send = Some(pending);
+        self.compose_confirm_discard = false;
+        self.compose_autocomplete_field = None;
+        self.pending_forward_msg_id = None;
+        self.right_mode = RightPaneMode::Reader;
+        self.error_banner = None;
+        self.status_line = SharedString::from("邮件将在 5 秒后发出，可随时点击「撤销发送」");
+
+        cx.spawn(async move |this, cx| {
+            for _ in 0..5 {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let keep_going = this
+                    .update(cx, |app, cx| {
+                        let Some(pending) = app.pending_send.as_mut() else {
+                            return false;
+                        };
+                        if pending.token != token {
+                            return false;
+                        }
+                        if pending.remaining_secs > 1 {
+                            pending.remaining_secs -= 1;
+                            cx.notify();
+                            true
+                        } else {
+                            app.commit_pending_send(token, cx);
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    /// 真正将 `pending_send` 投递给 Worker（倒计时到期或点击「立即发送」）。
+    pub(crate) fn commit_pending_send(&mut self, token: u64, cx: &mut Context<Self>) {
+        if self.pending_send.as_ref().map(|p| p.token) != Some(token) {
+            return;
+        }
+        let Some(pending) = self.pending_send.take() else {
+            return;
+        };
+
+        if self.demo_mode {
+            self.status_line = SharedString::from(format!(
+                "演示发件成功：收件人=\"{}\"，主题=\"{}\"，附件={} 个",
+                if pending.draft.to.is_empty() {
+                    "(未填写)"
+                } else {
+                    &pending.draft.to
+                },
+                if pending.draft.subject.is_empty() {
+                    "(无主题)"
+                } else {
+                    &pending.draft.subject
+                },
+                pending.draft.attachment_paths.len()
+            ));
             cx.notify();
             return;
         }
@@ -2127,19 +2633,39 @@ impl HylkiApp {
         if let Some(ref w) = self.worker {
             self.status_line = SharedString::from("正在持久化至发件箱并发送...");
             w.send(MailRequest::SendDraft {
-                account_id: self.compose_account_id,
-                draft: ComposeDraft {
-                    to,
-                    cc: self.compose_cc.read(cx).value().to_string(),
-                    bcc: self.compose_bcc.read(cx).value().to_string(),
-                    subject,
-                    body,
-                    in_reply_to: self.compose_in_reply_to.clone(),
-                    attachment_paths: self.compose_attachments.clone(),
-                },
-                local_draft_id: self.compose_draft_id,
+                account_id: pending.account_id,
+                draft: pending.draft,
+                local_draft_id: pending.local_draft_id,
             });
         }
+        cx.notify();
+    }
+
+    /// 撤销发送：取消 5 秒缓冲并恢复全部内容回到写信页。
+    pub(crate) fn undo_pending_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_send.take() else {
+            return;
+        };
+        self.main_view = MainContentView::Mail;
+        self.compose_account_id = pending.account_id;
+        self.compose_draft_id = pending.local_draft_id;
+        self.compose_in_reply_to = pending.draft.in_reply_to;
+        self.compose_attachments = pending.draft.attachment_paths;
+        self.compose_show_cc_bcc =
+            !pending.draft.cc.trim().is_empty() || !pending.draft.bcc.trim().is_empty();
+        self.compose_to
+            .update(cx, |s, cx| s.set_value(pending.draft.to, window, cx));
+        self.compose_cc
+            .update(cx, |s, cx| s.set_value(pending.draft.cc, window, cx));
+        self.compose_bcc
+            .update(cx, |s, cx| s.set_value(pending.draft.bcc, window, cx));
+        self.compose_subject
+            .update(cx, |s, cx| s.set_value(pending.draft.subject, window, cx));
+        self.compose_body
+            .update(cx, |s, cx| s.set_value(pending.draft.body, window, cx));
+        self.compose_confirm_discard = false;
+        self.right_mode = RightPaneMode::Compose;
+        self.status_line = SharedString::from("已撤销发送，返回编辑邮件");
         cx.notify();
     }
 
@@ -2174,6 +2700,8 @@ impl HylkiApp {
             .update(cx, |s, cx| s.set_value(c.smtp_username, window, cx));
         self.cfg_smtp_pass
             .update(cx, |s, cx| s.set_value("", window, cx));
+        self.cfg_signature
+            .update(cx, |s, cx| s.set_value(c.signature, window, cx));
         self.cfg_feedback = None;
         self.cfg_auth_guide = None;
         self.active_modal = ActiveModal::Accounts;
@@ -2334,6 +2862,7 @@ impl HylkiApp {
             },
             smtp_username: smtp_user,
             smtp_separate_credentials: self.cfg_smtp_separate,
+            signature: self.cfg_signature.read(cx).value().to_string(),
         };
         let imap_pwd = self.cfg_imap_pass.read(cx).value().to_string();
         let smtp_pwd = if self.cfg_smtp_separate {
@@ -3087,6 +3616,53 @@ impl HylkiApp {
         }
     }
 
+    /// 检查当前窗口焦点是否位于任意文本输入框（防止 Delete / 方向键与打字冲突）。
+    fn is_text_input_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+        self.search_input.focus_handle(cx).is_focused(window)
+            || self.compose_to.focus_handle(cx).is_focused(window)
+            || self.compose_cc.focus_handle(cx).is_focused(window)
+            || self.compose_bcc.focus_handle(cx).is_focused(window)
+            || self.compose_subject.focus_handle(cx).is_focused(window)
+            || self.compose_body.focus_handle(cx).is_focused(window)
+            || self.cfg_display_name.focus_handle(cx).is_focused(window)
+            || self.cfg_email.focus_handle(cx).is_focused(window)
+            || self.cfg_imap_host.focus_handle(cx).is_focused(window)
+            || self.cfg_imap_port.focus_handle(cx).is_focused(window)
+            || self.cfg_imap_user.focus_handle(cx).is_focused(window)
+            || self.cfg_imap_pass.focus_handle(cx).is_focused(window)
+            || self.cfg_smtp_host.focus_handle(cx).is_focused(window)
+            || self.cfg_smtp_port.focus_handle(cx).is_focused(window)
+            || self.cfg_smtp_user.focus_handle(cx).is_focused(window)
+            || self.cfg_smtp_pass.focus_handle(cx).is_focused(window)
+            || self.cfg_oauth_client_id.focus_handle(cx).is_focused(window)
+            || self.cfg_signature.focus_handle(cx).is_focused(window)
+    }
+
+    /// 键盘方向键切换中栏下一封 (`delta = 1`) / 上一封 (`delta = -1`) 邮件。
+    fn select_adjacent_message(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.current_view == CurrentView::Drafts && !self.demo_mode {
+            return;
+        }
+        let items = &self.current_page.items;
+        let current_idx = self
+            .selected_message
+            .as_ref()
+            .and_then(|sel| items.iter().position(|m| m.id == sel.id));
+        let Some(next_idx) = next_adjacent_index(current_idx, items.len(), delta) else {
+            return;
+        };
+        let msg = items[next_idx].clone();
+        self.selected_message_ids.clear();
+        self.select_message(
+            msg.account_id,
+            msg.id,
+            msg.uid,
+            msg.unread,
+            &msg.folder_path,
+            cx,
+        );
+    }
+
     // ---- 右栏渲染（阅读态 / 写信 / 账号管理 / 欢迎页由 ui:: 渲染）----
 
     fn render_right_pane(
@@ -3244,6 +3820,60 @@ impl Render for HylkiApp {
                         )),
                 )
             })
+            .when_some(self.pending_send.as_ref(), |el, pending| {
+                let token = pending.token;
+                let recipient = if pending.draft.to.trim().is_empty() {
+                    "(未填写收件人)".to_string()
+                } else {
+                    pending.draft.to.trim().to_string()
+                };
+                let secs = pending.remaining_secs;
+                el.child(
+                    h_flex()
+                        .px_3()
+                        .py_1p5()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .bg(p.accent_soft())
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .text_color(p.text)
+                                .truncate()
+                                .child(SharedString::from(format!(
+                                    "正在准备发送给 {recipient}（{secs} 秒后发出）..."
+                                ))),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .flex_shrink_0()
+                                .items_center()
+                                .child(
+                                    Button::new("undo-send-btn")
+                                        .primary()
+                                        .compact()
+                                        .label("撤销发送")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.undo_pending_send(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("send-now-btn")
+                                        .outline()
+                                        .compact()
+                                        .label("立即发送")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.commit_pending_send(token, cx);
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .child(body)
             .when(!self.status_line.is_empty(), |el| {
                 el.child(
@@ -3291,11 +3921,65 @@ impl Render for HylkiApp {
                     this.refresh_all(cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &CloseOverlay, _window, cx| {
-                // Esc：优先关闭当前浮层；无浮层时由搜索框既有清空逻辑处理，
-                // 不在此重复清空（避免双重处理）。
+            .on_action(cx.listener(|this, _: &SendCompose, _window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Compose
+                {
+                    this.send_compose(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenPreferences, window, cx| {
+                if this.active_modal == ActiveModal::None {
+                    this.open_preferences(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &QuitApp, _window, cx| {
+                this.quit_app(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSelectedMessage, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    if this.selected_message_ids.len() > 1 {
+                        this.batch_delete(cx);
+                    } else {
+                        this.delete_selected(cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectNextMessage, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    this.select_adjacent_message(1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrevMessage, window, cx| {
+                if this.active_modal == ActiveModal::None
+                    && this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Reader
+                    && !this.is_text_input_focused(window, cx)
+                {
+                    this.select_adjacent_message(-1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
+                // Esc 优先级：关闭浮层 > 写信退出确认 > 撤销发送 > 取消多选。
                 if this.active_modal != ActiveModal::None {
                     this.close_modal(cx);
+                } else if this.main_view == MainContentView::Mail
+                    && this.right_mode == RightPaneMode::Compose
+                {
+                    this.request_close_compose(cx);
+                } else if this.pending_send.is_some() && !this.is_text_input_focused(window, cx) {
+                    this.undo_pending_send(window, cx);
+                } else if !this.selected_message_ids.is_empty() {
+                    this.clear_message_selection(cx);
                 }
             }));
 
@@ -3462,6 +4146,124 @@ pub(crate) fn split_sender(sender: &str) -> (String, String) {
     (sender.trim().to_string(), String::new())
 }
 
+/// 若账号配置了非空签名，则使用标准 `-- \n` 分隔符将其插入正文末尾。
+pub(crate) fn append_signature(body: &str, signature: &str) -> String {
+    let sig = signature.trim_end();
+    if sig.trim().is_empty() {
+        return body.to_string();
+    }
+    if body.is_empty() {
+        format!("\n\n-- \n{sig}")
+    } else {
+        format!("{}\n\n-- \n{sig}", body.trim_end_matches('\n'))
+    }
+}
+
+/// 判断写信表单是否存在未保存内容（任意地址/主题/正文非空或有附件）。
+pub(crate) fn has_unsaved_compose_content(
+    to: &str,
+    cc: &str,
+    bcc: &str,
+    subject: &str,
+    body: &str,
+    attachment_count: usize,
+) -> bool {
+    !to.trim().is_empty()
+        || !cc.trim().is_empty()
+        || !bcc.trim().is_empty()
+        || !subject.trim().is_empty()
+        || !body.trim().is_empty()
+        || attachment_count > 0
+}
+
+/// 根据收件人输入框最后一段（最后一个逗号后）过滤匹配的已知联系人，最多返回 `max_items` 条。
+pub(crate) fn filter_contact_suggestions<'a>(
+    input: &str,
+    contacts: &'a [KnownContact],
+    max_items: usize,
+) -> Vec<&'a KnownContact> {
+    if max_items == 0 {
+        return Vec::new();
+    }
+    let parts: Vec<&str> = input.split(',').collect();
+    let Some(last) = parts.last() else {
+        return Vec::new();
+    };
+    let token = last.trim().to_lowercase();
+    if token.is_empty() {
+        return Vec::new();
+    }
+    // 排除前面已输入的邮箱，避免重复建议。
+    let existing: HashSet<String> = parts[..parts.len().saturating_sub(1)]
+        .iter()
+        .map(|p| {
+            let (_, email) = split_sender(p);
+            if email.is_empty() {
+                p.trim().to_lowercase()
+            } else {
+                email.to_lowercase()
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    contacts
+        .iter()
+        .filter(|c| !existing.contains(&c.email.to_lowercase()))
+        .filter(|c| {
+            c.name.to_lowercase().contains(&token) || c.email.to_lowercase().contains(&token)
+        })
+        .take(max_items)
+        .collect()
+}
+
+/// 将选中的联系人补全到当前收件人输入字符串末尾，并追加 `, `。
+pub(crate) fn apply_contact_completion(current: &str, contact: &KnownContact) -> String {
+    let formatted = if contact.name.trim().is_empty() {
+        contact.email.clone()
+    } else {
+        format!("{} <{}>", contact.name.trim(), contact.email)
+    };
+    let mut parts: Vec<String> = current
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .collect();
+    if !parts.is_empty() {
+        parts.pop();
+    }
+    parts.retain(|p| !p.is_empty());
+    parts.push(formatted);
+    format!("{}, ", parts.join(", "))
+}
+
+/// 计算方向键切换上一封 / 下一封邮件的目标索引。
+pub(crate) fn next_adjacent_index(
+    current: Option<usize>,
+    len: usize,
+    delta: isize,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    match current {
+        None => {
+            if delta >= 0 {
+                Some(0)
+            } else {
+                Some(len - 1)
+            }
+        }
+        Some(idx) => {
+            let next = idx as isize + delta;
+            if next < 0 || next >= len as isize {
+                None
+            } else {
+                Some(next as usize)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3604,5 +4406,103 @@ mod tests {
 
         let unfolded = compute_default_collapsed_cards(&detail, true, false);
         assert!(unfolded.is_empty());
+    }
+
+    #[test]
+    fn append_signature_inserts_standard_separator() {
+        assert_eq!(append_signature("hello", ""), "hello");
+        assert_eq!(append_signature("hello", "   \n "), "hello");
+        assert_eq!(append_signature("", "张三\n研发部"), "\n\n-- \n张三\n研发部");
+        assert_eq!(
+            append_signature("\n\n--- 原始邮件 ---\n正文\n", "Best,\nAlice  "),
+            "\n\n--- 原始邮件 ---\n正文\n\n-- \nBest,\nAlice"
+        );
+    }
+
+    #[test]
+    fn has_unsaved_compose_content_detects_any_non_empty_field_or_attachment() {
+        assert!(!has_unsaved_compose_content("", " ", "", "\n", "  ", 0));
+        assert!(has_unsaved_compose_content("a@b.com", "", "", "", "", 0));
+        assert!(has_unsaved_compose_content("", "", "", "主题", "", 0));
+        assert!(has_unsaved_compose_content("", "", "", "", "正文", 0));
+        assert!(has_unsaved_compose_content("", "", "", "", "", 1));
+    }
+
+    #[test]
+    fn contact_autocomplete_filters_limits_dedupes_and_applies() {
+        let contacts = vec![
+            KnownContact {
+                name: "林晓明".to_string(),
+                email: "xiaoming@example.com".to_string(),
+                message_count: 10,
+            },
+            KnownContact {
+                name: "陈思远".to_string(),
+                email: "siyuan@example.org".to_string(),
+                message_count: 8,
+            },
+            KnownContact {
+                name: String::new(),
+                email: "alice@example.com".to_string(),
+                message_count: 6,
+            },
+            KnownContact {
+                name: "Bob".to_string(),
+                email: "bob@example.com".to_string(),
+                message_count: 5,
+            },
+            KnownContact {
+                name: "Carol".to_string(),
+                email: "carol@example.com".to_string(),
+                message_count: 4,
+            },
+            KnownContact {
+                name: "Dave".to_string(),
+                email: "dave@example.com".to_string(),
+                message_count: 3,
+            },
+            KnownContact {
+                name: "Eve".to_string(),
+                email: "eve@example.com".to_string(),
+                message_count: 2,
+            },
+        ];
+
+        // 空输入不弹建议
+        assert!(filter_contact_suggestions("", &contacts, 5).is_empty());
+        assert!(filter_contact_suggestions("xiaoming@example.com, ", &contacts, 5).is_empty());
+
+        // 最多返回 5 条
+        let many = filter_contact_suggestions("example", &contacts, 5);
+        assert_eq!(many.len(), 5);
+
+        // 排除前面已经填过的联系人
+        let after_first = filter_contact_suggestions("林晓明 <xiaoming@example.com>, xiao", &contacts, 5);
+        assert!(after_first.is_empty());
+
+        // 中文姓名匹配 + 补全追加逗号
+        let matched = filter_contact_suggestions("思远", &contacts, 5);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(
+            apply_contact_completion("林晓明 <xiaoming@example.com>, 思远", matched[0]),
+            "林晓明 <xiaoming@example.com>, 陈思远 <siyuan@example.org>, "
+        );
+
+        // 无姓名联系人直接补全邮箱并追加逗号
+        assert_eq!(
+            apply_contact_completion("ali", &contacts[2]),
+            "alice@example.com, "
+        );
+    }
+
+    #[test]
+    fn next_adjacent_index_respects_bounds() {
+        assert_eq!(next_adjacent_index(None, 0, 1), None);
+        assert_eq!(next_adjacent_index(None, 3, 1), Some(0));
+        assert_eq!(next_adjacent_index(None, 3, -1), Some(2));
+        assert_eq!(next_adjacent_index(Some(0), 3, 1), Some(1));
+        assert_eq!(next_adjacent_index(Some(0), 3, -1), None);
+        assert_eq!(next_adjacent_index(Some(2), 3, 1), None);
+        assert_eq!(next_adjacent_index(Some(2), 3, -1), Some(1));
     }
 }

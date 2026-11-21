@@ -41,6 +41,9 @@ pub struct AccountConfig {
     pub smtp_security: SecurityMode,
     pub smtp_username: String,
     pub smtp_separate_credentials: bool,
+    /// Optional plain-text email signature appended to newly composed / replied / forwarded mails.
+    #[serde(default)]
+    pub signature: String,
 }
 
 impl Default for AccountConfig {
@@ -60,6 +63,7 @@ impl Default for AccountConfig {
             smtp_security: SecurityMode::Tls,
             smtp_username: String::new(),
             smtp_separate_credentials: false,
+            signature: String::new(),
         }
     }
 }
@@ -326,12 +330,40 @@ mod tests {
             smtp_security: SecurityMode::Tls,
             smtp_username: "user@example.com".to_string(),
             smtp_separate_credentials: false,
+            signature: "Best regards,\nTester".to_string(),
         };
 
         upsert_account_in(&base, account.clone()).expect("upsert should succeed");
         let loaded = load_accounts_in(&base).expect("load should succeed");
         assert_eq!(loaded, vec![account]);
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn accounts_missing_signature_defaults_to_empty() {
+        let base = std::env::temp_dir().join("hylki test 旧账号无签名");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let legacy_toml = r#"
+[[accounts]]
+id = 1
+display_name = "Legacy"
+email = "legacy@example.com"
+imap_host = "imap.example.com"
+imap_port = 993
+imap_security = "Tls"
+imap_username = "legacy@example.com"
+smtp_host = "smtp.example.com"
+smtp_port = 465
+smtp_security = "Tls"
+smtp_username = "legacy@example.com"
+smtp_separate_credentials = false
+"#;
+        fs::write(accounts_file_in(&base), legacy_toml).unwrap();
+        let loaded = load_accounts_in(&base).expect("load legacy account");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].signature, "");
         let _ = fs::remove_dir_all(&base);
     }
 
