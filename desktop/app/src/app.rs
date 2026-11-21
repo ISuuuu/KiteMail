@@ -29,7 +29,7 @@ use hylki_mail_core::demo::{
 use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
     ComposeDraft, FolderSummary, LocalDraft, MailPage, MailRequest, MessageDetail, MessageFilter,
-    MessageSummary, OutboxItem, UnifiedView, WorkerEvent,
+    MessageSort, MessageSummary, OutboxItem, QuickFilterSet, SearchScope, UnifiedView, WorkerEvent,
 };
 
 use crate::theme;
@@ -314,8 +314,18 @@ pub(crate) struct HylkiApp {
     pub(crate) system_dark_mode: bool,
     /// 左栏是否隐藏（中栏顶部开关）。
     pub(crate) sidebar_hidden: bool,
-    /// 中栏列表客户端过滤。
+    /// 中栏列表客户端过滤（向后兼容单选枚举）。
     pub(crate) list_filter: ListFilter,
+    /// 列表排序方式（6 种，默认最新优先）。
+    pub(crate) list_sort: MessageSort,
+    /// 多条件快捷筛选（仅未读 / 仅星标 / 含附件 / 今天）。
+    pub(crate) quick_filters: QuickFilterSet,
+    /// 本地搜索范围（当前视图 / 全部文件夹）。
+    pub(crate) search_scope: SearchScope,
+    /// 服务端在线搜索状态与远端命中缓存。
+    pub(crate) server_search_loading: bool,
+    pub(crate) server_search_query: String,
+    pub(crate) server_search_results: Vec<MessageSummary>,
     /// 账号分组折叠状态（缺省展开）。
     pub(crate) collapsed_accounts: HashSet<u32>,
     /// 阅读器是否强制以纯文本渲染（false = 有 HTML 时渲染富文本）。
@@ -445,12 +455,15 @@ impl HylkiApp {
             }
         }
 
-        let search_input = cx
-            .new(|cx| InputState::new(window, cx).placeholder("搜索本地缓存（主题 / 发件人）..."));
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("搜索主题、发件人、正文（支持 from: / has:attachment）...")
+        });
 
         cx.subscribe(&search_input, |this, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.search_query = input.read(cx).value().to_string();
+                this.clear_server_search();
                 this.reset_list_pagination();
                 this.reload_current_page(cx);
             }
@@ -611,6 +624,12 @@ impl HylkiApp {
                 system_dark_mode,
                 sidebar_hidden: false,
                 list_filter: ListFilter::All,
+                list_sort: MessageSort::DateNewest,
+                quick_filters: QuickFilterSet::default(),
+                search_scope: SearchScope::ThisFolder,
+                server_search_loading: false,
+                server_search_query: String::new(),
+                server_search_results: Vec::new(),
                 collapsed_accounts: HashSet::new(),
                 reader_prefer_plain: false,
                 allowed_remote_image_ids: HashSet::new(),
@@ -747,6 +766,12 @@ impl HylkiApp {
             system_dark_mode,
             sidebar_hidden: false,
             list_filter: ListFilter::All,
+            list_sort: MessageSort::DateNewest,
+            quick_filters: QuickFilterSet::default(),
+            search_scope: SearchScope::ThisFolder,
+            server_search_loading: false,
+            server_search_query: String::new(),
+            server_search_results: Vec::new(),
             collapsed_accounts: HashSet::new(),
             reader_prefer_plain: false,
             allowed_remote_image_ids: HashSet::new(),
@@ -965,6 +990,21 @@ impl HylkiApp {
                     // 这里刷新当前列表并在阅读态显示该邮件时回到空态。
                     self.after_message_moved(account_id, message_id, cx);
                 }
+                WorkerEvent::AllFoldersSearchLoaded(page) => {
+                    self.loading_more_local = false;
+                    if self.search_scope == SearchScope::AllFolders
+                        && !self.search_query.trim().is_empty()
+                    {
+                        self.merge_loaded_page(page, cx);
+                    }
+                }
+                WorkerEvent::ServerSearchResults { query, items } => {
+                    if query.trim() == self.search_query.trim() {
+                        self.server_search_loading = false;
+                        self.server_search_query = query;
+                        self.server_search_results = items;
+                    }
+                }
                 WorkerEvent::UnifiedViewLoaded { view, page } => {
                     self.loading_more_local = false;
                     if self.current_view.unified() == Some(view) {
@@ -1055,39 +1095,54 @@ impl HylkiApp {
     }
 
     pub(crate) fn reload_current_page(&mut self, cx: &mut Context<Self>) {
-        let filter = self.list_filter.to_mail_filter();
         let limit = self.loaded_limit.max(self.prefs.page_size);
+        let cross_folder_search =
+            !self.search_query.trim().is_empty() && self.search_scope == SearchScope::AllFolders;
         if self.demo_mode {
-            // 演示模式：全部统一视图（含星标）与文件夹均支持筛选和滚动预加载。
-            self.current_page = match self.current_view {
-                CurrentView::Starred => {
-                    self.demo_store
-                        .list_starred_page(&self.search_query, filter, 0, limit)
-                }
-                other => {
-                    let folder_id = match other {
-                        CurrentView::UnifiedInbox | CurrentView::AccountFolder => {
-                            self.selected_folder_id
-                        }
-                        CurrentView::Sent => DEMO_SENT_ID,
-                        CurrentView::Drafts => DEMO_DRAFTS_ID,
-                        CurrentView::Archive => DEMO_ARCHIVE_ID,
-                        CurrentView::Starred => DEMO_INBOX_ID,
-                    };
-                    self.demo_store.list_messages_page_filtered(
-                        folder_id,
+            // 演示模式：支持跨文件夹搜索、多条件快捷筛选与 6 种排序。
+            self.current_page = if cross_folder_search {
+                self.demo_store.search_all_folders(
+                    &self.search_query,
+                    self.quick_filters,
+                    self.list_sort,
+                    0,
+                    limit,
+                )
+            } else {
+                match self.current_view {
+                    CurrentView::Starred => self.demo_store.list_starred_page_with_options(
                         &self.search_query,
-                        filter,
+                        self.quick_filters,
+                        self.list_sort,
                         0,
                         limit,
-                    )
+                    ),
+                    other => {
+                        let folder_id = match other {
+                            CurrentView::UnifiedInbox | CurrentView::AccountFolder => {
+                                self.selected_folder_id
+                            }
+                            CurrentView::Sent => DEMO_SENT_ID,
+                            CurrentView::Drafts => DEMO_DRAFTS_ID,
+                            CurrentView::Archive => DEMO_ARCHIVE_ID,
+                            CurrentView::Starred => DEMO_INBOX_ID,
+                        };
+                        self.demo_store.list_messages_page_with_options(
+                            folder_id,
+                            &self.search_query,
+                            self.quick_filters,
+                            self.list_sort,
+                            0,
+                            limit,
+                        )
+                    }
                 }
             };
             cx.notify();
             return;
         }
         // 本地草稿视图：直接由渲染层从 `self.drafts` 合成，无需 worker 请求。
-        if self.current_view == CurrentView::Drafts {
+        if self.current_view == CurrentView::Drafts && !cross_folder_search {
             cx.notify();
             return;
         }
@@ -1095,13 +1150,28 @@ impl HylkiApp {
     }
 
     fn send_page_request(&self, offset: usize, limit: usize) {
-        let filter = self.list_filter.to_mail_filter();
+        let quick_filters = self.quick_filters;
+        let sort = self.list_sort;
+        let cross_folder_search =
+            !self.search_query.trim().is_empty() && self.search_scope == SearchScope::AllFolders;
         if let Some(ref w) = self.worker {
+            if cross_folder_search {
+                w.send(MailRequest::SearchAllFolders {
+                    query: self.search_query.clone(),
+                    quick_filters,
+                    sort,
+                    offset,
+                    limit,
+                });
+                return;
+            }
             match self.current_view {
                 CurrentView::UnifiedInbox => {
                     w.send(MailRequest::LoadUnifiedInbox {
                         query: self.search_query.clone(),
-                        filter,
+                        filter: MessageFilter::All,
+                        quick_filters,
+                        sort,
                         offset,
                         limit,
                     });
@@ -1112,7 +1182,9 @@ impl HylkiApp {
                         w.send(MailRequest::LoadUnifiedView {
                             view,
                             query: self.search_query.clone(),
-                            filter,
+                            filter: MessageFilter::All,
+                            quick_filters,
+                            sort,
                             offset,
                             limit,
                         });
@@ -1122,7 +1194,9 @@ impl HylkiApp {
                     w.send(MailRequest::LoadMessagesPage {
                         folder_id: self.selected_folder_id,
                         query: self.search_query.clone(),
-                        filter,
+                        filter: MessageFilter::All,
+                        quick_filters,
+                        sort,
                         offset,
                         limit,
                     });
@@ -1252,10 +1326,11 @@ impl HylkiApp {
         self.main_view = MainContentView::Mail;
 
         if self.demo_mode {
-            self.current_page = self.demo_store.list_messages_page_filtered(
+            self.current_page = self.demo_store.list_messages_page_with_options(
                 folder_id,
                 &self.search_query,
-                self.list_filter.to_mail_filter(),
+                self.quick_filters,
+                self.list_sort,
                 0,
                 self.prefs.page_size,
             );
@@ -1617,6 +1692,7 @@ impl HylkiApp {
             },
             subject,
             preview,
+            date_ts: draft.updated_at,
             // 本地草稿不展示时钟时间（避免 UI 层引入时区处理）。
             date_display: String::new(),
             unread: false,
@@ -2275,14 +2351,97 @@ impl HylkiApp {
         cx.notify();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_list_filter(&mut self, filter: ListFilter, cx: &mut Context<Self>) {
         if self.list_filter != filter {
             self.list_filter = filter;
+            self.quick_filters = QuickFilterSet::from_message_filter(filter.to_mail_filter());
             self.reset_list_pagination();
             self.reload_current_page(cx);
         } else {
             cx.notify();
         }
+    }
+
+    pub(crate) fn set_list_sort(&mut self, sort: MessageSort, cx: &mut Context<Self>) {
+        if self.list_sort != sort {
+            self.list_sort = sort;
+            self.reset_list_pagination();
+            self.reload_current_page(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_quick_filter_unread(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.unread = !self.quick_filters.unread;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn toggle_quick_filter_starred(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.starred = !self.quick_filters.starred;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn toggle_quick_filter_attachment(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.has_attachment = !self.quick_filters.has_attachment;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn toggle_quick_filter_today(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.today = !self.quick_filters.today;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn clear_quick_filters(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.clear();
+        self.list_filter = ListFilter::All;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn set_search_scope(&mut self, scope: SearchScope, cx: &mut Context<Self>) {
+        if self.search_scope != scope {
+            self.search_scope = scope;
+            self.reset_list_pagination();
+            self.reload_current_page(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn clear_server_search(&mut self) {
+        self.server_search_loading = false;
+        self.server_search_query.clear();
+        self.server_search_results.clear();
+    }
+
+    pub(crate) fn trigger_server_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_query.trim().to_string();
+        if query.chars().count() < 2 || self.demo_mode || self.server_search_loading {
+            return;
+        }
+        let account_id = if self.search_scope == SearchScope::ThisFolder
+            && self.current_view == CurrentView::AccountFolder
+        {
+            self.folders_by_account
+                .iter()
+                .find(|(_, fs)| fs.iter().any(|f| f.id == self.selected_folder_id))
+                .map(|(aid, _)| *aid)
+        } else {
+            None
+        };
+        self.server_search_loading = true;
+        self.server_search_query = query.clone();
+        self.status_line = SharedString::from(format!("正在搜索服务器：{query}..."));
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::SearchServer { query, account_id });
+        }
+        cx.notify();
     }
 
     pub(crate) fn toggle_account_expanded(&mut self, account_id: u32, cx: &mut Context<Self>) {

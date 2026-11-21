@@ -5,9 +5,11 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::search_query::SearchQuery;
 use crate::{
-    AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail, MessageFilter,
-    MessageSummary, OutboxItem, OutboxStatus, ThreadMessage,
+    start_of_today_ts, AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail,
+    MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet,
+    ThreadMessage,
 };
 
 /// Remote folder metadata returned by IMAP LIST/STATUS.
@@ -74,6 +76,10 @@ const ARCHIVE_FOLDER_MATCH: &str = "(f.name = '归档' OR UPPER(f.path) LIKE '%A
 /// SQL predicate matching every account's Trash/Deleted folder by friendly name or raw path.
 const TRASH_FOLDER_MATCH: &str =
     "(f.name = '已删除' OR UPPER(f.path) LIKE '%TRASH%' OR UPPER(f.path) LIKE '%DELETED%')";
+
+/// SQL predicate matching every account's Junk/Spam folder by friendly name or raw path.
+const JUNK_FOLDER_MATCH: &str =
+    "(f.name = '垃圾邮件' OR UPPER(f.path) LIKE '%JUNK%' OR UPPER(f.path) LIKE '%SPAM%')";
 
 /// Normalize a subject line for conversation grouping by stripping common
 /// reply/forward prefixes (`Re:`, `Fwd:`, `Fw:`, `回复:`, `转发:`).
@@ -227,6 +233,54 @@ impl CacheStore {
         // 历史邮件增量预加载游标：标记服务端是否仍有更早邮件及 Graph nextLink。
         self.ensure_column("folders", "has_more_remote", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("folders", "remote_next_link", "TEXT NOT NULL DEFAULT ''")?;
+        // FTS5 全文索引：覆盖主题、发件人、收件人、摘要与正文，由触发器自动维护。
+        self.conn
+            .execute_batch(
+                "
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                    subject,
+                    sender,
+                    recipients,
+                    preview,
+                    body_text,
+                    content='messages',
+                    content_rowid='id',
+                    tokenize='unicode61 remove_diacritics 2'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+                    INSERT INTO messages_fts(rowid, subject, sender, recipients, preview, body_text)
+                    VALUES (new.id, new.subject, new.sender, new.recipients, new.preview, COALESCE(new.body_text, ''));
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, subject, sender, recipients, preview, body_text)
+                    VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.preview, COALESCE(old.body_text, ''));
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS messages_au
+                AFTER UPDATE OF subject, sender, recipients, preview, body_text ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, subject, sender, recipients, preview, body_text)
+                    VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.preview, COALESCE(old.body_text, ''));
+                    INSERT INTO messages_fts(rowid, subject, sender, recipients, preview, body_text)
+                    VALUES (new.id, new.subject, new.sender, new.recipients, new.preview, COALESCE(new.body_text, ''));
+                END;
+                ",
+            )
+            .map_err(|e| format!("初始化 FTS5 全文检索索引失败: {e}"))?;
+
+        let schema_version: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if schema_version < 1 {
+            self.conn
+                .execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')", [])
+                .map_err(|e| format!("重建 FTS5 全文索引失败: {e}"))?;
+            self.conn
+                .execute("PRAGMA user_version = 1", [])
+                .map_err(|e| format!("更新缓存 schema 版本失败: {e}"))?;
+        }
         Ok(())
     }
 
@@ -576,12 +630,118 @@ impl CacheStore {
         Ok(())
     }
 
-    /// SQL filter suffix for [`MessageFilter`].
-    fn filter_sql(filter: MessageFilter) -> &'static str {
-        match filter {
-            MessageFilter::All => "",
-            MessageFilter::Unread => " AND m.unread = 1",
-            MessageFilter::Starred => " AND m.flagged = 1",
+    /// Build an FTS5 MATCH expression for pure ASCII alphanumeric/phrase terms.
+    /// Non-ASCII terms (e.g. Chinese like "发票", "合同") and punctuation terms fall
+    /// back to SQLite `LIKE` so 100% of Chinese substrings and email addresses match.
+    fn fts5_term(term: &str) -> Option<String> {
+        if !term.is_ascii() || !term.chars().any(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        if !term
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+        {
+            return None;
+        }
+        let escaped = term.replace('"', "\"\"");
+        if term.contains(char::is_whitespace) {
+            Some(format!("\"{escaped}\""))
+        } else {
+            Some(format!("\"{escaped}\"*"))
+        }
+    }
+
+    /// ORDER BY clause for [`MessageSort`] on table alias `m`.
+    fn sort_sql_prefixed(sort: MessageSort) -> &'static str {
+        match sort {
+            MessageSort::DateNewest => "m.date_ts DESC, m.uid DESC",
+            MessageSort::DateOldest => "m.date_ts ASC, m.uid ASC",
+            MessageSort::SenderAsc => "LOWER(m.sender) ASC, m.date_ts DESC, m.uid DESC",
+            MessageSort::SubjectAsc => "LOWER(m.subject) ASC, m.date_ts DESC, m.uid DESC",
+            MessageSort::UnreadFirst => "m.unread DESC, m.date_ts DESC, m.uid DESC",
+            MessageSort::StarredFirst => "m.flagged DESC, m.date_ts DESC, m.uid DESC",
+        }
+    }
+
+    /// ORDER BY clause for [`MessageSort`] on unprefixed CTE columns.
+    fn sort_sql_bare(sort: MessageSort) -> &'static str {
+        match sort {
+            MessageSort::DateNewest => "date_ts DESC, uid DESC",
+            MessageSort::DateOldest => "date_ts ASC, uid ASC",
+            MessageSort::SenderAsc => "LOWER(sender) ASC, date_ts DESC, uid DESC",
+            MessageSort::SubjectAsc => "LOWER(subject) ASC, date_ts DESC, uid DESC",
+            MessageSort::UnreadFirst => "unread DESC, date_ts DESC, uid DESC",
+            MessageSort::StarredFirst => "flagged DESC, date_ts DESC, uid DESC",
+        }
+    }
+
+    /// Append WHERE predicates and bind values for `quick_filters` and `parsed` search query.
+    fn append_search_and_filter_clauses(
+        parsed: &SearchQuery,
+        quick_filters: QuickFilterSet,
+        today_start_ts: i64,
+        clauses: &mut Vec<String>,
+        args: &mut Vec<rusqlite::types::Value>,
+    ) {
+        if quick_filters.unread {
+            clauses.push("m.unread = 1".to_string());
+        }
+        if quick_filters.starred {
+            clauses.push("m.flagged = 1".to_string());
+        }
+        if quick_filters.has_attachment {
+            clauses.push("m.has_attachment = 1".to_string());
+        }
+        if quick_filters.today {
+            clauses.push("m.date_ts >= ?".to_string());
+            args.push(today_start_ts.into());
+        }
+
+        if parsed.attachment {
+            clauses.push("m.has_attachment = 1".to_string());
+        }
+        if let Some(want_unread) = parsed.unread {
+            clauses.push("m.unread = ?".to_string());
+            args.push(i64::from(want_unread).into());
+        }
+        if parsed.starred {
+            clauses.push("m.flagged = 1".to_string());
+        }
+        for val in &parsed.from {
+            clauses.push("LOWER(m.sender) LIKE ?".to_string());
+            args.push(format!("%{val}%").into());
+        }
+        for val in &parsed.to {
+            clauses.push("LOWER(m.recipients) LIKE ?".to_string());
+            args.push(format!("%{val}%").into());
+        }
+        for val in &parsed.subject {
+            clauses.push("LOWER(m.subject) LIKE ?".to_string());
+            args.push(format!("%{val}%").into());
+        }
+        for val in &parsed.folder {
+            clauses.push("(LOWER(f.name) LIKE ? OR LOWER(f.path) LIKE ?)".to_string());
+            let pat = format!("%{val}%");
+            args.push(pat.clone().into());
+            args.push(pat.into());
+        }
+        for term in &parsed.terms {
+            if let Some(fts_q) = Self::fts5_term(term) {
+                clauses.push(
+                    "m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)"
+                        .to_string(),
+                );
+                args.push(fts_q.into());
+            } else {
+                clauses.push(
+                    "(LOWER(m.subject) LIKE ? OR LOWER(m.sender) LIKE ? OR LOWER(m.recipients) LIKE ? OR LOWER(m.preview) LIKE ? OR LOWER(COALESCE(m.body_text, '')) LIKE ?)"
+                        .to_string(),
+                );
+                let pat = format!("%{term}%");
+                for _ in 0..5 {
+                    args.push(pat.clone().into());
+                }
+            }
         }
     }
 
@@ -605,90 +765,85 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        let trimmed = query.trim();
-        let extra = Self::filter_sql(filter);
-        let (total, items) = if trimmed.is_empty() {
-            let total: i64 = self
-                .conn
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM messages m WHERE m.folder_id = ?1{extra}"),
-                    params![folder_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("统计邮件分页总数失败: {e}"))?;
+        self.list_messages_page_with_options(
+            folder_id,
+            query,
+            QuickFilterSet::from_message_filter(filter),
+            MessageSort::DateNewest,
+            offset,
+            limit,
+        )
+    }
 
-            let mut stmt = self
-                .conn
-                .prepare(&format!(
+    /// Query a page of cached message summaries for `folder_id`, with structured search,
+    /// multi-condition quick filters, and sort order.
+    pub fn list_messages_page_with_options(
+        &self,
+        folder_id: u32,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        let parsed = SearchQuery::parse(query);
+        let mut clauses = vec!["m.folder_id = ?".to_string()];
+        let mut args: Vec<rusqlite::types::Value> = vec![i64::from(folder_id).into()];
+        Self::append_search_and_filter_clauses(
+            &parsed,
+            quick_filters,
+            start_of_today_ts(),
+            &mut clauses,
+            &mut args,
+        );
+        let where_sql = clauses.join(" AND ");
+        let order_sql = Self::sort_sql_prefixed(sort);
+
+        let total: i64 = self
+            .conn
+            .query_row(
+                &format!(
                     "
-                    SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                           m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
+                    SELECT COUNT(*)
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
-                    WHERE m.folder_id = ?1{extra}
-                    ORDER BY m.date_ts DESC, m.uid DESC
-                    LIMIT ?2 OFFSET ?3
+                    WHERE {where_sql}
                     "
-                ))
-                .map_err(|e| format!("准备分页查询失败: {e}"))?;
+                ),
+                rusqlite::params_from_iter(args.iter()),
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("统计邮件分页总数失败: {e}"))?;
 
-            let rows = stmt
-                .query_map(
-                    params![folder_id, limit as i64, offset as i64],
-                    map_summary_row,
-                )
-                .map_err(|e| format!("执行分页查询失败: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("解析分页结果失败: {e}"))?;
+        let mut page_args = args;
+        page_args.push((limit as i64).into());
+        page_args.push((offset as i64).into());
 
-            (total.max(0) as usize, rows)
-        } else {
-            let pattern = format!("%{trimmed}%");
-            let total: i64 = self
-                .conn
-                .query_row(
-                    &format!(
-                        "
-                        SELECT COUNT(*) FROM messages m
-                        WHERE m.folder_id = ?1{extra} AND (m.subject LIKE ?2 OR m.sender LIKE ?2)
-                        "
-                    ),
-                    params![folder_id, pattern],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("统计搜索结果总数失败: {e}"))?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "
+                SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment
+                FROM messages m
+                JOIN folders f ON f.id = m.folder_id
+                WHERE {where_sql}
+                ORDER BY {order_sql}
+                LIMIT ? OFFSET ?
+                "
+            ))
+            .map_err(|e| format!("准备分页查询失败: {e}"))?;
 
-            let mut stmt = self
-                .conn
-                .prepare(&format!(
-                    "
-                    SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                           m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
-                    FROM messages m
-                    JOIN folders f ON f.id = m.folder_id
-                    WHERE m.folder_id = ?1{extra} AND (m.subject LIKE ?2 OR m.sender LIKE ?2)
-                    ORDER BY m.date_ts DESC, m.uid DESC
-                    LIMIT ?3 OFFSET ?4
-                    "
-                ))
-                .map_err(|e| format!("准备搜索分页查询失败: {e}"))?;
-
-            let rows = stmt
-                .query_map(
-                    params![folder_id, pattern, limit as i64, offset as i64],
-                    map_summary_row,
-                )
-                .map_err(|e| format!("执行搜索分页查询失败: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("解析搜索结果失败: {e}"))?;
-
-            (total.max(0) as usize, rows)
-        };
+        let items = stmt
+            .query_map(rusqlite::params_from_iter(page_args.iter()), map_summary_row)
+            .map_err(|e| format!("执行分页查询失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析分页结果失败: {e}"))?;
 
         Ok(MailPage {
             folder_id,
             offset,
-            total,
+            total: total.max(0) as usize,
             items,
         })
     }
@@ -712,11 +867,30 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        self.list_role_messages(
+        self.list_unified_inbox_with_options(
+            query,
+            QuickFilterSet::from_message_filter(filter),
+            MessageSort::DateNewest,
+            offset,
+            limit,
+        )
+    }
+
+    /// Query a unified inbox page across all accounts with [`QuickFilterSet`] and [`MessageSort`].
+    pub fn list_unified_inbox_with_options(
+        &self,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options(
             "(UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)",
             "统一收件箱",
             query,
-            filter,
+            quick_filters,
+            sort,
             offset,
             limit,
         )
@@ -740,7 +914,33 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        self.list_role_messages("m.flagged = 1", "星标邮件", query, filter, offset, limit)
+        self.list_starred_messages_with_options(
+            query,
+            QuickFilterSet::from_message_filter(filter),
+            MessageSort::DateNewest,
+            offset,
+            limit,
+        )
+    }
+
+    /// Query a page of starred messages with [`QuickFilterSet`] and [`MessageSort`].
+    pub fn list_starred_messages_with_options(
+        &self,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options(
+            "m.flagged = 1",
+            "星标邮件",
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
     }
 
     /// Query a page of messages aggregated across every account's Sent folder
@@ -762,7 +962,33 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        self.list_role_messages(SENT_FOLDER_MATCH, "已发送", query, filter, offset, limit)
+        self.list_sent_messages_with_options(
+            query,
+            QuickFilterSet::from_message_filter(filter),
+            MessageSort::DateNewest,
+            offset,
+            limit,
+        )
+    }
+
+    /// Query a page of sent messages across all accounts with [`QuickFilterSet`] and [`MessageSort`].
+    pub fn list_sent_messages_with_options(
+        &self,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options(
+            SENT_FOLDER_MATCH,
+            "已发送",
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
     }
 
     /// Query a page of messages aggregated across every account's Archive folder.
@@ -783,112 +1009,242 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        self.list_role_messages(ARCHIVE_FOLDER_MATCH, "归档", query, filter, offset, limit)
+        self.list_archived_messages_with_options(
+            query,
+            QuickFilterSet::from_message_filter(filter),
+            MessageSort::DateNewest,
+            offset,
+            limit,
+        )
     }
 
-    /// Shared implementation for unified message pages: `predicate` is a trusted
-    /// constant SQL fragment applied to the `messages JOIN folders` row set.
-    fn list_role_messages(
+    /// Query a page of archived messages across all accounts with [`QuickFilterSet`] and [`MessageSort`].
+    pub fn list_archived_messages_with_options(
         &self,
-        predicate: &str,
-        label: &str,
         query: &str,
-        filter: MessageFilter,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        let trimmed = query.trim();
-        let extra = Self::filter_sql(filter);
-        let (total, items) = if trimmed.is_empty() {
-            let total: i64 = self
-                .conn
-                .query_row(
-                    &format!(
-                        "
-                        SELECT COUNT(*)
-                        FROM messages m
-                        JOIN folders f ON f.id = m.folder_id
-                        WHERE {predicate}{extra}
-                        "
-                    ),
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("统计{label}总数失败: {e}"))?;
+        self.list_role_messages_with_options(
+            ARCHIVE_FOLDER_MATCH,
+            "归档",
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
 
-            let mut stmt = self
-                .conn
-                .prepare(&format!(
-                    "
-                    SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                           m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
-                    FROM messages m
-                    JOIN folders f ON f.id = m.folder_id
-                    WHERE {predicate}{extra}
-                    ORDER BY m.date_ts DESC, m.uid DESC
-                    LIMIT ?1 OFFSET ?2
-                    "
-                ))
-                .map_err(|e| format!("准备{label}分页查询失败: {e}"))?;
-
-            let rows = stmt
-                .query_map(params![limit as i64, offset as i64], map_summary_row)
-                .map_err(|e| format!("执行{label}分页查询失败: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("解析{label}结果失败: {e}"))?;
-
-            (total.max(0) as usize, rows)
+    /// Cross-account, cross-folder local search.
+    ///
+    /// Excludes Trash and Junk folders by default (unless the query explicitly
+    /// specifies an `in:` / `folder:` operator), and deduplicates by non-empty
+    /// `message_id` preferring Inbox > regular folders > Archive > Trash/Junk.
+    pub fn search_all_folders(
+        &self,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        let parsed = SearchQuery::parse(query);
+        let mut clauses: Vec<String> = Vec::new();
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        if parsed.folder.is_empty() {
+            clauses.push(format!("NOT ({TRASH_FOLDER_MATCH} OR {JUNK_FOLDER_MATCH})"));
+        }
+        Self::append_search_and_filter_clauses(
+            &parsed,
+            quick_filters,
+            start_of_today_ts(),
+            &mut clauses,
+            &mut args,
+        );
+        let where_sql = if clauses.is_empty() {
+            "1 = 1".to_string()
         } else {
-            let pattern = format!("%{trimmed}%");
-            let total: i64 = self
-                .conn
-                .query_row(
-                    &format!(
-                        "
-                        SELECT COUNT(*)
-                        FROM messages m
-                        JOIN folders f ON f.id = m.folder_id
-                        WHERE {predicate}{extra}
-                          AND (m.subject LIKE ?1 OR m.sender LIKE ?1)
-                        "
-                    ),
-                    params![pattern],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("统计{label}搜索总数失败: {e}"))?;
-
-            let mut stmt = self
-                .conn
-                .prepare(&format!(
-                    "
-                    SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                           m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
-                    FROM messages m
-                    JOIN folders f ON f.id = m.folder_id
-                    WHERE {predicate}{extra}
-                      AND (m.subject LIKE ?1 OR m.sender LIKE ?1)
-                    ORDER BY m.date_ts DESC, m.uid DESC
-                    LIMIT ?2 OFFSET ?3
-                    "
-                ))
-                .map_err(|e| format!("准备{label}搜索查询失败: {e}"))?;
-
-            let rows = stmt
-                .query_map(
-                    params![pattern, limit as i64, offset as i64],
-                    map_summary_row,
-                )
-                .map_err(|e| format!("执行{label}搜索查询失败: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("解析{label}搜索结果失败: {e}"))?;
-
-            (total.max(0) as usize, rows)
+            clauses.join(" AND ")
         };
+        let order_sql = Self::sort_sql_bare(sort);
+        let cte = format!(
+            "
+            WITH ranked AS (
+                SELECT m.id, m.account_id, m.folder_id, f.path AS folder_path, m.uid, m.sender, m.subject,
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY CASE
+                               WHEN m.message_id != '' THEN m.message_id
+                               ELSE 'id:' || CAST(m.id AS TEXT)
+                           END
+                           ORDER BY CASE
+                               WHEN UPPER(f.path) = 'INBOX' OR f.is_inbox = 1 THEN 0
+                               WHEN {TRASH_FOLDER_MATCH} OR {JUNK_FOLDER_MATCH} THEN 3
+                               WHEN {ARCHIVE_FOLDER_MATCH} THEN 2
+                               ELSE 1
+                           END ASC, m.id ASC
+                       ) AS rn
+                FROM messages m
+                JOIN folders f ON f.id = m.folder_id
+                WHERE {where_sql}
+            )
+            "
+        );
+
+        let total: i64 = self
+            .conn
+            .query_row(
+                &format!("{cte} SELECT COUNT(*) FROM ranked WHERE rn = 1"),
+                rusqlite::params_from_iter(args.iter()),
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("统计跨文件夹搜索总数失败: {e}"))?;
+
+        let mut page_args = args;
+        page_args.push((limit as i64).into());
+        page_args.push((offset as i64).into());
+
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "
+                {cte}
+                SELECT id, account_id, folder_id, folder_path, uid, sender, subject,
+                       preview, date_ts, date_display, unread, flagged, has_attachment
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY {order_sql}
+                LIMIT ? OFFSET ?
+                "
+            ))
+            .map_err(|e| format!("准备跨文件夹搜索查询失败: {e}"))?;
+
+        let items = stmt
+            .query_map(rusqlite::params_from_iter(page_args.iter()), map_summary_row)
+            .map_err(|e| format!("执行跨文件夹搜索查询失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析跨文件夹搜索结果失败: {e}"))?;
 
         Ok(MailPage {
             folder_id: 0,
             offset,
-            total,
+            total: total.max(0) as usize,
+            items,
+        })
+    }
+
+    /// Find the account's Inbox folder `(folder_id, path)` if synced.
+    pub fn find_inbox_folder(&self, account_id: u32) -> Result<Option<(u32, String)>, String> {
+        self.find_role_folder(account_id, "(UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)")
+    }
+
+    /// Look up cached [`MessageSummary`] rows by `(folder_id, uids)` (used after server search commits).
+    pub fn list_summaries_by_uids(
+        &self,
+        folder_id: u32,
+        uids: &[u32],
+    ) -> Result<Vec<MessageSummary>, String> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; uids.len()].join(", ");
+        let mut args: Vec<rusqlite::types::Value> = vec![i64::from(folder_id).into()];
+        args.extend(uids.iter().map(|u| i64::from(*u).into()));
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "
+                SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment
+                FROM messages m
+                JOIN folders f ON f.id = m.folder_id
+                WHERE m.folder_id = ? AND m.uid IN ({marks})
+                ORDER BY m.date_ts DESC, m.uid DESC
+                "
+            ))
+            .map_err(|e| format!("准备按 UID 查询邮件摘要失败: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), map_summary_row)
+            .map_err(|e| format!("执行按 UID 查询邮件摘要失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析按 UID 查询邮件摘要失败: {e}"))?;
+        Ok(rows)
+    }
+
+    /// Shared implementation for unified message pages: `predicate` is a trusted
+    /// constant SQL fragment applied to the `messages JOIN folders` row set.
+    #[allow(clippy::too_many_arguments)]
+    fn list_role_messages_with_options(
+        &self,
+        predicate: &str,
+        label: &str,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        let parsed = SearchQuery::parse(query);
+        let mut clauses = vec![predicate.to_string()];
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        Self::append_search_and_filter_clauses(
+            &parsed,
+            quick_filters,
+            start_of_today_ts(),
+            &mut clauses,
+            &mut args,
+        );
+        let where_sql = clauses.join(" AND ");
+        let order_sql = Self::sort_sql_prefixed(sort);
+
+        let total: i64 = self
+            .conn
+            .query_row(
+                &format!(
+                    "
+                    SELECT COUNT(*)
+                    FROM messages m
+                    JOIN folders f ON f.id = m.folder_id
+                    WHERE {where_sql}
+                    "
+                ),
+                rusqlite::params_from_iter(args.iter()),
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("统计{label}总数失败: {e}"))?;
+
+        let mut page_args = args;
+        page_args.push((limit as i64).into());
+        page_args.push((offset as i64).into());
+
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "
+                SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment
+                FROM messages m
+                JOIN folders f ON f.id = m.folder_id
+                WHERE {where_sql}
+                ORDER BY {order_sql}
+                LIMIT ? OFFSET ?
+                "
+            ))
+            .map_err(|e| format!("准备{label}分页查询失败: {e}"))?;
+
+        let items = stmt
+            .query_map(rusqlite::params_from_iter(page_args.iter()), map_summary_row)
+            .map_err(|e| format!("执行{label}分页查询失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析{label}结果失败: {e}"))?;
+
+        Ok(MailPage {
+            folder_id: 0,
+            offset,
+            total: total.max(0) as usize,
             items,
         })
     }
@@ -1714,10 +2070,11 @@ fn map_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> 
         sender: row.get(5)?,
         subject: row.get(6)?,
         preview: row.get(7)?,
-        date_display: row.get(8)?,
-        unread: row.get::<_, i32>(9)? != 0,
-        flagged: row.get::<_, i32>(10)? != 0,
-        has_attachment: row.get::<_, i32>(11)? != 0,
+        date_ts: row.get(8)?,
+        date_display: row.get(9)?,
+        unread: row.get::<_, i32>(10)? != 0,
+        flagged: row.get::<_, i32>(11)? != 0,
+        has_attachment: row.get::<_, i32>(12)? != 0,
     })
 }
 
@@ -2947,5 +3304,295 @@ mod tests {
         let reloaded = cache.list_folders(1).unwrap();
         assert!(!reloaded[0].has_more_remote);
         assert_eq!(reloaded[0].total_count, 5);
+    }
+
+    #[test]
+    fn fts5_and_chinese_body_search_with_structured_operators() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[
+                    RemoteFolder {
+                        name: "收件箱".to_string(),
+                        path: "INBOX".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "归档".to_string(),
+                        path: "Archive".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        let inbox = folders[0].id;
+        let archive = folders[1].id;
+
+        let mut h1 = sample_header(1, "Q4 Financial Review");
+        h1.sender = "Mário Rossi <mario@example.com>".to_string();
+        h1.recipients = "财务部 <finance@company.cn>".to_string();
+        h1.unread = true;
+        h1.flagged = true;
+        h1.has_attachment = true;
+        h1.date_ts = 1_700_000_200;
+
+        let mut h2 = sample_header(2, "Weekly Standup");
+        h2.sender = "Bob Lee <bob@example.com>".to_string();
+        h2.recipients = "team@company.cn".to_string();
+        h2.unread = false;
+        h2.flagged = false;
+        h2.has_attachment = false;
+        h2.date_ts = 1_700_000_100;
+
+        let mut h3 = sample_header(3, "采购协议归档");
+        h3.sender = "法务部 <legal@company.cn>".to_string();
+        h3.recipients = "张总 <ceo@company.cn>".to_string();
+        h3.unread = false;
+        h3.flagged = true;
+        h3.has_attachment = true;
+        h3.date_ts = 1_700_000_300;
+
+        cache
+            .commit_folder_headers(1, inbox, 1, &[h1, h2], None)
+            .unwrap();
+        cache
+            .commit_folder_headers(1, archive, 1, &[h3], None)
+            .unwrap();
+
+        let inbox_page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let m1_id = inbox_page.items.iter().find(|m| m.uid == 1).unwrap().id;
+        let m2_id = inbox_page.items.iter().find(|m| m.uid == 2).unwrap().id;
+        let archive_page = cache.list_messages_page(archive, "", 0, 10).unwrap();
+        let m3_id = archive_page.items[0].id;
+
+        cache
+            .store_message_body(m1_id, "请核对本月增值税发票及 quarterly budget 报表。", &[])
+            .unwrap();
+        cache
+            .store_message_body(m2_id, "Everything is on track for Friday release.", &[])
+            .unwrap();
+        cache
+            .store_message_body(m3_id, "附件为最终签署的年度采购合同扫描件。", &[])
+            .unwrap();
+
+        // 1. 中文正文搜索（发票 / 合同）
+        let cn_invoice = cache.list_messages_page(inbox, "发票", 0, 10).unwrap();
+        assert_eq!(cn_invoice.total, 1);
+        assert_eq!(cn_invoice.items[0].uid, 1);
+
+        let cn_contract = cache
+            .search_all_folders("合同", QuickFilterSet::default(), MessageSort::DateNewest, 0, 10)
+            .unwrap();
+        assert_eq!(cn_contract.total, 1);
+        assert_eq!(cn_contract.items[0].uid, 3);
+
+        // 2. FTS5 英文正文前缀、短语与重音折叠搜索
+        let fts_prefix = cache.list_messages_page(inbox, "quart", 0, 10).unwrap();
+        assert_eq!(fts_prefix.total, 1);
+        assert_eq!(fts_prefix.items[0].uid, 1);
+
+        let fts_phrase = cache
+            .list_messages_page(inbox, r#""quarterly budget""#, 0, 10)
+            .unwrap();
+        assert_eq!(fts_phrase.total, 1);
+        assert_eq!(fts_phrase.items[0].uid, 1);
+
+        let fts_diacritic = cache.list_messages_page(inbox, "mario", 0, 10).unwrap();
+        assert_eq!(fts_diacritic.total, 1);
+        assert_eq!(fts_diacritic.items[0].uid, 1);
+
+        // 3. 结构化操作符：from / to / in / has:attachment / is:unread / is:read / is:starred
+        let op_from_to = cache
+            .search_all_folders(
+                "from:mario to:finance has:attachment is:unread is:starred",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                10,
+            )
+            .unwrap();
+        assert_eq!(op_from_to.total, 1);
+        assert_eq!(op_from_to.items[0].uid, 1);
+
+        let op_read_in = cache
+            .search_all_folders(
+                "is:read in:archive",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                10,
+            )
+            .unwrap();
+        assert_eq!(op_read_in.total, 1);
+        assert_eq!(op_read_in.items[0].uid, 3);
+    }
+
+    #[test]
+    fn sort_orders_and_multi_quick_filters() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[RemoteFolder {
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 0,
+                    total_count: 0,
+                }],
+            )
+            .unwrap();
+        let inbox = folders[0].id;
+        let now_ts = chrono::Utc::now().timestamp();
+        let old_ts = now_ts - 10 * 86_400;
+
+        let mut a = sample_header(1, "Zebra");
+        a.sender = "Charlie <c@x.com>".to_string();
+        a.date_ts = old_ts;
+        a.unread = false;
+        a.flagged = true;
+        a.has_attachment = false;
+
+        let mut b = sample_header(2, "Alpha");
+        b.sender = "Alice <a@x.com>".to_string();
+        b.date_ts = now_ts;
+        b.unread = true;
+        b.flagged = true;
+        b.has_attachment = true;
+
+        let mut c = sample_header(3, "Middle");
+        c.sender = "Bob <b@x.com>".to_string();
+        c.date_ts = now_ts - 3600;
+        c.unread = true;
+        c.flagged = false;
+        c.has_attachment = true;
+
+        cache
+            .commit_folder_headers(1, inbox, 1, &[a, b, c], None)
+            .unwrap();
+
+        let uids_for = |sort: MessageSort| -> Vec<u32> {
+            cache
+                .list_messages_page_with_options(
+                    inbox,
+                    "",
+                    QuickFilterSet::default(),
+                    sort,
+                    0,
+                    10,
+                )
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|m| m.uid)
+                .collect()
+        };
+
+        assert_eq!(uids_for(MessageSort::DateNewest), vec![2, 3, 1]);
+        assert_eq!(uids_for(MessageSort::DateOldest), vec![1, 3, 2]);
+        assert_eq!(uids_for(MessageSort::SenderAsc), vec![2, 3, 1]);
+        assert_eq!(uids_for(MessageSort::SubjectAsc), vec![2, 3, 1]);
+        assert_eq!(uids_for(MessageSort::UnreadFirst), vec![2, 3, 1]);
+        assert_eq!(uids_for(MessageSort::StarredFirst), vec![2, 1, 3]);
+
+        // 多条件组合：未读 + 星标 + 含附件 + 今天
+        let multi = QuickFilterSet {
+            unread: true,
+            starred: true,
+            has_attachment: true,
+            today: true,
+        };
+        let filtered = cache
+            .list_messages_page_with_options(inbox, "", multi, MessageSort::DateNewest, 0, 10)
+            .unwrap();
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.items[0].uid, 2);
+    }
+
+    #[test]
+    fn cross_folder_search_excludes_waste_and_deduplicates_by_message_id() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[
+                    RemoteFolder {
+                        name: "收件箱".to_string(),
+                        path: "INBOX".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "归档".to_string(),
+                        path: "Archive".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "已删除".to_string(),
+                        path: "Trash".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "垃圾邮件".to_string(),
+                        path: "Junk".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        let inbox = folders[0].id;
+        let archive = folders[1].id;
+        let trash = folders[2].id;
+        let junk = folders[3].id;
+
+        // 同一封邮件（相同 message_id）同时存在于 INBOX 与 Archive，应去重并保留 INBOX 副本。
+        let mut in_copy = sample_header(10, "重要合同通知");
+        in_copy.message_id = "<dup-001@example.com>".to_string();
+        let mut arch_copy = sample_header(20, "重要合同通知");
+        arch_copy.message_id = "<dup-001@example.com>".to_string();
+        let mut arch_only = sample_header(21, "归档独有合同");
+        arch_only.message_id = "<arch-002@example.com>".to_string();
+        let mut trash_msg = sample_header(30, "已删除合同");
+        trash_msg.message_id = "<trash-003@example.com>".to_string();
+        let mut junk_msg = sample_header(40, "垃圾合同广告");
+        junk_msg.message_id = "<junk-004@example.com>".to_string();
+
+        cache
+            .commit_folder_headers(1, inbox, 1, &[in_copy], None)
+            .unwrap();
+        cache
+            .commit_folder_headers(1, archive, 1, &[arch_copy, arch_only], None)
+            .unwrap();
+        cache
+            .commit_folder_headers(1, trash, 1, &[trash_msg], None)
+            .unwrap();
+        cache
+            .commit_folder_headers(1, junk, 1, &[junk_msg], None)
+            .unwrap();
+
+        let all = cache
+            .search_all_folders("合同", QuickFilterSet::default(), MessageSort::DateNewest, 0, 20)
+            .unwrap();
+        assert_eq!(all.total, 2, "应排除 Trash/Junk 并按 message_id 去重");
+        assert!(all.items.iter().any(|m| m.folder_path == "INBOX" && m.uid == 10));
+        assert!(all.items.iter().any(|m| m.folder_path == "Archive" && m.uid == 21));
+
+        // 显式指定 in:trash 时可搜到已删除邮件。
+        let in_trash = cache
+            .search_all_folders(
+                "in:trash 合同",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                20,
+            )
+            .unwrap();
+        assert_eq!(in_trash.total, 1);
+        assert_eq!(in_trash.items[0].uid, 30);
     }
 }

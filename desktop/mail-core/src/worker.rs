@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use crate::cache::CacheStore;
 use crate::config::{self, AccountConfig, AuthBackend};
+use crate::search_query::SearchQuery;
 use crate::secrets::{self, AccountSecrets};
 use crate::smtp_client::SendOutcome;
 use crate::{
-    graph_client, imap_client, oauth, smtp_client, MailRequest, OutboxStatus, UnifiedView,
-    WorkerEvent,
+    graph_client, imap_client, oauth, smtp_client, MailRequest, MessageFilter, MessageSummary,
+    OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
 };
 
 type TokenCache = HashMap<u32, (String, Instant)>;
@@ -322,11 +323,59 @@ async fn handle_request(
         MailRequest::LoadUnifiedInbox {
             query,
             filter,
+            quick_filters,
+            sort,
             offset,
             limit,
-        } => match cache.list_unified_inbox_filtered(&query, filter, offset, limit) {
+        } => {
+            let effective = merge_filter_options(filter, quick_filters);
+            match cache.list_unified_inbox_with_options(&query, effective, sort, offset, limit) {
+                Ok(page) => {
+                    let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        MailRequest::LoadMessagesPage {
+            folder_id,
+            query,
+            filter,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        } => {
+            let effective = merge_filter_options(filter, quick_filters);
+            match cache
+                .list_messages_page_with_options(folder_id, &query, effective, sort, offset, limit)
+            {
+                Ok(page) => {
+                    let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        MailRequest::SearchAllFolders {
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        } => match cache.search_all_folders(&query, quick_filters, sort, offset, limit) {
             Ok(page) => {
-                let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+                let _ = evt_tx.send(WorkerEvent::AllFoldersSearchLoaded(page));
             }
             Err(e) => {
                 let _ = evt_tx.send(WorkerEvent::Error {
@@ -336,23 +385,9 @@ async fn handle_request(
             }
         },
 
-        MailRequest::LoadMessagesPage {
-            folder_id,
-            query,
-            filter,
-            offset,
-            limit,
-        } => match cache.list_messages_page_filtered(folder_id, &query, filter, offset, limit) {
-            Ok(page) => {
-                let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
-            }
-            Err(e) => {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: None,
-                    message: e,
-                });
-            }
-        },
+        MailRequest::SearchServer { query, account_id } => {
+            search_server_inner(data_dir, cache, tokens, &query, account_id, evt_tx).await;
+        }
 
         MailRequest::LoadMessageBody {
             account_id,
@@ -677,18 +712,21 @@ async fn handle_request(
             view,
             query,
             filter,
+            quick_filters,
+            sort,
             offset,
             limit,
         } => {
+            let effective = merge_filter_options(filter, quick_filters);
             let result = match view {
                 UnifiedView::Starred => {
-                    cache.list_starred_messages_filtered(&query, filter, offset, limit)
+                    cache.list_starred_messages_with_options(&query, effective, sort, offset, limit)
                 }
                 UnifiedView::Sent => {
-                    cache.list_sent_messages_filtered(&query, filter, offset, limit)
+                    cache.list_sent_messages_with_options(&query, effective, sort, offset, limit)
                 }
                 UnifiedView::Archive => {
-                    cache.list_archived_messages_filtered(&query, filter, offset, limit)
+                    cache.list_archived_messages_with_options(&query, effective, sort, offset, limit)
                 }
             };
             match result {
@@ -1428,6 +1466,153 @@ async fn send_outbox_item(
             items: outbox,
         });
     }
+}
+
+fn merge_filter_options(filter: MessageFilter, mut quick_filters: QuickFilterSet) -> QuickFilterSet {
+    match filter {
+        MessageFilter::All => quick_filters,
+        MessageFilter::Unread => {
+            quick_filters.unread = true;
+            quick_filters
+        }
+        MessageFilter::Starred => {
+            quick_filters.starred = true;
+            quick_filters
+        }
+    }
+}
+
+/// Search remote IMAP / Graph servers for `query` with per-account timeout protection,
+/// committing matched headers to the local cache so the user can open any hit immediately.
+async fn search_server_inner(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    raw_query: &str,
+    target_account_id: Option<u32>,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let parsed = SearchQuery::parse(raw_query);
+    let search_text = {
+        let s = parsed.server_search_text();
+        if s.is_empty() {
+            raw_query.trim().to_string()
+        } else {
+            s
+        }
+    };
+    if search_text.chars().count() < 2 {
+        let _ = evt_tx.send(WorkerEvent::ServerSearchResults {
+            query: raw_query.to_string(),
+            items: Vec::new(),
+        });
+        return;
+    }
+
+    let accounts: Vec<AccountConfig> = config::load_accounts_in(data_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| target_account_id.is_none_or(|id| a.id == id))
+        .collect();
+
+    if accounts.is_empty() {
+        let _ = evt_tx.send(WorkerEvent::ServerSearchResults {
+            query: raw_query.to_string(),
+            items: Vec::new(),
+        });
+        return;
+    }
+
+    let _ = evt_tx.send(WorkerEvent::Status {
+        account_id: target_account_id,
+        text: format!("正在服务端在线搜索「{search_text}」..."),
+    });
+
+    let mut all_hits: Vec<MessageSummary> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+
+    for account in accounts {
+        let inbox = cache.find_inbox_folder(account.id).ok().flatten();
+        let Some((inbox_id, inbox_path)) = inbox else {
+            continue;
+        };
+
+        match account.auth_backend {
+            AuthBackend::MicrosoftGraphOAuth2 => {
+                let Ok(token) = ensure_graph_token(tokens, &account).await else {
+                    continue;
+                };
+                let q = search_text.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    graph_client::search_messages(&token, &q, 50)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Graph 搜索任务异常: {e}")));
+
+                if let Ok(items) = res {
+                    let uids: Vec<u32> = items.iter().map(|(h, _)| h.uid).collect();
+                    let _ = cache.commit_folder_headers_with_remote(
+                        account.id, inbox_id, 1, &items, None,
+                    );
+                    if let Ok(summaries) = cache.list_summaries_by_uids(inbox_id, &uids) {
+                        for item in summaries {
+                            if seen_keys.insert((item.account_id, item.uid)) {
+                                all_hits.push(item);
+                            }
+                        }
+                    }
+                }
+            }
+            AuthBackend::Password => {
+                let Ok(sec) = secrets::load_account_secrets(account.id) else {
+                    continue;
+                };
+                let res = imap_client::search_folder_messages(
+                    &account,
+                    &sec.imap_password,
+                    &inbox_path,
+                    &search_text,
+                    50,
+                )
+                .await;
+                if let Ok(headers) = res {
+                    let uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
+                    let uid_validity = cache
+                        .folder_meta(inbox_id)
+                        .ok()
+                        .flatten()
+                        .map(|(_, v)| v)
+                        .unwrap_or(1)
+                        .max(1);
+                    let _ = cache.commit_folder_headers(
+                        account.id,
+                        inbox_id,
+                        uid_validity,
+                        &headers,
+                        None,
+                    );
+                    if let Ok(summaries) = cache.list_summaries_by_uids(inbox_id, &uids) {
+                        for item in summaries {
+                            if seen_keys.insert((item.account_id, item.uid)) {
+                                all_hits.push(item);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    all_hits.sort_by(|a, b| b.date_ts.cmp(&a.date_ts).then_with(|| b.uid.cmp(&a.uid)));
+    let count = all_hits.len();
+    let _ = evt_tx.send(WorkerEvent::ServerSearchResults {
+        query: raw_query.to_string(),
+        items: all_hits,
+    });
+    let _ = evt_tx.send(WorkerEvent::Status {
+        account_id: target_account_id,
+        text: format!("服务端搜索完成，命中 {count} 封邮件"),
+    });
 }
 
 fn load_account_config(data_dir: &PathBuf, account_id: u32) -> Result<AccountConfig, String> {
