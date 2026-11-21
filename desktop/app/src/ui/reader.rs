@@ -1,8 +1,9 @@
 //! 右栏阅读态（方案文档第三节 1.3）：
 //! - 顶部操作栏 48px：左侧回复 / 回复全部 / 转发 / 星标 / 归档 / 删除；
-//!   右侧标记已读/未读（双向动态切换）+ 复制正文。
+//!   右侧标记已读/未读（双向动态切换）+ 复制正文；窗口过窄（<880px，B-5）时
+//!   上述右侧低频动作收进「⋯」下拉菜单。
 //! - 标题区（内边距 16px 24px 8px）：所属账号邮箱胶囊（浅蓝底蓝字圆角）
-//!   + 20px 粗体主题。
+//!   + 阅读视图开关与单封邮件亮 / 暗背景切换（B-5）+ 20px 粗体主题。
 //! - 卡片式正文（外层滚动、内边距 12px 24px 24px）：`surface_raised`
 //!   圆角 12px、1px border、微阴影、内边距 20px；卡片头部：34x34 头像 +
 //!   发件人姓名与 <邮箱> + 真实收件人胶囊 + 右侧时间 + `...` 更多操作菜单
@@ -16,7 +17,7 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
@@ -25,7 +26,7 @@ use gpui_kit::{
 use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display};
 use hylki_mail_core::{AttachmentMeta, MailRequest, MessageDetail, ThreadMessage};
 
-use crate::app::{split_sender, HylkiApp};
+use crate::app::{split_sender, HylkiApp, READER_OVERFLOW_BREAKPOINT};
 use crate::theme;
 use crate::ui::{avatar, window_controls};
 
@@ -33,6 +34,14 @@ use crate::ui::{avatar, window_controls};
 const HEADER_HEIGHT: f32 = 48.0;
 /// 卡片头像尺寸。
 const CARD_AVATAR: f32 = 34.0;
+/// B-5：单封邮件亮 / 暗背景覆盖的强制亮色（近纯白底）。
+const FORCE_LIGHT_BG: gpui_kit::Hsla = gpui_kit::hsla(0.0, 0.0, 1.0, 1.0);
+/// B-5：强制亮色背景下的正文前景色（近黑）。
+const FORCE_LIGHT_FG: gpui_kit::Hsla = gpui_kit::hsla(0.0, 0.0, 0.13, 1.0);
+/// B-5：单封邮件亮 / 暗背景覆盖的强制暗色（深灰底）。
+const FORCE_DARK_BG: gpui_kit::Hsla = gpui_kit::hsla(240.0 / 360.0, 0.06, 0.12, 1.0);
+/// B-5：强制暗色背景下的正文前景色（近白）。
+const FORCE_DARK_FG: gpui_kit::Hsla = gpui_kit::hsla(0.0, 0.0, 0.92, 1.0);
 
 /// 48px 操作栏上的紧凑图标按钮。
 fn action_button(id: &'static str, icon: IconName, tooltip: &'static str) -> Button {
@@ -267,6 +276,9 @@ fn build_card_more_menu(
 }
 
 /// 渲染单张邮件正文卡片（既用于单封邮件，也用于会话线程中的多张叠放卡片）。
+///
+/// `bg_pick` 为 B-5 的单封邮件亮 / 暗背景覆盖（`Some(false)` 强制亮色、
+/// `Some(true)` 强制暗色、`None` 跟随主题；会话级状态，不持久化）。
 #[allow(clippy::too_many_arguments)]
 fn render_message_card(
     account_id: u32,
@@ -284,6 +296,7 @@ fn render_message_card(
     is_collapsed: bool,
     show_raw_source: bool,
     zoom_percent: u32,
+    bg_pick: Option<bool>,
     attachments: &[AttachmentMeta],
     is_current: bool,
     more_menu: gpui_kit::AnyElement,
@@ -612,7 +625,13 @@ fn render_message_card(
                     ),
             )
         })
-        .child(
+        .child({
+            // B-5：亮 / 暗背景覆盖只作用于正文块（卡片外壳保持主题配色）。
+            let (forced_bg, forced_fg) = match bg_pick {
+                Some(false) => (Some(FORCE_LIGHT_BG), Some(FORCE_LIGHT_FG)),
+                Some(true) => (Some(FORCE_DARK_BG), Some(FORCE_DARK_FG)),
+                None => (None, None),
+            };
             div()
                 .when(show_raw_source, |el| {
                     el.p_3()
@@ -623,21 +642,31 @@ fn render_message_card(
                         .text_size(px((12.0 * zoom_scale).max(10.0)))
                 })
                 .when(!show_raw_source, |el| el.text_size(px(body_font_px)))
-                .text_color(if body_loaded { p.text } else { muted_fg })
+                .map(|el| match forced_bg {
+                    Some(bg) => el
+                        .bg(bg)
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(border)
+                        .p_2(),
+                    None => el,
+                })
+                .text_color(forced_fg.unwrap_or(if body_loaded { p.text } else { muted_fg }))
                 .child(
                     TextView::html(
                         SharedString::from(format!(
-                            "reader-body-{msg_id}-{}-{}-{}-{}",
+                            "reader-body-{msg_id}-{}-{}-{}-{}-{}",
                             prefer_plain as u8,
                             block_remote_images as u8,
                             show_raw_source as u8,
-                            zoom_percent
+                            zoom_percent,
+                            bg_pick.map(|b| b as u8).unwrap_or(2)
                         )),
                         rendered_html,
                     )
                     .selectable(true),
-                ),
-        )
+                )
+        })
         .when(!body_loaded, |card| {
             card.child(
                 h_flex().child(
@@ -694,9 +723,16 @@ pub(crate) fn render(
     // 避坑清单第 4 条：render 开头先把语义色 Copy 出来。
     let p = theme::current(cx);
     let (canvas, border, muted_fg, accent) = (p.canvas, p.border, p.text_muted, p.accent);
+    // L-6：阅读器在下方时列表顶栏即窗口顶栏，此处不再重复画窗口控制按钮。
+    let pane_top = app.pane_at_window_top();
+    // B-5：窗口宽度低于阈值时顶栏低频动作收进「⋯」菜单。
+    let narrow_topbar = window.viewport_size().width.as_f32() < READER_OVERFLOW_BREAKPOINT;
+    let entity_for_overflow = cx.entity();
     let win_controls = window_controls::render_window_controls("reader-wc", window, cx);
 
     let Some(detail) = app.selected_message.clone() else {
+        // L-6：阅读器在下方 / 关闭时列表顶栏即窗口顶栏，此处不再重复画窗口控制按钮。
+        let pane_top = app.pane_at_window_top();
         return v_flex()
             .flex_1()
             .min_w_0()
@@ -710,7 +746,7 @@ pub(crate) fn render(
                     .border_b_1()
                     .border_color(border)
                     .child(window_controls::drag_spacer())
-                    .child(win_controls),
+                    .when(pane_top, |bar| bar.child(win_controls)),
             )
             .child(
                 v_flex()
@@ -739,14 +775,6 @@ pub(crate) fn render(
     let prefer_plain = app.reader_prefer_plain;
     let zoom_percent = app.prefs.reader_zoom_percent.clamp(70, 160);
     let thread_count = detail.thread_messages.len();
-    let has_any_html = detail
-        .body_html
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty())
-        || detail
-            .thread_messages
-            .iter()
-            .any(|m| m.body_html.as_deref().is_some_and(|s| !s.trim().is_empty()));
 
     // 汇总当前会话全部附件 ID（用于顶部「保存全部附件」入口）。
     let all_thread_attachment_ids: Vec<u32> = if thread_count > 1 {
@@ -763,6 +791,14 @@ pub(crate) fn render(
             .thread_messages
             .iter()
             .any(|tm| app.collapsed_thread_cards.contains(&tm.id));
+
+    // B-5：标题区亮 / 暗按钮的当前态与目标邮件（会话线程下作用于锚点邮件本身）。
+    let bg_msg_id = detail.id;
+    let bg_msg_picked_dark = app
+        .message_bg_picks
+        .get(&bg_msg_id)
+        .copied()
+        .unwrap_or(app.dark_mode);
 
     // 构造单卡或多线程叠放卡片列表：每张卡片均带独立的 `...` 操作菜单与折叠/原文态。
     let cards: Vec<gpui_kit::AnyElement> = if thread_count > 1 {
@@ -827,6 +863,7 @@ pub(crate) fn render(
                     is_collapsed,
                     show_raw_source,
                     zoom_percent,
+                    app.message_bg_picks.get(&tm.id).copied(),
                     &tm.attachments,
                     is_current,
                     menu,
@@ -865,6 +902,7 @@ pub(crate) fn render(
             is_collapsed,
             show_raw_source,
             zoom_percent,
+            app.message_bg_picks.get(&detail.id).copied(),
             &detail.attachments,
             false,
             menu,
@@ -1009,63 +1047,87 @@ pub(crate) fn render(
                         })
                 })
                 .child(window_controls::drag_spacer())
-                // 右侧操作组：HTML/纯文本切换 + 动态标记已读/未读 + 复制正文（严格放在 48px 顶栏内）。
+                // 右侧操作组：动态标记已读/未读 + 复制正文（严格放在 48px 顶栏内）。
                 // 缩放改为 Ctrl+= / Ctrl+- / Ctrl+0 快捷键 + 标题区缩放胶囊（S-8），不再常驻顶栏。
+                // B-5：HTML/纯文本切换升级为标题区「阅读视图」按钮（低频且与阅读视图语义重合）；
+                // 窗口宽度低于 READER_OVERFLOW_BREAKPOINT（880px，≈三栏最小宽度之和的下限）
+                // 时剩余低频动作收进「⋯」下拉，宽窗口仍平铺（对齐原版 reader 顶栏折叠 #475）。
                 .child(
                     h_flex()
                         .gap_1()
                         .pr_1()
                         .items_center()
-                        .when(has_any_html, |el| {
+                        .when(!narrow_topbar, |el| {
                             el.child(
-                                Button::new("reader-toggle-html")
+                                Button::new("reader-toggle-seen")
                                     .ghost()
                                     .compact()
-                                    .icon(if prefer_plain {
-                                        IconName::FileCode
+                                    .icon(if is_unread {
+                                        IconName::MailOpen
                                     } else {
-                                        IconName::FileText
+                                        IconName::Mail
                                     })
-                                    .tooltip(if prefer_plain {
-                                        "切换为富文本 HTML 视图"
+                                    .tooltip(if is_unread {
+                                        "标记为已读"
                                     } else {
-                                        "切换为纯文本视图"
+                                        "标记为未读"
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_reader_plain_mode(cx);
+                                        this.toggle_message_seen(cx);
+                                    })),
+                            )
+                            .child(
+                                action_button("reader-copy-body", IconName::Copy, "复制正文")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.copy_selected_body(cx);
                                     })),
                             )
                         })
-                        .child(
-                            Button::new("reader-toggle-seen")
-                                .ghost()
-                                .compact()
-                                .icon(if is_unread {
-                                    IconName::MailOpen
-                                } else {
-                                    IconName::Mail
-                                })
-                                .tooltip(if is_unread {
-                                    "标记为已读"
-                                } else {
-                                    "标记为未读"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_message_seen(cx);
-                                })),
-                        )
-                        .child(
-                            action_button("reader-copy-body", IconName::Copy, "复制正文").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.copy_selected_body(cx);
-                                }),
-                            ),
-                        ),
+                        .when(narrow_topbar, |el| {
+                            el.child(
+                                Button::new("reader-overflow")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::Ellipsis)
+                                    .tooltip("更多邮件操作")
+                                    .dropdown_menu(move |menu, _, _| {
+                                        let e_seen = entity_for_overflow.clone();
+                                        let e_copy = entity_for_overflow.clone();
+                                        menu.item(
+                                            PopupMenuItem::new(if is_unread {
+                                                "标记为已读"
+                                            } else {
+                                                "标记为未读"
+                                            })
+                                            .icon(Icon::new(if is_unread {
+                                                IconName::MailOpen
+                                            } else {
+                                                IconName::Mail
+                                            }))
+                                            .on_click(move |_, _, cx| {
+                                                e_seen.update(cx, |app, cx| {
+                                                    app.toggle_message_seen(cx);
+                                                });
+                                            }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new("复制正文")
+                                                .icon(Icon::new(IconName::Copy))
+                                                .on_click(move |_, _, cx| {
+                                                    e_copy.update(cx, |app, cx| {
+                                                        app.copy_selected_body(cx);
+                                                    });
+                                                }),
+                                        )
+                                    }),
+                            )
+                        }),
                 )
-                .child(win_controls),
+                // L-6：阅读器在下方时窗口控制按钮由列表顶栏承载，此处不再重复画。
+                .when(pane_top, |bar| bar.child(win_controls)),
         )
         // 标题区（8px 24px 8px，L-5 实测顶边距）：账号胶囊 + 缩放胶囊 + 可选会话数胶囊
-        // + 展开/折叠全部 & 保存全部附件 + 20px 粗体主题。
+        // + 阅读视图 & 亮暗切换（B-5）+ 展开/折叠全部 & 保存全部附件 + 20px 粗体主题。
         .child(
             v_flex()
                 .flex_shrink_0()
@@ -1074,126 +1136,140 @@ pub(crate) fn render(
                 .px(px(24.0))
                 .pb(px(8.0))
                 .gap_1()
-                .when(
-                    !owner_email.is_empty()
-                        || thread_count > 1
-                        || all_thread_attachment_ids.len() >= 2
-                        || zoom_percent != 100,
-                    |el| {
-                        let save_all_ids = all_thread_attachment_ids.clone();
-                        let save_all_count = save_all_ids.len();
-                        el.child(
+                // B-5：标题区改为常驻行——右侧新增「阅读视图」与亮 / 暗背景切换按钮。
+                .child({
+                    let save_all_ids = all_thread_attachment_ids.clone();
+                    let save_all_count = save_all_ids.len();
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        .justify_between()
+                        .child(
                             h_flex()
-                                .w_full()
                                 .gap_2()
                                 .items_center()
-                                .justify_between()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .when(!owner_email.is_empty(), |row| {
-                                            row.child(
-                                                div()
-                                                    .px_2()
-                                                    .py_0p5()
-                                                    .rounded_full()
-                                                    .bg(p.accent_soft())
-                                                    .text_color(accent)
-                                                    .text_xs()
-                                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                    .child(SharedString::from(owner_email)),
-                                            )
-                                        })
-                                        // 缩放胶囊（S-8）：非 100% 时显示，点击重置（Ctrl+0 同效）。
-                                        .when(zoom_percent != 100, |row| {
-                                            row.child(
-                                                div()
-                                                    .id("reader-zoom-pill")
-                                                    .px_2()
-                                                    .py_0p5()
-                                                    .rounded_full()
-                                                    .border_1()
-                                                    .border_color(border)
-                                                    .text_color(accent)
-                                                    .text_xs()
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(p.accent_soft()))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.set_reader_zoom(100, cx);
-                                                    }))
-                                                    .child(SharedString::from(format!(
-                                                        "{zoom_percent}%"
-                                                    ))),
-                                            )
-                                        })
-                                        .when(thread_count > 1, |row| {
-                                            row.child(
-                                                div()
-                                                    .px_2()
-                                                    .py_0p5()
-                                                    .rounded_full()
-                                                    .bg(p.surface_raised)
-                                                    .border_1()
-                                                    .border_color(border)
-                                                    .text_color(muted_fg)
-                                                    .text_xs()
-                                                    .child(SharedString::from(format!(
-                                                        "{thread_count} 封往来会话"
-                                                    ))),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_1p5()
-                                        .items_center()
-                                        .when(save_all_count >= 2, |row| {
-                                            row.child(
-                                                Button::new("reader-save-all-attachments")
-                                                    .outline()
-                                                    .compact()
-                                                    .icon(IconName::Download)
-                                                    .label(SharedString::from(format!(
-                                                        "保存全部附件 ({save_all_count})"
-                                                    )))
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.save_all_attachments(
-                                                                save_all_ids.clone(),
-                                                                cx,
-                                                            );
-                                                        },
-                                                    )),
-                                            )
-                                        })
-                                        .when(thread_count > 1, |row| {
-                                            row.child(
-                                                Button::new("reader-toggle-fold-all")
-                                                    .ghost()
-                                                    .compact()
-                                                    .label(if any_card_collapsed {
-                                                        "展开全部"
-                                                    } else {
-                                                        "折叠全部"
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            if any_card_collapsed {
-                                                                this.expand_all_thread_cards(cx);
-                                                            } else {
-                                                                this.collapse_older_thread_cards(
-                                                                    cx,
-                                                                );
-                                                            }
-                                                        },
-                                                    )),
-                                            )
-                                        }),
-                                ),
+                                .when(!owner_email.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .bg(p.accent_soft())
+                                            .text_color(accent)
+                                            .text_xs()
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .child(SharedString::from(owner_email)),
+                                    )
+                                })
+                                // 缩放胶囊（S-8）：非 100% 时显示，点击重置（Ctrl+0 同效）。
+                                .when(zoom_percent != 100, |row| {
+                                    row.child(
+                                        div()
+                                            .id("reader-zoom-pill")
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(border)
+                                            .text_color(accent)
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(p.accent_soft()))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_reader_zoom(100, cx);
+                                            }))
+                                            .child(SharedString::from(format!("{zoom_percent}%"))),
+                                    )
+                                })
+                                .when(thread_count > 1, |row| {
+                                    row.child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .bg(p.surface_raised)
+                                            .border_1()
+                                            .border_color(border)
+                                            .text_color(muted_fg)
+                                            .text_xs()
+                                            .child(SharedString::from(format!(
+                                                "{thread_count} 封往来会话"
+                                            ))),
+                                    )
+                                }),
                         )
-                    },
-                )
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .items_center()
+                                // B-5：阅读视图（复用现有 HTML/纯文本切换状态，
+                                // 以纯文本渲染剥离 HTML 花哨排版）。
+                                .child(
+                                    Button::new("reader-reading-view")
+                                        .ghost()
+                                        .compact()
+                                        .icon(IconName::BookText)
+                                        .selected(prefer_plain)
+                                        .tooltip(if prefer_plain {
+                                            "阅读视图已开启（点击恢复原始排版）"
+                                        } else {
+                                            "阅读视图（剥离花哨排版，以纯文本渲染）"
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_reader_plain_mode(cx);
+                                        })),
+                                )
+                                // B-5：单封邮件亮 / 暗背景切换（仅本会话，不持久化）。
+                                .child(
+                                    Button::new("reader-bg-toggle")
+                                        .ghost()
+                                        .compact()
+                                        .icon(if bg_msg_picked_dark {
+                                            IconName::Sun
+                                        } else {
+                                            IconName::Moon
+                                        })
+                                        .tooltip("切换此邮件亮 / 暗背景（仅本会话）")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_message_bg_pick(bg_msg_id, cx);
+                                        })),
+                                )
+                                .when(save_all_count >= 2, |row| {
+                                    row.child(
+                                        Button::new("reader-save-all-attachments")
+                                            .outline()
+                                            .compact()
+                                            .icon(IconName::Download)
+                                            .label(SharedString::from(format!(
+                                                "保存全部附件 ({save_all_count})"
+                                            )))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.save_all_attachments(save_all_ids.clone(), cx);
+                                            })),
+                                    )
+                                })
+                                .when(thread_count > 1, |row| {
+                                    row.child(
+                                        Button::new("reader-toggle-fold-all")
+                                            .ghost()
+                                            .compact()
+                                            .label(if any_card_collapsed {
+                                                "展开全部"
+                                            } else {
+                                                "折叠全部"
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if any_card_collapsed {
+                                                    this.expand_all_thread_cards(cx);
+                                                } else {
+                                                    this.collapse_older_thread_cards(cx);
+                                                }
+                                            })),
+                                    )
+                                }),
+                        )
+                })
                 .child(
                     div()
                         .text_size(px(20.0))

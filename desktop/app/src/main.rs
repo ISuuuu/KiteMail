@@ -24,10 +24,11 @@ use crate::app::{
     CloseOverlay, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose, OpenCommandPalette,
     OpenCommandPaletteActions, OpenPreferences, OpenShortcutsWindow, QuitApp, RefreshAllAccounts,
     ReplyAllCurrent, ReplyCurrent, SelectNextMessage, SelectPrevMessage, SendCompose,
-    SingleKeyArchive, SingleKeyBackToList, SingleKeyCompose, SingleKeyDelete, SingleKeyForward,
-    SingleKeyMarkSpam, SingleKeyNextCard, SingleKeyNextMessage, SingleKeyPrevCard,
-    SingleKeyPrevMessage, SingleKeyReply, SingleKeyReplyAll, SingleKeyToggleRead,
-    SingleKeyToggleStar, ToggleAccountsList, ToggleFullscreen, UndoLastMove, ViewMessageSource,
+    SetReaderPositionBelow, SetReaderPositionHidden, SetReaderPositionRight, SingleKeyArchive,
+    SingleKeyBackToList, SingleKeyCompose, SingleKeyDelete, SingleKeyForward, SingleKeyMarkSpam,
+    SingleKeyNextCard, SingleKeyNextMessage, SingleKeyPrevCard, SingleKeyPrevMessage,
+    SingleKeyReply, SingleKeyReplyAll, SingleKeyToggleRead, SingleKeyToggleStar,
+    ToggleAccountsList, ToggleFocusMode, ToggleFullscreen, UndoLastMove, ViewMessageSource,
     ZoomIn, ZoomOut, ZoomReset,
 };
 
@@ -210,6 +211,11 @@ fn main() {
                 // 阶段二主菜单动作：显示/隐藏账号列表、全屏、快捷键帮助。
                 KeyBinding::new("ctrl-shift-a", ToggleAccountsList, None),
                 KeyBinding::new("f11", ToggleFullscreen, None),
+                // L-6：阅读器位置（右侧 / 下方 / 关闭）与专注模式（对齐原版 #475）。
+                KeyBinding::new("ctrl-alt-1", SetReaderPositionRight, None),
+                KeyBinding::new("ctrl-alt-2", SetReaderPositionBelow, None),
+                KeyBinding::new("ctrl-alt-3", SetReaderPositionHidden, None),
+                KeyBinding::new("ctrl-shift-f", ToggleFocusMode, None),
                 // F1 与 `?` 都绑：Windows 上 Shift+/ 实际产生 `?` 键（gpui 会
                 // 清除 shift 修饰），而部分布局/平台仍按 shift-/ 上报（原版
                 // 同样对两种写法都注册兜底）。

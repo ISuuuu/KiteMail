@@ -8,20 +8,22 @@
 //! --demo、多账号同步、OAuth、搜索、分页、草稿、Outbox 重试、附件保存、
 //! 标记已读 / 星标、账号增删配置全部保留。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::resizable::{resize_handle, HandleEdge};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    actions, black, div, point, px, AnyWindowHandle, AppContext, ClipboardItem, Context, Entity,
-    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollHandle,
-    SharedString, Styled, Subscription, Window, WindowAppearance, WindowBounds,
+    actions, black, div, point, px, AnyWindowHandle, AppContext, Axis, ClipboardItem, Context,
+    DragMoveEvent, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Render, ScrollHandle, SharedString, Styled, Subscription, Window, WindowAppearance,
+    WindowBounds,
 };
 use hylki_mail_core::cache::{sanitize_filename, CachedAttachment, KnownContact};
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend, SecurityMode};
@@ -43,6 +45,42 @@ use crate::ui::preferences::{PreferencesEvent, PreferencesState};
 use crate::ui::{accounts, compose, message_list, reader, sidebar, welcome, window_controls};
 
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
+
+// ---- L-2：三栏宽度常量（对齐原版 app.rs L270-L341 与 list_header.rs）----
+
+/// 左栏最小宽度（原版 OverlaySplitView `min_sidebar_width`）。
+pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 180.0;
+/// 左栏最大宽度（原版 `max_sidebar_width`）。
+pub(crate) const SIDEBAR_MAX_WIDTH: f32 = 280.0;
+/// 中栏列表最小宽度（列表自身的下限）。
+pub(crate) const LIST_MIN_WIDTH: f32 = 280.0;
+/// 右栏（阅读器）最小宽度（原版 READER_MIN_WIDTH = 441：顶栏整排动作不被挤出窗口）。
+pub(crate) const READER_MIN_WIDTH: f32 = 441.0;
+/// 中栏 ≥ 该宽度自动切换单行表格模式（原版 LIST_WIDE_ON，含迟滞）。
+pub(crate) const LIST_WIDE_ON: f32 = 600.0;
+/// 单行表格模式退回卡片模式的迟滞下限（原版 LIST_WIDE_OFF，两侧留余量防抖动）。
+pub(crate) const LIST_WIDE_OFF: f32 = 560.0;
+/// 阅读器在下方时的最小高度。
+pub(crate) const BELOW_PANE_MIN_HEIGHT: f32 = 200.0;
+/// 下方模式列表最小高度。
+pub(crate) const BELOW_LIST_MIN_HEIGHT: f32 = 240.0;
+/// 下方模式列表默认高度（无持久化值时）。
+pub(crate) const BELOW_LIST_DEFAULT_HEIGHT: f32 = 360.0;
+/// B-5：窗口宽度低于该值时阅读器顶栏低频动作收进「⋯」菜单（≈ 左栏最小 + 列表最小
+/// + 阅读器最小 441 的下限组合，此时右栏已被压至最小宽度附近，平铺按钮放不下）。
+pub(crate) const READER_OVERFLOW_BREAKPOINT: f32 = 880.0;
+/// L-2：宽度拖拽停止后的落盘防抖时长（对齐原版 mail_split.rs SAVE_AFTER = 600ms）。
+const LAYOUT_SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
+
+/// L-2：单行表格模式迟滞判定（对齐原版 list_header.rs：进入 ≥600、退出 <560，
+/// 两侧留余量防拖拽在阈值附近来回抖动）。
+fn list_wide_next(current_wide: bool, width: f32) -> bool {
+    if current_wide {
+        width >= LIST_WIDE_OFF
+    } else {
+        width >= LIST_WIDE_ON
+    }
+}
 
 /// 邮箱服务商预设（原样迁自原型）。
 pub(crate) struct ProviderPreset {
@@ -187,6 +225,65 @@ impl CurrentView {
     }
 }
 
+/// L-6：阅读器位置（对齐原版 config::ReadingPane #475）：列表右侧 / 列表下方 / 关闭。
+///
+/// 关闭时列表占满内容区，点击邮件仅选中并在状态栏提示（原版「不展示、不拉取正文、
+/// 不标已读」中的前两条因写信 / 复制等动作依赖正文而放宽为仍拉取，但保持不标已读）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ReaderPosition {
+    #[default]
+    Right,
+    Below,
+    Hidden,
+}
+
+impl ReaderPosition {
+    /// 持久化到 preferences.toml 的字符串键（对齐原版 ReadingPane::key）。
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Below => "below",
+            Self::Hidden => "off",
+        }
+    }
+
+    /// 从偏好字符串解析（未知值回落 Right，兼容手改配置文件）。
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "right" => Some(Self::Right),
+            "below" => Some(Self::Below),
+            "off" => Some(Self::Hidden),
+            _ => None,
+        }
+    }
+}
+
+// L-2：三栏拖拽把手载荷。gpui 按载荷类型区分拖拽事件；渲染为空白 div（无拖拽预览）。
+/// 左栏右缘把手载荷。
+pub(crate) struct SidebarDrag;
+/// 列表与右栏之间的竖直分隔把手载荷（Right 模式）。
+pub(crate) struct ListDrag;
+/// 列表与下方阅读器之间的水平分隔把手载荷（Below 模式）。
+pub(crate) struct BelowDrag;
+
+impl Render for SidebarDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl Render for ListDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl Render for BelowDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 // 全局快捷键动作（方案文档五.3）；键绑定注册在 main.rs，
 // 动作监听挂在根节点 render 上。
 //
@@ -233,7 +330,12 @@ actions!(
         SingleKeyCompose,
         SingleKeyBackToList,
         SingleKeyNextCard,
-        SingleKeyPrevCard
+        SingleKeyPrevCard,
+        // L-6：阅读器位置（Ctrl+Alt+1/2/3）与专注模式（Ctrl+Shift+F）。
+        SetReaderPositionRight,
+        SetReaderPositionBelow,
+        SetReaderPositionHidden,
+        ToggleFocusMode
     ]
 );
 
@@ -481,11 +583,34 @@ pub(crate) struct HylkiApp {
     /// 后台自动刷新到期时刻（`None` 表示待重算；demo 模式不轮询）。
     auto_sync_deadline: Option<Instant>,
     /// Windows 系统托盘句柄（退出时显式销毁图标避免残留）。
-    tray: Option<Arc<TrayHandle>>,
+    pub(crate) tray: Option<Arc<TrayHandle>>,
     /// 主窗口句柄（供托盘菜单触发写信 / 退出前保存窗口几何）。
     window_handle: AnyWindowHandle,
     /// 各账号最近一次收件箱未读数基线（首次加载只建基线不弹窗，后续增长才触发桌面通知）。
     last_unread_by_account: BTreeMap<u32, u32>,
+
+    // ---- L-2：三栏可拖拽调宽（宽度实时更新，停 600ms 后防抖落盘）----
+    /// 左栏宽度（180~280；窄轨模式固定 80px 不参与）。
+    pub(crate) sidebar_width: f32,
+    /// 中栏列表宽度（≥280；Hidden / Welcome 模式下列表可能占满或保持该宽度）。
+    pub(crate) list_width: f32,
+    /// 中栏 ≥600px 自动单行表格模式的迟滞状态（原版 LIST_WIDE_ON / LIST_WIDE_OFF）。
+    pub(crate) list_wide: bool,
+    /// 宽度落盘防抖截止时刻（`None` 表示无待写入）。
+    layout_save_deadline: Option<Instant>,
+    /// 宽度落盘防抖任务是否已在后台轮询（避免每次拖拽都重复 spawn）。
+    layout_save_scheduled: bool,
+
+    // ---- L-6：阅读器位置与专注模式 ----
+    /// 阅读器位置（右 / 下 / 关，持久化到 prefs.reader_position）。
+    pub(crate) reader_position: ReaderPosition,
+    /// 专注模式（会话级，不持久化）：隐藏左栏与列表，只保留阅读器。
+    pub(crate) focus_mode: bool,
+    /// 阅读器在下方时列表的高度（持久化到 prefs.list_below_height）。
+    pub(crate) list_below_height: f32,
+
+    // ---- B-5：单封邮件亮 / 暗背景覆盖（msg_id → true=暗 / false=亮，会话级不持久化）----
+    pub(crate) message_bg_picks: HashMap<u32, bool>,
 }
 
 impl HylkiApp {
@@ -698,6 +823,22 @@ impl HylkiApp {
         );
         let initial_theme_id = theme::static_theme_id(&prefs.theme_id);
         let initial_dark_mode = prefs.dark_mode.unwrap_or(system_dark_mode);
+        // L-2/L-6：从持久化偏好恢复三栏宽度与阅读器位置（旧配置缺字段回落默认值）。
+        let initial_sidebar_width = prefs
+            .sidebar_width
+            .unwrap_or(crate::ui::sidebar::SIDEBAR_WIDTH)
+            .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        let initial_list_width = prefs
+            .list_width
+            .unwrap_or(message_list::LIST_WIDTH)
+            .max(LIST_MIN_WIDTH);
+        let initial_list_wide = initial_list_width >= LIST_WIDE_ON;
+        let initial_list_below_height = prefs
+            .list_below_height
+            .unwrap_or(BELOW_LIST_DEFAULT_HEIGHT)
+            .clamp(BELOW_LIST_MIN_HEIGHT, BELOW_PANE_MIN_HEIGHT * 4.0);
+        let initial_reader_position =
+            ReaderPosition::from_key(&prefs.reader_position).unwrap_or_default();
         // 当偏好为「跟随系统」且系统是暗色时，补一次主题应用对齐 Windows 外观。
         if prefs.dark_mode.is_none() && system_dark_mode {
             theme::apply(initial_theme_id, true, cx);
@@ -830,6 +971,15 @@ impl HylkiApp {
                 tray,
                 window_handle,
                 last_unread_by_account: BTreeMap::new(),
+                sidebar_width: initial_sidebar_width,
+                list_width: initial_list_width,
+                list_wide: initial_list_wide,
+                layout_save_deadline: None,
+                layout_save_scheduled: false,
+                reader_position: initial_reader_position,
+                focus_mode: false,
+                list_below_height: initial_list_below_height,
+                message_bg_picks: HashMap::new(),
             };
         }
 
@@ -993,6 +1143,15 @@ impl HylkiApp {
             tray,
             window_handle,
             last_unread_by_account: BTreeMap::new(),
+            sidebar_width: initial_sidebar_width,
+            list_width: initial_list_width,
+            list_wide: initial_list_wide,
+            layout_save_deadline: None,
+            layout_save_scheduled: false,
+            reader_position: initial_reader_position,
+            focus_mode: false,
+            list_below_height: initial_list_below_height,
+            message_bg_picks: HashMap::new(),
         };
 
         // 启动视图非统一收件箱时立即请求对应列表（LoadAllCached 只覆盖收件箱）。
@@ -1373,11 +1532,13 @@ impl HylkiApp {
         }
         if self.selected_message.is_none() {
             if let Some(first) = self.current_page.items.first() {
+                // L-6：阅读器关闭时首屏自动选中同样不标已读（对齐「未展示不标读」语义）。
+                let mark_read = first.unread && self.reader_position != ReaderPosition::Hidden;
                 self.request_message_detail(
                     first.account_id,
                     first.id,
                     first.uid,
-                    first.unread,
+                    mark_read,
                     &first.folder_path.clone(),
                 );
             }
@@ -1518,9 +1679,15 @@ impl HylkiApp {
         }
     }
 
-    /// 持久化当前窗口尺寸与最大化状态到 `preferences.toml`。
+    /// 持久化当前窗口尺寸与最大化状态到 `preferences.toml`（顺带写入三栏宽度，
+    /// 覆盖拖拽防抖未及落盘的情形，如拖拽后立即关闭 / 隐藏窗口）。
     pub(crate) fn save_window_geometry(&mut self, window: &Window) {
-        if capture_window_geometry(&mut self.prefs, window.window_bounds()) {
+        let geometry_changed = capture_window_geometry(&mut self.prefs, window.window_bounds());
+        let layout_changed = self.layout_save_deadline.take().is_some();
+        if geometry_changed || layout_changed {
+            self.prefs.sidebar_width = Some(self.sidebar_width);
+            self.prefs.list_width = Some(self.list_width);
+            self.prefs.list_below_height = Some(self.list_below_height);
             let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
         }
     }
@@ -1578,6 +1745,10 @@ impl HylkiApp {
             if capture_window_geometry(&mut self.prefs, wb) {
                 let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
             }
+        }
+        // L-2：退出前把未及防抖落盘的三栏宽度一并写入。
+        if self.layout_save_deadline.take().is_some() {
+            self.persist_layout_prefs();
         }
         self.shutdown_tray();
         cx.quit();
@@ -1664,6 +1835,13 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) {
         self.right_mode = RightPaneMode::Reader;
+        // L-6：阅读器关闭时点击邮件仅选中不展示（对齐原版 select_without_reader 语义），
+        // 状态栏提示如何重新打开；正文仍拉取以支撑回复 / 复制等动作，但不自动标已读。
+        let reader_hidden = self.reader_position == ReaderPosition::Hidden;
+        if reader_hidden {
+            self.status_line =
+                SharedString::from("阅读器已关闭：邮件已选中，按 Ctrl+Alt+1 重新打开");
+        }
         if self.demo_mode {
             if let Some(detail) = self.demo_message_detail(message_id) {
                 self.set_selected_message(detail);
@@ -1673,7 +1851,13 @@ impl HylkiApp {
             cx.notify();
             return;
         }
-        self.request_message_detail(account_id, message_id, uid, unread, folder_path);
+        self.request_message_detail(
+            account_id,
+            message_id,
+            uid,
+            unread && !reader_hidden,
+            folder_path,
+        );
         cx.notify();
     }
 
@@ -3472,6 +3656,152 @@ impl HylkiApp {
         cx.notify();
     }
 
+    // ---- L-2：三栏宽度拖拽与持久化 ----
+
+    /// 当前左栏在界面上的实际宽度（窄轨模式为固定 80px，不参与拖拽）。
+    pub(crate) fn sidebar_visual_width(&self) -> f32 {
+        if self.sidebar_hidden {
+            sidebar::RAIL_WIDTH
+        } else {
+            self.sidebar_width
+        }
+    }
+
+    /// 把当前三栏宽度写入偏好副本并立即落盘（拖拽结束 / 退出时调用）。
+    fn persist_layout_prefs(&mut self) {
+        self.prefs.sidebar_width = Some(self.sidebar_width);
+        self.prefs.list_width = Some(self.list_width);
+        self.prefs.list_below_height = Some(self.list_below_height);
+        let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
+    }
+
+    /// 宽度拖拽进行中调用：延迟 600ms 防抖落盘（对齐原版 mail_split.rs 的 SAVE_AFTER）。
+    fn schedule_layout_save(&mut self, cx: &mut Context<Self>) {
+        self.layout_save_deadline = Some(Instant::now() + LAYOUT_SAVE_DEBOUNCE);
+        if self.layout_save_scheduled {
+            return;
+        }
+        self.layout_save_scheduled = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            // 返回 true 表示本轮应结束（无待写入或已完成写入；实体释放也结束）。
+            let done = this
+                .update(cx, |app, _cx| match app.layout_save_deadline {
+                    None => true,
+                    Some(deadline) => {
+                        if Instant::now() >= deadline {
+                            app.layout_save_deadline = None;
+                            app.layout_save_scheduled = false;
+                            app.persist_layout_prefs();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                })
+                .unwrap_or(true);
+            if done {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// 左栏拖拽把手移动：宽度 = 指针 x − 内容行左缘，钳制 180~280。
+    fn on_sidebar_drag_move(&mut self, event: &DragMoveEvent<SidebarDrag>, cx: &mut Context<Self>) {
+        let pointer_x = event.event.position.x.as_f32();
+        let row_left = event.bounds.left().as_f32();
+        self.sidebar_width = (pointer_x - row_left).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        self.schedule_layout_save(cx);
+        cx.notify();
+    }
+
+    /// 列表 | 右栏分隔把手移动（Right 模式）：列表宽 = 指针 x − 行左缘 − 左栏宽，
+    /// 右栏保底 READER_MIN_WIDTH；同时按迟滞阈值更新单行表格模式状态。
+    fn on_list_drag_move(&mut self, event: &DragMoveEvent<ListDrag>, cx: &mut Context<Self>) {
+        let pointer_x = event.event.position.x.as_f32();
+        let row_left = event.bounds.left().as_f32();
+        let row_width = event.bounds.size.width.as_f32();
+        let max_list =
+            (row_width - self.sidebar_visual_width() - READER_MIN_WIDTH).max(LIST_MIN_WIDTH);
+        self.list_width =
+            (pointer_x - row_left - self.sidebar_visual_width()).clamp(LIST_MIN_WIDTH, max_list);
+        // 原版迟滞：进入宽表格 ≥600，退出 <560，两侧留余量防拖拽抖动。
+        self.list_wide = list_wide_next(self.list_wide, self.list_width);
+        self.schedule_layout_save(cx);
+        cx.notify();
+    }
+
+    /// 列表 | 下方阅读器分隔把手移动（Below 模式）：列表高 = 指针 y − 行上缘，
+    /// 阅读器保底 BELOW_PANE_MIN_HEIGHT。
+    fn on_below_drag_move(&mut self, event: &DragMoveEvent<BelowDrag>, cx: &mut Context<Self>) {
+        let pointer_y = event.event.position.y.as_f32();
+        let row_top = event.bounds.top().as_f32();
+        let row_height = event.bounds.size.height.as_f32();
+        let max_list = (row_height - BELOW_PANE_MIN_HEIGHT).max(BELOW_LIST_MIN_HEIGHT);
+        self.list_below_height = (pointer_y - row_top).clamp(BELOW_LIST_MIN_HEIGHT, max_list);
+        self.schedule_layout_save(cx);
+        cx.notify();
+    }
+
+    // ---- L-6：阅读器位置与专注模式 ----
+
+    /// 阅读器 / 写信窗格是否位于窗口顶部（决定窗口控制按钮放阅读器顶栏还是列表顶栏，
+    /// 对齐原版 controls_in_list：阅读器在下方或关闭时列表顶栏即窗口顶栏）。
+    pub(crate) fn pane_at_window_top(&self) -> bool {
+        self.focus_mode
+            || self.main_view != MainContentView::Mail
+            || self.right_mode == RightPaneMode::Welcome
+            || self.reader_position == ReaderPosition::Right
+    }
+
+    /// 切换阅读器位置（菜单 / 快捷键入口），立即落盘（对齐原版 pref! 保存时机）。
+    pub(crate) fn set_reader_position(&mut self, position: ReaderPosition, cx: &mut Context<Self>) {
+        if self.reader_position == position {
+            return;
+        }
+        self.reader_position = position;
+        self.prefs.reader_position = position.key().to_string();
+        let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
+        self.status_line = SharedString::from(match position {
+            ReaderPosition::Right => "阅读器已移到列表右侧",
+            ReaderPosition::Below => "阅读器已移到列表下方",
+            ReaderPosition::Hidden => "阅读器已关闭：邮件仅选中，按 Ctrl+Alt+1 重新打开",
+        });
+        cx.notify();
+    }
+
+    /// 切换专注模式（会话级）：隐藏左栏与列表只留阅读器，再按一次恢复原布局。
+    pub(crate) fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
+        self.focus_mode = !self.focus_mode;
+        self.status_line = SharedString::from(if self.focus_mode {
+            "专注模式已开启：左栏与列表已隐藏（Ctrl+Shift+F 恢复）"
+        } else {
+            "专注模式已关闭"
+        });
+        cx.notify();
+    }
+
+    // ---- B-5：标题区视图切换 ----
+
+    /// 切换单封邮件正文的亮 / 暗背景覆盖（会话级，键为邮件 ID；不持久化）。
+    /// 首次点击取与当前主题相反的背景，再次点击在亮 / 暗之间切换。
+    pub(crate) fn toggle_message_bg_pick(&mut self, message_id: u32, cx: &mut Context<Self>) {
+        let next = match self.message_bg_picks.get(&message_id).copied() {
+            None => !self.dark_mode,
+            Some(picked_dark) => !picked_dark,
+        };
+        self.message_bg_picks.insert(message_id, next);
+        self.status_line = SharedString::from(if next {
+            "此邮件正文已强制暗色背景（仅本会话）"
+        } else {
+            "此邮件正文已强制亮色背景（仅本会话）"
+        });
+        cx.notify();
+    }
+
     pub(crate) fn set_list_sort(&mut self, sort: MessageSort, cx: &mut Context<Self>) {
         if self.list_sort != sort {
             self.list_sort = sort;
@@ -4367,6 +4697,128 @@ impl HylkiApp {
 
     // ---- 右栏渲染（阅读态 / 写信 / 账号管理 / 欢迎页由 ui:: 渲染）----
 
+    /// L-2/L-6：Mail 内容区组装——专注模式与阅读器位置（Right / Below / Hidden）路由。
+    ///
+    /// - 专注模式：左栏与列表整体隐藏，右栏（阅读器 / 写信 / 欢迎页）占满。
+    /// - Right：侧栏 | 列表（持久化宽度）| 右栏（左缘拖拽把手）。
+    /// - Below：侧栏 | 垂直分割列（列表上，持久化高度；阅读器下占满，上缘把手）。
+    /// - Hidden：侧栏 | 列表占满（无右栏、无右栏把手）。
+    /// - 欢迎页（无账号）：侧栏 | 列表 | 欢迎页（只有侧栏把手）。
+    fn render_mail_body(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        sidebar_el: Option<gpui_kit::AnyElement>,
+    ) -> gpui_kit::AnyElement {
+        let list_el = message_list::render(self, window, cx);
+
+        if self.focus_mode {
+            return h_flex()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_right_pane(window, cx))
+                .into_any_element();
+        }
+
+        match self.right_mode {
+            RightPaneMode::Welcome => h_flex()
+                .flex_1()
+                .min_h_0()
+                .children(sidebar_el)
+                .child(
+                    div()
+                        .w(px(self.list_width))
+                        .h_full()
+                        .flex_shrink_0()
+                        .child(list_el),
+                )
+                .child(self.render_right_pane(window, cx))
+                .into_any_element(),
+            RightPaneMode::Compose | RightPaneMode::Reader => match self.reader_position {
+                ReaderPosition::Right => h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .children(sidebar_el)
+                    .child(
+                        div()
+                            .w(px(self.list_width))
+                            .h_full()
+                            .flex_shrink_0()
+                            .child(list_el),
+                    )
+                    .child(self.render_mail_pane(window, cx))
+                    .into_any_element(),
+                ReaderPosition::Below => h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .children(sidebar_el)
+                    .child(
+                        v_flex()
+                            .w(px(self.list_width))
+                            .h_full()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .h(px(self.list_below_height))
+                                    .min_h(px(BELOW_LIST_MIN_HEIGHT))
+                                    .flex_shrink_0()
+                                    .child(list_el),
+                            )
+                            .child(self.render_mail_pane_below(window, cx)),
+                    )
+                    .into_any_element(),
+                ReaderPosition::Hidden => h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .children(sidebar_el)
+                    .child(div().flex_1().min_w_0().h_full().child(list_el))
+                    .into_any_element(),
+            },
+        }
+    }
+
+    /// 右栏容器（阅读器 / 写信）：内容 + 左缘拖拽把手（列表与右栏之间，L-2）。
+    fn render_mail_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let inner = self.render_right_pane(window, cx);
+        div()
+            .relative()
+            .flex_1()
+            .min_w(px(READER_MIN_WIDTH))
+            .h_full()
+            .child(inner)
+            .child(
+                resize_handle::<ListDrag, ListDrag>("mail-pane-handle", Axis::Horizontal)
+                    .inside(HandleEdge::Leading)
+                    .on_drag(ListDrag, |_, _, _, cx| cx.new(|_| ListDrag)),
+            )
+            .into_any_element()
+    }
+
+    /// 右栏容器（阅读器在下方）：内容 + 上缘拖拽把手（列表与阅读器之间，L-6）。
+    fn render_mail_pane_below(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let inner = self.render_right_pane(window, cx);
+        div()
+            .relative()
+            .flex_1()
+            .w_full()
+            .min_h(px(BELOW_PANE_MIN_HEIGHT))
+            .child(inner)
+            .child(
+                resize_handle::<BelowDrag, BelowDrag>("mail-below-handle", Axis::Vertical)
+                    .inside(HandleEdge::Leading)
+                    .on_drag(BelowDrag, |_, _, _, cx| cx.new(|_| BelowDrag)),
+            )
+            .into_any_element()
+    }
+
     fn render_right_pane(
         &mut self,
         window: &Window,
@@ -4375,8 +4827,9 @@ impl HylkiApp {
         match self.right_mode {
             RightPaneMode::Compose => {
                 let p = theme::current(cx);
-                let win_controls =
-                    window_controls::render_window_controls("compose-wc", window, cx);
+                // L-6：阅读器在下方 / 关闭时列表顶栏即窗口顶栏（对齐原版 controls_in_list），
+                // 写信页顶栏不再重复画窗口控制按钮。
+                let pane_top = self.pane_at_window_top();
                 // 写信页唯一标题栏（B-8：合并进 48px 顶栏，compose.rs 不再画第二层标题）：
                 // 左侧「取消 / 存草稿」，中间拖拽区，右侧「附件 / 发送」，复用现有动作。
                 v_flex()
@@ -4433,7 +4886,13 @@ impl HylkiApp {
                                         this.send_compose(cx);
                                     })),
                             )
-                            .child(win_controls),
+                            .when(pane_top, |bar| {
+                                bar.child(window_controls::render_window_controls(
+                                    "compose-wc",
+                                    window,
+                                    cx,
+                                ))
+                            }),
                     )
                     .child(compose::render(self, cx))
                     .into_any_element()
@@ -4459,7 +4918,10 @@ impl Render for HylkiApp {
             self.last_move_undo = None;
         }
 
-        let sidebar_el = if self.sidebar_hidden {
+        let sidebar_el = if self.focus_mode {
+            // L-6 专注模式：左栏整体隐藏（用户自己的窄轨选择在退出专注后原样恢复）。
+            None
+        } else if self.sidebar_hidden {
             // 折叠为 80px 图标窄轨（对齐原版 rail），不再整体移除左栏。
             Some(sidebar::render_collapsed(self, cx))
         } else {
@@ -4469,16 +4931,7 @@ impl Render for HylkiApp {
         // 主内容区路由（方案文档五.1）：Gallery / Contacts 保留左栏，
         // 中栏 + 右栏区域整体替换为对应组件。
         let body = match self.main_view {
-            MainContentView::Mail => {
-                let list_el = message_list::render(self, cx);
-                let right_el = self.render_right_pane(window, cx);
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .children(sidebar_el)
-                    .child(list_el)
-                    .child(right_el)
-            }
+            MainContentView::Mail => self.render_mail_body(window, cx, sidebar_el),
             MainContentView::Gallery => {
                 let win_controls =
                     window_controls::render_window_controls("gallery-wc", window, cx);
@@ -4506,6 +4959,7 @@ impl Render for HylkiApp {
                     .min_h_0()
                     .children(sidebar_el)
                     .child(gallery_el)
+                    .into_any_element()
             }
             MainContentView::Contacts => {
                 let win_controls =
@@ -4536,6 +4990,7 @@ impl Render for HylkiApp {
                     .min_h_0()
                     .children(sidebar_el)
                     .child(contacts_el)
+                    .into_any_element()
             }
         };
 
@@ -4666,6 +5121,17 @@ impl Render for HylkiApp {
                 )
             })
             .child(body)
+            // L-2：三栏拖拽把手的移动监听（把手元素只负责发起拖拽，宽度更新在此完成），
+            // 挂在根节点上使 Mail / Gallery / Contacts 等任意视图下的侧栏把手都生效。
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<SidebarDrag>, _, cx| {
+                this.on_sidebar_drag_move(event, cx);
+            }))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<ListDrag>, _, cx| {
+                this.on_list_drag_move(event, cx);
+            }))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<BelowDrag>, _, cx| {
+                this.on_below_drag_move(event, cx);
+            }))
             .when(!self.status_line.is_empty(), |el| {
                 el.child(
                     h_flex()
@@ -4771,6 +5237,28 @@ impl Render for HylkiApp {
             // Ctrl+Shift+A 显示 / 隐藏账号列表（对齐原版 show-accounts）。
             .on_action(cx.listener(|this, _: &ToggleAccountsList, _window, cx| {
                 this.toggle_accounts_list(cx);
+            }))
+            // L-6：阅读器位置（Ctrl+Alt+1/2/3，对齐原版 reading-pane 单选动作）。
+            .on_action(cx.listener(|this, _: &SetReaderPositionRight, _window, cx| {
+                if this.active_modal == ActiveModal::None {
+                    this.set_reader_position(ReaderPosition::Right, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SetReaderPositionBelow, _window, cx| {
+                if this.active_modal == ActiveModal::None {
+                    this.set_reader_position(ReaderPosition::Below, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SetReaderPositionHidden, _window, cx| {
+                if this.active_modal == ActiveModal::None {
+                    this.set_reader_position(ReaderPosition::Hidden, cx);
+                }
+            }))
+            // L-6：专注模式开关（Ctrl+Shift+F，对齐原版 focus-mode）。
+            .on_action(cx.listener(|this, _: &ToggleFocusMode, _window, cx| {
+                if this.active_modal == ActiveModal::None {
+                    this.toggle_focus_mode(cx);
+                }
             }))
             // F1 / ? 快捷键速查：无浮层或已在速查浮层时响应（同键再按关闭）。
             .on_action(cx.listener(|this, _: &OpenShortcutsWindow, _window, cx| {
@@ -5279,6 +5767,8 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("检查新邮件", "F5"),
             ("搜索邮件列表", "Ctrl+F"),
             ("显示 / 隐藏侧栏账号列表", "Ctrl+Shift+A"),
+            ("阅读器移到右侧 / 下方 / 关闭", "Ctrl+Alt+1 / 2 / 3"),
+            ("专注模式", "Ctrl+Shift+F"),
             ("全屏切换", "F11"),
             ("本清单", "F1 / ?"),
             ("打开偏好设置", "Ctrl+,"),
@@ -6083,6 +6573,55 @@ mod tests {
         assert!(!is_trash_or_junk_folder("收件箱", "INBOX"));
         assert!(!is_trash_or_junk_folder("已发送", "Sent"));
         assert!(!is_trash_or_junk_folder("归档", "Archive"));
+    }
+
+    /// L-6：阅读器位置枚举与偏好字符串互转（未知值返回 None，加载侧回落 Right）。
+    #[test]
+    fn reader_position_key_roundtrip() {
+        assert_eq!(ReaderPosition::default(), ReaderPosition::Right);
+        for (key, expected) in [
+            ("right", ReaderPosition::Right),
+            ("below", ReaderPosition::Below),
+            ("off", ReaderPosition::Hidden),
+        ] {
+            assert_eq!(ReaderPosition::from_key(key), Some(expected));
+            assert_eq!(expected.key(), key);
+        }
+        // 未知 / 旧值不解析成功（加载端 unwrap_or_default 回落 Right）。
+        assert_eq!(ReaderPosition::from_key("under"), None);
+        assert_eq!(ReaderPosition::from_key(""), None);
+        assert_eq!(ReaderPosition::from_key("true"), None);
+    }
+
+    /// L-2：单行表格模式迟滞阈值（进入 ≥600，退出 <560，区间内保持原状态）。
+    #[test]
+    fn list_wide_hysteresis_matches_original_thresholds() {
+        // 未进入宽模式：≥600 才进入。
+        assert!(!list_wide_next(false, 559.0));
+        assert!(!list_wide_next(false, 599.0));
+        assert!(list_wide_next(false, 600.0));
+        assert!(list_wide_next(false, 900.0));
+        // 已进入宽模式：<560 才退出，560~599 区间保持。
+        assert!(list_wide_next(true, 600.0));
+        assert!(list_wide_next(true, 560.0));
+        assert!(list_wide_next(true, 599.0));
+        assert!(!list_wide_next(true, 559.0));
+    }
+
+    /// L-2：布局常量自洽（侧栏范围、列表 / 阅读器最小值与顶栏收纳阈值关系）。
+    #[test]
+    fn layout_constants_are_self_consistent() {
+        assert!(SIDEBAR_MIN_WIDTH < sidebar::SIDEBAR_WIDTH);
+        assert!(sidebar::SIDEBAR_WIDTH < SIDEBAR_MAX_WIDTH);
+        assert!(LIST_MIN_WIDTH < message_list::LIST_WIDTH);
+        assert!(LIST_WIDE_OFF < LIST_WIDE_ON);
+        // 顶栏收纳阈值语义：完整平铺阅读器顶栏至少需要 侧栏上限 + 列表下限 + 阅读器
+        // 最小宽度（280+280+441=1001px），阈值 880px 落在其下——窗口低于阈值时右栏
+        // 必然已被压缩，低频动作应收进 ⋯ 菜单。
+        assert!(SIDEBAR_MAX_WIDTH + LIST_MIN_WIDTH + READER_MIN_WIDTH > READER_OVERFLOW_BREAKPOINT);
+        // 阈值本身仍大于「侧栏下限 + 列表下限」，保证折叠时右栏保有可用空间。
+        assert!(READER_OVERFLOW_BREAKPOINT > SIDEBAR_MIN_WIDTH + LIST_MIN_WIDTH);
+        assert!(BELOW_LIST_MIN_HEIGHT >= BELOW_PANE_MIN_HEIGHT);
     }
 
     /// B-6：已发送文件夹判定（对齐 cache.rs SENT_FOLDER_MATCH）。

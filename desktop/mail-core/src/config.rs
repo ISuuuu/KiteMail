@@ -135,6 +135,18 @@ pub struct AppPreferences {
     /// Ctrl combos always work regardless of this flag.
     #[serde(default = "default_true")]
     pub single_key_shortcuts: bool,
+    /// L-2：左栏（侧边栏）宽度，逻辑像素（180~280）；`None` 用默认 240。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f32>,
+    /// L-2：中栏邮件列表宽度，逻辑像素（≥280）；`None` 用默认 360。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_width: Option<f32>,
+    /// L-6：阅读器位置（`"right"` 右侧 / `"below"` 列表下方 / `"off"` 关闭）。
+    #[serde(default = "default_reader_position")]
+    pub reader_position: String,
+    /// L-6：阅读器在下方时列表的高度，逻辑像素；`None` 用默认 360。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_below_height: Option<f32>,
 }
 
 fn default_true() -> bool {
@@ -143,6 +155,10 @@ fn default_true() -> bool {
 
 fn default_reader_zoom_percent() -> u32 {
     100
+}
+
+fn default_reader_position() -> String {
+    "right".to_string()
 }
 
 /// Clamp reader zoom percentage to the supported `70..=160` range.
@@ -215,6 +231,10 @@ impl Default for AppPreferences {
             allowed_remote_senders: Vec::new(),
             reader_zoom_percent: 100,
             single_key_shortcuts: true,
+            sidebar_width: None,
+            list_width: None,
+            reader_position: "right".to_string(),
+            list_below_height: None,
         }
     }
 }
@@ -410,6 +430,10 @@ smtp_separate_credentials = false
             allowed_remote_senders: vec!["trusted@example.com".to_string()],
             reader_zoom_percent: 125,
             single_key_shortcuts: false,
+            sidebar_width: None,
+            list_width: None,
+            reader_position: "right".to_string(),
+            list_below_height: None,
         };
         save_preferences_in(&base, &prefs).expect("save should succeed");
         let loaded = load_preferences_in(&base).expect("load should succeed");
@@ -512,6 +536,40 @@ smtp_separate_credentials = false
         save_preferences_in(&base, &custom).expect("save custom prefs");
         let reloaded = load_preferences_in(&base).expect("reload custom prefs");
         assert_eq!(reloaded, custom);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// L-2/L-6：布局字段（宽度 / 阅读器位置 / 下方列表高度）默认值、旧文件兼容与往返。
+    #[test]
+    fn preferences_layout_fields_defaults_and_roundtrip() {
+        let base = std::env::temp_dir().join("hylki test 偏好布局字段");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // 旧格式文件（无布局字段）加载后回落默认值。
+        fs::write(
+            preferences_file_in(&base),
+            "theme_id = 'default'\npage_size = 50\n",
+        )
+        .expect("write legacy prefs");
+        let legacy = load_preferences_in(&base).expect("load legacy file");
+        assert_eq!(legacy.sidebar_width, None);
+        assert_eq!(legacy.list_width, None);
+        assert_eq!(legacy.reader_position, "right");
+        assert_eq!(legacy.list_below_height, None);
+
+        // 往返：持久化全部布局字段。
+        let prefs = AppPreferences {
+            sidebar_width: Some(208.0),
+            list_width: Some(640.0),
+            reader_position: "below".to_string(),
+            list_below_height: Some(420.0),
+            ..AppPreferences::default()
+        };
+        save_preferences_in(&base, &prefs).expect("save should succeed");
+        let loaded = load_preferences_in(&base).expect("load should succeed");
+        assert_eq!(loaded, prefs);
 
         let _ = fs::remove_dir_all(&base);
     }

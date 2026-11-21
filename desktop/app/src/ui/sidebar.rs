@@ -12,23 +12,24 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
+use gpui_kit::component::resizable::{resize_handle, HandleEdge};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, WindowControlArea,
+    div, px, AppContext, Axis, Context, Div, InteractiveElement, IntoElement, ParentElement,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, WindowControlArea,
 };
 use hylki_mail_core::config::AuthBackend;
 use hylki_mail_core::{MailRequest, OutboxItem, OutboxStatus};
 
-use crate::app::{CurrentView, HylkiApp, MainContentView};
+use crate::app::{CurrentView, HylkiApp, MainContentView, ReaderPosition, SidebarDrag};
 use crate::theme;
 use crate::ui::avatar;
 
-/// 左栏宽度（方案文档：230 ~ 250px）。
-const SIDEBAR_WIDTH: f32 = 240.0;
+/// 左栏默认宽度（方案文档：230 ~ 250px；L-2 起可拖拽调整为 180~280，持久化到偏好）。
+pub(crate) const SIDEBAR_WIDTH: f32 = 240.0;
 /// 顶部栏高度。
 const HEADER_HEIGHT: f32 = 48.0;
 /// 导航行高度。
@@ -437,12 +438,22 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let menu_button = main_menu_button(app, cx);
 
     v_flex()
-        .w(px(SIDEBAR_WIDTH))
+        .w(px(app.sidebar_width))
+        .min_w(px(crate::app::SIDEBAR_MIN_WIDTH))
+        .max_w(px(crate::app::SIDEBAR_MAX_WIDTH))
         .h_full()
         .flex_shrink_0()
+        .relative()
         .bg(sidebar_bg)
         .border_r_1()
         .border_color(border)
+        // L-2：右缘拖拽把手（180~280 调宽，移动监听与持久化在 app.rs 根节点）；
+        // 窄轨模式（render_collapsed）不挂把手。
+        .child(
+            resize_handle::<SidebarDrag, SidebarDrag>("sidebar-resize-handle", Axis::Horizontal)
+                .inside(HandleEdge::Trailing)
+                .on_drag(SidebarDrag, |_, _, _, cx| cx.new(|_| SidebarDrag)),
+        )
         // 顶部栏 48px：刷新 + Hylki + 菜单。
         .child(
             h_flex()
@@ -738,6 +749,8 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
     let dark = app.dark_mode;
     let demo_mode = app.demo_mode;
     let show_accounts = app.show_accounts;
+    let reader_position = app.reader_position;
+    let focus_mode = app.focus_mode;
     let entity = cx.entity();
     let entity_for_accounts = entity.clone();
     let entity_for_fullscreen = entity.clone();
@@ -747,11 +760,13 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
     let entity_for_shortcuts = entity.clone();
     let entity_for_about = entity.clone();
     let entity_for_quit = entity.clone();
+    let entity_for_reader_pos = entity.clone();
+    let entity_for_focus = entity.clone();
     Button::new("sb-menu")
         .ghost()
         .compact()
         .icon(IconName::Menu)
-        .dropdown_menu(move |menu, _, _| {
+        .dropdown_menu(move |menu, window, cx| {
             let entity = entity.clone();
             let entity_for_accounts = entity_for_accounts.clone();
             let entity_for_fullscreen = entity_for_fullscreen.clone();
@@ -761,6 +776,8 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
             let entity_for_shortcuts = entity_for_shortcuts.clone();
             let entity_for_about = entity_for_about.clone();
             let entity_for_quit = entity_for_quit.clone();
+            let entity_for_reader_pos = entity_for_reader_pos.clone();
+            let entity_for_focus = entity_for_focus.clone();
             menu.item(
                 // 演示模式下账号管理不可用（无 worker 账号可编辑）。
                 PopupMenuItem::new("账号管理")
@@ -787,6 +804,41 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
                 }),
             )
             .separator()
+            // L-6：阅读器位置子菜单（右上 / 下方 / 关闭，当前项打勾，Ctrl+Alt+1/2/3），
+            // 对齐原版主菜单「Reading Pane」单选组（#475）。
+            .submenu("阅读器位置", window, cx, move |mut sub, _, _| {
+                for (label, position) in [
+                    ("右侧  Ctrl+Alt+1", ReaderPosition::Right),
+                    ("下方  Ctrl+Alt+2", ReaderPosition::Below),
+                    ("关闭  Ctrl+Alt+3", ReaderPosition::Hidden),
+                ] {
+                    let e_pos = entity_for_reader_pos.clone();
+                    let is_current = reader_position == position;
+                    sub = sub.item(PopupMenuItem::new(label).checked(is_current).on_click(
+                        move |_, _, cx| {
+                            e_pos.update(cx, |app, cx| {
+                                app.set_reader_position(position, cx);
+                            });
+                        },
+                    ));
+                }
+                sub
+            })
+            .item(
+                // L-6：专注模式开关（会话级，Ctrl+Shift+F，对齐原版 focus-mode）。
+                PopupMenuItem::new(if focus_mode {
+                    "关闭专注模式  Ctrl+Shift+F"
+                } else {
+                    "专注模式  Ctrl+Shift+F"
+                })
+                .checked(focus_mode)
+                .icon(Icon::new(IconName::Eye))
+                .on_click(move |_, _, cx| {
+                    entity_for_focus.update(cx, |app, cx| {
+                        app.toggle_focus_mode(cx);
+                    });
+                }),
+            )
             .item(
                 PopupMenuItem::new("全屏切换  F11")
                     .icon(Icon::new(IconName::Maximize))
@@ -860,7 +912,7 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
 }
 
 /// 折叠窄轨宽度（对齐原版 `SIDEBAR_RAIL_WIDTH` = 80px）。
-const RAIL_WIDTH: f32 = 80.0;
+pub(crate) const RAIL_WIDTH: f32 = 80.0;
 
 /// 左栏折叠窄轨（`sidebar_hidden` 时替代宽栏，对齐原版图标窄轨）：
 /// - 顶部固定：主菜单 + 刷新；下方写邮件图标按钮（触发现有写信动作）。
