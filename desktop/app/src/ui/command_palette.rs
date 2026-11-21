@@ -1,0 +1,594 @@
+#![allow(dead_code)]
+// TODO(phase3-wire): integrate into HylkiApp.
+//! 命令面板（方案文档第三节页面 6）：
+//! - 居中悬浮卡片 560x440（阴影 + 圆角 12px），带半透明遮罩，
+//!   点击遮罩或按 Esc 发 [`CommandPaletteEvent::Closed`]。
+//! - 顶部单行搜索框（placeholder「输入命令、文件夹或 > 仅筛选操作...」），
+//!   输入以 `>` 开头时仅显示操作类命令；其余为忽略大小写的名称子串过滤。
+//! - 下方滚动结果列表：图标 + 名称 + 右侧类型提示（「操作」/「文件夹」/
+//!   快捷键）；↑ / ↓ 循环移动高亮，Enter（或点击行）执行并发
+//!   [`CommandPaletteEvent::CommandExecuted`]。
+//!
+//! 自包含组件：键盘依赖 gpui-kit Input 的既有全局绑定（单行输入对
+//! ↑ / ↓ / Esc 不消费事件，会冒泡到卡片上的 `on_key_down`）。
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::Icon;
+use gpui_kit::component::{h_flex, v_flex, Sizable};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::{
+    black, div, px, AppContext, Context, EventEmitter, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled,
+};
+
+/// 命令面板可执行的命令（由集成者构造并传入）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteCommand {
+    /// 写新邮件。
+    NewCompose,
+    /// 刷新所有账号。
+    RefreshAll,
+    /// 切换统一收件箱视图。
+    ToggleUnifiedInbox,
+    /// 打开账号管理。
+    OpenAccountSettings,
+    /// 打开偏好设置。
+    OpenPreferences,
+    /// 切换亮 / 暗主题。
+    ToggleTheme,
+    /// 跳转到指定账号的指定文件夹。
+    GoFolder { account_id: u32, folder_id: u32 },
+}
+
+impl PaletteCommand {
+    /// 命令显示名（GoFolder 为通用名，动态名见 [`Self::label_with`]）。
+    pub fn label(&self) -> &'static str {
+        match self {
+            PaletteCommand::NewCompose => "写新邮件",
+            PaletteCommand::RefreshAll => "刷新全部",
+            PaletteCommand::ToggleUnifiedInbox => "切换统一收件箱",
+            PaletteCommand::OpenAccountSettings => "打开账号管理",
+            PaletteCommand::OpenPreferences => "打开偏好设置",
+            PaletteCommand::ToggleTheme => "切换亮暗主题",
+            PaletteCommand::GoFolder { .. } => "跳转到文件夹",
+        }
+    }
+
+    /// 带文件夹名的显示名（非 GoFolder 命令与 [`Self::label`] 相同）。
+    pub fn label_with(&self, folder_name: &str) -> String {
+        match self {
+            PaletteCommand::GoFolder { .. } => format!("跳转到 {folder_name}"),
+            _ => self.label().to_string(),
+        }
+    }
+
+    /// 是否为文件夹跳转类命令（`>` 前缀过滤时被排除）。
+    pub fn is_folder(&self) -> bool {
+        matches!(self, PaletteCommand::GoFolder { .. })
+    }
+
+    /// 命令图标。
+    fn icon(self) -> IconName {
+        match self {
+            PaletteCommand::NewCompose => IconName::Plus,
+            PaletteCommand::RefreshAll => IconName::RefreshCw,
+            PaletteCommand::ToggleUnifiedInbox => IconName::Inbox,
+            PaletteCommand::OpenAccountSettings => IconName::Settings,
+            PaletteCommand::OpenPreferences => IconName::Settings2,
+            PaletteCommand::ToggleTheme => IconName::Moon,
+            PaletteCommand::GoFolder { .. } => IconName::Folder,
+        }
+    }
+
+    /// 已知全局快捷键提示（无则返回 None，列表显示类型提示）。
+    fn shortcut(self) -> Option<&'static str> {
+        match self {
+            PaletteCommand::NewCompose => Some("Ctrl+N"),
+            PaletteCommand::RefreshAll => Some("Ctrl+R"),
+            _ => None,
+        }
+    }
+}
+
+/// 命令面板事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandPaletteEvent {
+    /// 用户通过 Enter 或点击行执行了命令。
+    CommandExecuted(PaletteCommand),
+    /// 用户按 Esc 或点击遮罩关闭面板。
+    Closed,
+}
+
+/// 命令面板视图状态（独立 Entity，phase3 接线；通常作为浮层挂载）。
+pub struct CommandPaletteState {
+    search_input: gpui_kit::Entity<InputState>,
+    /// 当前搜索词（含可能的 `>` 前缀）。
+    query: String,
+    /// 集成者传入的候选命令。
+    commands: Vec<PaletteCommand>,
+    /// GoFolder 命令的动态显示名 `(account_id, folder_id, 文件夹名)`，
+    /// 由集成者通过 [`Self::set_folder_names`] 提供。
+    folder_names: Vec<(u32, u32, String)>,
+    /// 当前高亮下标（指向过滤后的列表）。
+    selected: usize,
+}
+
+impl EventEmitter<CommandPaletteEvent> for CommandPaletteState {}
+
+impl CommandPaletteState {
+    pub fn new(
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+        commands: Vec<PaletteCommand>,
+    ) -> Self {
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("输入命令、文件夹或 > 仅筛选操作...")
+        });
+        cx.subscribe(
+            &search_input,
+            |this, input, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    this.query = input.read(cx).value().to_string();
+                    this.selected = 0;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.execute_selected(cx);
+                }
+                _ => {}
+            },
+        )
+        .detach();
+        // 打开面板即聚焦搜索框，保证键盘输入与 ↑ / ↓ / Esc 可用。
+        search_input.update(cx, |state, cx| state.focus(window, cx));
+        Self {
+            search_input,
+            query: String::new(),
+            commands,
+            folder_names: Vec::new(),
+            selected: 0,
+        }
+    }
+
+    /// 注入 GoFolder 命令的文件夹显示名（`(account_id, folder_id, 名称)`）。
+    pub fn set_folder_names(&mut self, names: Vec<(u32, u32, String)>) {
+        self.folder_names = names;
+    }
+
+    /// GoFolder 命令的显示名（找不到动态名时回落到通用名）。
+    fn display_name(&self, command: &PaletteCommand) -> String {
+        match command {
+            PaletteCommand::GoFolder {
+                account_id,
+                folder_id,
+            } => self
+                .folder_names
+                .iter()
+                .find(|(acc, folder, _)| acc == account_id && folder == folder_id)
+                .map(|(_, _, name)| command.label_with(name))
+                .unwrap_or_else(|| command.label().to_string()),
+            _ => command.label().to_string(),
+        }
+    }
+
+    /// 命令是否匹配当前搜索词（空词匹配全部）。
+    fn command_matches(&self, command: &PaletteCommand, query: &str) -> bool {
+        let name = self.display_name(command).to_lowercase();
+        name.contains(&query.to_lowercase())
+    }
+
+    /// 过滤后的命令列表；查询以 `>` 开头时仅保留操作类命令，
+    /// 其余按忽略大小写的名称子串匹配。
+    fn filtered_commands(&self) -> Vec<PaletteCommand> {
+        filter_commands(&self.commands, &self.query, &self.folder_names)
+    }
+
+    /// 执行当前高亮命令并发事件；无候选时不动。
+    fn execute_selected(&mut self, cx: &mut Context<Self>) {
+        let filtered = self.filtered_commands();
+        if filtered.is_empty() {
+            return;
+        }
+        let index = self.selected.min(filtered.len() - 1);
+        let command = filtered[index];
+        cx.emit(CommandPaletteEvent::CommandExecuted(command));
+        cx.notify();
+    }
+
+    /// ↑ / ↓ 循环移动高亮；无候选时不动。
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.filtered_commands().len();
+        if len == 0 {
+            return;
+        }
+        let current = self.selected.min(len - 1) as isize;
+        let next = (current + delta).rem_euclid(len as isize) as usize;
+        self.selected = next;
+        cx.notify();
+    }
+}
+
+/// 纯过滤逻辑（便于单元测试）：见 [`CommandPaletteState::filtered_commands`]。
+fn filter_commands(
+    commands: &[PaletteCommand],
+    query: &str,
+    folder_names: &[(u32, u32, String)],
+) -> Vec<PaletteCommand> {
+    let query = query.trim();
+    // `>` 前缀：仅显示操作类命令。
+    let (actions_only, keyword) = match query.strip_prefix('>') {
+        Some(rest) => (true, rest.trim().to_lowercase()),
+        None => (false, query.to_lowercase()),
+    };
+    commands
+        .iter()
+        .copied()
+        .filter(|command| !actions_only || !command.is_folder())
+        .filter(|command| {
+            keyword.is_empty() || {
+                let name = match command {
+                    PaletteCommand::GoFolder {
+                        account_id,
+                        folder_id,
+                    } => folder_names
+                        .iter()
+                        .find(|(acc, folder, _)| acc == account_id && folder == folder_id)
+                        .map(|(_, _, name)| format!("跳转到 {name}"))
+                        .unwrap_or_else(|| command.label().to_string()),
+                    _ => command.label().to_string(),
+                };
+                name.to_lowercase().contains(&keyword)
+            }
+        })
+        .collect()
+}
+
+impl Render for CommandPaletteState {
+    fn render(
+        &mut self,
+        _window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // 避坑清单第 4 条：render 开头先把语义色 Copy 成局部变量。
+        let p = crate::theme::current(cx);
+        let (surface_raised, border, text, muted_fg, accent, accent_soft, danger) = (
+            p.surface_raised,
+            p.border,
+            p.text,
+            p.text_muted,
+            p.accent,
+            p.accent_soft(),
+            p.danger,
+        );
+
+        let filtered = self.filtered_commands();
+        let selected = if filtered.is_empty() {
+            0
+        } else {
+            self.selected.min(filtered.len() - 1)
+        };
+        let is_empty_result = filtered.is_empty();
+
+        let rows: Vec<Stateful<gpui_kit::Div>> = filtered
+            .iter()
+            .enumerate()
+            .map(|(ix, command)| {
+                let is_selected = ix == selected;
+                let name = self.display_name(command);
+                let hint = command
+                    .shortcut()
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| {
+                        SharedString::from(if command.is_folder() {
+                            "文件夹"
+                        } else {
+                            "操作"
+                        })
+                    });
+                let icon = command.icon();
+                let command = *command;
+                h_flex()
+                    .id(("palette-row", ix))
+                    .h(px(36.0))
+                    .mx_2()
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .when(is_selected, |row| row.bg(accent_soft))
+                    .when(!is_selected, |row| row.hover(move |s| s.bg(accent_soft)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(CommandPaletteEvent::CommandExecuted(command));
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(icon)
+                            .with_size(px(15.0))
+                            .text_color(if is_selected { accent } else { muted_fg }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(if is_selected { accent } else { text })
+                            .truncate()
+                            .child(SharedString::from(name)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(hint),
+                    )
+            })
+            .collect();
+
+        // 遮罩：点击关闭（卡片内部 mousedown 阻止冒泡，避免误关）。
+        let backdrop = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(black().opacity(0.4))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(CommandPaletteEvent::Closed);
+                }),
+            );
+
+        // 居中卡片 560x440：搜索框 + 滚动结果列表。
+        let card = v_flex()
+            .id("palette-card")
+            .w(px(560.0))
+            .h(px(440.0))
+            .bg(surface_raised)
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(border)
+            .shadow_xl()
+            .overflow_hidden()
+            // 吃掉卡片内部的鼠标按下事件，避免点击行 / 输入框时冒泡到遮罩。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            // ↑ / ↓ 移动高亮、Esc 关闭：搜索框聚焦时按键冒泡到此处。
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "up" => {
+                        this.move_selection(-1, cx);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                    "down" => {
+                        this.move_selection(1, cx);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        cx.emit(CommandPaletteEvent::Closed);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        Icon::new(IconName::Search)
+                            .with_size(px(16.0))
+                            .text_color(muted_fg),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.search_input)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("palette-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .py_1()
+                    .when(is_empty_result, |el| {
+                        el.child(
+                            v_flex()
+                                .flex_1()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::Search)
+                                        .with_size(px(22.0))
+                                        .text_color(muted_fg),
+                                )
+                                .child(div().text_sm().text_color(muted_fg).child(
+                                    if self.query.starts_with('>') {
+                                        "没有匹配的操作"
+                                    } else {
+                                        "没有匹配的命令"
+                                    },
+                                )),
+                        )
+                    })
+                    .children(rows),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::Keyboard)
+                                    .with_size(px(12.0))
+                                    .text_color(muted_fg),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child("↑↓ 选择  Enter 执行  Esc 关闭  > 仅操作"),
+                            ),
+                    )
+                    .child(
+                        h_flex().gap_1().items_center().child(
+                            div()
+                                .text_xs()
+                                .text_color(if is_empty_result { danger } else { muted_fg })
+                                .child(SharedString::from(format!(
+                                    "{} / {}",
+                                    if is_empty_result { 0 } else { selected + 1 },
+                                    filtered.len()
+                                ))),
+                        ),
+                    ),
+            );
+
+        backdrop.child(
+            h_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(card),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_commands() -> Vec<PaletteCommand> {
+        vec![
+            PaletteCommand::NewCompose,
+            PaletteCommand::RefreshAll,
+            PaletteCommand::ToggleUnifiedInbox,
+            PaletteCommand::OpenAccountSettings,
+            PaletteCommand::OpenPreferences,
+            PaletteCommand::ToggleTheme,
+            PaletteCommand::GoFolder {
+                account_id: 1,
+                folder_id: 7,
+            },
+        ]
+    }
+
+    #[test]
+    fn labels_are_visible_and_typed() {
+        assert_eq!(PaletteCommand::NewCompose.label(), "写新邮件");
+        assert_eq!(PaletteCommand::ToggleTheme.label(), "切换亮暗主题");
+        assert_eq!(
+            PaletteCommand::GoFolder {
+                account_id: 1,
+                folder_id: 7
+            }
+            .label(),
+            "跳转到文件夹"
+        );
+        assert_eq!(
+            PaletteCommand::GoFolder {
+                account_id: 1,
+                folder_id: 7
+            }
+            .label_with("收件箱"),
+            "跳转到 收件箱"
+        );
+        assert_eq!(PaletteCommand::NewCompose.label_with("收件箱"), "写新邮件");
+        assert!(PaletteCommand::GoFolder {
+            account_id: 1,
+            folder_id: 7
+        }
+        .is_folder());
+        assert!(!PaletteCommand::RefreshAll.is_folder());
+    }
+
+    #[test]
+    fn filter_empty_query_returns_all() {
+        let result = filter_commands(&all_commands(), "", &[]);
+        assert_eq!(result.len(), 7);
+    }
+
+    #[test]
+    fn filter_substring_is_case_insensitive() {
+        // 中文子串。
+        let result = filter_commands(&all_commands(), "刷新", &[]);
+        assert_eq!(result, vec![PaletteCommand::RefreshAll]);
+        // 大小写不敏感（对含 ASCII 的显示名）。
+        let result = filter_commands(&all_commands(), "CTRL", &[]);
+        assert!(result.is_empty(), "按显示名过滤而非快捷键");
+        // 无匹配。
+        assert!(filter_commands(&all_commands(), "zzz", &[]).is_empty());
+    }
+
+    #[test]
+    fn filter_gt_prefix_shows_actions_only() {
+        // `>` 前缀 + 空关键词：仅操作类，排除文件夹跳转。
+        let result = filter_commands(&all_commands(), ">", &[]);
+        assert_eq!(result.len(), 6);
+        assert!(result.iter().all(|c| !c.is_folder()));
+
+        // `>` 前缀 + 关键词：在操作类里继续子串过滤。
+        let result = filter_commands(&all_commands(), "> 刷新", &[]);
+        assert_eq!(result, vec![PaletteCommand::RefreshAll]);
+
+        // `>` 前缀下文件夹动态名不参与匹配：命中「收件箱」的只有
+        // 「切换统一收件箱」这个操作，GoFolder（动态名收件箱）被排除。
+        let folders = vec![(1u32, 7u32, "收件箱".to_string())];
+        let result = filter_commands(&all_commands(), "> 收件箱", &folders);
+        assert_eq!(result, vec![PaletteCommand::ToggleUnifiedInbox]);
+    }
+
+    #[test]
+    fn filter_matches_folder_display_name() {
+        let folders = vec![(1u32, 7u32, "收件箱".to_string())];
+        let result = filter_commands(&all_commands(), "收件箱", &folders);
+        assert_eq!(
+            result,
+            vec![
+                PaletteCommand::ToggleUnifiedInbox,
+                PaletteCommand::GoFolder {
+                    account_id: 1,
+                    folder_id: 7
+                },
+            ]
+        );
+        // 没有动态名时回落到通用名。
+        let result = filter_commands(&all_commands(), "跳转到", &[]);
+        assert_eq!(
+            result,
+            vec![PaletteCommand::GoFolder {
+                account_id: 1,
+                folder_id: 7
+            }]
+        );
+    }
+}
