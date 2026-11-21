@@ -14,9 +14,31 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_INITIAL_FETCH: usize = 100;
 
 type TlsStream = async_native_tls::TlsStream<TcpStream>;
-type ImapSession = async_imap::Session<TlsStream>;
+pub(crate) type ImapSession = async_imap::Session<TlsStream>;
 
-async fn connect_imap(account: &AccountConfig, password: &str) -> Result<ImapSession, String> {
+/// XOAUTH2 SASL authenticator for async-imap (`AUTHENTICATE XOAUTH2`).
+struct XOAuth2 {
+    user: String,
+    token: String,
+    step: u8,
+}
+
+impl async_imap::Authenticator for XOAuth2 {
+    type Response = Vec<u8>;
+    fn process(&mut self, challenge: &[u8]) -> Self::Response {
+        self.step += 1;
+        if self.step == 1 {
+            format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.token).into_bytes()
+        } else {
+            let _ = challenge;
+            Vec::new()
+        }
+    }
+}
+
+async fn connect_imap_client(
+    account: &AccountConfig,
+) -> Result<async_imap::Client<TlsStream>, String> {
     if account.imap_host.trim().is_empty() {
         return Err("IMAP 主机地址不能为空".to_string());
     }
@@ -61,13 +83,22 @@ async fn connect_imap(account: &AccountConfig, password: &str) -> Result<ImapSes
         }
     };
 
-    let username = if account.imap_username.trim().is_empty() {
+    Ok(client)
+}
+
+fn imap_username_for(account: &AccountConfig) -> &str {
+    if account.imap_username.trim().is_empty() {
         account.email.as_str()
     } else {
         account.imap_username.as_str()
-    };
+    }
+}
 
-    let session = client.login(username, password).await.map_err(|(e, _)| {
+async fn connect_imap(account: &AccountConfig, password: &str) -> Result<ImapSession, String> {
+    let client = connect_imap_client(account).await?;
+    let username = imap_username_for(account);
+
+    let mut session = client.login(username, password).await.map_err(|(e, _)| {
         let msg = e.to_string();
         if msg.contains("Basic authentication is disabled") {
             "该邮箱服务商已禁用传统密码登录（Basic authentication is disabled），Outlook / Microsoft 365 需通过 OAuth2 授权登录；请先使用 QQ 邮箱、网易 163 或支持应用专用密码的邮箱测试。".to_string()
@@ -76,7 +107,138 @@ async fn connect_imap(account: &AccountConfig, password: &str) -> Result<ImapSes
         }
     })?;
 
+    if is_netease_host(&account.imap_host) {
+        send_netease_id_in_place(&mut session).await;
+    }
     Ok(session)
+}
+
+/// Connect to an IMAP server using OAuth2 (`AUTHENTICATE XOAUTH2`).
+pub async fn connect_imap_xoauth2(
+    account: &AccountConfig,
+    access_token: &str,
+) -> Result<ImapSession, String> {
+    let client = connect_imap_client(account).await?;
+    let auth = XOAuth2 {
+        user: imap_username_for(account).to_string(),
+        token: access_token.to_string(),
+        step: 0,
+    };
+    let mut session = tokio::time::timeout(IO_TIMEOUT, client.authenticate("XOAUTH2", auth))
+        .await
+        .map_err(|_| "IMAP XOAUTH2 认证超时".to_string())?
+        .map_err(|(e, _)| format!("IMAP XOAUTH2 认证失败: {e}"))?;
+
+    if is_netease_host(&account.imap_host) {
+        send_netease_id_in_place(&mut session).await;
+    }
+    Ok(session)
+}
+
+fn is_netease_host(host: &str) -> bool {
+    let lower = host.trim().to_ascii_lowercase();
+    lower.ends_with(".163.com")
+        || lower.ends_with(".126.com")
+        || lower.ends_with(".yeah.net")
+        || lower.ends_with(".188.com")
+}
+
+/// NetEase (163/126/yeah.net) requires RFC 2971 `ID` identification on some accounts
+/// before `SELECT`/`EXAMINE` is permitted. Best-effort and ignored if unsupported.
+async fn send_netease_id_in_place(session: &mut ImapSession) {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.run_command_and_check_ok(
+            "ID (\"name\" \"Hylki\" \"version\" \"1.0\" \"vendor\" \"Hylki\")",
+        ),
+    )
+    .await;
+}
+
+/// Result of one IMAP IDLE watch cycle on a mailbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdleWatchEvent {
+    /// The server announced new/expunged mail or the mailbox state changed.
+    MailboxChanged,
+    /// The connection was lost or authentication failed and needs to be re-established.
+    Disconnected,
+}
+
+/// Open an examine-only IMAP session on `folder_path` (e.g. `"INBOX"`) and enter
+/// `IDLE` push mode. Whenever the server pushes `NewData` (or the unseen/exists count
+/// changes after a periodic 60-second heartbeat), calls `on_changed()` so the worker
+/// can immediately sync new messages.
+///
+/// Works with both Password IMAP (163, 126, QQ, Gmail, iCloud, Exmail, Aliyun, etc.)
+/// and OAuth2 XOAUTH2 IMAP (`outlook.office365.com:993`, `imap.gmail.com:993`).
+pub async fn run_idle_inbox_session<F>(
+    mut session: ImapSession,
+    folder_path: &str,
+    mut on_changed: F,
+) -> Result<(), String>
+where
+    F: FnMut(),
+{
+    const IDLE_INIT_TIMEOUT: Duration = Duration::from_secs(15);
+    const IDLE_DONE_TIMEOUT: Duration = Duration::from_secs(10);
+    // Keep each IDLE round to 120 seconds so NAT/firewalls don't drop silent TCP sockets,
+    // and so servers that don't push flag changes still get a lightweight UIDNEXT/EXISTS check.
+    const IDLE_ROUND_DURATION: Duration = Duration::from_secs(120);
+
+    let initial_mb = tokio::time::timeout(IO_TIMEOUT, session.examine(folder_path))
+        .await
+        .map_err(|_| format!("IDLE 监听打开 {folder_path} 超时"))?
+        .map_err(|e| format!("IDLE 监听打开 {folder_path} 失败: {e}"))?;
+
+    let mut last_exists = initial_mb.exists;
+    let mut last_uid_next = initial_mb.uid_next;
+
+    loop {
+        let mut handle = session.idle();
+        match tokio::time::timeout(IDLE_INIT_TIMEOUT, handle.init()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("启动 IMAP IDLE 失败: {e}")),
+            Err(_) => return Err("启动 IMAP IDLE 超时".to_string()),
+        }
+
+        let idle_res = {
+            let (idle_fut, _stop) = handle.wait_with_timeout(IDLE_ROUND_DURATION);
+            idle_fut.await
+        };
+
+        session = match tokio::time::timeout(IDLE_DONE_TIMEOUT, handle.done()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(format!("结束 IMAP IDLE 握手失败: {e}")),
+            Err(_) => return Err("结束 IMAP IDLE (DONE) 超时".to_string()),
+        };
+
+        let pushed_new_data = matches!(
+            idle_res,
+            Ok(async_imap::extensions::idle::IdleResponse::NewData(_))
+        );
+
+        // Re-examine to get fresh EXISTS / UIDNEXT and verify connection health.
+        let mb = tokio::time::timeout(IO_TIMEOUT, session.examine(folder_path))
+            .await
+            .map_err(|_| "IDLE 状态校验超时".to_string())?
+            .map_err(|e| format!("IDLE 状态校验失败: {e}"))?;
+
+        let state_changed = mb.exists != last_exists || mb.uid_next != last_uid_next;
+        last_exists = mb.exists;
+        last_uid_next = mb.uid_next;
+
+        if pushed_new_data || state_changed {
+            on_changed();
+        }
+    }
+}
+
+/// Open an examine-only IMAP session using password credentials.
+pub async fn connect_imap_password(
+    account: &AccountConfig,
+    password: &str,
+) -> Result<ImapSession, String> {
+    connect_imap(account, password).await
 }
 
 /// Verify IMAP connectivity and login credentials.
@@ -1035,5 +1197,29 @@ mod tests {
             build_imap_search_query("发票"),
             "CHARSET UTF-8 OR SUBJECT \"发票\" TEXT \"发票\""
         );
+    }
+
+    #[test]
+    fn xoauth2_authenticator_sends_bearer_then_empty_on_error() {
+        use async_imap::Authenticator;
+        let mut auth = XOAuth2 {
+            user: "user@outlook.com".to_string(),
+            token: "test_token_123".to_string(),
+            step: 0,
+        };
+        assert_eq!(
+            auth.process(b""),
+            b"user=user@outlook.com\x01auth=Bearer test_token_123\x01\x01".to_vec()
+        );
+        assert_eq!(auth.process(b"{\"status\":\"400\"}"), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn netease_host_detection_matches_163_126_yeah() {
+        assert!(is_netease_host("imap.163.com"));
+        assert!(is_netease_host("imap.126.com"));
+        assert!(is_netease_host("imap.yeah.net"));
+        assert!(!is_netease_host("imap.gmail.com"));
+        assert!(!is_netease_host("outlook.office365.com"));
     }
 }

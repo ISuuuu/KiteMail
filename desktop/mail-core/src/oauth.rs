@@ -15,6 +15,15 @@ const MICROSOFT_SCOPES: &str = "https://graph.microsoft.com/Mail.ReadWrite \
                                 https://graph.microsoft.com/Mail.Send \
                                 https://graph.microsoft.com/User.Read \
                                 offline_access";
+/// Authorize scope requesting both Microsoft Graph and Exchange Online IMAP IDLE permissions.
+const MICROSOFT_AUTH_SCOPES: &str = "https://graph.microsoft.com/Mail.ReadWrite \
+                                     https://graph.microsoft.com/Mail.Send \
+                                     https://graph.microsoft.com/User.Read \
+                                     https://outlook.office.com/IMAP.AccessAsUser.All \
+                                     offline_access";
+/// Token refresh scope for Exchange Online IMAP (`outlook.office365.com:993` XOAUTH2 + IDLE).
+const MICROSOFT_IMAP_SCOPES: &str =
+    "https://outlook.office.com/IMAP.AccessAsUser.All offline_access";
 
 const SUCCESS_HTML: &str = r##"<!doctype html>
 <html lang="zh-CN">
@@ -112,7 +121,7 @@ pub fn run_microsoft_oauth_login(custom_client_id: &str) -> Result<OAuthSignInRe
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_mode", "query")
-        .append_pair("scope", MICROSOFT_SCOPES)
+        .append_pair("scope", MICROSOFT_AUTH_SCOPES)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &state)
@@ -240,6 +249,22 @@ pub fn refresh_microsoft_token(
     custom_client_id: &str,
     refresh_token: &str,
 ) -> Result<RefreshedTokens, String> {
+    refresh_microsoft_token_with_scope(custom_client_id, refresh_token, MICROSOFT_SCOPES)
+}
+
+/// Exchange a saved `refresh_token` for a fresh Exchange Online IMAP access token (`XOAUTH2` + `IDLE`).
+pub fn refresh_microsoft_imap_token(
+    custom_client_id: &str,
+    refresh_token: &str,
+) -> Result<RefreshedTokens, String> {
+    refresh_microsoft_token_with_scope(custom_client_id, refresh_token, MICROSOFT_IMAP_SCOPES)
+}
+
+fn refresh_microsoft_token_with_scope(
+    custom_client_id: &str,
+    refresh_token: &str,
+    scope: &str,
+) -> Result<RefreshedTokens, String> {
     let client_id = if custom_client_id.trim().is_empty() {
         DEFAULT_MICROSOFT_CLIENT_ID
     } else {
@@ -251,7 +276,7 @@ pub fn refresh_microsoft_token(
             ("client_id", client_id),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("scope", MICROSOFT_SCOPES),
+            ("scope", scope),
         ])
         .map_err(format_ureq_error)?;
 

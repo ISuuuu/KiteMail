@@ -217,6 +217,7 @@ fn default_view_label(view: &str) -> &'static str {
 #[allow(dead_code)]
 fn sync_interval_label(minutes: u32) -> &'static str {
     match minutes {
+        1 => "1 分钟",
         5 => "5 分钟",
         15 => "15 分钟",
         _ => "手动",
@@ -409,7 +410,7 @@ impl Render for PreferencesState {
                 );
                 let sync_pills = option_pills(
                     "pref-sync",
-                    &[(0u32, "手动"), (5, "5 分钟"), (15, "15 分钟")],
+                    &[(0u32, "手动"), (1, "1 分钟"), (5, "5 分钟"), (15, "15 分钟")],
                     prefs.auto_sync_minutes,
                     cx,
                     PreferencesState::set_auto_sync_minutes,
@@ -770,6 +771,7 @@ mod tests {
         assert_eq!(default_view_label("last"), "上次文件夹");
         assert_eq!(default_view_label("unknown"), "统一收件箱");
         assert_eq!(sync_interval_label(0), "手动");
+        assert_eq!(sync_interval_label(1), "1 分钟");
         assert_eq!(sync_interval_label(5), "5 分钟");
         assert_eq!(sync_interval_label(15), "15 分钟");
     }

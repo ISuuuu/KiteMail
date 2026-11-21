@@ -16,6 +16,7 @@ use crate::{
 };
 
 type TokenCache = HashMap<u32, (String, Instant)>;
+type IdleWatchers = HashMap<u32, tokio::task::JoinHandle<()>>;
 
 /// Handle owned by the UI to dispatch [`MailRequest`]s and poll [`WorkerEvent`]s.
 pub struct MailWorkerHandle {
@@ -28,6 +29,7 @@ impl MailWorkerHandle {
     pub fn spawn(data_dir: PathBuf) -> Result<Self, String> {
         let (req_tx, req_rx) = mpsc::channel::<MailRequest>();
         let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
+        let worker_req_tx = req_tx.clone();
 
         std::thread::Builder::new()
             .name("hylki-mail-worker".to_string())
@@ -38,7 +40,7 @@ impl MailWorkerHandle {
                     .build()
                     .expect("failed to start Tokio runtime");
 
-                rt.block_on(worker_loop(data_dir, req_rx, evt_tx));
+                rt.block_on(worker_loop(data_dir, worker_req_tx, req_rx, evt_tx));
             })
             .map_err(|e| format!("启动邮件后台线程失败: {e}"))?;
 
@@ -62,6 +64,7 @@ impl MailWorkerHandle {
 
 async fn worker_loop(
     data_dir: PathBuf,
+    req_tx: mpsc::Sender<MailRequest>,
     req_rx: mpsc::Receiver<MailRequest>,
     evt_tx: mpsc::Sender<WorkerEvent>,
 ) {
@@ -77,9 +80,212 @@ async fn worker_loop(
         }
     };
     let mut tokens: TokenCache = HashMap::new();
+    let mut watchers: IdleWatchers = HashMap::new();
+
+    if let Ok(accounts) = config::load_accounts_in(&data_dir) {
+        for acc in accounts {
+            spawn_account_idle_watcher(&mut watchers, acc, req_tx.clone());
+        }
+    }
 
     while let Ok(req) = req_rx.recv() {
-        handle_request(&data_dir, &mut cache, &mut tokens, req, &evt_tx).await;
+        handle_request(
+            &data_dir,
+            &mut cache,
+            &mut tokens,
+            &mut watchers,
+            &req_tx,
+            req,
+            &evt_tx,
+        )
+        .await;
+    }
+
+    for (_, handle) in watchers.drain() {
+        handle.abort();
+    }
+}
+
+/// Spawn or replace a background IMAP IDLE push watcher for `account`.
+/// Supports both standard Password IMAP (163, 126, QQ, Gmail, iCloud, Exmail, Aliyun, etc.)
+/// and Microsoft Outlook OAuth2 accounts (via `XOAUTH2` on `outlook.office365.com:993`).
+/// For Microsoft OAuth2 accounts whose older refresh token has not yet been granted
+/// `IMAP.AccessAsUser.All`, automatically falls back to a lightweight 20-second Graph inbox
+/// unread/total check so push-like responsiveness works immediately without re-login.
+fn spawn_account_idle_watcher(
+    watchers: &mut IdleWatchers,
+    account: AccountConfig,
+    req_tx: mpsc::Sender<MailRequest>,
+) {
+    if let Some(old) = watchers.remove(&account.id) {
+        old.abort();
+    }
+    let account_id = account.id;
+    let handle = tokio::spawn(async move {
+        run_account_push_watcher(account, req_tx).await;
+    });
+    watchers.insert(account_id, handle);
+}
+
+fn stop_account_idle_watcher(watchers: &mut IdleWatchers, account_id: u32) {
+    if let Some(old) = watchers.remove(&account_id) {
+        old.abort();
+    }
+}
+
+async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<MailRequest>) {
+    // Brief initial delay so startup sync finishes first without competing for connections.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut backoff = Duration::from_secs(15);
+    let mut cached_imap_token: Option<(String, Instant)> = None;
+
+    loop {
+        match account.auth_backend {
+            AuthBackend::Password => {
+                let Ok(sec) = secrets::load_account_secrets(account.id) else {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                };
+                match imap_client::connect_imap_password(&account, &sec.imap_password).await {
+                    Ok(session) => {
+                        backoff = Duration::from_secs(15);
+                        let tx = req_tx.clone();
+                        let aid = account.id;
+                        let _ = imap_client::run_idle_inbox_session(session, "INBOX", move || {
+                            let _ = tx.send(MailRequest::SyncAccount { account_id: aid });
+                        })
+                        .await;
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(300));
+                        continue;
+                    }
+                }
+            }
+            AuthBackend::MicrosoftGraphOAuth2 => {
+                // 1. Try to obtain an Exchange Online IMAP token from the saved refresh token
+                //    so we can use genuine IMAP IDLE push on outlook.office365.com:993.
+                let imap_token = match cached_imap_token.as_ref() {
+                    Some((tok, exp)) if Instant::now() < *exp => Some(tok.clone()),
+                    _ => {
+                        let Ok(rt) = secrets::load_oauth_refresh_token(account.id) else {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            continue;
+                        };
+                        let cid = account.oauth_client_id.clone();
+                        let refreshed = tokio::task::spawn_blocking(move || {
+                            oauth::refresh_microsoft_imap_token(&cid, &rt)
+                        })
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok());
+
+                        if let Some(refreshed) = refreshed {
+                            if let Some(new_rt) = refreshed.refresh_token {
+                                let _ = secrets::save_oauth_refresh_token(account.id, new_rt);
+                            }
+                            let exp = Instant::now()
+                                + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
+                            cached_imap_token = Some((refreshed.access_token.clone(), exp));
+                            Some(refreshed.access_token)
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some(token) = imap_token {
+                    match imap_client::connect_imap_xoauth2(&account, &token).await {
+                        Ok(session) => {
+                            backoff = Duration::from_secs(15);
+                            let tx = req_tx.clone();
+                            let aid = account.id;
+                            let _ =
+                                imap_client::run_idle_inbox_session(session, "INBOX", move || {
+                                    let _ = tx.send(MailRequest::SyncAccount { account_id: aid });
+                                })
+                                .await;
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            cached_imap_token = None;
+                        }
+                    }
+                }
+
+                // 2. Fallback when an older refresh token has not yet been re-authorized with
+                //    IMAP.AccessAsUser.All (or tenant blocks IMAP): lightweight 20-second Graph
+                //    inbox unread/total pulse check; only triggers full sync when counts change.
+                run_graph_fast_poll_fallback(&account, &req_tx).await;
+            }
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(300));
+    }
+}
+
+async fn run_graph_fast_poll_fallback(
+    account: &AccountConfig,
+    req_tx: &mpsc::Sender<MailRequest>,
+) {
+    let mut cached_graph_token: Option<(String, Instant)> = None;
+    let mut last_inbox_sig: Option<(u32, usize)> = None;
+
+    // Run for 10 minutes before re-checking whether the user re-authorized IMAP IDLE.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let token = match cached_graph_token.as_ref() {
+            Some((tok, exp)) if Instant::now() < *exp => tok.clone(),
+            _ => {
+                let Ok(rt) = secrets::load_oauth_refresh_token(account.id) else {
+                    return;
+                };
+                let cid = account.oauth_client_id.clone();
+                let Ok(Ok(refreshed)) = tokio::task::spawn_blocking(move || {
+                    oauth::refresh_microsoft_token(&cid, &rt)
+                })
+                .await
+                else {
+                    return;
+                };
+                if let Some(new_rt) = refreshed.refresh_token {
+                    let _ = secrets::save_oauth_refresh_token(account.id, new_rt);
+                }
+                let exp = Instant::now()
+                    + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
+                cached_graph_token = Some((refreshed.access_token.clone(), exp));
+                refreshed.access_token
+            }
+        };
+
+        let tok_for_call = token.clone();
+        let Ok(Ok(folders)) =
+            tokio::task::spawn_blocking(move || graph_client::fetch_folders(&tok_for_call)).await
+        else {
+            cached_graph_token = None;
+            continue;
+        };
+
+        if let Some((inbox, _)) = folders
+            .iter()
+            .find(|(_, is_inbox)| *is_inbox)
+            .or_else(|| folders.first())
+        {
+            let sig = (inbox.unread_count, inbox.total_count);
+            if let Some(prev) = last_inbox_sig {
+                if sig != prev {
+                    let _ = req_tx.send(MailRequest::SyncAccount {
+                        account_id: account.id,
+                    });
+                }
+            }
+            last_inbox_sig = Some(sig);
+        }
     }
 }
 
@@ -87,6 +293,8 @@ async fn handle_request(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
     tokens: &mut TokenCache,
+    watchers: &mut IdleWatchers,
+    req_tx: &mpsc::Sender<MailRequest>,
     req: MailRequest,
     evt_tx: &mpsc::Sender<WorkerEvent>,
 ) {
@@ -145,6 +353,7 @@ async fn handle_request(
                 return;
             }
             let account_id = config.id;
+            spawn_account_idle_watcher(watchers, config.clone(), req_tx.clone());
             let _ = evt_tx.send(WorkerEvent::AccountSaved { account: config });
             sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
         }
@@ -243,11 +452,13 @@ async fn handle_request(
                 ok: true,
                 message: "Outlook OAuth2 授权成功，正在同步邮件...".to_string(),
             });
+            spawn_account_idle_watcher(watchers, account.clone(), req_tx.clone());
             let _ = evt_tx.send(WorkerEvent::AccountSaved { account });
             sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
         }
 
         MailRequest::DeleteAccount { account_id } => {
+            stop_account_idle_watcher(watchers, account_id);
             tokens.remove(&account_id);
             let _ = secrets::delete_account_secrets(account_id);
             let _ = config::delete_account_in(data_dir, account_id);
