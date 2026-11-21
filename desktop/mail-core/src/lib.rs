@@ -99,6 +99,10 @@ pub struct LocalDraft {
     pub id: u32,
     pub account_id: u32,
     pub to_addr: String,
+    /// Comma-separated Cc addresses (empty when unset).
+    pub cc_addr: String,
+    /// Comma-separated Bcc addresses (empty when unset).
+    pub bcc_addr: String,
     pub subject: String,
     pub body_text: String,
     pub in_reply_to: String,
@@ -119,6 +123,10 @@ pub struct MailPage {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComposeDraft {
     pub to: String,
+    /// Comma-separated Cc addresses (empty when unset).
+    pub cc: String,
+    /// Comma-separated Bcc addresses (empty when unset).
+    pub bcc: String,
     pub subject: String,
     pub body: String,
     pub in_reply_to: String,
@@ -161,6 +169,10 @@ pub struct OutboxItem {
     pub id: u32,
     pub account_id: u32,
     pub to_addr: String,
+    /// Comma-separated Cc addresses (empty when unset).
+    pub cc_addr: String,
+    /// Comma-separated Bcc addresses (empty when unset).
+    pub bcc_addr: String,
     pub subject: String,
     pub body_text: String,
     pub in_reply_to: String,

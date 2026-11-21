@@ -158,6 +158,8 @@ impl CacheStore {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id INTEGER NOT NULL,
                     to_addr TEXT NOT NULL,
+                    cc_addr TEXT NOT NULL DEFAULT '',
+                    bcc_addr TEXT NOT NULL DEFAULT '',
                     subject TEXT NOT NULL,
                     body_text TEXT NOT NULL,
                     in_reply_to TEXT NOT NULL DEFAULT '',
@@ -171,6 +173,8 @@ impl CacheStore {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id INTEGER NOT NULL,
                     to_addr TEXT NOT NULL,
+                    cc_addr TEXT NOT NULL DEFAULT '',
+                    bcc_addr TEXT NOT NULL DEFAULT '',
                     subject TEXT NOT NULL,
                     body_text TEXT NOT NULL,
                     in_reply_to TEXT NOT NULL DEFAULT '',
@@ -182,6 +186,11 @@ impl CacheStore {
             .map_err(|e| format!("初始化缓存表结构失败: {e}"))?;
         self.ensure_column("folders", "is_inbox", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("messages", "remote_id", "TEXT NOT NULL DEFAULT ''")?;
+        // Cc/Bcc（迭代 2）：旧库无列时补充，历史数据视为空字符串。
+        self.ensure_column("outbox", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("outbox", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("drafts", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
         Ok(())
     }
 
@@ -1206,10 +1215,13 @@ impl CacheStore {
     }
 
     /// Persist a new outgoing message in the Outbox before SMTP transmission begins.
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_outbox(
         &mut self,
         account_id: u32,
         to_addr: &str,
+        cc_addr: &str,
+        bcc_addr: &str,
         subject: &str,
         body_text: &str,
         in_reply_to: &str,
@@ -1222,14 +1234,16 @@ impl CacheStore {
             .execute(
                 "
                 INSERT INTO outbox (
-                    account_id, to_addr, subject, body_text, in_reply_to,
+                    account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to,
                     attachment_paths_json, status, last_error, created_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', '', ?7)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', '', ?9)
                 ",
                 params![
                     account_id,
                     to_addr,
+                    cc_addr,
+                    bcc_addr,
                     subject,
                     body_text,
                     in_reply_to,
@@ -1271,8 +1285,8 @@ impl CacheStore {
             .conn
             .prepare(
                 "
-                SELECT id, account_id, to_addr, subject, body_text, in_reply_to,
-                       attachment_paths_json, status, last_error
+                SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
+                       in_reply_to, attachment_paths_json, status, last_error
                 FROM outbox
                 WHERE account_id = ?1
                 ORDER BY id DESC
@@ -1282,20 +1296,22 @@ impl CacheStore {
 
         let rows = stmt
             .query_map(params![account_id], |row| {
-                let paths_json: String = row.get(6)?;
+                let paths_json: String = row.get(8)?;
                 let attachment_paths: Vec<String> =
                     serde_json::from_str(&paths_json).unwrap_or_default();
-                let status_str: String = row.get(7)?;
+                let status_str: String = row.get(9)?;
                 Ok(OutboxItem {
                     id: row.get(0)?,
                     account_id: row.get(1)?,
                     to_addr: row.get(2)?,
-                    subject: row.get(3)?,
-                    body_text: row.get(4)?,
-                    in_reply_to: row.get(5)?,
+                    cc_addr: row.get(3)?,
+                    bcc_addr: row.get(4)?,
+                    subject: row.get(5)?,
+                    body_text: row.get(6)?,
+                    in_reply_to: row.get(7)?,
                     attachment_paths,
                     status: OutboxStatus::from_str(&status_str),
-                    last_error: row.get(8)?,
+                    last_error: row.get(10)?,
                 })
             })
             .map_err(|e| format!("读取发件箱失败: {e}"))?
@@ -1313,14 +1329,16 @@ impl CacheStore {
                 .execute(
                     "
                     INSERT INTO drafts (
-                        account_id, to_addr, subject, body_text, in_reply_to,
-                        attachment_paths_json, updated_at
+                        account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
+                        in_reply_to, attachment_paths_json, updated_at
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                     ",
                     params![
                         draft.account_id,
                         draft.to_addr,
+                        draft.cc_addr,
+                        draft.bcc_addr,
                         draft.subject,
                         draft.body_text,
                         draft.in_reply_to,
@@ -1335,13 +1353,16 @@ impl CacheStore {
                 .execute(
                     "
                     UPDATE drafts
-                    SET account_id = ?1, to_addr = ?2, subject = ?3, body_text = ?4,
-                        in_reply_to = ?5, attachment_paths_json = ?6, updated_at = ?7
-                    WHERE id = ?8
+                    SET account_id = ?1, to_addr = ?2, cc_addr = ?3, bcc_addr = ?4,
+                        subject = ?5, body_text = ?6, in_reply_to = ?7,
+                        attachment_paths_json = ?8, updated_at = ?9
+                    WHERE id = ?10
                     ",
                     params![
                         draft.account_id,
                         draft.to_addr,
+                        draft.cc_addr,
+                        draft.bcc_addr,
                         draft.subject,
                         draft.body_text,
                         draft.in_reply_to,
@@ -1361,8 +1382,8 @@ impl CacheStore {
             .conn
             .prepare(
                 "
-                SELECT id, account_id, to_addr, subject, body_text, in_reply_to,
-                       attachment_paths_json, updated_at
+                SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
+                       in_reply_to, attachment_paths_json, updated_at
                 FROM drafts
                 ORDER BY updated_at DESC, id DESC
                 ",
@@ -1371,18 +1392,20 @@ impl CacheStore {
 
         let rows = stmt
             .query_map([], |row| {
-                let paths_json: String = row.get(6)?;
+                let paths_json: String = row.get(8)?;
                 let attachment_paths: Vec<String> =
                     serde_json::from_str(&paths_json).unwrap_or_default();
                 Ok(LocalDraft {
                     id: row.get(0)?,
                     account_id: row.get(1)?,
                     to_addr: row.get(2)?,
-                    subject: row.get(3)?,
-                    body_text: row.get(4)?,
-                    in_reply_to: row.get(5)?,
+                    cc_addr: row.get(3)?,
+                    bcc_addr: row.get(4)?,
+                    subject: row.get(5)?,
+                    body_text: row.get(6)?,
+                    in_reply_to: row.get(7)?,
                     attachment_paths,
-                    updated_at: row.get(7)?,
+                    updated_at: row.get(9)?,
                 })
             })
             .map_err(|e| format!("读取本地草稿失败: {e}"))?
@@ -1604,6 +1627,8 @@ mod tests {
             .enqueue_outbox(
                 1,
                 "to@example.com",
+                "",
+                "",
                 "带附件回复",
                 "测试正文",
                 "<orig@example.com>",
@@ -1620,6 +1645,145 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, OutboxStatus::Uncertain);
         assert_eq!(items[0].attachment_paths, vec!["C:\\temp\\test.txt"]);
+    }
+
+    #[test]
+    fn outbox_round_trips_cc_and_bcc() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        cache
+            .enqueue_outbox(
+                1,
+                "to@example.com",
+                "c1@example.com, Carol <carol@c.com>",
+                "secret@example.com",
+                "带抄送的邮件",
+                "正文",
+                "",
+                &[],
+                1_700_000_200,
+            )
+            .unwrap();
+
+        let items = cache.list_outbox(1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].to_addr, "to@example.com");
+        assert_eq!(items[0].cc_addr, "c1@example.com, Carol <carol@c.com>");
+        assert_eq!(items[0].bcc_addr, "secret@example.com");
+    }
+
+    #[test]
+    fn legacy_db_without_cc_bcc_columns_is_migrated() {
+        // 模拟迭代 2 之前的旧库结构（outbox/drafts 无 cc_addr/bcc_addr 列）。
+        let dir = std::env::temp_dir().join(format!("hylki-legacy-db-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("legacy-cache.db");
+        {
+            let conn = Connection::open(&db_path).expect("open legacy db");
+            conn.execute_batch(
+                "
+                CREATE TABLE folders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    uid_validity INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(account_id, path)
+                );
+                CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    folder_id INTEGER NOT NULL,
+                    uid INTEGER NOT NULL,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    sender TEXT NOT NULL,
+                    recipients TEXT NOT NULL DEFAULT '',
+                    subject TEXT NOT NULL,
+                    preview TEXT NOT NULL DEFAULT '',
+                    date_ts INTEGER NOT NULL DEFAULT 0,
+                    date_display TEXT NOT NULL DEFAULT '',
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    flagged INTEGER NOT NULL DEFAULT 0,
+                    has_attachment INTEGER NOT NULL DEFAULT 0,
+                    body_text TEXT,
+                    UNIQUE(folder_id, uid)
+                );
+                CREATE TABLE attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    content BLOB NOT NULL
+                );
+                CREATE TABLE outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    to_addr TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body_text TEXT NOT NULL,
+                    in_reply_to TEXT NOT NULL DEFAULT '',
+                    attachment_paths_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE drafts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    to_addr TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body_text TEXT NOT NULL,
+                    in_reply_to TEXT NOT NULL DEFAULT '',
+                    attachment_paths_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO outbox (account_id, to_addr, subject, body_text, in_reply_to,
+                                    attachment_paths_json, status, last_error, created_at)
+                VALUES (1, 'old@example.com', '旧邮件', '正文', '', '[]', 'queued', '', 100);
+                INSERT INTO drafts (account_id, to_addr, subject, body_text, in_reply_to,
+                                    attachment_paths_json, updated_at)
+                VALUES (1, 'old-draft@example.com', '旧草稿', '正文', '', '[]', 100);
+                ",
+            )
+            .expect("create legacy schema");
+        }
+
+        let mut cache = CacheStore::open(&db_path).expect("open legacy db through migration");
+
+        // 旧数据 cc/bcc 视为空字符串。
+        let outbox = cache.list_outbox(1).unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].cc_addr, "");
+        assert_eq!(outbox[0].bcc_addr, "");
+        let drafts = cache.list_drafts().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].cc_addr, "");
+        assert_eq!(drafts[0].bcc_addr, "");
+
+        // 迁移后可正常写入并读回 cc/bcc。
+        cache
+            .enqueue_outbox(
+                1,
+                "to@example.com",
+                "cc@example.com",
+                "bcc@example.com",
+                "迁移后新邮件",
+                "正文",
+                "",
+                &[],
+                200,
+            )
+            .unwrap();
+        let outbox = cache.list_outbox(1).unwrap();
+        assert_eq!(outbox.len(), 2);
+        let fresh = outbox.iter().find(|i| i.subject == "迁移后新邮件").unwrap();
+        assert_eq!(fresh.cc_addr, "cc@example.com");
+        assert_eq!(fresh.bcc_addr, "bcc@example.com");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1691,6 +1855,8 @@ mod tests {
                 id: 0,
                 account_id: 1,
                 to_addr: "alice@example.com".to_string(),
+                cc_addr: "bob@example.com".to_string(),
+                bcc_addr: String::new(),
                 subject: "草稿主题".to_string(),
                 body_text: "第一版内容".to_string(),
                 in_reply_to: String::new(),
@@ -1702,7 +1868,18 @@ mod tests {
         let drafts = cache.list_drafts().unwrap();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].id, id);
+        assert_eq!(drafts[0].cc_addr, "bob@example.com");
+        assert_eq!(drafts[0].bcc_addr, "");
         assert_eq!(drafts[0].attachment_paths, vec!["C:\\tmp\\report.pdf"]);
+
+        // 更新 cc/bcc 也走同一 upsert 链路。
+        let mut updated = drafts[0].clone();
+        updated.bcc_addr = "secret@example.com".to_string();
+        updated.updated_at = 200;
+        cache.upsert_draft(&updated).unwrap();
+        let drafts = cache.list_drafts().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].bcc_addr, "secret@example.com");
 
         cache.delete_draft(id).unwrap();
         assert!(cache.list_drafts().unwrap().is_empty());

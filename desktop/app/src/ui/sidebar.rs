@@ -21,7 +21,7 @@ use gpui_kit::{
 };
 use hylki_mail_core::{MailRequest, OutboxItem, OutboxStatus};
 
-use crate::app::{HylkiApp, UNIFIED_INBOX_FOLDER_ID};
+use crate::app::{CurrentView, HylkiApp};
 use crate::theme;
 use crate::ui::avatar;
 
@@ -207,7 +207,9 @@ fn account_section(
             section.children(folders.iter().map(|folder| {
                 let folder_id = folder.id;
                 let folder_path = folder.path.clone();
-                let is_selected = folder_id == selected_folder_id;
+                // 仅在「账号文件夹」视图下高亮具体文件夹行。
+                let is_selected = folder_id == selected_folder_id
+                    && app.current_view == CurrentView::AccountFolder;
                 let unread = folder.unread_count;
                 let total = folder.total_count as u32;
                 let folder_name = folder.name.clone();
@@ -256,7 +258,6 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let (sidebar_bg, border, text, muted_fg, danger) =
         (p.sidebar, p.border, p.text, p.text_muted, p.danger);
     let unified_unread = app.unified_unread_count();
-    let drafts_count = app.drafts.len() as u32;
     let outbox_items: Vec<OutboxItem> = app
         .outbox_by_account
         .values()
@@ -268,11 +269,23 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .count() as u32;
     let dark = app.dark_mode;
     let demo_mode = app.demo_mode;
-    // 统一收件箱行选中态：真实账号看 UNIFIED_INBOX_FOLDER_ID(0)，演示模式看演示 INBOX。
-    let is_unified_selected = if demo_mode {
-        app.selected_folder_id == hylki_mail_core::demo::DEMO_INBOX_ID
+    let current_view = app.current_view;
+    // 统一视图行选中态由 `current_view` 决定（演示模式同样映射）。
+    let is_unified_selected = current_view == CurrentView::UnifiedInbox;
+    let is_starred_selected = current_view == CurrentView::Starred;
+    let is_sent_selected = current_view == CurrentView::Sent;
+    let is_drafts_selected = current_view == CurrentView::Drafts;
+    let is_archive_selected = current_view == CurrentView::Archive;
+    // 草稿计数：真实账号取本地草稿数，演示模式取演示草稿箱邮件总数。
+    let drafts_count = if demo_mode {
+        app.demo_store
+            .folders
+            .iter()
+            .find(|f| f.id == hylki_mail_core::demo::DEMO_DRAFTS_ID)
+            .map(|f| f.total_count as u32)
+            .unwrap_or(0)
     } else {
-        app.selected_folder_id == UNIFIED_INBOX_FOLDER_ID
+        app.drafts.len() as u32
     };
 
     let account_sections: Vec<gpui_kit::AnyElement> = app
@@ -313,12 +326,13 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 let entity = entity.clone();
                 let entity_for_theme = entity_for_theme.clone();
                 menu.item(
+                    // 演示模式下账号管理不可用（无 worker 账号可编辑）。
                     PopupMenuItem::new("账号管理")
                         .icon(Icon::new(IconName::Settings))
-                        .on_click(move |_, window, cx| {
+                        .disabled(demo_mode)
+                        .on_click(move |_, _, cx| {
                             entity.update(cx, |app, cx| {
-                                let first = app.accounts.first().cloned();
-                                app.load_account_into_form(first.as_ref(), window, cx);
+                                app.open_account_manager(cx);
                             });
                         }),
                 )
@@ -425,54 +439,62 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         &p,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_unified_inbox(cx);
+                        this.select_unified_view(CurrentView::UnifiedInbox, cx);
                     })),
                 )
-                // TODO(phase2): 已加星标——后端统一视图查询（另一并行分支提供）就绪后接线。
+                // 迭代 2：已加星标 / 已发送 / 归档接入 mail-core 统一视图查询。
                 .child(
-                    nav_row("nav-starred", IconName::Star, "已加星标", None, false, &p).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            // 暂回落到统一收件箱。
-                            this.select_unified_inbox(cx);
-                        }),
-                    ),
+                    nav_row(
+                        "nav-starred",
+                        IconName::Star,
+                        "已加星标",
+                        None,
+                        is_starred_selected,
+                        &p,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.select_unified_view(CurrentView::Starred, cx);
+                    })),
                 )
-                // TODO(phase2): 已发送——同上。
                 .child(
-                    nav_row("nav-sent", IconName::Redo2, "已发送", None, false, &p).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            // 暂回落到统一收件箱。
-                            this.select_unified_inbox(cx);
-                        }),
-                    ),
+                    nav_row(
+                        "nav-sent",
+                        IconName::Redo2,
+                        "已发送",
+                        None,
+                        is_sent_selected,
+                        &p,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.select_unified_view(CurrentView::Sent, cx);
+                    })),
                 )
-                // 草稿箱行沿用现有本地草稿展示逻辑（草稿条目列于账号分组后）。
+                // 草稿箱：真实账号展示本地草稿（中栏列表 + 侧栏条目），
+                // 演示模式映射到演示草稿箱文件夹。
                 .child(
                     nav_row(
                         "nav-drafts",
                         IconName::FileText,
                         "草稿箱",
                         Some((drafts_count, false)),
-                        false,
+                        is_drafts_selected,
                         &p,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_unified_inbox(cx);
+                        this.select_unified_view(CurrentView::Drafts, cx);
                     })),
                 )
-                // TODO(phase2): 归档——同上。
                 .child(
                     nav_row(
                         "nav-archive",
                         IconName::FolderClosed,
                         "归档",
                         None,
-                        false,
+                        is_archive_selected,
                         &p,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        // 暂回落到统一收件箱。
-                        this.select_unified_inbox(cx);
+                        this.select_unified_view(CurrentView::Archive, cx);
                     })),
                 )
                 .when(!outbox_items.is_empty(), |el| {

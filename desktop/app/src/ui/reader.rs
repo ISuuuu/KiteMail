@@ -14,7 +14,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
 use gpui_kit::component::IconName;
-use gpui_kit::component::{h_flex, v_flex, Disableable, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, relative, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
@@ -183,15 +183,23 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                     this.toggle_flagged(&star_detail, cx);
                                 })),
                         )
-                        // TODO(phase2): 归档（MailRequest::ArchiveMessage，由并行分支提供后接线）。
-                        .child(
-                            action_button("reader-archive", IconName::FolderClosed, "归档")
-                                .disabled(true),
-                        )
-                        // TODO(phase2): 删除（MailRequest::DeleteMessage，由并行分支提供后接线）。
-                        .child(
-                            action_button("reader-delete", IconName::Delete, "删除").disabled(true),
-                        )
+                        // 迭代 2：归档 / 删除接线（IMAP MOVE / Graph move）；
+                        // 演示模式不支持服务端移动，隐藏这两个入口。
+                        .when(!app.demo_mode, |el| {
+                            el.child(
+                                action_button("reader-archive", IconName::FolderClosed, "归档")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.archive_selected(cx);
+                                    })),
+                            )
+                            .child(
+                                action_button("reader-delete", IconName::Delete, "删除").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.delete_selected(cx);
+                                    }),
+                                ),
+                            )
+                        })
                 }),
         )
         .child(h_flex().gap_1().items_center().when(!app.demo_mode, |el| {

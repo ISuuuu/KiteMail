@@ -13,42 +13,43 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, AppContext, Context, Entity, FontWeight, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window,
+    div, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
+    Window,
 };
 use hylki_mail_core::config::{self, AccountConfig, AuthBackend, SecurityMode};
-use hylki_mail_core::demo::{DemoStore, DEMO_INBOX_ID};
+use hylki_mail_core::demo::{
+    DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_SENT_ID,
+};
 use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
-    ComposeDraft, FolderSummary, LocalDraft, MailPage, MailRequest, MessageDetail, OutboxItem,
-    WorkerEvent,
+    ComposeDraft, FolderSummary, LocalDraft, MailPage, MailRequest, MessageDetail, MessageSummary,
+    OutboxItem, UnifiedView, WorkerEvent,
 };
 
 use crate::theme;
-use crate::ui::{message_list, reader, sidebar};
+use crate::ui::{accounts, compose, message_list, reader, sidebar, welcome};
 
 pub(crate) const PAGE_SIZE: usize = 100;
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
 
 /// 邮箱服务商预设（原样迁自原型）。
-struct ProviderPreset {
-    id: &'static str,
-    label: &'static str,
-    imap_host: &'static str,
-    imap_port: &'static str,
-    imap_tls: bool,
-    smtp_host: &'static str,
-    smtp_port: &'static str,
-    smtp_tls: bool,
-    guide: &'static str,
+pub(crate) struct ProviderPreset {
+    pub(crate) id: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) imap_host: &'static str,
+    pub(crate) imap_port: &'static str,
+    pub(crate) imap_tls: bool,
+    pub(crate) smtp_host: &'static str,
+    pub(crate) smtp_port: &'static str,
+    pub(crate) smtp_tls: bool,
+    pub(crate) guide: &'static str,
 }
 
-const PROVIDER_PRESETS: &[ProviderPreset] = &[
+pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "preset-qq",
         label: "QQ 邮箱",
@@ -144,6 +145,39 @@ pub(crate) enum RightPaneMode {
     Reader,
     Compose,
     AccountSetup,
+    /// 首次启动欢迎向导（无账号且非 demo 时默认进入，方案文档五.1）。
+    Welcome,
+}
+
+/// 左栏统一导航的当前视图（方案文档五.1）。
+///
+/// `AccountFolder` 表示正在浏览某个账号的具体文件夹（此时 `selected_folder_id`
+/// 才参与列表请求）；其余视图为跨账号统一视图。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentView {
+    UnifiedInbox,
+    Starred,
+    Sent,
+    Drafts,
+    Archive,
+    AccountFolder,
+}
+
+impl CurrentView {
+    /// 对应的 mail-core 统一视图查询；`UnifiedInbox`/`Drafts` 走独立链路。
+    pub(crate) fn unified(self) -> Option<UnifiedView> {
+        match self {
+            Self::Starred => Some(UnifiedView::Starred),
+            Self::Sent => Some(UnifiedView::Sent),
+            Self::Archive => Some(UnifiedView::Archive),
+            Self::UnifiedInbox | Self::Drafts | Self::AccountFolder => None,
+        }
+    }
+
+    /// 是否为跨账号统一视图（中栏多账号标签胶囊的显示条件）。
+    pub(crate) fn is_unified(self) -> bool {
+        !matches!(self, Self::AccountFolder)
+    }
 }
 
 /// 中栏列表客户端过滤（对当前页数据）。
@@ -181,6 +215,8 @@ pub(crate) struct HylkiApp {
     pub(crate) folders_by_account: BTreeMap<u32, Vec<FolderSummary>>,
     /// `0` means Unified Inbox across all accounts.
     pub(crate) selected_folder_id: u32,
+    /// 左栏统一导航当前视图（决定列表请求走统一视图还是具体文件夹）。
+    pub(crate) current_view: CurrentView,
     pub(crate) page_offset: usize,
     pub(crate) current_page: MailPage,
     pub(crate) selected_message: Option<MessageDetail>,
@@ -194,6 +230,10 @@ pub(crate) struct HylkiApp {
     pub(crate) compose_account_id: u32,
     pub(crate) compose_draft_id: Option<u32>,
     pub(crate) compose_to: Entity<InputState>,
+    pub(crate) compose_cc: Entity<InputState>,
+    pub(crate) compose_bcc: Entity<InputState>,
+    /// Cc / Bcc 输入行是否展开（默认折叠，方案文档页面 3）。
+    pub(crate) compose_show_cc_bcc: bool,
     pub(crate) compose_subject: Entity<InputState>,
     pub(crate) compose_body: Entity<TextareaState>,
     pub(crate) compose_in_reply_to: String,
@@ -201,6 +241,8 @@ pub(crate) struct HylkiApp {
 
     // Account configuration fields
     pub(crate) editing_account_id: Option<u32>,
+    /// 账号管理页等待确认移除的账号 ID（内联二次确认）。
+    pub(crate) pending_delete_account_id: Option<u32>,
     pub(crate) cfg_display_name: Entity<InputState>,
     pub(crate) cfg_email: Entity<InputState>,
     pub(crate) cfg_imap_host: Entity<InputState>,
@@ -258,6 +300,11 @@ impl HylkiApp {
 
         let compose_to =
             cx.new(|cx| InputState::new(window, cx).placeholder("收件人：name@example.com"));
+        let compose_cc = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("抄送：cc1@example.com, cc2@example.com")
+        });
+        let compose_bcc =
+            cx.new(|cx| InputState::new(window, cx).placeholder("密送：bcc@example.com"));
         let compose_subject = cx.new(|cx| {
             InputState::new(window, cx).placeholder("主题：输入邮件主题（支持中文 IME）")
         });
@@ -347,6 +394,7 @@ impl HylkiApp {
                 accounts: vec![demo_acc],
                 folders_by_account,
                 selected_folder_id: DEMO_INBOX_ID,
+                current_view: CurrentView::UnifiedInbox,
                 page_offset: 0,
                 current_page,
                 selected_message,
@@ -358,11 +406,15 @@ impl HylkiApp {
                 compose_account_id: 1,
                 compose_draft_id: None,
                 compose_to,
+                compose_cc,
+                compose_bcc,
+                compose_show_cc_bcc: false,
                 compose_subject,
                 compose_body,
                 compose_in_reply_to: String::new(),
                 compose_attachments: Vec::new(),
                 editing_account_id: Some(1),
+                pending_delete_account_id: None,
                 cfg_display_name,
                 cfg_email,
                 cfg_imap_host,
@@ -431,6 +483,7 @@ impl HylkiApp {
             accounts: existing_accounts,
             folders_by_account: BTreeMap::new(),
             selected_folder_id: UNIFIED_INBOX_FOLDER_ID,
+            current_view: CurrentView::UnifiedInbox,
             page_offset: 0,
             current_page: MailPage {
                 folder_id: UNIFIED_INBOX_FOLDER_ID,
@@ -441,21 +494,26 @@ impl HylkiApp {
             selected_message: None,
             drafts: Vec::new(),
             outbox_by_account: BTreeMap::new(),
+            // 方案文档页面 2：启动且无账号（非 demo）时进入欢迎向导。
             right_mode: if has_account {
                 RightPaneMode::Reader
             } else {
-                RightPaneMode::AccountSetup
+                RightPaneMode::Welcome
             },
             search_input,
             search_query: String::new(),
             compose_account_id,
             compose_draft_id: None,
             compose_to,
+            compose_cc,
+            compose_bcc,
+            compose_show_cc_bcc: false,
             compose_subject,
             compose_body,
             compose_in_reply_to: String::new(),
             compose_attachments: Vec::new(),
             editing_account_id,
+            pending_delete_account_id: None,
             cfg_display_name,
             cfg_email,
             cfg_imap_host,
@@ -497,6 +555,7 @@ impl HylkiApp {
                     }
                     self.editing_account_id = Some(account.id);
                     self.compose_account_id = account.id;
+                    self.pending_delete_account_id = None;
                     self.right_mode = RightPaneMode::Reader;
                     self.error_banner = None;
                     self.status_line =
@@ -507,7 +566,9 @@ impl HylkiApp {
                     self.folders_by_account.remove(&account_id);
                     self.outbox_by_account.remove(&account_id);
                     self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
+                    self.current_view = CurrentView::UnifiedInbox;
                     self.selected_message = None;
+                    self.pending_delete_account_id = None;
                     self.editing_account_id = self.accounts.first().map(|a| a.id);
                     self.right_mode = if self.accounts.is_empty() {
                         RightPaneMode::AccountSetup
@@ -523,7 +584,19 @@ impl HylkiApp {
                     self.folders_by_account.insert(account_id, folders);
                 }
                 WorkerEvent::MessagesPageLoaded(page) => {
-                    if page.folder_id == self.selected_folder_id {
+                    // 仅当事件页与当前视图匹配时才采用；统一视图（星标/已发送/归档）
+                    // 忽略文件夹级页面事件。
+                    let page_matches = match self.current_view {
+                        CurrentView::UnifiedInbox => {
+                            !self.demo_mode && page.folder_id == UNIFIED_INBOX_FOLDER_ID
+                        }
+                        CurrentView::AccountFolder => page.folder_id == self.selected_folder_id,
+                        CurrentView::Starred
+                        | CurrentView::Sent
+                        | CurrentView::Drafts
+                        | CurrentView::Archive => false,
+                    };
+                    if page_matches {
                         self.current_page = page;
                         if self.selected_message.is_none() {
                             if let Some(first) = self.current_page.items.first() {
@@ -536,7 +609,10 @@ impl HylkiApp {
                                 );
                             }
                         }
-                    } else if self.selected_folder_id == UNIFIED_INBOX_FOLDER_ID {
+                    } else if matches!(
+                        self.current_view,
+                        CurrentView::UnifiedInbox | CurrentView::AccountFolder
+                    ) {
                         self.reload_current_page(cx);
                     }
                 }
@@ -582,15 +658,38 @@ impl HylkiApp {
                     self.error_banner = Some(SharedString::from(message.clone()));
                     self.status_line = SharedString::from(message);
                 }
-                WorkerEvent::MessageArchived { .. } | WorkerEvent::MessageDeleted { .. } => {
-                    // Backend receipt for archive/delete; the accompanying
-                    // FoldersLoaded event already refreshes folder counters.
-                    // TODO(phase2): leave the current list / reader state.
+                WorkerEvent::MessageArchived {
+                    account_id,
+                    message_id,
                 }
-                WorkerEvent::UnifiedViewLoaded { .. }
-                | WorkerEvent::CachedAttachmentsLoaded { .. }
+                | WorkerEvent::MessageDeleted {
+                    account_id,
+                    message_id,
+                } => {
+                    // 后端回执：随事件先行到达的 FoldersLoaded 已刷新文件夹计数；
+                    // 这里刷新当前列表并在阅读态显示该邮件时回到空态。
+                    self.after_message_moved(account_id, message_id, cx);
+                }
+                WorkerEvent::UnifiedViewLoaded { view, page } => {
+                    if self.current_view.unified() == Some(view) {
+                        self.current_page = page;
+                        self.page_offset = self.current_page.offset;
+                        if self.selected_message.is_none() {
+                            if let Some(first) = self.current_page.items.first() {
+                                self.request_message_detail(
+                                    first.account_id,
+                                    first.id,
+                                    first.uid,
+                                    first.unread,
+                                    &first.folder_path.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+                WorkerEvent::CachedAttachmentsLoaded { .. }
                 | WorkerEvent::KnownContactsLoaded { .. } => {
-                    // TODO(phase2/3): wire unified views, gallery and contacts.
+                    // TODO(phase3): wire gallery and contacts views.
                 }
             }
         }
@@ -599,8 +698,26 @@ impl HylkiApp {
 
     pub(crate) fn reload_current_page(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
+            // 演示模式：统一视图映射到对应的演示文件夹；
+            // DemoStore 没有星标视图 → 空列表（中栏渲染「演示模式不支持该视图」提示）。
+            let folder_id = match self.current_view {
+                CurrentView::UnifiedInbox | CurrentView::AccountFolder => self.selected_folder_id,
+                CurrentView::Sent => DEMO_SENT_ID,
+                CurrentView::Drafts => DEMO_DRAFTS_ID,
+                CurrentView::Archive => DEMO_ARCHIVE_ID,
+                CurrentView::Starred => {
+                    self.current_page = MailPage {
+                        folder_id: 0,
+                        offset: 0,
+                        total: 0,
+                        items: Vec::new(),
+                    };
+                    cx.notify();
+                    return;
+                }
+            };
             self.current_page = self.demo_store.list_messages_page(
-                self.selected_folder_id,
+                folder_id,
                 &self.search_query,
                 self.page_offset,
                 PAGE_SIZE,
@@ -608,34 +725,60 @@ impl HylkiApp {
             cx.notify();
             return;
         }
+        // 本地草稿视图：直接由渲染层从 `self.drafts` 合成，无需 worker 请求。
+        if self.current_view == CurrentView::Drafts {
+            cx.notify();
+            return;
+        }
         if let Some(ref w) = self.worker {
-            if self.selected_folder_id == UNIFIED_INBOX_FOLDER_ID {
-                w.send(MailRequest::LoadUnifiedInbox {
-                    query: self.search_query.clone(),
-                    offset: self.page_offset,
-                    limit: PAGE_SIZE,
-                });
-            } else {
-                w.send(MailRequest::LoadMessagesPage {
-                    folder_id: self.selected_folder_id,
-                    query: self.search_query.clone(),
-                    offset: self.page_offset,
-                    limit: PAGE_SIZE,
-                });
+            match self.current_view {
+                CurrentView::UnifiedInbox => {
+                    w.send(MailRequest::LoadUnifiedInbox {
+                        query: self.search_query.clone(),
+                        offset: self.page_offset,
+                        limit: PAGE_SIZE,
+                    });
+                }
+                CurrentView::Starred | CurrentView::Sent | CurrentView::Archive => {
+                    // unified() 在这三个视图下恒为 Some。
+                    if let Some(view) = self.current_view.unified() {
+                        w.send(MailRequest::LoadUnifiedView {
+                            view,
+                            query: self.search_query.clone(),
+                            offset: self.page_offset,
+                            limit: PAGE_SIZE,
+                        });
+                    }
+                }
+                CurrentView::AccountFolder => {
+                    w.send(MailRequest::LoadMessagesPage {
+                        folder_id: self.selected_folder_id,
+                        query: self.search_query.clone(),
+                        offset: self.page_offset,
+                        limit: PAGE_SIZE,
+                    });
+                }
+                CurrentView::Drafts => {}
             }
         }
     }
 
-    pub(crate) fn select_unified_inbox(&mut self, cx: &mut Context<Self>) {
-        // 演示模式下统一收件箱映射到演示 INBOX（demo store 只有文件夹 1）。
-        self.selected_folder_id = if self.demo_mode {
-            DEMO_INBOX_ID
-        } else {
-            UNIFIED_INBOX_FOLDER_ID
-        };
+    /// 切换左栏统一导航视图（收件箱 / 星标 / 已发送 / 草稿 / 归档）。
+    pub(crate) fn select_unified_view(&mut self, view: CurrentView, cx: &mut Context<Self>) {
+        self.current_view = view;
         self.page_offset = 0;
         self.selected_message = None;
         self.right_mode = RightPaneMode::Reader;
+        if self.demo_mode {
+            // 演示模式下统一视图映射到对应的演示文件夹。
+            self.selected_folder_id = match view {
+                CurrentView::UnifiedInbox | CurrentView::Starred => DEMO_INBOX_ID,
+                CurrentView::Sent => DEMO_SENT_ID,
+                CurrentView::Drafts => DEMO_DRAFTS_ID,
+                CurrentView::Archive => DEMO_ARCHIVE_ID,
+                CurrentView::AccountFolder => self.selected_folder_id,
+            };
+        }
         self.reload_current_page(cx);
         cx.notify();
     }
@@ -648,6 +791,7 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) {
         self.selected_folder_id = folder_id;
+        self.current_view = CurrentView::AccountFolder;
         self.page_offset = 0;
         self.selected_message = None;
         self.right_mode = RightPaneMode::Reader;
@@ -784,6 +928,204 @@ impl HylkiApp {
         cx.notify();
     }
 
+    // ---- 迭代 2：归档 / 删除与列表行操作（方案文档五.3）----
+
+    /// 归档 / 删除完成后的公共收尾：清空正在显示的目标邮件并刷新当前列表。
+    fn after_message_moved(&mut self, account_id: u32, message_id: u32, cx: &mut Context<Self>) {
+        if self
+            .selected_message
+            .as_ref()
+            .is_some_and(|m| m.account_id == account_id && m.id == message_id)
+        {
+            self.selected_message = None;
+        }
+        self.reload_current_page(cx);
+    }
+
+    /// 阅读态归档当前邮件（发 `MailRequest::ArchiveMessage`）。
+    pub(crate) fn archive_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.selected_message.clone() else {
+            return;
+        };
+        self.archive_message(detail.account_id, detail.id, cx);
+    }
+
+    /// 阅读态删除当前邮件（发 `MailRequest::DeleteMessage`）。
+    pub(crate) fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.selected_message.clone() else {
+            return;
+        };
+        self.delete_message(detail.account_id, detail.id, cx);
+    }
+
+    /// 归档指定邮件（右键菜单入口）。
+    pub(crate) fn archive_message(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from("正在归档邮件...");
+            w.send(MailRequest::ArchiveMessage {
+                account_id,
+                message_id,
+            });
+        }
+        cx.notify();
+    }
+
+    /// 删除指定邮件（右键菜单入口）。
+    pub(crate) fn delete_message(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from("正在删除邮件...");
+            w.send(MailRequest::DeleteMessage {
+                account_id,
+                message_id,
+            });
+        }
+        cx.notify();
+    }
+
+    /// 列表行「标记已读 / 未读」：真实账号走 `SetSeen`，演示模式仅本地切换。
+    pub(crate) fn set_row_seen(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        folder_path: String,
+        seen: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(item) = self
+            .current_page
+            .items
+            .iter_mut()
+            .find(|m| m.id == message_id)
+        {
+            item.unread = !seen;
+        }
+        if self.demo_mode {
+            cx.notify();
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::SetSeen {
+                account_id,
+                folder_path,
+                message_id,
+                uid,
+                seen,
+            });
+        }
+        cx.notify();
+    }
+
+    /// 列表行「加星 / 取消星标」：真实账号走 `SetFlagged`，演示模式仅本地切换。
+    pub(crate) fn set_row_flagged(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        folder_path: String,
+        flagged: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(item) = self
+            .current_page
+            .items
+            .iter_mut()
+            .find(|m| m.id == message_id)
+        {
+            item.flagged = flagged;
+        }
+        if let Some(sel) = self.selected_message.as_mut() {
+            if sel.id == message_id {
+                sel.flagged = flagged;
+            }
+        }
+        if self.demo_mode {
+            cx.notify();
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::SetFlagged {
+                account_id,
+                folder_path,
+                message_id,
+                uid,
+                flagged,
+            });
+        }
+        cx.notify();
+    }
+
+    /// 删除本地草稿（草稿视图右键菜单入口，走现有 `DeleteLocalDraft`）。
+    pub(crate) fn delete_row_draft(&mut self, draft_id: u32, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::DeleteLocalDraft { draft_id });
+        }
+        cx.notify();
+    }
+
+    /// 把本地草稿合成为中栏列表行（草稿视图，真实账号模式）。
+    pub(crate) fn draft_row_summary(&self, draft: &LocalDraft) -> MessageSummary {
+        let subject = if draft.subject.trim().is_empty() {
+            "(无主题草稿)".to_string()
+        } else {
+            draft.subject.clone()
+        };
+        let preview = draft
+            .body_text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(120)
+            .collect::<String>();
+        let owner_email = self.account_email_for(draft.account_id).to_string();
+        MessageSummary {
+            id: draft.id,
+            account_id: draft.account_id,
+            folder_id: 0,
+            folder_path: String::new(),
+            uid: 0,
+            sender: if owner_email.is_empty() {
+                "草稿".to_string()
+            } else {
+                format!("草稿 · {owner_email}")
+            },
+            subject,
+            preview,
+            // 本地草稿不展示时钟时间（避免 UI 层引入时区处理）。
+            date_display: String::new(),
+            unread: false,
+            flagged: false,
+            has_attachment: !draft.attachment_paths.is_empty(),
+        }
+    }
+
+    /// 展开 / 折叠 Cc / Bcc 输入行（方案文档页面 3）。
+    pub(crate) fn toggle_compose_cc_bcc(&mut self, cx: &mut Context<Self>) {
+        self.compose_show_cc_bcc = !self.compose_show_cc_bcc;
+        cx.notify();
+    }
+
     pub(crate) fn start_new_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.compose_account_id = self.accounts.first().map(|a| a.id).unwrap_or(1);
         self.compose_draft_id = None;
@@ -791,6 +1133,11 @@ impl HylkiApp {
         self.compose_attachments.clear();
         self.compose_to
             .update(cx, |s, cx| s.set_value("", window, cx));
+        self.compose_cc
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.compose_bcc
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.compose_show_cc_bcc = false;
         self.compose_subject
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.compose_body
@@ -821,6 +1168,7 @@ impl HylkiApp {
         self.compose_attachments.clear();
         self.compose_to
             .update(cx, |s, cx| s.set_value(detail.sender.clone(), window, cx));
+        self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
         self.compose_body
@@ -868,6 +1216,7 @@ impl HylkiApp {
         self.compose_attachments.clear();
         self.compose_to
             .update(cx, |s, cx| s.set_value("", window, cx));
+        self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(forward_subject, window, cx));
         self.compose_body
@@ -905,12 +1254,22 @@ impl HylkiApp {
         self.compose_attachments.clear();
         self.compose_to
             .update(cx, |s, cx| s.set_value(to.to_string(), window, cx));
+        self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
         self.compose_body
             .update(cx, |s, cx| s.set_value(quoted, window, cx));
         self.right_mode = RightPaneMode::Compose;
         cx.notify();
+    }
+
+    /// 清空 Cc / Bcc 输入（新写信 / 回复 / 转发入口共用）。
+    fn clear_compose_cc_bcc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.compose_cc
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.compose_bcc
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.compose_show_cc_bcc = false;
     }
 
     pub(crate) fn open_local_draft(
@@ -925,6 +1284,12 @@ impl HylkiApp {
         self.compose_attachments = draft.attachment_paths.clone();
         self.compose_to
             .update(cx, |s, cx| s.set_value(draft.to_addr.clone(), window, cx));
+        self.compose_cc
+            .update(cx, |s, cx| s.set_value(draft.cc_addr.clone(), window, cx));
+        self.compose_bcc
+            .update(cx, |s, cx| s.set_value(draft.bcc_addr.clone(), window, cx));
+        self.compose_show_cc_bcc =
+            !draft.cc_addr.trim().is_empty() || !draft.bcc_addr.trim().is_empty();
         self.compose_subject
             .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
         self.compose_body
@@ -933,7 +1298,7 @@ impl HylkiApp {
         cx.notify();
     }
 
-    fn save_local_draft(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_local_draft(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
             self.status_line = SharedString::from("演示模式下不支持写入本地草稿数据库");
             cx.notify();
@@ -943,6 +1308,8 @@ impl HylkiApp {
             id: self.compose_draft_id.unwrap_or(0),
             account_id: self.compose_account_id,
             to_addr: self.compose_to.read(cx).value().to_string(),
+            cc_addr: self.compose_cc.read(cx).value().to_string(),
+            bcc_addr: self.compose_bcc.read(cx).value().to_string(),
             subject: self.compose_subject.read(cx).value().to_string(),
             body_text: self.compose_body.read(cx).value().to_string(),
             in_reply_to: self.compose_in_reply_to.clone(),
@@ -955,7 +1322,7 @@ impl HylkiApp {
         cx.notify();
     }
 
-    fn pick_attachments(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn pick_attachments(&mut self, cx: &mut Context<Self>) {
         if let Some(files) = rfd::FileDialog::new().pick_files() {
             for file in files {
                 let p = file.to_string_lossy().to_string();
@@ -981,7 +1348,7 @@ impl HylkiApp {
         }
     }
 
-    fn send_compose(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn send_compose(&mut self, cx: &mut Context<Self>) {
         let to = self.compose_to.read(cx).value().to_string();
         let subject = self.compose_subject.read(cx).value().to_string();
         let body = self.compose_body.read(cx).value().to_string();
@@ -1014,6 +1381,8 @@ impl HylkiApp {
                 account_id: self.compose_account_id,
                 draft: ComposeDraft {
                     to,
+                    cc: self.compose_cc.read(cx).value().to_string(),
+                    bcc: self.compose_bcc.read(cx).value().to_string(),
                     subject,
                     body,
                     in_reply_to: self.compose_in_reply_to.clone(),
@@ -1062,7 +1431,87 @@ impl HylkiApp {
         cx.notify();
     }
 
-    fn apply_preset(
+    /// 欢迎页服务商预设入口：载入空白表单并自动带入主机 / 端口 / 加密与指引。
+    pub(crate) fn start_preset_account(
+        &mut self,
+        preset: &ProviderPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_account_into_form(None, window, cx);
+        self.apply_preset(preset, window, cx);
+    }
+
+    /// 运行时进入演示模式（欢迎页入口 3）：复用 `--demo` 启动路径的初始化。
+    pub(crate) fn enter_demo_mode(&mut self, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            return;
+        }
+        self.demo_mode = true;
+        let current_page = self
+            .demo_store
+            .list_messages_page(DEMO_INBOX_ID, "", 0, PAGE_SIZE);
+        let selected_message = current_page
+            .items
+            .first()
+            .and_then(|msg| self.demo_store.get_message_detail(msg.id));
+        self.current_page = current_page;
+        self.selected_message = selected_message;
+        let mut folders_by_account = BTreeMap::new();
+        folders_by_account.insert(1, self.demo_store.folders.clone());
+        self.folders_by_account = folders_by_account;
+        let demo_acc = AccountConfig {
+            id: 1,
+            display_name: self.demo_store.accounts[0].display_name.clone(),
+            email: self.demo_store.accounts[0].email.clone(),
+            ..Default::default()
+        };
+        self.accounts = vec![demo_acc];
+        self.selected_folder_id = DEMO_INBOX_ID;
+        self.current_view = CurrentView::UnifiedInbox;
+        self.page_offset = 0;
+        self.compose_account_id = 1;
+        self.editing_account_id = Some(1);
+        self.pending_delete_account_id = None;
+        self.right_mode = RightPaneMode::Reader;
+        self.error_banner = None;
+        self.status_line = SharedString::from("演示模式：已加载 10,000 封模拟邮件");
+        cx.notify();
+    }
+
+    /// 打开账号管理页（菜单 / 欢迎页入口），保留当前表单选择。
+    pub(crate) fn open_account_manager(&mut self, cx: &mut Context<Self>) {
+        self.pending_delete_account_id = None;
+        self.right_mode = RightPaneMode::AccountSetup;
+        cx.notify();
+    }
+
+    /// 账号卡片「移除账号」：先进入内联确认态（含确认）。
+    pub(crate) fn request_delete_account(&mut self, account_id: u32, cx: &mut Context<Self>) {
+        self.pending_delete_account_id = Some(account_id);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_delete_account(&mut self, cx: &mut Context<Self>) {
+        self.pending_delete_account_id = None;
+        cx.notify();
+    }
+
+    /// 确认移除账号：发 `MailRequest::DeleteAccount`（清理配置、缓存与凭据）。
+    pub(crate) fn confirm_delete_account(&mut self, cx: &mut Context<Self>) {
+        let Some(account_id) = self.pending_delete_account_id.take() else {
+            return;
+        };
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::DeleteAccount { account_id });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn apply_preset(
         &mut self,
         preset: &ProviderPreset,
         window: &mut Window,
@@ -1141,7 +1590,7 @@ impl HylkiApp {
         (config, imap_pwd, smtp_pwd)
     }
 
-    fn start_outlook_oauth(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn start_outlook_oauth(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
             return;
         }
@@ -1159,7 +1608,7 @@ impl HylkiApp {
         cx.notify();
     }
 
-    fn verify_account_form(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn verify_account_form(&mut self, cx: &mut Context<Self>) {
         let (config, imap_password, smtp_password) = self.collect_account_form(cx);
         self.cfg_feedback = Some((true, SharedString::from("正在验证 IMAP / SMTP 连接...")));
         if let Some(ref w) = self.worker {
@@ -1172,7 +1621,7 @@ impl HylkiApp {
         cx.notify();
     }
 
-    fn save_account_form(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_account_form(&mut self, cx: &mut Context<Self>) {
         let (config, imap_password, smtp_password) = self.collect_account_form(cx);
         self.cfg_feedback = Some((true, SharedString::from("正在保存凭据并启动同步...")));
         if let Some(ref w) = self.worker {
@@ -1261,403 +1710,13 @@ impl HylkiApp {
         cx.notify();
     }
 
-    // ---- 右栏渲染（阅读态由 ui::reader 渲染）----
-
-    /// 写信 / 回复面板：本轮保留原型渲染（迭代 2 再拆 compose.rs）。
-    fn render_compose_pane(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let p = theme::current(cx);
-        let muted_fg = p.text_muted;
-
-        v_flex()
-            .flex_1()
-            .h_full()
-            .bg(p.canvas)
-            .p_4()
-            .gap_3()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_base().font_weight(FontWeight::BOLD).child(
-                                if self.compose_in_reply_to.is_empty() {
-                                    "写新邮件"
-                                } else {
-                                    "回复邮件"
-                                },
-                            ))
-                            .when(!self.accounts.is_empty(), |el| {
-                                el.child(
-                                    h_flex()
-                                        .gap_1()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted_fg)
-                                                .child("发件账号："),
-                                        )
-                                        .children(self.accounts.iter().map(|acc| {
-                                            let acc_id = acc.id;
-                                            let active = acc_id == self.compose_account_id;
-                                            Button::new(("compose-from", acc_id))
-                                                .ghost()
-                                                .label(if active {
-                                                    format!("● {}", acc.email)
-                                                } else {
-                                                    acc.email.clone()
-                                                })
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.compose_account_id = acc_id;
-                                                    cx.notify();
-                                                }))
-                                        })),
-                                )
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("compose-save-draft")
-                                    .outline()
-                                    .label("存草稿")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_local_draft(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("compose-attach")
-                                    .outline()
-                                    .label("添加附件")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.pick_attachments(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("compose-cancel")
-                                    .ghost()
-                                    .label("取消")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.right_mode = RightPaneMode::Reader;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("compose-send")
-                                    .primary()
-                                    .label("发送")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.send_compose(cx);
-                                    })),
-                            ),
-                    ),
-            )
-            .child(Input::new(&self.compose_to))
-            .child(Input::new(&self.compose_subject))
-            .when(!self.compose_attachments.is_empty(), |el| {
-                el.child(
-                    h_flex().gap_2().flex_wrap().children(
-                        self.compose_attachments
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, path)| {
-                                let name = std::path::Path::new(path)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(path)
-                                    .to_string();
-                                Button::new(("remove-att", idx))
-                                    .outline()
-                                    .label(format!("📎 {name} ×"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if idx < this.compose_attachments.len() {
-                                            this.compose_attachments.remove(idx);
-                                            cx.notify();
-                                        }
-                                    }))
-                            }),
-                    ),
-                )
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(Textarea::new(&self.compose_body)),
-            )
-            .into_any_element()
-    }
-
-    /// 账号设置页：本轮保留原型渲染（迭代 2 再拆 accounts.rs）。
-    fn render_account_setup_pane(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let p = theme::current(cx);
-        let border = p.border;
-        let muted_fg = p.text_muted;
-        let accent_soft = p.accent_soft();
-        let primary = p.accent;
-        let danger = p.danger;
-
-        v_flex()
-            .flex_1()
-            .h_full()
-            .bg(p.canvas)
-            .p_5()
-            .gap_3()
-            .overflow_y_scrollbar()
-            .when(!self.accounts.is_empty(), |el| {
-                el.child(
-                    h_flex()
-                        .gap_2()
-                        .flex_wrap()
-                        .items_center()
-                        .pb_2()
-                        .border_b_1()
-                        .border_color(border)
-                        .children(self.accounts.iter().map(|acc| {
-                            let cfg_clone = acc.clone();
-                            let selected = self.editing_account_id == Some(acc.id);
-                            Button::new(("edit-acc", acc.id))
-                                .outline()
-                                .label(if selected {
-                                    format!("● {}", acc.email)
-                                } else {
-                                    acc.email.clone()
-                                })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.load_account_into_form(Some(&cfg_clone), window, cx);
-                                }))
-                        }))
-                        .child(
-                            Button::new("add-new-acc")
-                                .primary()
-                                .label("+ 添加新账号")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.load_account_into_form(None, window, cx);
-                                })),
-                        ),
-                )
-            })
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(div().text_lg().font_weight(FontWeight::BOLD).child(
-                        if self.editing_account_id.is_some() {
-                            "编辑邮箱账号（IMAP / SMTP）"
-                        } else {
-                            "添加新邮箱账号（IMAP / SMTP）"
-                        },
-                    ))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .children(PROVIDER_PRESETS.iter().map(|preset| {
-                                Button::new(preset.id)
-                                    .outline()
-                                    .label(preset.label)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.apply_preset(preset, window, cx);
-                                    }))
-                            })),
-                    ),
-            )
-            .when(!self.demo_mode, |el| {
-                el.child(
-                    v_flex()
-                        .p_3()
-                        .gap_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    v_flex()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::BOLD)
-                                                .child("Outlook / Microsoft 365 (OAuth2 登录)"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted_fg)
-                                                .child("微软已禁用传统密码登录，点击右侧按钮通过系统浏览器授权并通过 Microsoft Graph 收发邮件。"),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("outlook-oauth-btn")
-                                        .primary()
-                                        .label("Outlook OAuth2 登录")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.start_outlook_oauth(cx);
-                                        })),
-                                ),
-                        )
-                        .child(Input::new(&self.cfg_oauth_client_id)),
-                )
-            })
-            .when_some(self.cfg_auth_guide.as_ref(), |el, guide| {
-                el.child(
-                    div()
-                        .p_2()
-                        .rounded_md()
-                        .bg(accent_soft)
-                        .text_color(p.text)
-                        .text_xs()
-                        .child(guide.clone()),
-                )
-            })
-            .child(div().text_xs().text_color(muted_fg).child(
-                "授权码仅保存在 Windows 凭据管理器中，配置文件 accounts.toml 不记录密码。",
-            ))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(Input::new(&self.cfg_display_name)))
-                    .child(div().flex_1().child(Input::new(&self.cfg_email))),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .child("收信设置 (IMAP)"),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(Input::new(&self.cfg_imap_host)))
-                    .child(div().w(px(100.0)).child(Input::new(&self.cfg_imap_port)))
-                    .child(
-                        Button::new("toggle-imap-tls")
-                            .outline()
-                            .label(if self.cfg_imap_tls {
-                                "TLS (993)"
-                            } else {
-                                "STARTTLS (143)"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cfg_imap_tls = !this.cfg_imap_tls;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(Input::new(&self.cfg_imap_user)))
-                    .child(div().flex_1().child(Input::new(&self.cfg_imap_pass))),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("发信设置 (SMTP)"),
-                    )
-                    .child(
-                        Button::new("toggle-smtp-sep")
-                            .ghost()
-                            .label(if self.cfg_smtp_separate {
-                                "✓ 使用独立 SMTP 凭据"
-                            } else {
-                                "复用 IMAP 凭据"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cfg_smtp_separate = !this.cfg_smtp_separate;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(Input::new(&self.cfg_smtp_host)))
-                    .child(div().w(px(100.0)).child(Input::new(&self.cfg_smtp_port)))
-                    .child(
-                        Button::new("toggle-smtp-tls")
-                            .outline()
-                            .label(if self.cfg_smtp_tls {
-                                "TLS (465)"
-                            } else {
-                                "STARTTLS (587)"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cfg_smtp_tls = !this.cfg_smtp_tls;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .when(self.cfg_smtp_separate, |el| {
-                el.child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().flex_1().child(Input::new(&self.cfg_smtp_user)))
-                        .child(div().flex_1().child(Input::new(&self.cfg_smtp_pass))),
-                )
-            })
-            .when_some(self.cfg_feedback.as_ref(), |el, (ok, msg)| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(if *ok { primary } else { danger })
-                        .child(msg.clone()),
-                )
-            })
-            .child(
-                h_flex()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("verify-account")
-                            .outline()
-                            .label("测试连接")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.verify_account_form(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("save-account")
-                            .primary()
-                            .label("保存并同步")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.save_account_form(cx);
-                            })),
-                    )
-                    .when_some(self.editing_account_id, |el, acc_id| {
-                        el.child(
-                            Button::new("delete-account")
-                                .ghost()
-                                .label("移除此账号")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(ref w) = this.worker {
-                                        w.send(MailRequest::DeleteAccount {
-                                            account_id: acc_id,
-                                        });
-                                        cx.notify();
-                                    }
-                                })),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
+    // ---- 右栏渲染（阅读态 / 写信 / 账号管理 / 欢迎页由 ui:: 渲染）----
 
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         match self.right_mode {
-            RightPaneMode::Compose => self.render_compose_pane(cx),
-            RightPaneMode::AccountSetup => self.render_account_setup_pane(cx),
+            RightPaneMode::Compose => compose::render(self, cx),
+            RightPaneMode::AccountSetup => accounts::render(self, cx),
+            RightPaneMode::Welcome => welcome::render(self, cx),
             RightPaneMode::Reader => reader::render(self, cx),
         }
     }
