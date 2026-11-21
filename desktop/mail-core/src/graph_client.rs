@@ -8,6 +8,7 @@ use base64::Engine;
 use crate::cache::{CachedAttachmentInput, CachedHeaderInput, RemoteFolder};
 use crate::imap_client::html_to_readable_text;
 use crate::smtp_client::SendOutcome;
+use crate::FetchedMessageBody;
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0/me";
 
@@ -249,9 +250,11 @@ fn parse_graph_messages_json(
 pub fn fetch_message_body(
     access_token: &str,
     remote_id: &str,
-) -> Result<(String, Option<String>, Vec<CachedAttachmentInput>), String> {
+) -> Result<FetchedMessageBody, String> {
     let encoded_id = urlencoding_segment(remote_id);
-    let url = format!("{GRAPH_BASE}/messages/{encoded_id}?$select=body,hasAttachments");
+    let url = format!(
+        "{GRAPH_BASE}/messages/{encoded_id}?$select=body,hasAttachments,internetMessageHeaders"
+    );
     let resp = ureq::get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .call()
@@ -300,7 +303,31 @@ pub fn fetch_message_body(
         }
     }
 
-    Ok((body_text, body_html, attachments))
+    // F-7 一键退订：internetMessageHeaders 中查找退订相关头（名称大小写不敏感）。
+    let header_value = |name: &str| -> Option<String> {
+        json["internetMessageHeaders"]
+            .as_array()?
+            .iter()
+            .find(|h| {
+                h["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            .and_then(|h| h["value"].as_str().map(str::trim).map(ToString::to_string))
+    };
+    let unsubscribe_url =
+        header_value("List-Unsubscribe").and_then(|v| crate::cache::extract_unsubscribe_url(&v));
+    let unsubscribe_one_click = header_value("List-Unsubscribe-Post")
+        .map(|v| crate::cache::is_one_click_post(&v))
+        .unwrap_or(false);
+
+    Ok(FetchedMessageBody {
+        body_text,
+        body_html,
+        attachments,
+        unsubscribe_url,
+        unsubscribe_one_click,
+    })
 }
 
 /// Fetch the complete raw MIME message via Graph `/$value` (used for .eml export).

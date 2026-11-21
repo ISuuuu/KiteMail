@@ -9,6 +9,7 @@ use tokio::net::TcpStream;
 
 use crate::cache::{CachedAttachmentInput, CachedHeaderInput, RemoteFolder};
 use crate::config::{AccountConfig, SecurityMode};
+use crate::FetchedMessageBody;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_INITIAL_FETCH: usize = 100;
@@ -417,7 +418,7 @@ pub async fn fetch_message_body(
     password: &str,
     folder_path: &str,
     uid: u32,
-) -> Result<(String, Option<String>, Vec<CachedAttachmentInput>), String> {
+) -> Result<FetchedMessageBody, String> {
     let mut session = connect_imap(account, password).await?;
     session
         .select(folder_path)
@@ -475,7 +476,32 @@ pub async fn fetch_message_body(
         });
     }
 
-    Ok((body_text, body_html, attachments))
+    // F-7 一键退订：`List-Unsubscribe` / `List-Unsubscribe-Post` 头随正文抓取
+    // 一并读出（header_raw 含字段名，剥出值后再提取 URL）。
+    let unsubscribe_url =
+        raw_header_value(parsed.header_raw("List-Unsubscribe").unwrap_or_default())
+            .and_then(crate::cache::extract_unsubscribe_url);
+    let unsubscribe_one_click = raw_header_value(
+        parsed
+            .header_raw("List-Unsubscribe-Post")
+            .unwrap_or_default(),
+    )
+    .map(crate::cache::is_one_click_post)
+    .unwrap_or(false);
+
+    Ok(FetchedMessageBody {
+        body_text,
+        body_html,
+        attachments,
+        unsubscribe_url,
+        unsubscribe_one_click,
+    })
+}
+
+/// 从原始头字段文本（含 `字段名:` 前缀）中剥出值部分。
+fn raw_header_value(raw: &str) -> Option<&str> {
+    let idx = raw.find(':')?;
+    Some(raw[idx + 1..].trim())
 }
 
 /// Fetch the complete raw RFC 822 bytes for `uid` in `folder_path` via
@@ -802,9 +828,12 @@ pub async fn search_folder_messages(
     let cap = limit.max(1);
     let start = uids.len().saturating_sub(cap);
     let target_uids = &uids[start..];
-    let headers = tokio::time::timeout(search_timeout, fetch_headers_for_uids(&mut session, target_uids))
-        .await
-        .map_err(|_| "拉取服务端搜索结果邮件头超时".to_string())??;
+    let headers = tokio::time::timeout(
+        search_timeout,
+        fetch_headers_for_uids(&mut session, target_uids),
+    )
+    .await
+    .map_err(|_| "拉取服务端搜索结果邮件头超时".to_string())??;
     let _ = session.logout().await;
     Ok(headers)
 }

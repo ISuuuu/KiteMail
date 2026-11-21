@@ -3004,6 +3004,7 @@ dependencies = [
 name = "hylki-windows"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gpui-kit",
  "hylki-mail-core",
  "rfd",

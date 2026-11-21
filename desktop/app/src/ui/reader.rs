@@ -286,6 +286,10 @@ fn render_message_card(
     zoom_percent: u32,
     attachments: &[AttachmentMeta],
     is_current: bool,
+    unsubscribe_url: Option<&str>,
+    unsubscribe_one_click: bool,
+    // F-7 该卡片是否处于「退订确认中」（全局待确认邮件 ID 匹配本卡片）。
+    unsubscribe_confirming: bool,
     more_menu: gpui_kit::AnyElement,
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
@@ -612,6 +616,86 @@ fn render_message_card(
                     ),
             )
         })
+        // F-7 一键退订横幅：仅当邮件携带 List-Unsubscribe 头时显示在卡片头部下
+        // 方（不触碰阅读器顶栏与标题区）；点击「退订」后进入卡内二次确认。
+        .when(unsubscribe_url.is_some(), |card| {
+            let confirming = unsubscribe_confirming;
+            let one_click = unsubscribe_one_click;
+            card.child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.0))
+                    .bg(canvas)
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .min_w_0()
+                            .child(
+                                Icon::new(IconName::MailX)
+                                    .with_size(px(14.0))
+                                    .text_color(muted_fg),
+                            )
+                            .child(div().text_xs().text_color(muted_fg).truncate().child(
+                                SharedString::from(if confirming {
+                                    format!(
+                                        "确认退订该邮件列表？{}",
+                                        if one_click {
+                                            "将直接发送一键退订请求"
+                                        } else {
+                                            "将打开退订页面 / 邮件客户端"
+                                        }
+                                    )
+                                } else {
+                                    "这是来自邮件列表的邮件，可以一键退订".to_string()
+                                }),
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .when(!confirming, |el| {
+                                el.child(
+                                    Button::new(("unsubscribe-ask", msg_id))
+                                        .outline()
+                                        .compact()
+                                        .label("退订")
+                                        .icon(IconName::MailX)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.request_unsubscribe(msg_id, cx);
+                                        })),
+                                )
+                            })
+                            .when(confirming, |el| {
+                                el.child(
+                                    Button::new(("unsubscribe-cancel", msg_id))
+                                        .outline()
+                                        .compact()
+                                        .label("取消")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.cancel_unsubscribe(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("unsubscribe-confirm", msg_id))
+                                        .primary()
+                                        .compact()
+                                        .label("确认退订")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.confirm_unsubscribe(msg_id, cx);
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+        })
         .child(
             div()
                 .when(show_raw_source, |el| {
@@ -802,6 +886,8 @@ pub(crate) fn render(
                     flagged: tm.flagged,
                     attachments: tm.attachments.clone(),
                     thread_messages: Vec::new(),
+                    unsubscribe_url: None,
+                    unsubscribe_one_click: false,
                 };
                 let eml_exporting = app.pending_eml_export == Some(tm.id);
                 let menu = build_card_more_menu(
@@ -829,6 +915,9 @@ pub(crate) fn render(
                     zoom_percent,
                     &tm.attachments,
                     is_current,
+                    None,
+                    false,
+                    app.pending_unsubscribe == Some(tm.id),
                     menu,
                     &p,
                     cx,
@@ -867,6 +956,9 @@ pub(crate) fn render(
             zoom_percent,
             &detail.attachments,
             false,
+            detail.unsubscribe_url.as_deref(),
+            detail.unsubscribe_one_click,
+            app.pending_unsubscribe == Some(detail.id),
             menu,
             &p,
             cx,

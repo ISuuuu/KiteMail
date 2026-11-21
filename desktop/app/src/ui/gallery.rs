@@ -1,8 +1,15 @@
 //! 附件总览页（方案文档第三节页面 7）：
 //! - 顶部栏：附件图标 + 标题 + 搜索框（即时过滤，变更发 [`GalleryEvent::QueryChanged`]）
-//!   + 账号筛选下拉（变更发 [`GalleryEvent::AccountFilterChanged`]）。
-//! - 下方紧凑表格：文件图标、文件名、大小（人类可读）、发件人、所属邮件主题、
-//!   日期，以及「保存」「定位到原邮件」按钮（点击发对应事件）。
+//!   + 账号筛选下拉（变更发 [`GalleryEvent::AccountFilterChanged`]）
+//!   + F-6「网格 / 列表」视图切换（会话级记忆）。
+//! - 下方紧凑表格 / 卡片网格：
+//!   - 列表：文件图标、文件名、大小（人类可读）、发件人、所属邮件主题、日期，
+//!     以及「保存」「定位到原邮件」按钮；文件名 / 大小 / 日期表头点击排序
+//!     （升 ↔ 降循环，箭头指示方向），与账号筛选叠加。
+//!   - 网格：卡片（类型图标 + 文件名 + 大小）；图片附件点击预览发
+//!     [`GalleryEvent::PreviewImage`]，其余定位到原邮件。
+//! - F-6 图片预览浮层：集成者回填附件字节后显示大图（`img` + ObjectFit），
+//!   无字节（demo / 非缓存）显示占位说明与「打开所在邮件」。
 //!
 //! 自包含组件：数据由集成者通过 [`GalleryState::set_items`] /
 //! [`GalleryState::set_accounts`] 注入，交互通过 [`GalleryEvent`] 通知集成者，
@@ -14,11 +21,12 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, AppContext, Context, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Stateful, StatefulInteractiveElement, Styled, WindowControlArea,
+    black, div, img, px, AppContext, Context, EventEmitter, ImageFormat, InteractiveElement,
+    IntoElement, MouseButton, ObjectFit, ParentElement, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, StyledImage, WindowControlArea,
 };
 use hylki_mail_core::cache::CachedAttachment;
 
@@ -32,6 +40,36 @@ const COL_SUBJECT_W: f32 = 200.0;
 const COL_SIZE_W: f32 = 80.0;
 const COL_DATE_W: f32 = 120.0;
 const COL_ACTIONS_W: f32 = 210.0;
+/// F-6 网格卡片尺寸。
+const GRID_CARD_W: f32 = 150.0;
+const GRID_CARD_H: f32 = 112.0;
+
+/// F-6 可排序的表头列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GallerySortColumn {
+    Filename,
+    Size,
+    Date,
+}
+
+impl GallerySortColumn {
+    /// 表头展示名。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Filename => "文件名",
+            Self::Size => "大小",
+            Self::Date => "日期",
+        }
+    }
+}
+
+/// F-6 图片预览浮层状态。
+struct GalleryPreview {
+    attachment_id: u32,
+    filename: String,
+    /// 已加载的图片字节（格式 + 原始字节）；`None` 表示未加载或无法渲染。
+    image: Option<(ImageFormat, Vec<u8>)>,
+}
 
 /// 附件总览事件：由集成者订阅并转换为缓存查询 / 文件保存 / 视图跳转。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +82,8 @@ pub enum GalleryEvent {
     SaveAttachment(u32),
     /// 请求定位到附件所属原邮件（参数为邮件 id）。
     LocateMessage(u32),
+    /// F-6 请求预览图片附件（参数为附件 id；字节由集成者回传）。
+    PreviewImage(u32),
 }
 
 /// 附件总览视图状态（独立 Entity，由 HylkiApp 挂载）。
@@ -53,6 +93,14 @@ pub struct GalleryState {
     query: String,
     /// 当前账号筛选。
     account_filter: Option<u32>,
+    /// F-6 表头排序（`None` = 默认按日期倒序的服务端次序）。
+    sort_column: Option<GallerySortColumn>,
+    /// F-6 当前排序方向。
+    sort_asc: bool,
+    /// F-6 视图模式（`true` = 网格，`false` = 列表；会话级记忆）。
+    view_grid: bool,
+    /// F-6 当前打开的图片预览浮层。
+    preview: Option<GalleryPreview>,
     /// 集成者注入的账号列表 `(account_id, 显示名)`。
     accounts: Vec<(u32, String)>,
     /// 集成者注入的附件列表。
@@ -78,6 +126,10 @@ impl GalleryState {
             search_input,
             query: String::new(),
             account_filter: None,
+            sort_column: None,
+            sort_asc: true,
+            view_grid: false,
+            preview: None,
             accounts: Vec::new(),
             items: Vec::new(),
         }
@@ -93,10 +145,45 @@ impl GalleryState {
         self.accounts = accounts;
     }
 
-    /// 客户端过滤：搜索词匹配文件名 / 发件人 / 主题，且命中账号筛选。
+    /// F-6 回填图片预览字节：MIME 非图片或字节为空时保持占位态。
+    pub fn set_preview_image(&mut self, filename: &str, mime_type: &str, bytes: Vec<u8>) {
+        let format = image_format_for_mime(mime_type);
+        let preview = self.preview.as_mut();
+        if let Some(preview) = preview {
+            preview.filename = filename.to_string();
+            preview.image = format.filter(|_| !bytes.is_empty()).map(|f| (f, bytes));
+        }
+    }
+
+    /// F-6 预览字节不可用（demo / 抓取失败）：显示占位说明。
+    pub fn set_preview_unavailable(&mut self) {
+        if let Some(preview) = self.preview.as_mut() {
+            preview.image = None;
+        }
+    }
+
+    /// F-6 表头点击循环排序：切列默认升序，再点同列反转方向。
+    fn cycle_sort(&mut self, column: GallerySortColumn) {
+        if self.sort_column == Some(column) {
+            if self.sort_asc {
+                self.sort_asc = false;
+            } else {
+                // 第三次点击恢复默认次序。
+                self.sort_column = None;
+                self.sort_asc = true;
+            }
+        } else {
+            self.sort_column = Some(column);
+            self.sort_asc = true;
+        }
+    }
+
+    /// 客户端过滤 + F-6 表头排序：搜索词匹配文件名 / 发件人 / 主题，
+    /// 命中账号筛选；按所选列升 / 降序（默认服务端日期倒序）。
     fn visible_items(&self) -> Vec<&CachedAttachment> {
         let query = self.query.trim().to_lowercase();
-        self.items
+        let mut items: Vec<&CachedAttachment> = self
+            .items
             .iter()
             .filter(|item| {
                 self.account_filter.is_none_or(|id| item.account_id == id)
@@ -105,7 +192,59 @@ impl GalleryState {
                         || item.sender.to_lowercase().contains(&query)
                         || item.subject.to_lowercase().contains(&query))
             })
-            .collect()
+            .collect();
+        match self.sort_column {
+            Some(GallerySortColumn::Filename) => {
+                items.sort_by(|a, b| {
+                    let ord = a.filename.to_lowercase().cmp(&b.filename.to_lowercase());
+                    if self.sort_asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+            Some(GallerySortColumn::Size) => {
+                items.sort_by(|a, b| {
+                    let ord = a.size_bytes.cmp(&b.size_bytes);
+                    if self.sort_asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+            Some(GallerySortColumn::Date) => {
+                items.sort_by(|a, b| {
+                    let ord = a.date_ts.cmp(&b.date_ts).then_with(|| a.id.cmp(&b.id));
+                    if self.sort_asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+            None => {}
+        }
+        items
+    }
+}
+
+/// F-6 MIME 类型 → gpui 可渲染的图片格式（仅常见位图；SVG 不支持预览）。
+fn image_format_for_mime(mime_type: &str) -> Option<ImageFormat> {
+    let mime = mime_type.to_ascii_lowercase();
+    if mime.starts_with("image/png") {
+        Some(ImageFormat::Png)
+    } else if mime.starts_with("image/jpeg") {
+        Some(ImageFormat::Jpeg)
+    } else if mime.starts_with("image/webp") {
+        Some(ImageFormat::Webp)
+    } else if mime.starts_with("image/gif") {
+        Some(ImageFormat::Gif)
+    } else if mime.starts_with("image/bmp") {
+        Some(ImageFormat::Bmp)
+    } else {
+        None
     }
 }
 
@@ -208,6 +347,76 @@ impl Render for GalleryState {
                         );
                     }
                     menu
+                })
+        };
+
+        // F-6：「网格 / 列表」视图切换（会话级记忆，默认列表）。
+        let entity_for_views = entity.clone();
+        let grid_btn = Button::new("gallery-view-grid")
+            .ghost()
+            .compact()
+            .icon(IconName::LayoutGrid)
+            .tooltip("网格视图")
+            .selected(self.view_grid)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.view_grid = true;
+                cx.notify();
+            }));
+        let list_btn = Button::new("gallery-view-list")
+            .ghost()
+            .compact()
+            .icon(IconName::List)
+            .tooltip("列表视图")
+            .selected(!self.view_grid)
+            .on_click(move |_, _, cx| {
+                entity_for_views.update(cx, |this, cx| {
+                    this.view_grid = false;
+                    cx.notify();
+                });
+            });
+
+        // F-6：表头单元格（文件名 / 大小 / 日期）点击循环排序，箭头指示方向。
+        let sort_header = |column: GallerySortColumn| -> gpui_kit::Stateful<gpui_kit::Div> {
+            let active = self.sort_column == Some(column);
+            let (label, width) = match column {
+                GallerySortColumn::Filename => (column.label(), 0.0),
+                GallerySortColumn::Size => (column.label(), COL_SIZE_W),
+                GallerySortColumn::Date => (column.label(), COL_DATE_W),
+            };
+            let arrow = if active {
+                Some(if self.sort_asc {
+                    IconName::SortAscending
+                } else {
+                    IconName::SortDescending
+                })
+            } else {
+                None
+            };
+            let mut cell = h_flex()
+                .id(("gallery-sort", column as u32))
+                .items_center()
+                .gap_0p5()
+                .cursor_pointer();
+            if width > 0.0 {
+                cell = cell.w(px(width)).flex_shrink_0();
+            } else {
+                cell = cell.flex_1().min_w_0();
+            }
+            let entity_for_sort = entity.clone();
+            cell.child(div().child(label))
+                .when_some(arrow, |el, icon| {
+                    el.child(Icon::new(icon).with_size(px(12.0)).text_color(if active {
+                        text
+                    } else {
+                        muted_fg
+                    }))
+                })
+                .when(active, |el| el.text_color(text))
+                .on_click(move |_, _, cx| {
+                    entity_for_sort.update(cx, |this, cx| {
+                        this.cycle_sort(column);
+                        cx.notify();
+                    });
                 })
         };
 
@@ -321,6 +530,117 @@ impl Render for GalleryState {
             })
             .collect();
 
+        // F-6：图片预览浮层（遮罩 + 居中卡片）。
+        // 已回传图片字节时显示大图（ObjectFit::Contain 等比缩放），
+        // 否则显示占位说明与「打开所在邮件」跳转。
+        let preview_overlay = if let Some(preview) = self.preview.as_ref() {
+            let message_id = self
+                .items
+                .iter()
+                .find(|item| item.id == preview.attachment_id)
+                .map(|item| item.message_id);
+            let filename = preview.filename.clone();
+            let image = preview.image.clone().map(|(format, bytes)| {
+                std::sync::Arc::new(gpui_kit::Image::from_bytes(format, bytes))
+            });
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .bg(black().opacity(0.5))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.preview = None;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    h_flex().size_full().items_center().justify_center().child(
+                        v_flex()
+                            .bg(p.surface)
+                            .rounded(px(12.0))
+                            .border_1()
+                            .border_color(p.border)
+                            .shadow_xl()
+                            .p_3()
+                            .gap_2()
+                            .max_w(px(720.0))
+                            .max_h(px(560.0))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .text_color(text)
+                                            .truncate()
+                                            .child(SharedString::from(filename.clone())),
+                                    )
+                                    .child(
+                                        Button::new("gallery-preview-close")
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::Close)
+                                            .tooltip("关闭预览")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.preview = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(if let Some(image) = image {
+                                img(image)
+                                    .object_fit(ObjectFit::Contain)
+                                    .flex_1()
+                                    .min_h_0()
+                                    .rounded(px(6.0))
+                                    .into_any_element()
+                            } else {
+                                v_flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .py_8()
+                                    .child(
+                                        Icon::new(IconName::Image)
+                                            .with_size(px(32.0))
+                                            .text_color(muted_fg),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child("未能加载图片数据（演示模式或缓存不完整）"),
+                                    )
+                                    .when_some(message_id, |el, msg_id| {
+                                        el.child(
+                                            Button::new("gallery-preview-locate")
+                                                .outline()
+                                                .compact()
+                                                .label("打开所在邮件")
+                                                .icon(IconName::ExternalLink)
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    cx.emit(GalleryEvent::LocateMessage(msg_id));
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    })
+                                    .into_any_element()
+                            }),
+                    ),
+                )
+        } else {
+            div()
+        };
+
         v_flex()
             .size_full()
             .bg(canvas)
@@ -354,6 +674,9 @@ impl Render for GalleryState {
                             .child(Input::new(&self.search_input)),
                     )
                     .child(filter_button)
+                    // F-6：网格 / 列表视图切换。
+                    .child(grid_btn)
+                    .child(list_btn)
                     .child(
                         h_flex()
                             .flex_1()
@@ -361,36 +684,42 @@ impl Render for GalleryState {
                             .pr(px(144.0))
                             .items_center()
                             .window_control_area(WindowControlArea::Drag)
-                            .child(div().text_xs().text_color(muted_fg).child(
-                                SharedString::from(format!(
-                                    "共 {total} 个附件，当前显示 {} 个",
-                                    visible.len()
-                                )),
-                            )),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(SharedString::from(format!(
+                                        "共 {total} 个附件，当前显示 {} 个",
+                                        visible.len()
+                                    ))),
+                            ),
                     ),
             )
-            // 表头。
-            .child(
-                h_flex()
-                    .h(px(30.0))
-                    .flex_shrink_0()
-                    .mx_2()
-                    .px_3()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(border)
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child(div().w(px(18.0)).flex_shrink_0())
-                    .child(div().flex_1().min_w_0().child("文件名"))
-                    .child(div().w(px(COL_SENDER_W)).flex_shrink_0().child("发件人"))
-                    .child(div().w(px(COL_SUBJECT_W)).flex_shrink_0().child("邮件主题"))
-                    .child(div().w(px(COL_SIZE_W)).flex_shrink_0().child("大小"))
-                    .child(div().w(px(COL_DATE_W)).flex_shrink_0().child("日期"))
-                    .child(div().w(px(COL_ACTIONS_W)).flex_shrink_0().child("操作")),
-            )
-            // 附件行（可滚动）。行点击即「定位到原邮件」。
+            // 表头（列表视图）：文件名 / 大小 / 日期可点击排序。
+            .when(!self.view_grid, |el| {
+                el.child(
+                    h_flex()
+                        .h(px(30.0))
+                        .flex_shrink_0()
+                        .mx_2()
+                        .px_3()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(border)
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(div().w(px(18.0)).flex_shrink_0())
+                        .child(sort_header(GallerySortColumn::Filename))
+                        .child(div().w(px(COL_SENDER_W)).flex_shrink_0().child("发件人"))
+                        .child(div().w(px(COL_SUBJECT_W)).flex_shrink_0().child("邮件主题"))
+                        .child(sort_header(GallerySortColumn::Size))
+                        .child(sort_header(GallerySortColumn::Date))
+                        .child(div().w(px(COL_ACTIONS_W)).flex_shrink_0().child("操作")),
+                )
+            })
+            // 附件行 / 卡片网格（可滚动）。列表行点击即「定位到原邮件」；
+            // 网格卡片：图片附件点击预览，其余定位到原邮件。
             .child(
                 v_flex()
                     .id("gallery-list")
@@ -417,8 +746,80 @@ impl Render for GalleryState {
                                 })),
                         )
                     })
-                    .children(rows),
+                    .when(self.view_grid, |el| {
+                        // F-6 网格视图：卡片流式布局（类型图标 + 文件名 + 大小）。
+                        let cards: Vec<gpui_kit::Stateful<gpui_kit::Div>> = visible
+                            .iter()
+                            .map(|item| {
+                                let icon = icon_for_mime(&item.mime_type);
+                                let is_image = item.mime_type.to_lowercase().starts_with("image/");
+                                let filename = item.filename.clone();
+                                let preview_filename = filename.clone();
+                                let size_text = format_size(item.size_bytes);
+                                let attachment_id = item.id;
+                                let message_id = item.message_id;
+                                h_flex()
+                                    .id(("gallery-card", attachment_id))
+                                    .flex_col()
+                                    .w(px(GRID_CARD_W))
+                                    .h(px(GRID_CARD_H))
+                                    .p_2()
+                                    .gap_1()
+                                    .rounded(px(10.0))
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(surface)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(accent_soft))
+                                    .items_center()
+                                    .justify_center()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if is_image {
+                                            // F-6：先打开占位浮层，字节回传后显示大图。
+                                            this.preview = Some(GalleryPreview {
+                                                attachment_id,
+                                                filename: preview_filename.clone(),
+                                                image: None,
+                                            });
+                                            cx.emit(GalleryEvent::PreviewImage(attachment_id));
+                                        } else {
+                                            cx.emit(GalleryEvent::LocateMessage(message_id));
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(Icon::new(icon).with_size(px(32.0)).text_color(muted_fg))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .text_xs()
+                                            .text_color(text)
+                                            .text_center()
+                                            .truncate()
+                                            .child(SharedString::from(filename)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child(SharedString::from(size_text)),
+                                    )
+                            })
+                            .collect();
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .p_2()
+                                .gap_2()
+                                .content_start()
+                                .children(cards),
+                        )
+                    })
+                    .when(!self.view_grid, |el| el.children(rows)),
             )
+            // F-6 图片预览浮层（页内居中，遮罩点击关闭）。
+            .relative()
+            .when(self.preview.is_some(), |root| root.child(preview_overlay))
     }
 }
 
@@ -451,5 +852,16 @@ mod tests {
             icon_for_mime("application/octet-stream"),
             IconName::File
         ));
+    }
+
+    #[test]
+    fn image_format_for_mime_maps_common_bitmaps() {
+        assert_eq!(image_format_for_mime("image/png"), Some(ImageFormat::Png));
+        assert_eq!(image_format_for_mime("IMAGE/JPEG"), Some(ImageFormat::Jpeg));
+        assert_eq!(image_format_for_mime("image/gif"), Some(ImageFormat::Gif));
+        assert_eq!(image_format_for_mime("image/webp"), Some(ImageFormat::Webp));
+        // SVG 不支持预览渲染，回退占位说明。
+        assert_eq!(image_format_for_mime("image/svg+xml"), None);
+        assert_eq!(image_format_for_mime("application/pdf"), None);
     }
 }
