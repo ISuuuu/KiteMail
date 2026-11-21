@@ -1,0 +1,462 @@
+//! Async IMAP client supporting TLS and STARTTLS with MIME header/body parsing.
+
+use std::time::Duration;
+
+use async_native_tls::TlsConnector;
+use futures::StreamExt;
+use mail_parser::{MessageParser, MimeHeaders};
+use tokio::net::TcpStream;
+
+use crate::cache::{CachedAttachmentInput, CachedHeaderInput, RemoteFolder};
+use crate::config::{AccountConfig, SecurityMode};
+
+const IO_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_INITIAL_FETCH: usize = 100;
+
+type TlsStream = async_native_tls::TlsStream<TcpStream>;
+type ImapSession = async_imap::Session<TlsStream>;
+
+async fn connect_imap(account: &AccountConfig, password: &str) -> Result<ImapSession, String> {
+    if account.imap_host.trim().is_empty() {
+        return Err("IMAP 主机地址不能为空".to_string());
+    }
+    let addr = (account.imap_host.as_str(), account.imap_port);
+    let tcp = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| {
+            format!(
+                "连接 IMAP 服务器 {}:{} 超时",
+                account.imap_host, account.imap_port
+            )
+        })?
+        .map_err(|e| format!("连接 IMAP 服务器失败: {e}"))?;
+
+    let tls = TlsConnector::new();
+    let client = match account.imap_security {
+        SecurityMode::StartTls => {
+            let mut plain = async_imap::Client::new(tcp);
+            let _ = tokio::time::timeout(IO_TIMEOUT, plain.read_response()).await;
+            tokio::time::timeout(IO_TIMEOUT, plain.run_command_and_check_ok("STARTTLS", None))
+                .await
+                .map_err(|_| "IMAP STARTTLS 握手超时".to_string())?
+                .map_err(|e| format!("IMAP STARTTLS 失败: {e}"))?;
+            let stream = tokio::time::timeout(
+                IO_TIMEOUT,
+                tls.connect(account.imap_host.as_str(), plain.into_inner()),
+            )
+            .await
+            .map_err(|_| "IMAP TLS 升级超时".to_string())?
+            .map_err(|e| format!("IMAP TLS 证书校验或握手失败: {e}"))?;
+            async_imap::Client::new(stream)
+        }
+        SecurityMode::Tls => {
+            let stream =
+                tokio::time::timeout(IO_TIMEOUT, tls.connect(account.imap_host.as_str(), tcp))
+                    .await
+                    .map_err(|_| "IMAP TLS 握手超时".to_string())?
+                    .map_err(|e| format!("IMAP TLS 证书校验或握手失败: {e}"))?;
+            let mut c = async_imap::Client::new(stream);
+            let _ = tokio::time::timeout(IO_TIMEOUT, c.read_response()).await;
+            c
+        }
+    };
+
+    let username = if account.imap_username.trim().is_empty() {
+        account.email.as_str()
+    } else {
+        account.imap_username.as_str()
+    };
+
+    let session = client.login(username, password).await.map_err(|(e, _)| {
+        let msg = e.to_string();
+        if msg.contains("Basic authentication is disabled") {
+            "该邮箱服务商已禁用传统密码登录（Basic authentication is disabled），Outlook / Microsoft 365 需通过 OAuth2 授权登录；请先使用 QQ 邮箱、网易 163 或支持应用专用密码的邮箱测试。".to_string()
+        } else {
+            format!("IMAP 登录失败（请检查用户名或授权码）: {msg}")
+        }
+    })?;
+
+    Ok(session)
+}
+
+/// Verify IMAP connectivity and login credentials.
+pub async fn verify_login(account: &AccountConfig, password: &str) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+/// Fetch mailbox folder list from the IMAP server.
+pub async fn fetch_folders(
+    account: &AccountConfig,
+    password: &str,
+) -> Result<Vec<RemoteFolder>, String> {
+    let mut session = connect_imap(account, password).await?;
+    let mut stream = session
+        .list(None, Some("*"))
+        .await
+        .map_err(|e| format!("拉取文件夹列表失败: {e}"))?;
+
+    let mut folders = Vec::new();
+    while let Some(item) = stream.next().await {
+        if let Ok(name) = item {
+            let path = name.name().to_string();
+            let display = friendly_folder_name(&path);
+            folders.push(RemoteFolder {
+                name: display,
+                path,
+                unread_count: 0,
+                total_count: 0,
+            });
+        }
+    }
+    drop(stream);
+    let _ = session.logout().await;
+
+    if folders.is_empty() {
+        folders.push(RemoteFolder {
+            name: "收件箱".to_string(),
+            path: "INBOX".to_string(),
+            unread_count: 0,
+            total_count: 0,
+        });
+    }
+    Ok(folders)
+}
+
+/// Fetch recent message headers and flags for `folder_path`.
+/// Returns `(uid_validity, headers, live_uids)`.
+pub async fn fetch_folder_headers(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+) -> Result<(u32, Vec<CachedHeaderInput>, Vec<u32>), String> {
+    let mut session = connect_imap(account, password).await?;
+    let mailbox = session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    let uid_validity = mailbox.uid_validity.unwrap_or(1);
+    let uids_set = session
+        .uid_search("ALL")
+        .await
+        .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
+
+    let mut live_uids: Vec<u32> = uids_set.into_iter().collect();
+    live_uids.sort_unstable();
+
+    if live_uids.is_empty() {
+        let _ = session.logout().await;
+        return Ok((uid_validity, Vec::new(), Vec::new()));
+    }
+
+    let start_idx = live_uids.len().saturating_sub(MAX_INITIAL_FETCH);
+    let target_uids = &live_uids[start_idx..];
+    let uid_list = target_uids
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut fetches = session
+        .uid_fetch(&uid_list, "(UID FLAGS RFC822.HEADER)")
+        .await
+        .map_err(|e| format!("拉取邮件头失败: {e}"))?;
+
+    let parser = MessageParser::default();
+    let mut headers = Vec::with_capacity(target_uids.len());
+
+    while let Some(fetch_res) = fetches.next().await {
+        let Ok(fetch) = fetch_res else {
+            continue;
+        };
+        let Some(uid) = fetch.uid else {
+            continue;
+        };
+        let mut unread = true;
+        let mut flagged = false;
+        for flag in fetch.flags() {
+            match flag {
+                async_imap::types::Flag::Seen => unread = false,
+                async_imap::types::Flag::Flagged => flagged = true,
+                _ => {}
+            }
+        }
+        let raw_header = fetch.header().unwrap_or_default();
+        headers.push(parse_header_bytes(
+            &parser, uid, unread, flagged, raw_header,
+        ));
+    }
+    drop(fetches);
+    let _ = session.logout().await;
+
+    Ok((uid_validity, headers, live_uids))
+}
+
+/// Fetch full RFC 822 message body and attachments for `uid` in `folder_path`.
+pub async fn fetch_message_body(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+) -> Result<(String, Vec<CachedAttachmentInput>), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    let mut fetches = session
+        .uid_fetch(uid.to_string(), "RFC822")
+        .await
+        .map_err(|e| format!("拉取邮件正文失败 (UID {uid}): {e}"))?;
+
+    let mut raw_body: Option<Vec<u8>> = None;
+    while let Some(fetch_res) = fetches.next().await {
+        if let Ok(fetch) = fetch_res {
+            if let Some(body) = fetch.body() {
+                raw_body = Some(body.to_vec());
+                break;
+            }
+        }
+    }
+    drop(fetches);
+    let _ = session.logout().await;
+
+    let bytes = raw_body.ok_or_else(|| format!("服务器未返回 UID {uid} 的邮件内容"))?;
+    let parsed = MessageParser::default()
+        .parse(&bytes)
+        .ok_or_else(|| "解析邮件 MIME 内容失败".to_string())?;
+
+    let body_text = if let Some(text) = parsed.body_text(0) {
+        text.into_owned()
+    } else if let Some(html) = parsed.body_html(0) {
+        html_to_readable_text(&html)
+    } else {
+        "(此邮件无可读正文)".to_string()
+    };
+
+    let mut attachments = Vec::new();
+    for att in parsed.attachments() {
+        let filename = att
+            .attachment_name()
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let mime_type = att
+            .content_type()
+            .map(|ct| match ct.subtype() {
+                Some(sub) => format!("{}/{}", ct.ctype(), sub),
+                None => ct.ctype().to_string(),
+            })
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        attachments.push(CachedAttachmentInput {
+            filename,
+            mime_type,
+            content: att.contents().to_vec(),
+        });
+    }
+
+    Ok((body_text, attachments))
+}
+
+/// Add or remove `\Seen` or `\Flagged` on the server for `uid`.
+pub async fn set_flag(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+    flag: &str,
+    add: bool,
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    let op = if add {
+        "+FLAGS.SILENT"
+    } else {
+        "-FLAGS.SILENT"
+    };
+    let query = format!("{op} ({flag})");
+    let mut stream = session
+        .uid_store(uid.to_string(), query)
+        .await
+        .map_err(|e| format!("同步邮件标记 {flag} 失败: {e}"))?;
+    while stream.next().await.is_some() {}
+    drop(stream);
+    let _ = session.logout().await;
+    Ok(())
+}
+
+fn parse_header_bytes(
+    parser: &MessageParser,
+    uid: u32,
+    unread: bool,
+    flagged: bool,
+    raw: &[u8],
+) -> CachedHeaderInput {
+    let Some(msg) = parser.parse(raw) else {
+        return CachedHeaderInput {
+            uid,
+            message_id: String::new(),
+            sender: "(未知发件人)".to_string(),
+            recipients: String::new(),
+            subject: "(无法解析标题)".to_string(),
+            preview: String::new(),
+            date_ts: uid as i64,
+            date_display: String::new(),
+            unread,
+            flagged,
+            has_attachment: false,
+        };
+    };
+
+    let sender = msg
+        .from()
+        .and_then(|addr| addr.first())
+        .map(format_address)
+        .unwrap_or_else(|| "(未知发件人)".to_string());
+
+    let recipients = msg
+        .to()
+        .map(|list| {
+            list.iter()
+                .map(format_address)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+
+    let subject = msg
+        .subject()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(无主题)")
+        .to_string();
+
+    let message_id = msg.message_id().unwrap_or_default().to_string();
+
+    let (date_ts, date_display) = match msg.date() {
+        Some(dt) => {
+            let ts = dt.to_timestamp();
+            let display = chrono::DateTime::from_timestamp(ts, 0)
+                .map(|utc| {
+                    utc.with_timezone(&chrono::Local)
+                        .format("%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            (ts, display)
+        }
+        None => (uid as i64, String::new()),
+    };
+
+    let has_attachment = msg.content_type().is_some_and(|ct| {
+        ct.ctype().eq_ignore_ascii_case("multipart") && ct.subtype() == Some("mixed")
+    });
+
+    CachedHeaderInput {
+        uid,
+        message_id,
+        sender,
+        recipients,
+        subject,
+        preview: "点击加载邮件正文...".to_string(),
+        date_ts,
+        date_display,
+        unread,
+        flagged,
+        has_attachment,
+    }
+}
+
+fn format_address(addr: &mail_parser::Addr<'_>) -> String {
+    match (addr.name(), addr.address()) {
+        (Some(name), Some(email)) if !name.trim().is_empty() => {
+            format!("{} <{}>", name.trim(), email)
+        }
+        (_, Some(email)) => email.to_string(),
+        (Some(name), None) => name.to_string(),
+        _ => "(未知)".to_string(),
+    }
+}
+
+fn friendly_folder_name(path: &str) -> String {
+    match path.to_ascii_uppercase().as_str() {
+        "INBOX" => "收件箱".to_string(),
+        "SENT" | "SENT MESSAGES" | "SENT ITEMS" => "已发送".to_string(),
+        "DRAFTS" => "草稿箱".to_string(),
+        "TRASH" | "DELETED" | "DELETED MESSAGES" => "已删除".to_string(),
+        "JUNK" | "SPAM" => "垃圾邮件".to_string(),
+        "ARCHIVE" => "归档".to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// Convert HTML-only messages into readable plain text while stripping scripts/styles.
+pub fn html_to_readable_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    let mut skip_block = false;
+    let mut tag_buf = String::new();
+
+    for ch in html.chars() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+            continue;
+        }
+        if ch == '>' && in_tag {
+            in_tag = false;
+            let lower = tag_buf.trim().to_ascii_lowercase();
+            if lower.starts_with("script") || lower.starts_with("style") {
+                skip_block = true;
+            } else if lower.starts_with("/script") || lower.starts_with("/style") {
+                skip_block = false;
+            } else if lower == "br"
+                || lower == "br/"
+                || lower.starts_with("br ")
+                || lower.starts_with("/p")
+                || lower.starts_with("/div")
+                || lower.starts_with("/li")
+            {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            continue;
+        }
+        if in_tag {
+            tag_buf.push(ch);
+            continue;
+        }
+        if !skip_block {
+            out.push(ch);
+        }
+    }
+
+    out.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .trim()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_stripping_preserves_readable_lines() {
+        let html = "<html><head><style>body{color:red}</style></head><body><p>你好，世界</p><p>第二行 &amp; 测试</p></body></html>";
+        let text = html_to_readable_text(html);
+        assert!(text.contains("你好，世界"));
+        assert!(text.contains("第二行 & 测试"));
+        assert!(!text.contains("color:red"));
+    }
+}

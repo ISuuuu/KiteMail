@@ -1,0 +1,67 @@
+name: Windows x64 Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    paths:
+      - "desktop/**"
+      - ".github/workflows/windows.yml"
+  workflow_dispatch:
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            desktop/target/
+          key: ${{ runner.os }}-desktop-cargo-${{ hashFiles('desktop/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-desktop-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
+
+      - name: Check workspace
+        run: cargo check --manifest-path desktop/Cargo.toml --workspace --target x86_64-pc-windows-msvc --locked
+
+      - name: Run unit tests
+        run: cargo test --manifest-path desktop/Cargo.toml --workspace --target x86_64-pc-windows-msvc --locked
+
+      - name: Build release binary
+        run: cargo build --manifest-path desktop/Cargo.toml -p hylki-windows --release --target x86_64-pc-windows-msvc --locked
+
+      - name: Package Windows x64 ZIP
+        shell: pwsh
+        run: |
+          $stage = "dist/hylki-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/hylki-windows.exe" $stage
+          Copy-Item "LICENSE" $stage
+          Copy-Item "README.md" $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/hylki-windows-x64.zip" -Force
+
+      - name: Upload Windows x64 ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hylki-windows-x64
+          path: dist/hylki-windows-x64.zip

@@ -1,0 +1,11 @@
+[package]
+name = "hylki-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Windows GPUI client for Hylki"
+
+[dependencies]
+gpui-kit = { workspace = true }
+hylki-mail-core = { path = "../mail-core" }
+rfd = { workspace = true }
