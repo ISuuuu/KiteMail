@@ -82,6 +82,10 @@ pub struct AttachmentMeta {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadMessage {
     pub id: u32,
+    #[serde(default)]
+    pub rfc_message_id: String,
+    #[serde(default)]
+    pub subject: String,
     pub sender: String,
     pub recipients: String,
     pub date_display: String,
@@ -294,6 +298,10 @@ pub enum MailRequest {
         attachment_id: u32,
         dest_path: std::path::PathBuf,
     },
+    SaveAllAttachments {
+        attachment_ids: Vec<u32>,
+        dest_dir: std::path::PathBuf,
+    },
     SaveLocalDraft {
         draft: LocalDraft,
     },
@@ -368,6 +376,10 @@ pub enum WorkerEvent {
     },
     AttachmentSaved {
         path: std::path::PathBuf,
+    },
+    AttachmentsSaved {
+        count: usize,
+        dest_dir: std::path::PathBuf,
     },
     /// A message was moved to the account's archive folder on the server and
     /// removed from the local cache; the UI should refresh its lists.

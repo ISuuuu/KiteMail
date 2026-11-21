@@ -321,6 +321,10 @@ pub(crate) struct HylkiApp {
     pub(crate) reader_prefer_plain: bool,
     /// 本次会话中用户手动放行远程图片的邮件 ID 集合。
     pub(crate) allowed_remote_image_ids: HashSet<u32>,
+    /// 当前会话阅读器中处于折叠状态的卡片邮件 ID 集合。
+    pub(crate) collapsed_thread_cards: HashSet<u32>,
+    /// 当前会话阅读器中处于「查看邮件原文」模式的卡片邮件 ID 集合。
+    pub(crate) raw_source_message_ids: HashSet<u32>,
 
     // ---- 阶段 3：全局路由 / 模态 / 偏好（方案文档五.1、五.2）----
     /// 持久化偏好副本（preferences.toml；last_view / last_folder 随切换落盘）。
@@ -493,10 +497,19 @@ impl HylkiApp {
 
         if demo_mode {
             let current_page = demo_store.list_messages_page(DEMO_INBOX_ID, "", 0, prefs.page_size);
-            let selected_message = current_page
+            let mut selected_message = current_page
                 .items
                 .first()
                 .and_then(|msg| demo_store.get_message_detail(msg.id));
+            if !prefs.thread_newest_first {
+                if let Some(ref mut d) = selected_message {
+                    d.thread_messages.reverse();
+                }
+            }
+            let initial_collapsed = selected_message
+                .as_ref()
+                .map(|d| compute_default_collapsed_cards(d, prefs.thread_newest_first, prefs.fold_older_messages))
+                .unwrap_or_default();
             let mut folders_by_account = BTreeMap::new();
             folders_by_account.insert(1, demo_store.folders.clone());
             let demo_acc = AccountConfig {
@@ -562,6 +575,8 @@ impl HylkiApp {
                 collapsed_accounts: HashSet::new(),
                 reader_prefer_plain: false,
                 allowed_remote_image_ids: HashSet::new(),
+                collapsed_thread_cards: initial_collapsed,
+                raw_source_message_ids: HashSet::new(),
                 prefs,
                 main_view: MainContentView::Mail,
                 active_modal: ActiveModal::None,
@@ -695,6 +710,8 @@ impl HylkiApp {
             collapsed_accounts: HashSet::new(),
             reader_prefer_plain: false,
             allowed_remote_image_ids: HashSet::new(),
+            collapsed_thread_cards: HashSet::new(),
+            raw_source_message_ids: HashSet::new(),
             prefs,
             main_view: MainContentView::Mail,
             active_modal: ActiveModal::None,
@@ -815,7 +832,7 @@ impl HylkiApp {
                     }
                 }
                 WorkerEvent::MessageBodyLoaded(detail) => {
-                    self.selected_message = Some(detail);
+                    self.set_selected_message(detail);
                     self.error_banner = None;
                 }
                 WorkerEvent::DraftsUpdated { drafts } => {
@@ -842,6 +859,12 @@ impl HylkiApp {
                 WorkerEvent::AttachmentSaved { path } => {
                     self.status_line =
                         SharedString::from(format!("附件已保存至：{}", path.display()));
+                }
+                WorkerEvent::AttachmentsSaved { count, dest_dir } => {
+                    self.status_line = SharedString::from(format!(
+                        "已保存 {count} 个附件至：{}",
+                        dest_dir.display()
+                    ));
                 }
                 WorkerEvent::Status {
                     account_id: _,
@@ -1063,11 +1086,16 @@ impl HylkiApp {
                 0,
                 self.prefs.page_size,
             );
-            self.selected_message = self
+            let first_detail = self
                 .current_page
                 .items
                 .first()
-                .and_then(|m| self.demo_store.get_message_detail(m.id));
+                .and_then(|m| self.demo_message_detail(m.id));
+            if let Some(d) = first_detail {
+                self.set_selected_message(d);
+            } else {
+                self.selected_message = None;
+            }
             cx.notify();
             return;
         }
@@ -1095,7 +1123,11 @@ impl HylkiApp {
     ) {
         self.right_mode = RightPaneMode::Reader;
         if self.demo_mode {
-            self.selected_message = self.demo_store.get_message_detail(message_id);
+            if let Some(detail) = self.demo_message_detail(message_id) {
+                self.set_selected_message(detail);
+            } else {
+                self.selected_message = None;
+            }
             cx.notify();
             return;
         }
@@ -1200,14 +1232,123 @@ impl HylkiApp {
         cx.notify();
     }
 
+    /// 永久信任该发件人（写入 `prefs.allowed_remote_senders` 并落盘）。
+    pub(crate) fn trust_remote_sender(&mut self, sender: &str, cx: &mut Context<Self>) {
+        if let Some(email) = self.prefs.allow_remote_sender(sender) {
+            if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
+                self.error_banner = Some(SharedString::from(e));
+            } else {
+                self.status_line =
+                    SharedString::from(format!("已将 {email} 加入远程图片发件人白名单"));
+            }
+            cx.notify();
+        }
+    }
+
+    /// 按偏好顺序返回演示邮件详情。
+    fn demo_message_detail(&self, message_id: u32) -> Option<MessageDetail> {
+        let mut detail = self.demo_store.get_message_detail(message_id)?;
+        if !self.prefs.thread_newest_first && detail.thread_messages.len() > 1 {
+            detail.thread_messages.reverse();
+        }
+        Some(detail)
+    }
+
+    /// 更新当前选中邮件详情并初始化会话卡片折叠态 / 原文态。
+    fn set_selected_message(&mut self, detail: MessageDetail) {
+        let same_thread = self.selected_message.as_ref().is_some_and(|prev| {
+            prev.id == detail.id || prev.thread_messages.iter().any(|m| m.id == detail.id)
+        });
+        if same_thread {
+            // 同一会话内加载单张卡片正文：保留其他卡片状态，但确保刚加载的卡片处于展开态。
+            self.collapsed_thread_cards.remove(&detail.id);
+        } else {
+            self.raw_source_message_ids.clear();
+            self.collapsed_thread_cards = compute_default_collapsed_cards(
+                &detail,
+                self.prefs.thread_newest_first,
+                self.prefs.fold_older_messages,
+            );
+        }
+        self.selected_message = Some(detail);
+    }
+
+    /// 切换指定会话卡片的折叠/展开态。
+    pub(crate) fn toggle_thread_card_collapsed(&mut self, msg_id: u32, cx: &mut Context<Self>) {
+        if !self.collapsed_thread_cards.remove(&msg_id) {
+            self.collapsed_thread_cards.insert(msg_id);
+        }
+        cx.notify();
+    }
+
+    /// 展开当前会话中的全部卡片。
+    pub(crate) fn expand_all_thread_cards(&mut self, cx: &mut Context<Self>) {
+        self.collapsed_thread_cards.clear();
+        cx.notify();
+    }
+
+    /// 折叠当前会话中的较早卡片（保留最新一封展开）。
+    pub(crate) fn collapse_older_thread_cards(&mut self, cx: &mut Context<Self>) {
+        if let Some(ref detail) = self.selected_message {
+            if detail.thread_messages.len() >= 2 {
+                let newest_id = if self.prefs.thread_newest_first {
+                    detail.thread_messages.first().map(|m| m.id)
+                } else {
+                    detail.thread_messages.last().map(|m| m.id)
+                };
+                self.collapsed_thread_cards = detail
+                    .thread_messages
+                    .iter()
+                    .map(|m| m.id)
+                    .filter(|&id| Some(id) != newest_id)
+                    .collect();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 切换指定卡片的「查看邮件原文 / 返回正文」视图。
+    pub(crate) fn toggle_raw_source(&mut self, msg_id: u32, cx: &mut Context<Self>) {
+        if !self.raw_source_message_ids.remove(&msg_id) {
+            self.raw_source_message_ids.insert(msg_id);
+            self.collapsed_thread_cards.remove(&msg_id);
+        }
+        cx.notify();
+    }
+
+    /// 调整阅读器正文字号缩放（步进 ±10%，范围 70..=160）并持久化。
+    pub(crate) fn adjust_reader_zoom(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let next = (self.prefs.reader_zoom_percent as i32 + delta).clamp(70, 160) as u32;
+        self.set_reader_zoom(next, cx);
+    }
+
+    /// 设置阅读器正文字号缩放百分比（范围 70..=160）并持久化。
+    pub(crate) fn set_reader_zoom(&mut self, percent: u32, cx: &mut Context<Self>) {
+        let clamped = config::clamp_reader_zoom(percent);
+        if self.prefs.reader_zoom_percent != clamped {
+            self.prefs.reader_zoom_percent = clamped;
+            if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
+                self.error_banner = Some(SharedString::from(e));
+            }
+            self.status_line = SharedString::from(format!("阅读字号已调整为 {clamped}%"));
+            cx.notify();
+        }
+    }
+
+    /// 复制任意文本到系统剪贴板（供单张会话卡片复制正文使用）。
+    pub(crate) fn copy_text_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.status_line = SharedString::from("已复制邮件正文到剪贴板");
+        cx.notify();
+    }
+
     /// 复制当前阅读邮件的正文到系统剪贴板。
     pub(crate) fn copy_selected_body(&mut self, cx: &mut Context<Self>) {
         let Some(detail) = self.selected_message.as_ref() else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(detail.body_text.clone()));
-        self.status_line = SharedString::from("已复制邮件正文到剪贴板");
-        cx.notify();
+        let text = detail.body_text.clone();
+        self.copy_text_to_clipboard(text, cx);
     }
 
     pub(crate) fn toggle_flagged(&mut self, detail: &MessageDetail, cx: &mut Context<Self>) {
@@ -1658,6 +1799,32 @@ impl HylkiApp {
         }
     }
 
+    /// 选择目标目录并批量导出指定附件列表（重名自动追加 `(1)` 后缀）。
+    pub(crate) fn save_all_attachments(&mut self, attachment_ids: Vec<u32>, cx: &mut Context<Self>) {
+        if attachment_ids.is_empty() {
+            return;
+        }
+        if self.demo_mode {
+            self.status_line = SharedString::from("演示模式下不支持导出真实附件文件");
+            cx.notify();
+            return;
+        }
+        if let Some(dest_dir) = rfd::FileDialog::new().pick_folder() {
+            if let Some(ref w) = self.worker {
+                self.status_line = SharedString::from(format!(
+                    "正在保存 {} 个附件至 {}...",
+                    attachment_ids.len(),
+                    dest_dir.display()
+                ));
+                w.send(MailRequest::SaveAllAttachments {
+                    attachment_ids,
+                    dest_dir,
+                });
+            }
+            cx.notify();
+        }
+    }
+
     pub(crate) fn send_compose(&mut self, cx: &mut Context<Self>) {
         let to = self.compose_to.read(cx).value().to_string();
         let subject = self.compose_subject.read(cx).value().to_string();
@@ -1764,9 +1931,13 @@ impl HylkiApp {
         let selected_message = current_page
             .items
             .first()
-            .and_then(|msg| self.demo_store.get_message_detail(msg.id));
+            .and_then(|msg| self.demo_message_detail(msg.id));
         self.current_page = current_page;
-        self.selected_message = selected_message;
+        if let Some(detail) = selected_message {
+            self.set_selected_message(detail);
+        } else {
+            self.selected_message = None;
+        }
         let mut folders_by_account = BTreeMap::new();
         folders_by_account.insert(1, self.demo_store.folders.clone());
         self.folders_by_account = folders_by_account;
@@ -2186,7 +2357,11 @@ impl HylkiApp {
         if self.demo_mode {
             self.main_view = MainContentView::Mail;
             self.right_mode = RightPaneMode::Reader;
-            self.selected_message = self.demo_store.get_message_detail(message_id);
+            if let Some(detail) = self.demo_message_detail(message_id) {
+                self.set_selected_message(detail);
+            } else {
+                self.selected_message = None;
+            }
             cx.notify();
             return;
         }
@@ -2307,6 +2482,8 @@ impl HylkiApp {
         let sync_changed = prefs.auto_sync_minutes != self.prefs.auto_sync_minutes;
         let theme_changed =
             prefs.theme_id != self.prefs.theme_id || prefs.dark_mode != self.prefs.dark_mode;
+        let thread_order_changed = prefs.thread_newest_first != self.prefs.thread_newest_first;
+        let fold_changed = prefs.fold_older_messages != self.prefs.fold_older_messages;
 
         self.prefs = prefs;
         if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
@@ -2324,6 +2501,22 @@ impl HylkiApp {
         if page_size_changed {
             self.reset_list_pagination();
             self.reload_current_page(cx);
+        }
+        if thread_order_changed {
+            if let Some(ref mut detail) = self.selected_message {
+                if detail.thread_messages.len() > 1 {
+                    detail.thread_messages.reverse();
+                }
+            }
+        }
+        if fold_changed || thread_order_changed {
+            if let Some(ref detail) = self.selected_message {
+                self.collapsed_thread_cards = compute_default_collapsed_cards(
+                    detail,
+                    self.prefs.thread_newest_first,
+                    self.prefs.fold_older_messages,
+                );
+            }
         }
         self.status_line = SharedString::from("偏好设置已保存");
         cx.notify();
@@ -2767,6 +2960,29 @@ impl Render for HylkiApp {
     }
 }
 
+/// 计算多封会话打开时默认折叠的卡片 ID 集合：
+/// 当会话有 >=2 封邮件且 `fold_older_messages == true` 时，默认展开最新一封与当前选中封，其余折叠。
+fn compute_default_collapsed_cards(
+    detail: &MessageDetail,
+    thread_newest_first: bool,
+    fold_older_messages: bool,
+) -> HashSet<u32> {
+    if !fold_older_messages || detail.thread_messages.len() < 2 {
+        return HashSet::new();
+    }
+    let newest_id = if thread_newest_first {
+        detail.thread_messages.first().map(|m| m.id)
+    } else {
+        detail.thread_messages.last().map(|m| m.id)
+    };
+    detail
+        .thread_messages
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != detail.id && Some(id) != newest_id)
+        .collect()
+}
+
 /// 拆分发件人字段为 (显示名, 邮箱)：`"Marcus Chen <marcus@x>"` →
 /// `("Marcus Chen", "marcus@x")`；无尖括号时整体为显示名。
 pub(crate) fn split_sender(sender: &str) -> (String, String) {
@@ -2834,5 +3050,48 @@ mod tests {
         );
         assert_eq!(HylkiApp::current_view_from_last(Some("bogus")), None);
         assert_eq!(HylkiApp::current_view_from_last(None), None);
+    }
+
+    #[test]
+    fn compute_default_collapsed_cards_keeps_newest_and_current_expanded() {
+        let make_tm = |id: u32| hylki_mail_core::ThreadMessage {
+            id,
+            rfc_message_id: format!("<{id}@test>"),
+            subject: "Test".to_string(),
+            sender: "a@test".to_string(),
+            recipients: "b@test".to_string(),
+            date_display: "10:00".to_string(),
+            body_text: "body".to_string(),
+            body_html: None,
+            body_loaded: true,
+            flagged: false,
+            attachments: Vec::new(),
+        };
+        let detail = MessageDetail {
+            id: 2,
+            account_id: 1,
+            folder_id: 1,
+            folder_path: "INBOX".to_string(),
+            uid: 2,
+            rfc_message_id: "<2@test>".to_string(),
+            sender: "a@test".to_string(),
+            recipients: "b@test".to_string(),
+            subject: "Test".to_string(),
+            date_display: "10:00".to_string(),
+            body_text: "body".to_string(),
+            body_html: None,
+            flagged: false,
+            attachments: Vec::new(),
+            // 降序：3 最新，2 当前，1 最早。
+            thread_messages: vec![make_tm(3), make_tm(2), make_tm(1)],
+        };
+
+        let folded_desc = compute_default_collapsed_cards(&detail, true, true);
+        assert!(folded_desc.contains(&1));
+        assert!(!folded_desc.contains(&2));
+        assert!(!folded_desc.contains(&3));
+
+        let unfolded = compute_default_collapsed_cards(&detail, true, false);
+        assert!(unfolded.is_empty());
     }
 }

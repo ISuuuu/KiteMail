@@ -95,7 +95,7 @@ pub fn fetch_folder_headers(
     let url = format!(
         "{GRAPH_BASE}/mailFolders/{encoded_folder}/messages?\
          $top=100&$orderby=receivedDateTime%20desc&\
-         $select=id,subject,from,toRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId"
+         $select=id,subject,from,toRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId,conversationId"
     );
     fetch_headers_from_url(access_token, &url)
 }
@@ -137,6 +137,11 @@ fn fetch_headers_from_url(
             let message_id = msg["internetMessageId"]
                 .as_str()
                 .unwrap_or_default()
+                .to_string();
+            let conversation_id = msg["conversationId"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
                 .to_string();
             let sender = format_graph_address(&msg["from"]["emailAddress"]);
             let recipients = msg["toRecipients"]
@@ -180,6 +185,8 @@ fn fetch_headers_from_url(
                 CachedHeaderInput {
                     uid,
                     message_id,
+                    in_reply_to: String::new(),
+                    references_header: conversation_id,
                     sender,
                     recipients,
                     subject,

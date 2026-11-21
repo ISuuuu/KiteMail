@@ -100,6 +100,73 @@ pub struct AppPreferences {
     /// `default_view == "last"` and takes precedence over [`Self::last_view`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_folder: Option<(u32, u32)>,
+    /// Show newest replies first in conversation threads (`true` = descending).
+    #[serde(default = "default_true")]
+    pub thread_newest_first: bool,
+    /// Automatically fold older messages when opening a multi-message thread.
+    #[serde(default = "default_true")]
+    pub fold_older_messages: bool,
+    /// Lowercased sender email addresses always allowed to load remote images.
+    #[serde(default)]
+    pub allowed_remote_senders: Vec<String>,
+    /// Reader body zoom percentage (`70..=160`, default `100`).
+    #[serde(default = "default_reader_zoom_percent")]
+    pub reader_zoom_percent: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reader_zoom_percent() -> u32 {
+    100
+}
+
+/// Clamp reader zoom percentage to the supported `70..=160` range.
+pub fn clamp_reader_zoom(percent: u32) -> u32 {
+    percent.clamp(70, 160)
+}
+
+/// Extract a normalized (trimmed, lowercased) email address from a sender header
+/// such as `"Alice <Alice@Example.com>"` or `"alice@example.com"`.
+pub fn normalize_sender_email(sender: &str) -> String {
+    let trimmed = sender.trim();
+    if let (Some(open), Some(close)) = (trimmed.rfind('<'), trimmed.rfind('>')) {
+        if open < close {
+            return trimmed[open + 1..close].trim().to_ascii_lowercase();
+        }
+    }
+    trimmed.to_ascii_lowercase()
+}
+
+impl AppPreferences {
+    /// Return whether `sender` is in the persistent remote-image allowlist.
+    pub fn is_remote_sender_allowed(&self, sender: &str) -> bool {
+        let email = normalize_sender_email(sender);
+        if email.is_empty() {
+            return false;
+        }
+        self.allowed_remote_senders
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&email))
+    }
+
+    /// Add `sender`'s normalized email address to [`Self::allowed_remote_senders`]
+    /// if valid and not already present. Returns the normalized email on insert/hit.
+    pub fn allow_remote_sender(&mut self, sender: &str) -> Option<String> {
+        let email = normalize_sender_email(sender);
+        if email.is_empty() || !email.contains('@') {
+            return None;
+        }
+        if !self
+            .allowed_remote_senders
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&email))
+        {
+            self.allowed_remote_senders.push(email.clone());
+        }
+        Some(email)
+    }
 }
 
 impl Default for AppPreferences {
@@ -115,6 +182,10 @@ impl Default for AppPreferences {
             default_view: "unified".to_string(),
             last_view: None,
             last_folder: None,
+            thread_newest_first: true,
+            fold_older_messages: true,
+            allowed_remote_senders: Vec::new(),
+            reader_zoom_percent: 100,
         }
     }
 }
@@ -272,6 +343,10 @@ mod tests {
             default_view: "last".to_string(),
             last_view: None,
             last_folder: None,
+            thread_newest_first: false,
+            fold_older_messages: false,
+            allowed_remote_senders: vec!["trusted@example.com".to_string()],
+            reader_zoom_percent: 125,
         };
         save_preferences_in(&base, &prefs).expect("save should succeed");
         let loaded = load_preferences_in(&base).expect("load should succeed");
@@ -339,5 +414,35 @@ mod tests {
         assert_eq!(loaded, prefs);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remote_sender_whitelist_and_zoom_clamping_work() {
+        let mut prefs = AppPreferences::default();
+        assert!(prefs.thread_newest_first);
+        assert!(prefs.fold_older_messages);
+        assert_eq!(prefs.reader_zoom_percent, 100);
+        assert!(prefs.allowed_remote_senders.is_empty());
+
+        assert!(!prefs.is_remote_sender_allowed("Alice <Alice@Example.COM>"));
+        let added = prefs.allow_remote_sender("Alice <Alice@Example.COM>");
+        assert_eq!(added.as_deref(), Some("alice@example.com"));
+        assert_eq!(prefs.allowed_remote_senders, vec!["alice@example.com"]);
+
+        // 重复添加不会产生重复项，且大小写不敏感匹配。
+        let again = prefs.allow_remote_sender("alice@example.com");
+        assert_eq!(again.as_deref(), Some("alice@example.com"));
+        assert_eq!(prefs.allowed_remote_senders.len(), 1);
+        assert!(prefs.is_remote_sender_allowed("ALICE@EXAMPLE.COM"));
+        assert!(prefs.is_remote_sender_allowed("Display Name <alice@example.com>"));
+        assert!(!prefs.is_remote_sender_allowed("bob@example.com"));
+
+        // 无效发件人（不含 @）不写入白名单。
+        assert_eq!(prefs.allow_remote_sender("(未知发件人)"), None);
+
+        // 字号范围钳制在 70..=160。
+        assert_eq!(clamp_reader_zoom(50), 70);
+        assert_eq!(clamp_reader_zoom(100), 100);
+        assert_eq!(clamp_reader_zoom(220), 160);
     }
 }

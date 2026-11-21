@@ -177,6 +177,21 @@ impl PreferencesState {
             self.emit_changed(cx);
         }
     }
+
+    fn set_thread_newest_first(&mut self, newest_first: bool, cx: &mut Context<Self>) {
+        if self.prefs.thread_newest_first != newest_first {
+            self.prefs.thread_newest_first = newest_first;
+            self.emit_changed(cx);
+        }
+    }
+
+    fn set_reader_zoom_percent(&mut self, zoom: u32, cx: &mut Context<Self>) {
+        let clamped = config::clamp_reader_zoom(zoom);
+        if self.prefs.reader_zoom_percent != clamped {
+            self.prefs.reader_zoom_percent = clamped;
+            self.emit_changed(cx);
+        }
+    }
 }
 
 /// 亮暗模式选项标签（渲染走 option_pills 内联文案；此助手仅单元测试引用）。
@@ -527,6 +542,20 @@ impl Render for PreferencesState {
                     cx,
                     PreferencesState::set_page_size,
                 );
+                let thread_order_pills = option_pills(
+                    "pref-thread-order",
+                    &[(true, "最新在前（降序）"), (false, "最早在前（升序）")],
+                    prefs.thread_newest_first,
+                    cx,
+                    PreferencesState::set_thread_newest_first,
+                );
+                let zoom_pills = option_pills(
+                    "pref-reader-zoom",
+                    &[(90u32, "90%"), (100, "100%"), (110, "110%"), (125, "125%")],
+                    prefs.reader_zoom_percent,
+                    cx,
+                    PreferencesState::set_reader_zoom_percent,
+                );
                 let entity = cx.entity();
                 let remote_switch = Switch::new("pref-block-remote-images")
                     .checked(prefs.block_remote_images)
@@ -536,10 +565,37 @@ impl Render for PreferencesState {
                             this.emit_changed(cx);
                         });
                     });
+                let entity_fold = cx.entity();
+                let fold_switch = Switch::new("pref-fold-older-messages")
+                    .checked(prefs.fold_older_messages)
+                    .on_click(move |checked, _, cx| {
+                        entity_fold.update(cx, |this, cx| {
+                            this.prefs.fold_older_messages = *checked;
+                            this.emit_changed(cx);
+                        });
+                    });
                 setting_card(
                     "阅读",
                     &p,
                     vec![
+                        setting_row(
+                            "会话邮件排序",
+                            Some("选择多封往来会话在阅读器中的排列顺序"),
+                            thread_order_pills,
+                            &p,
+                        ),
+                        setting_row(
+                            "自动折叠较早会话邮件",
+                            Some("打开多封往来会话时，默认折叠较早的邮件卡片"),
+                            fold_switch,
+                            &p,
+                        ),
+                        setting_row(
+                            "默认阅读字号",
+                            Some("调整阅读器正文默认缩放比例"),
+                            zoom_pills,
+                            &p,
+                        ),
                         setting_row(
                             "每页加载数量",
                             Some("邮件列表一次从缓存加载的邮件数"),

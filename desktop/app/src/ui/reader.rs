@@ -18,10 +18,11 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString, Styled,
+    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled,
 };
 use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display};
-use hylki_mail_core::{AttachmentMeta, MailRequest, ThreadMessage};
+use hylki_mail_core::{AttachmentMeta, MailRequest, MessageDetail, ThreadMessage};
 
 use crate::app::{split_sender, HylkiApp};
 use crate::theme;
@@ -55,11 +56,137 @@ fn recipient_summary(raw: &str) -> (String, String) {
     }
 }
 
+/// 提取折叠卡片用的单行正文摘要。
+fn first_snippet_line(body_text: &str) -> String {
+    body_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect()
+}
+
+/// 组装「查看邮件原文」展示内容（信头 + 原始纯文本 + 可选 HTML 源码）。
+fn format_raw_source(
+    rfc_message_id: &str,
+    sender: &str,
+    recipients: &str,
+    date_display: &str,
+    subject: &str,
+    body_text: &str,
+    body_html: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Message-ID: {}\nFrom: {}\nTo: {}\nDate: {}\nSubject: {}\n",
+        if rfc_message_id.trim().is_empty() {
+            "(无)"
+        } else {
+            rfc_message_id
+        },
+        sender,
+        if recipients.trim().is_empty() {
+            "(无)"
+        } else {
+            recipients
+        },
+        date_display,
+        subject,
+    ));
+    out.push_str("\n--- 纯文本正文 ---\n");
+    out.push_str(body_text);
+    if let Some(html) = body_html.filter(|s| !s.trim().is_empty()) {
+        out.push_str("\n\n--- 原始 HTML 源码 ---\n");
+        out.push_str(html);
+    }
+    out
+}
+
+/// 为单张会话卡片构造独立的 `...` 更多操作菜单（回复 / 回复全部 / 转发 / 复制正文 / 查看原文）。
+fn build_card_more_menu(
+    card_detail: MessageDetail,
+    show_raw_source: bool,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let entity = cx.entity();
+    let msg_id = card_detail.id;
+    let body_for_copy = card_detail.body_text.clone();
+    let reply_detail = card_detail.clone();
+    let reply_all_detail = card_detail.clone();
+    let forward_detail = card_detail;
+
+    Button::new(("reader-card-more", msg_id))
+        .ghost()
+        .compact()
+        .icon(IconName::Ellipsis)
+        .tooltip("更多操作")
+        .dropdown_menu(move |menu, _, _| {
+            let e_reply = entity.clone();
+            let e_reply_all = entity.clone();
+            let e_forward = entity.clone();
+            let e_copy = entity.clone();
+            let e_raw = entity.clone();
+            let d_reply = reply_detail.clone();
+            let d_reply_all = reply_all_detail.clone();
+            let d_forward = forward_detail.clone();
+            let copy_text = body_for_copy.clone();
+            menu.item(
+                PopupMenuItem::new("回复")
+                    .icon(Icon::new(IconName::Reply))
+                    .on_click(move |_, window, cx| {
+                        let d = d_reply.clone();
+                        e_reply.update(cx, |this, cx| this.start_reply(&d, window, cx));
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("回复全部")
+                    .icon(Icon::new(IconName::ReplyAll))
+                    .on_click(move |_, window, cx| {
+                        let d = d_reply_all.clone();
+                        e_reply_all.update(cx, |this, cx| this.start_reply_all(&d, window, cx));
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("转发")
+                    .icon(Icon::new(IconName::Forward))
+                    .on_click(move |_, window, cx| {
+                        let d = d_forward.clone();
+                        e_forward.update(cx, |this, cx| this.start_forward(&d, window, cx));
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("复制邮件正文")
+                    .icon(Icon::new(IconName::Copy))
+                    .on_click(move |_, _, cx| {
+                        let text = copy_text.clone();
+                        e_copy.update(cx, |this, cx| this.copy_text_to_clipboard(text, cx));
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(if show_raw_source {
+                    "返回正文"
+                } else {
+                    "查看邮件原文"
+                })
+                .icon(Icon::new(IconName::FileCode))
+                .on_click(move |_, _, cx| {
+                    e_raw.update(cx, |this, cx| this.toggle_raw_source(msg_id, cx));
+                }),
+            )
+        })
+        .into_any_element()
+}
+
 /// 渲染单张邮件正文卡片（既用于单封邮件，也用于会话线程中的多张叠放卡片）。
 #[allow(clippy::too_many_arguments)]
 fn render_message_card(
     account_id: u32,
     msg_id: u32,
+    rfc_message_id: &str,
+    subject: &str,
     sender: &str,
     recipients: &str,
     date_display: &str,
@@ -68,9 +195,12 @@ fn render_message_card(
     body_loaded: bool,
     prefer_plain: bool,
     block_remote_images: bool,
+    is_collapsed: bool,
+    show_raw_source: bool,
+    zoom_percent: u32,
     attachments: &[AttachmentMeta],
     is_current: bool,
-    more_menu: Option<gpui_kit::AnyElement>,
+    more_menu: gpui_kit::AnyElement,
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
@@ -81,12 +211,95 @@ fn render_message_card(
     } else {
         sender_name
     };
+    let sender_for_trust = sender.to_string();
+    let can_trust_sender = sender.contains('@');
+
+    // 折叠态：紧凑显示展开箭头 + 头像 + 发件人 + 单行摘要 + 时间 + 更多菜单。
+    if is_collapsed {
+        let snippet = first_snippet_line(body_text);
+        let has_snippet = !snippet.is_empty();
+        return h_flex()
+            .bg(p.surface_raised)
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(if is_current {
+                accent.opacity(0.45)
+            } else {
+                border
+            })
+            .shadow_xs()
+            .px(px(20.0))
+            .py(px(12.0))
+            .gap_2()
+            .items_center()
+            .child(
+                h_flex()
+                    .id(("reader-card-hdr", msg_id))
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_thread_card_collapsed(msg_id, cx);
+                    }))
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .with_size(px(14.0))
+                            .text_color(muted_fg),
+                    )
+                    .child(avatar::avatar(&display_name, &sender_email, 28.0))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(p.text)
+                            .child(SharedString::from(display_name)),
+                    )
+                    .when(has_snippet, |el| {
+                        el.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .truncate()
+                                .child(SharedString::from(snippet)),
+                        )
+                    })
+                    .when(!has_snippet, |el| el.child(div().flex_1()))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(SharedString::from(date_display.to_string())),
+                    ),
+            )
+            .child(more_menu)
+            .into_any_element();
+    }
+
     let (recipient_pill, recipient_list) = recipient_summary(recipients);
+    let zoom_scale = (zoom_percent.clamp(70, 160) as f32) / 100.0;
+    let body_font_px = 14.0 * zoom_scale;
 
     // 决定原生富文本渲染内容：有 HTML 且未切纯文本模式时渲染净化后的 HTML，
     // 否则将纯文本安全转义后通过 TextView::html(...).selectable(true) 渲染，
     // 保证所有邮件正文均支持鼠标框选与 Ctrl+C 复制。
-    let (rendered_html, blocked_images) = if !prefer_plain {
+    let (rendered_html, blocked_images) = if show_raw_source {
+        let raw = format_raw_source(
+            rfc_message_id,
+            sender,
+            recipients,
+            date_display,
+            subject,
+            body_text,
+            body_html,
+        );
+        (plain_text_to_html(&raw), 0)
+    } else if !prefer_plain {
         if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
             sanitize_html_for_display(raw_html, block_remote_images)
         } else {
@@ -96,6 +309,7 @@ fn render_message_card(
         (plain_text_to_html(body_text), 0)
     };
 
+    let card_attachment_ids: Vec<u32> = attachments.iter().map(|a| a.id).collect();
     let attachment_rows: Vec<gpui_kit::AnyElement> = attachments
         .iter()
         .map(|att| {
@@ -162,55 +376,74 @@ fn render_message_card(
                     h_flex()
                         .items_center()
                         .gap_2()
-                        .child(avatar::avatar(&display_name, &sender_email, CARD_AVATAR))
                         .child(
-                            v_flex()
+                            h_flex()
+                                .id(("reader-card-hdr", msg_id))
+                                .flex_1()
                                 .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_thread_card_collapsed(msg_id, cx);
+                                }))
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .with_size(px(14.0))
+                                        .text_color(muted_fg),
+                                )
+                                .child(avatar::avatar(&display_name, &sender_email, CARD_AVATAR))
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                                .text_color(p.text)
+                                                .truncate()
+                                                .child(SharedString::from(display_name)),
+                                        )
+                                        .when(!sender_email.is_empty(), |el| {
+                                            el.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted_fg)
+                                                    .truncate()
+                                                    .child(SharedString::from(format!(
+                                                        "<{sender_email}>"
+                                                    ))),
+                                            )
+                                        }),
+                                )
                                 .child(
                                     div()
-                                        .text_sm()
-                                        .font_weight(gpui_kit::FontWeight::BOLD)
-                                        .text_color(p.text)
-                                        .truncate()
-                                        .child(SharedString::from(display_name)),
+                                        .flex_shrink_0()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(canvas)
+                                        .border_1()
+                                        .border_color(border)
+                                        .text_color(muted_fg)
+                                        .text_xs()
+                                        .child(SharedString::from(recipient_pill)),
                                 )
-                                .when(!sender_email.is_empty(), |el| {
-                                    el.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted_fg)
-                                            .truncate()
-                                            .child(SharedString::from(format!("<{sender_email}>"))),
-                                    )
-                                }),
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child(SharedString::from(date_display.to_string())),
+                                ),
                         )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_full()
-                                .bg(canvas)
-                                .border_1()
-                                .border_color(border)
-                                .text_color(muted_fg)
-                                .text_xs()
-                                .child(SharedString::from(recipient_pill)),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(SharedString::from(date_display.to_string())),
-                        )
-                        .children(more_menu),
+                        .child(more_menu),
                 )
                 .when(!recipient_list.is_empty(), |el| {
                     el.child(
                         div()
-                            .pl(px(CARD_AVATAR + 8.0))
+                            .pl(px(CARD_AVATAR + 28.0))
                             .text_xs()
                             .text_color(muted_fg)
                             .truncate()
@@ -218,7 +451,36 @@ fn render_message_card(
                     )
                 }),
         )
-        .when(blocked_images > 0, |card| {
+        .when(show_raw_source, |card| {
+            card.child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.0))
+                    .bg(canvas)
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_color(muted_fg)
+                            .child("邮件原文视图（原始信头与正文源码）"),
+                    )
+                    .child(
+                        Button::new(("exit-raw-source", msg_id))
+                            .outline()
+                            .compact()
+                            .label("返回正文")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_raw_source(msg_id, cx);
+                            })),
+                    ),
+            )
+        })
+        .when(!show_raw_source && blocked_images > 0, |card| {
             card.child(
                 h_flex()
                     .px_3()
@@ -237,25 +499,53 @@ fn render_message_card(
                             ))),
                     )
                     .child(
-                        Button::new(("allow-remote-img", msg_id))
-                            .outline()
-                            .compact()
-                            .label("显示远程图片")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.allow_remote_images_for(msg_id, cx);
-                            })),
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(
+                                Button::new(("allow-remote-img", msg_id))
+                                    .outline()
+                                    .compact()
+                                    .label("显示远程图片")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.allow_remote_images_for(msg_id, cx);
+                                    })),
+                            )
+                            .when(can_trust_sender, |el| {
+                                let trust_sender = sender_for_trust.clone();
+                                el.child(
+                                    Button::new(("trust-remote-sender", msg_id))
+                                        .outline()
+                                        .compact()
+                                        .label("始终信任此发件人")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.trust_remote_sender(&trust_sender, cx);
+                                        })),
+                                )
+                            }),
                     ),
             )
         })
         .child(
             div()
-                .text_sm()
+                .when(show_raw_source, |el| {
+                    el.p_3()
+                        .rounded(px(8.0))
+                        .bg(canvas)
+                        .border_1()
+                        .border_color(border)
+                        .text_size(px((12.0 * zoom_scale).max(10.0)))
+                })
+                .when(!show_raw_source, |el| el.text_size(px(body_font_px)))
                 .text_color(if body_loaded { p.text } else { muted_fg })
                 .child(
                     TextView::html(
                         SharedString::from(format!(
-                            "reader-body-{msg_id}-{}-{}",
-                            prefer_plain as u8, block_remote_images as u8
+                            "reader-body-{msg_id}-{}-{}-{}-{}",
+                            prefer_plain as u8,
+                            block_remote_images as u8,
+                            show_raw_source as u8,
+                            zoom_percent
                         )),
                         rendered_html,
                     )
@@ -282,14 +572,29 @@ fn render_message_card(
             )
         })
         .when(!attachment_rows.is_empty(), |card| {
+            let show_save_all = card_attachment_ids.len() >= 2;
+            let save_all_ids = card_attachment_ids;
             card.child(
                 h_flex()
                     .gap_2()
                     .flex_wrap()
+                    .items_center()
                     .pt_2()
                     .border_t_1()
                     .border_color(border)
-                    .children(attachment_rows),
+                    .children(attachment_rows)
+                    .when(show_save_all, |row| {
+                        row.child(
+                            Button::new(("save-all-att-card", msg_id))
+                                .outline()
+                                .compact()
+                                .icon(IconName::Download)
+                                .label("保存全部附件")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.save_all_attachments(save_all_ids.clone(), cx);
+                                })),
+                        )
+                    }),
             )
         })
         .into_any_element()
@@ -327,6 +632,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let flagged = detail.flagged;
     let is_unread = app.selected_message_unread();
     let prefer_plain = app.reader_prefer_plain;
+    let zoom_percent = app.prefs.reader_zoom_percent.clamp(70, 160);
     let thread_count = detail.thread_messages.len();
     let has_any_html = detail
         .body_html
@@ -337,90 +643,62 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             .iter()
             .any(|m| m.body_html.as_deref().is_some_and(|s| !s.trim().is_empty()));
 
-    // 卡片头部 `...` 更多操作菜单。
-    let card_more_menu = {
-        let entity = cx.entity();
-        let reply_detail = detail.clone();
-        let reply_all_detail = detail.clone();
-        let forward_detail = detail.clone();
-        let star_detail = detail.clone();
-        Button::new("reader-card-more")
-            .ghost()
-            .compact()
-            .icon(IconName::Ellipsis)
-            .tooltip("更多操作")
-            .dropdown_menu(move |menu, _, _| {
-                let e_reply = entity.clone();
-                let e_reply_all = entity.clone();
-                let e_forward = entity.clone();
-                let e_star = entity.clone();
-                let e_copy = entity.clone();
-                let d_reply = reply_detail.clone();
-                let d_reply_all = reply_all_detail.clone();
-                let d_forward = forward_detail.clone();
-                let d_star = star_detail.clone();
-                menu.item(
-                    PopupMenuItem::new("回复")
-                        .icon(Icon::new(IconName::Reply))
-                        .on_click(move |_, window, cx| {
-                            let d = d_reply.clone();
-                            e_reply.update(cx, |this, cx| this.start_reply(&d, window, cx));
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("回复全部")
-                        .icon(Icon::new(IconName::ReplyAll))
-                        .on_click(move |_, window, cx| {
-                            let d = d_reply_all.clone();
-                            e_reply_all.update(cx, |this, cx| this.start_reply_all(&d, window, cx));
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("转发")
-                        .icon(Icon::new(IconName::Forward))
-                        .on_click(move |_, window, cx| {
-                            let d = d_forward.clone();
-                            e_forward.update(cx, |this, cx| this.start_forward(&d, window, cx));
-                        }),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new(if flagged { "取消星标" } else { "加星标" })
-                        .icon(Icon::new(if flagged {
-                            IconName::StarFill
-                        } else {
-                            IconName::Star
-                        }))
-                        .on_click(move |_, _, cx| {
-                            let d = d_star.clone();
-                            e_star.update(cx, |this, cx| this.toggle_flagged(&d, cx));
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("复制邮件正文")
-                        .icon(Icon::new(IconName::Copy))
-                        .on_click(move |_, _, cx| {
-                            e_copy.update(cx, |this, cx| this.copy_selected_body(cx));
-                        }),
-                )
-            })
-            .into_any_element()
+    // 汇总当前会话全部附件 ID（用于顶部「保存全部附件」入口）。
+    let all_thread_attachment_ids: Vec<u32> = if thread_count > 1 {
+        detail
+            .thread_messages
+            .iter()
+            .flat_map(|tm| tm.attachments.iter().map(|a| a.id))
+            .collect()
+    } else {
+        detail.attachments.iter().map(|a| a.id).collect()
     };
+    let any_card_collapsed = thread_count > 1
+        && detail
+            .thread_messages
+            .iter()
+            .any(|tm| app.collapsed_thread_cards.contains(&tm.id));
 
-    // 构造单卡或多线程叠放卡片列表。
+    // 构造单卡或多线程叠放卡片列表：每张卡片均带独立的 `...` 操作菜单与折叠/原文态。
     let cards: Vec<gpui_kit::AnyElement> = if thread_count > 1 {
-        let mut more_menu = Some(card_more_menu);
         detail
             .thread_messages
             .iter()
             .map(|tm: &ThreadMessage| {
                 let is_current = tm.id == detail.id;
-                let menu = if is_current { more_menu.take() } else { None };
-                let block_remote =
-                    app.prefs.block_remote_images && !app.allowed_remote_image_ids.contains(&tm.id);
+                let is_collapsed = app.collapsed_thread_cards.contains(&tm.id);
+                let show_raw_source = app.raw_source_message_ids.contains(&tm.id);
+                let block_remote = app.prefs.block_remote_images
+                    && !app.allowed_remote_image_ids.contains(&tm.id)
+                    && !app.prefs.is_remote_sender_allowed(&tm.sender);
+                let card_subject = if tm.subject.trim().is_empty() {
+                    detail.subject.clone()
+                } else {
+                    tm.subject.clone()
+                };
+                let card_detail = MessageDetail {
+                    id: tm.id,
+                    account_id: detail.account_id,
+                    folder_id: detail.folder_id,
+                    folder_path: detail.folder_path.clone(),
+                    uid: detail.uid,
+                    rfc_message_id: tm.rfc_message_id.clone(),
+                    sender: tm.sender.clone(),
+                    recipients: tm.recipients.clone(),
+                    subject: card_subject.clone(),
+                    date_display: tm.date_display.clone(),
+                    body_text: tm.body_text.clone(),
+                    body_html: tm.body_html.clone(),
+                    flagged: tm.flagged,
+                    attachments: tm.attachments.clone(),
+                    thread_messages: Vec::new(),
+                };
+                let menu = build_card_more_menu(card_detail, show_raw_source, cx);
                 render_message_card(
                     detail.account_id,
                     tm.id,
+                    &tm.rfc_message_id,
+                    &card_subject,
                     &tm.sender,
                     &tm.recipients,
                     &tm.date_display,
@@ -429,6 +707,9 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     tm.body_loaded,
                     prefer_plain,
                     block_remote,
+                    is_collapsed,
+                    show_raw_source,
+                    zoom_percent,
                     &tm.attachments,
                     is_current,
                     menu,
@@ -438,11 +719,17 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             })
             .collect()
     } else {
-        let block_remote =
-            app.prefs.block_remote_images && !app.allowed_remote_image_ids.contains(&detail.id);
+        let is_collapsed = app.collapsed_thread_cards.contains(&detail.id);
+        let show_raw_source = app.raw_source_message_ids.contains(&detail.id);
+        let block_remote = app.prefs.block_remote_images
+            && !app.allowed_remote_image_ids.contains(&detail.id)
+            && !app.prefs.is_remote_sender_allowed(&detail.sender);
+        let menu = build_card_more_menu(detail.clone(), show_raw_source, cx);
         vec![render_message_card(
             detail.account_id,
             detail.id,
+            &detail.rfc_message_id,
+            &detail.subject,
             &detail.sender,
             &detail.recipients,
             &detail.date_display,
@@ -451,9 +738,12 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             true,
             prefer_plain,
             block_remote,
+            is_collapsed,
+            show_raw_source,
+            zoom_percent,
             &detail.attachments,
             false,
-            Some(card_more_menu),
+            menu,
             &p,
             cx,
         )]
@@ -535,11 +825,41 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             )
                         })
                 })
-                // 右侧操作组：动态标记已读/未读 + HTML/纯文本切换 + 复制正文（严格放在 48px 顶栏内）。
+                // 右侧操作组：字号缩放 + HTML/纯文本切换 + 动态标记已读/未读 + 复制正文（严格放在 48px 顶栏内）。
                 .child(
                     h_flex()
                         .gap_1()
                         .items_center()
+                        .child(
+                            Button::new("reader-zoom-out")
+                                .ghost()
+                                .compact()
+                                .label("-")
+                                .tooltip("缩小正文字号")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.adjust_reader_zoom(-10, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("reader-zoom-reset")
+                                .ghost()
+                                .compact()
+                                .label(SharedString::from(format!("{zoom_percent}%")))
+                                .tooltip("重置正文字号为 100%")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_reader_zoom(100, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("reader-zoom-in")
+                                .ghost()
+                                .compact()
+                                .label("+")
+                                .tooltip("放大正文字号")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.adjust_reader_zoom(10, cx);
+                                })),
+                        )
                         .when(has_any_html, |el| {
                             el.child(
                                 Button::new("reader-toggle-html")
@@ -587,51 +907,106 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         ),
                 ),
         )
-        // 标题区（16px 24px 8px）：账号胶囊 + 可选会话数胶囊 + 20px 粗体主题。
+        // 标题区（16px 24px 8px）：账号胶囊 + 可选会话数胶囊 + 展开/折叠全部 & 保存全部附件 + 20px 粗体主题。
         .child(
             v_flex()
                 .flex_shrink_0()
-                .items_start()
+                .w_full()
                 .pt(px(16.0))
                 .px(px(24.0))
                 .pb(px(8.0))
                 .gap_1()
-                .when(!owner_email.is_empty() || thread_count > 1, |el| {
-                    el.child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .when(!owner_email.is_empty(), |row| {
-                                row.child(
-                                    div()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .bg(p.accent_soft())
-                                        .text_color(accent)
-                                        .text_xs()
-                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                        .child(SharedString::from(owner_email)),
+                .when(
+                    !owner_email.is_empty()
+                        || thread_count > 1
+                        || all_thread_attachment_ids.len() >= 2,
+                    |el| {
+                        let save_all_ids = all_thread_attachment_ids.clone();
+                        let save_all_count = save_all_ids.len();
+                        el.child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .when(!owner_email.is_empty(), |row| {
+                                            row.child(
+                                                div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_full()
+                                                    .bg(p.accent_soft())
+                                                    .text_color(accent)
+                                                    .text_xs()
+                                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                    .child(SharedString::from(owner_email)),
+                                            )
+                                        })
+                                        .when(thread_count > 1, |row| {
+                                            row.child(
+                                                div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_full()
+                                                    .bg(p.surface_raised)
+                                                    .border_1()
+                                                    .border_color(border)
+                                                    .text_color(muted_fg)
+                                                    .text_xs()
+                                                    .child(SharedString::from(format!(
+                                                        "{thread_count} 封往来会话"
+                                                    ))),
+                                            )
+                                        }),
                                 )
-                            })
-                            .when(thread_count > 1, |row| {
-                                row.child(
-                                    div()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .bg(p.surface_raised)
-                                        .border_1()
-                                        .border_color(border)
-                                        .text_color(muted_fg)
-                                        .text_xs()
-                                        .child(SharedString::from(format!(
-                                            "{thread_count} 封往来会话"
-                                        ))),
-                                )
-                            }),
-                    )
-                })
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .when(save_all_count >= 2, |row| {
+                                            row.child(
+                                                Button::new("reader-save-all-attachments")
+                                                    .outline()
+                                                    .compact()
+                                                    .icon(IconName::Download)
+                                                    .label(SharedString::from(format!(
+                                                        "保存全部附件 ({save_all_count})"
+                                                    )))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.save_all_attachments(
+                                                            save_all_ids.clone(),
+                                                            cx,
+                                                        );
+                                                    })),
+                                            )
+                                        })
+                                        .when(thread_count > 1, |row| {
+                                            row.child(
+                                                Button::new("reader-toggle-fold-all")
+                                                    .ghost()
+                                                    .compact()
+                                                    .label(if any_card_collapsed {
+                                                        "展开全部"
+                                                    } else {
+                                                        "折叠全部"
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        if any_card_collapsed {
+                                                            this.expand_all_thread_cards(cx);
+                                                        } else {
+                                                            this.collapse_older_thread_cards(cx);
+                                                        }
+                                                    })),
+                                            )
+                                        }),
+                                ),
+                        )
+                    },
+                )
                 .child(
                     div()
                         .text_size(px(20.0))
@@ -654,4 +1029,34 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .children(cards),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_snippet_line_skips_blank_lines() {
+        assert_eq!(first_snippet_line("\n  \n  你好世界  \n第二行"), "你好世界");
+        assert_eq!(first_snippet_line("   \n\t "), "");
+    }
+
+    #[test]
+    fn format_raw_source_includes_headers_and_optional_html() {
+        let raw = format_raw_source(
+            "<id@example.com>",
+            "Alice <a@example.com>",
+            "b@example.com",
+            "10:00",
+            "主题",
+            "纯文本正文",
+            Some("<p>HTML正文</p>"),
+        );
+        assert!(raw.contains("Message-ID: <id@example.com>"));
+        assert!(raw.contains("From: Alice <a@example.com>"));
+        assert!(raw.contains("To: b@example.com"));
+        assert!(raw.contains("Subject: 主题"));
+        assert!(raw.contains("纯文本正文"));
+        assert!(raw.contains("<p>HTML正文</p>"));
+    }
 }
