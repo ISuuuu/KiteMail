@@ -399,6 +399,15 @@ impl Render for PreferencesState {
                     cx,
                     PreferencesState::set_auto_sync_minutes,
                 );
+                let entity_for_close = cx.entity();
+                let close_minimize_switch = Switch::new("pref-close-to-minimize")
+                    .checked(prefs.close_to_minimize)
+                    .on_click(move |checked, _, cx| {
+                        entity_for_close.update(cx, |this, cx| {
+                            this.prefs.close_to_minimize = *checked;
+                            this.emit_changed(cx);
+                        });
+                    });
                 setting_card(
                     "常规",
                     &p,
@@ -413,6 +422,12 @@ impl Render for PreferencesState {
                             "后台自动刷新间隔",
                             Some("按间隔在后台同步所有账号；「手动」仅手动刷新"),
                             sync_pills,
+                            &p,
+                        ),
+                        setting_row(
+                            "点击关闭按钮时最小化",
+                            Some("关闭窗口时最小化到任务栏，可在左上角菜单选择「退出 Hylki」"),
+                            close_minimize_switch,
                             &p,
                         ),
                     ],

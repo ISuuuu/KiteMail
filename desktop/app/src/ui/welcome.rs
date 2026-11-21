@@ -9,7 +9,10 @@
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::{h_flex, v_flex};
-use gpui_kit::{div, px, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled};
+use gpui_kit::{
+    div, img, px, Context, FontWeight, IntoElement, ObjectFit, ParentElement, SharedString, Styled,
+    StyledImage,
+};
 
 use crate::app::{HylkiApp, PROVIDER_PRESETS};
 use crate::theme;
@@ -17,10 +20,15 @@ use crate::theme;
 /// 欢迎卡片最大宽度。
 const CARD_MAX_WIDTH: f32 = 540.0;
 
-pub(crate) fn render(_app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
+pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 成局部变量。
     let p = theme::current(cx);
-    let (border, muted_fg, accent) = (p.border, p.text_muted, p.accent);
+    let (border, muted_fg) = (p.border, p.text_muted);
+    let wordmark_path = if app.dark_mode {
+        "welcome/wordmark-white.png"
+    } else {
+        "welcome/wordmark-black.png"
+    };
 
     // 服务商预设快捷行。
     let preset_buttons: Vec<gpui_kit::AnyElement> = PROVIDER_PRESETS
@@ -52,13 +60,11 @@ pub(crate) fn render(_app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::A
                 .max_w(px(CARD_MAX_WIDTH))
                 .items_center()
                 .gap_2()
-                // Logo 与副标题。
+                // Logo 图形（亮/暗主题自动切换）与副标题。
                 .child(
-                    div()
-                        .text_size(px(32.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(accent)
-                        .child("Hylki"),
+                    img(wordmark_path)
+                        .h(px(46.0))
+                        .object_fit(ObjectFit::Contain),
                 )
                 .child(
                     div()

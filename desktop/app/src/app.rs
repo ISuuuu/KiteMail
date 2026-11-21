@@ -352,6 +352,18 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let demo_store = Arc::new(DemoStore::new());
+        window.set_window_title("Hylki");
+        // 点右上角关闭按钮时按偏好默认最小化（不直接退出），真正退出由菜单「退出 Hylki」触发。
+        let weak_self = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            if let Some(app) = weak_self.upgrade() {
+                if app.read(cx).prefs.close_to_minimize {
+                    window.minimize_window();
+                    return false;
+                }
+            }
+            true
+        });
         let data_dir = config::data_dir();
         let existing_accounts = if demo_mode {
             Vec::new()
@@ -950,6 +962,11 @@ impl HylkiApp {
                 CurrentView::Drafts => {}
             }
         }
+    }
+
+    /// 彻底退出应用（菜单「退出 Hylki」入口）。
+    pub(crate) fn quit_app(&mut self, cx: &mut Context<Self>) {
+        cx.quit();
     }
 
     /// 切换左栏统一导航视图（收件箱 / 星标 / 已发送 / 草稿 / 归档）。

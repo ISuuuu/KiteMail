@@ -356,12 +356,13 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         })
         .collect();
 
-    // 菜单按钮的弹出菜单（账号管理 / 切换亮暗主题 / 偏好设置 / 命令面板）。
+    // 菜单按钮的弹出菜单（账号管理 / 切换亮暗主题 / 偏好设置 / 命令面板 / 退出）。
     let menu_button = {
         let entity = cx.entity();
         let entity_for_theme = entity.clone();
         let entity_for_prefs = entity.clone();
         let entity_for_palette = entity.clone();
+        let entity_for_quit = entity.clone();
         Button::new("sb-menu")
             .ghost()
             .compact()
@@ -371,6 +372,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 let entity_for_theme = entity_for_theme.clone();
                 let entity_for_prefs = entity_for_prefs.clone();
                 let entity_for_palette = entity_for_palette.clone();
+                let entity_for_quit = entity_for_quit.clone();
                 menu.item(
                     // 演示模式下账号管理不可用（无 worker 账号可编辑）。
                     PopupMenuItem::new("账号管理")
@@ -411,6 +413,16 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .on_click(move |_, window, cx| {
                             entity_for_palette.update(cx, |app, cx| {
                                 app.open_command_palette(window, cx);
+                            });
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("退出 Hylki")
+                        .icon(Icon::new(IconName::LogOut))
+                        .on_click(move |_, _, cx| {
+                            entity_for_quit.update(cx, |app, cx| {
+                                app.quit_app(cx);
                             });
                         }),
                 )

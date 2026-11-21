@@ -87,6 +87,8 @@ pub struct AppPreferences {
     pub auto_sync_minutes: u32,
     /// Block remote images in HTML mail bodies.
     pub block_remote_images: bool,
+    /// Minimize the window instead of exiting when clicking the titlebar close button.
+    pub close_to_minimize: bool,
     /// View opened at startup: `"unified"` (unified inbox) or `"last"`
     /// (the folder selected in the previous session).
     pub default_view: String,
@@ -109,6 +111,7 @@ impl Default for AppPreferences {
             page_size: 100,
             auto_sync_minutes: 5,
             block_remote_images: true,
+            close_to_minimize: true,
             default_view: "unified".to_string(),
             last_view: None,
             last_folder: None,
@@ -265,6 +268,7 @@ mod tests {
             page_size: 50,
             auto_sync_minutes: 0,
             block_remote_images: false,
+            close_to_minimize: false,
             default_view: "last".to_string(),
             last_view: None,
             last_folder: None,
