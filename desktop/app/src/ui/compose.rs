@@ -10,9 +10,12 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea};
 use gpui_kit::component::{h_flex, v_flex, Selectable};
 use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::{div, px, Context, Entity, FontWeight, IntoElement, ParentElement, Styled};
+use gpui_kit::{
+    div, px, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, Styled,
+};
 
-use crate::app::HylkiApp;
+use crate::app::{filter_contact_suggestions, ComposeAddressField, HylkiApp};
 use crate::theme;
 
 /// 信头行标签宽度。
@@ -70,10 +73,104 @@ fn attachment_chip(idx: usize, path: &str, cx: &mut Context<HylkiApp>) -> Button
         }))
 }
 
+/// 渲染某个收件人字段（To / Cc / Bcc）的联系人自动补全下拉列表（最多 5 条）。
+fn render_autocomplete_dropdown(
+    app: &HylkiApp,
+    field: ComposeAddressField,
+    input_value: &str,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> Option<gpui_kit::AnyElement> {
+    if app.compose_autocomplete_field != Some(field) {
+        return None;
+    }
+    let suggestions = filter_contact_suggestions(input_value, &app.known_contacts, 5);
+    if suggestions.is_empty() {
+        return None;
+    }
+    let (border, surface_raised, accent_soft, text_fg, muted_fg) = (
+        p.border,
+        p.surface_raised,
+        p.accent_soft(),
+        p.text,
+        p.text_muted,
+    );
+    let rows: Vec<gpui_kit::AnyElement> = suggestions
+        .into_iter()
+        .enumerate()
+        .map(|(idx, contact)| {
+            let contact_owned = contact.clone();
+            let display_name = if contact.name.trim().is_empty() {
+                contact.email.clone()
+            } else {
+                contact.name.clone()
+            };
+            let email = contact.email.clone();
+            h_flex()
+                .id(("compose-ac", idx))
+                .px_2p5()
+                .py_1p5()
+                .gap_2()
+                .items_center()
+                .justify_between()
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(accent_soft))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.apply_contact_suggestion(field, &contact_owned, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(text_fg)
+                        .truncate()
+                        .child(SharedString::from(display_name)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .truncate()
+                        .child(SharedString::from(email)),
+                )
+                .into_any_element()
+        })
+        .collect();
+
+    Some(
+        v_flex()
+            .ml(px(LABEL_WIDTH + 8.0))
+            .my_1()
+            .p_1()
+            .gap_0p5()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(border)
+            .bg(surface_raised)
+            .shadow_md()
+            .children(rows)
+            .into_any_element(),
+    )
+}
+
 pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 成局部变量。
     let p = theme::current(cx);
     let muted_fg = p.text_muted;
+    let to_value = app.compose_to.read(cx).value().to_string();
+    let cc_value = app.compose_cc.read(cx).value().to_string();
+    let bcc_value = app.compose_bcc.read(cx).value().to_string();
+    let to_suggestions =
+        render_autocomplete_dropdown(app, ComposeAddressField::To, &to_value, &p, cx);
+    let cc_suggestions =
+        render_autocomplete_dropdown(app, ComposeAddressField::Cc, &cc_value, &p, cx);
+    let bcc_suggestions =
+        render_autocomplete_dropdown(app, ComposeAddressField::Bcc, &bcc_value, &p, cx);
 
     // 发件账号胶囊（多账号时切换 compose_account_id）。
     let account_pills: Vec<gpui_kit::AnyElement> = app
@@ -162,8 +259,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 .ghost()
                                 .label("取消")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.right_mode = crate::app::RightPaneMode::Reader;
-                                    cx.notify();
+                                    this.request_close_compose(cx);
                                 })),
                         )
                         .child(
@@ -176,6 +272,61 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         ),
                 ),
         )
+        // 未保存退出确认条。
+        .when(app.compose_confirm_discard, |el| {
+            el.child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.accent_soft())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.text)
+                            .child("有未保存的邮件内容，确定要离开吗？"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(
+                                Button::new("compose-discard-save")
+                                    .primary()
+                                    .compact()
+                                    .label("保存为草稿")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_draft_and_close_compose(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compose-discard-drop")
+                                    .outline()
+                                    .compact()
+                                    .label("放弃")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_compose(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compose-discard-keep")
+                                    .ghost()
+                                    .compact()
+                                    .label("继续编辑")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.compose_confirm_discard = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+        })
         // 信头表单区：收件人（右侧「抄送 / 密送」小按钮）+ 可选 Cc / Bcc + 主题。
         .child(
             v_flex()
@@ -216,9 +367,12 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 })),
                         ),
                 )
+                .children(to_suggestions)
                 .when(app.compose_show_cc_bcc, |el| {
                     el.child(header_row("抄送", &app.compose_cc, &p))
+                        .children(cc_suggestions)
                         .child(header_row("密送", &app.compose_bcc, &p))
+                        .children(bcc_suggestions)
                 })
                 .child(header_row("主题", &app.compose_subject, &p)),
         )

@@ -44,6 +44,7 @@ fn row_context_menu(
     row: Stateful<Div>,
     msg: &MessageSummary,
     draft: Option<LocalDraft>,
+    account_folders: Vec<(String, String)>,
     demo_mode: bool,
     cx: &mut Context<HylkiApp>,
 ) -> ContextMenu<Stateful<Div>> {
@@ -54,7 +55,7 @@ fn row_context_menu(
     let message_id = msg.id;
     let uid = msg.uid;
     let folder_path = msg.folder_path.clone();
-    row.context_menu(move |menu, _, _| {
+    row.context_menu(move |menu, window, cx| {
         let entity = entity.clone();
         if let Some(draft) = draft.clone() {
             // 本地草稿行：打开编辑 / 删除草稿（走现有 DeleteLocalDraft）。
@@ -74,10 +75,14 @@ fn row_context_menu(
         }
         let entity_for_flag = entity.clone();
         let entity_for_archive = entity.clone();
+        let entity_for_spam = entity.clone();
+        let entity_for_move = entity.clone();
         let entity_for_delete = entity.clone();
         // 内层 on_click 为 move 闭包，需逐项克隆（外层 builder 是 Fn，可多次调用）。
         let folder_path_for_seen = folder_path.clone();
         let folder_path_for_flag = folder_path.clone();
+        let current_folder_path = folder_path.clone();
+        let folders_for_move = account_folders.clone();
         let mut menu = menu
             .item(
                 PopupMenuItem::new(if unread {
@@ -114,7 +119,7 @@ fn row_context_menu(
                     },
                 ),
             );
-        // 演示模式仅支持本地 seen / flagged 两项；归档 / 删除仅真实账号可用。
+        // 演示模式仅支持本地 seen / flagged 两项；归档 / 标垃圾 / 移动 / 删除仅真实账号可用。
         if !demo_mode {
             menu = menu
                 .separator()
@@ -123,6 +128,34 @@ fn row_context_menu(
                         this.archive_message(account_id, message_id, cx);
                     });
                 }))
+                .item(PopupMenuItem::new("标记为垃圾邮件").on_click(move |_, _, cx| {
+                    entity_for_spam.update(cx, |this, cx| {
+                        this.mark_spam_message(account_id, message_id, cx);
+                    });
+                }))
+                .submenu("移动到文件夹...", window, cx, move |mut sub, _, _| {
+                    if folders_for_move.is_empty() {
+                        sub = sub.item(PopupMenuItem::new("暂无可用文件夹").disabled(true));
+                        return sub;
+                    }
+                    for (fname, fpath) in &folders_for_move {
+                        let is_current = *fpath == current_folder_path;
+                        let target_path = fpath.clone();
+                        let e_move = entity_for_move.clone();
+                        sub = sub.item(
+                            PopupMenuItem::new(fname.clone())
+                                .disabled(is_current)
+                                .when(is_current, |item| item.icon(Icon::new(IconName::Check)))
+                                .on_click(move |_, _, cx| {
+                                    let p = target_path.clone();
+                                    e_move.update(cx, |this, cx| {
+                                        this.move_message(account_id, message_id, p, cx);
+                                    });
+                                }),
+                        );
+                    }
+                    sub
+                })
                 .item(PopupMenuItem::new("删除").on_click(move |_, _, cx| {
                     entity_for_delete.update(cx, |this, cx| {
                         this.delete_message(account_id, message_id, cx);
@@ -195,10 +228,17 @@ fn message_row(
         .when(is_selected, |row| row.bg(p.accent))
         .on_click({
             let draft = draft.clone();
-            cx.listener(move |this, _, window, cx| match draft.as_ref() {
+            cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| match draft.as_ref() {
                 // 草稿行：点击进入写信编辑。
                 Some(d) => this.open_local_draft(d, window, cx),
-                None => this.select_message(account_id, msg_id, uid, unread, &folder_path, cx),
+                None => {
+                    if event.modifiers().control {
+                        this.toggle_message_selection(msg_id, cx);
+                    } else {
+                        this.selected_message_ids.clear();
+                        this.select_message(account_id, msg_id, uid, unread, &folder_path, cx);
+                    }
+                }
             })
         })
         // 左侧：36x36 圆形头像 + 固定 8px 宽未读圆点占位（确保已读/未读文字严格左对齐）。
@@ -353,7 +393,12 @@ fn message_row(
                 }),
         );
 
-    row_context_menu(row, msg, draft, app.demo_mode, cx)
+    let account_folders: Vec<(String, String)> = app
+        .folders_by_account
+        .get(&account_id)
+        .map(|list| list.iter().map(|f| (f.name.clone(), f.path.clone())).collect())
+        .unwrap_or_default();
+    row_context_menu(row, msg, draft, account_folders, app.demo_mode, cx)
 }
 
 /// 渲染中栏。
@@ -407,7 +452,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             .items
             .iter()
             .map(|msg| {
-                let is_selected = selected_id == Some(msg.id);
+                let is_selected =
+                    selected_id == Some(msg.id) || app.selected_message_ids.contains(&msg.id);
                 message_row(app, msg, None, is_selected, show_account_tag, &p, cx)
                     .into_any_element()
             })
@@ -553,6 +599,88 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 )
                 .when(is_unified_list, |el| el.child(filter_menu_button)),
         )
+        // 多选批量操作条（Ctrl+点击选中 > 1 封邮件时出现）。
+        .when(!drafts_view && app.selected_message_ids.len() > 1, |el| {
+            let count = app.selected_message_ids.len();
+            let demo_mode = app.demo_mode;
+            el.child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(p.accent_soft())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(p.accent)
+                            .child(SharedString::from(format!("已选 {count} 封"))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .items_center()
+                            .child(
+                                Button::new("batch-mark-read")
+                                    .ghost()
+                                    .compact()
+                                    .text_size(px(11.0))
+                                    .label("标为已读")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.batch_mark_read(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("batch-star")
+                                    .ghost()
+                                    .compact()
+                                    .text_size(px(11.0))
+                                    .label("加星标")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.batch_toggle_flagged(cx);
+                                    })),
+                            )
+                            .when(!demo_mode, |row| {
+                                row.child(
+                                    Button::new("batch-archive")
+                                        .ghost()
+                                        .compact()
+                                        .text_size(px(11.0))
+                                        .label("归档")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.batch_archive(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("batch-delete")
+                                        .ghost()
+                                        .compact()
+                                        .text_size(px(11.0))
+                                        .label("删除")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.batch_delete(cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("batch-clear")
+                                    .ghost()
+                                    .compact()
+                                    .text_size(px(11.0))
+                                    .label("取消选择")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.clear_message_selection(cx);
+                                    })),
+                            ),
+                    ),
+            )
+        })
         // 列表（滚到底部自动预加载下一批 100 条）。
         .child(
             div()

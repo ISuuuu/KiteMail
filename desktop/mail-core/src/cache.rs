@@ -75,6 +75,10 @@ const ARCHIVE_FOLDER_MATCH: &str = "(f.name = '归档' OR UPPER(f.path) LIKE '%A
 const TRASH_FOLDER_MATCH: &str =
     "(f.name = '已删除' OR UPPER(f.path) LIKE '%TRASH%' OR UPPER(f.path) LIKE '%DELETED%')";
 
+/// SQL predicate matching every account's Junk/Spam folder by friendly name or raw path.
+const SPAM_FOLDER_MATCH: &str =
+    "(f.name = '垃圾邮件' OR UPPER(f.path) LIKE '%JUNK%' OR UPPER(f.path) LIKE '%SPAM%')";
+
 /// Normalize a subject line for conversation grouping by stripping common
 /// reply/forward prefixes (`Re:`, `Fwd:`, `Fw:`, `回复:`, `转发:`).
 pub fn normalize_thread_subject(subject: &str) -> String {
@@ -1353,6 +1357,12 @@ impl CacheStore {
         self.find_role_folder(account_id, TRASH_FOLDER_MATCH)
     }
 
+    /// Find the account's Junk/Spam folder `(folder_id, path)` by friendly name
+    /// or raw path (`Junk`, `Spam`, `垃圾邮件`, etc.).
+    pub fn find_spam_folder(&self, account_id: u32) -> Result<Option<(u32, String)>, String> {
+        self.find_role_folder(account_id, SPAM_FOLDER_MATCH)
+    }
+
     fn find_role_folder(
         &self,
         account_id: u32,
@@ -1423,6 +1433,46 @@ impl CacheStore {
             )
             .optional()
             .map_err(|e| format!("读取附件内容失败: {e}"))
+    }
+
+    /// Export all cached attachments of `message_id` into `dest_dir` (used when
+    /// forwarding a message with its original attachments). Returns exported file paths.
+    pub fn export_message_attachments(
+        &self,
+        message_id: u32,
+        dest_dir: &Path,
+    ) -> Result<Vec<std::path::PathBuf>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT filename, content FROM attachments WHERE message_id = ?1 ORDER BY id ASC",
+            )
+            .map_err(|e| format!("查询邮件附件失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![message_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| format!("读取邮件附件失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析邮件附件失败: {e}"))?;
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        std::fs::create_dir_all(dest_dir)
+            .map_err(|e| format!("创建转发附件临时目录失败 ({}): {e}", dest_dir.display()))?;
+
+        let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut exported = Vec::with_capacity(rows.len());
+        for (raw_name, bytes) in rows {
+            let safe = sanitize_attachment_filename(&raw_name);
+            let unique = deduplicate_filename(&safe, &mut used_names);
+            let path = dest_dir.join(unique);
+            std::fs::write(&path, bytes)
+                .map_err(|e| format!("写入转发附件失败 ({}): {e}", path.display()))?;
+            exported.push(path);
+        }
+        Ok(exported)
     }
 
     /// Update local unread state and refresh folder unread counter.
@@ -2948,4 +2998,150 @@ mod tests {
         assert!(!reloaded[0].has_more_remote);
         assert_eq!(reloaded[0].total_count, 5);
     }
+
+    #[test]
+    fn find_spam_folder_matches_junk_spam_and_chinese_names() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        cache
+            .sync_folders(
+                1,
+                &[
+                    RemoteFolder {
+                        name: "收件箱".to_string(),
+                        path: "INBOX".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "垃圾邮件".to_string(),
+                        path: "Junk".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        let (_, path1) = cache.find_spam_folder(1).unwrap().expect("should find Junk");
+        assert_eq!(path1, "Junk");
+
+        cache
+            .sync_folders(
+                2,
+                &[RemoteFolder {
+                    name: "Spam".to_string(),
+                    path: "[Gmail]/Spam".to_string(),
+                    unread_count: 0,
+                    total_count: 0,
+                }],
+            )
+            .unwrap();
+        let (_, path2) = cache.find_spam_folder(2).unwrap().expect("should find Spam");
+        assert_eq!(path2, "[Gmail]/Spam");
+
+        assert!(cache.find_spam_folder(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn export_message_attachments_writes_sanitized_unique_files() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[RemoteFolder {
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 0,
+                    total_count: 0,
+                }],
+            )
+            .unwrap();
+        let inbox = folders[0].id;
+        cache
+            .commit_folder_headers(1, inbox, 1, &[sample_header(10, "带附件邮件")], None)
+            .unwrap();
+        let page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let msg_id = page.items[0].id;
+        cache
+            .store_message_body(
+                msg_id,
+                "hello",
+                &[
+                    CachedAttachmentInput {
+                        filename: "report.pdf".to_string(),
+                        mime_type: "application/pdf".to_string(),
+                        content: b"pdf-1".to_vec(),
+                    },
+                    CachedAttachmentInput {
+                        filename: "report.pdf".to_string(),
+                        mime_type: "application/pdf".to_string(),
+                        content: b"pdf-2".to_vec(),
+                    },
+                    CachedAttachmentInput {
+                        filename: "../bad:name?.txt".to_string(),
+                        mime_type: "text/plain".to_string(),
+                        content: b"txt".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let dest_dir = std::env::temp_dir().join("hylki-test-forward-export");
+        let _ = std::fs::remove_dir_all(&dest_dir);
+        let paths = cache.export_message_attachments(msg_id, &dest_dir).unwrap();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"pdf-1");
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"pdf-2");
+        assert_eq!(std::fs::read(&paths[2]).unwrap(), b"txt");
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths[2].starts_with(&dest_dir));
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+}
+
+fn sanitize_attachment_filename(raw: &str) -> String {
+    let base = Path::new(raw)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(raw)
+        .trim();
+    let cleaned: String = base
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            other => other,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c| c == '.' || c == ' ');
+    if cleaned.is_empty() {
+        "attachment.bin".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn deduplicate_filename(
+    filename: &str,
+    used: &mut std::collections::HashSet<String>,
+) -> String {
+    let lower = filename.to_lowercase();
+    if used.insert(lower) {
+        return filename.to_string();
+    }
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let ext = path.extension().and_then(|e| e.to_str());
+    for idx in 1..10_000 {
+        let candidate = match ext {
+            Some(e) if !e.is_empty() => format!("{stem} ({idx}).{e}"),
+            _ => format!("{stem} ({idx})"),
+        };
+        if used.insert(candidate.to_lowercase()) {
+            return candidate;
+        }
+    }
+    filename.to_string()
 }

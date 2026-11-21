@@ -290,6 +290,18 @@ pub enum MailRequest {
         account_id: u32,
         message_id: u32,
     },
+    MoveMessage {
+        account_id: u32,
+        message_id: u32,
+        target_folder_path: String,
+    },
+    MarkSpam {
+        account_id: u32,
+        message_id: u32,
+    },
+    ExportForwardAttachments {
+        message_id: u32,
+    },
     SaveAttachment {
         attachment_id: u32,
         dest_path: std::path::PathBuf,
@@ -380,6 +392,24 @@ pub enum WorkerEvent {
     MessageDeleted {
         account_id: u32,
         message_id: u32,
+    },
+    /// A message was moved to an explicit target folder on the server and
+    /// removed from the old folder's local cache.
+    MessageMoved {
+        account_id: u32,
+        message_id: u32,
+        target_folder_path: String,
+    },
+    /// A message was moved to the account's spam/junk folder on the server and
+    /// removed from the old folder's local cache.
+    MessageMarkedSpam {
+        account_id: u32,
+        message_id: u32,
+    },
+    /// Cached attachments of a forwarded message were exported to a temp directory.
+    ForwardAttachmentsExported {
+        message_id: u32,
+        paths: Vec<String>,
     },
     /// A page of one unified view (starred / sent / archive) was loaded.
     UnifiedViewLoaded {

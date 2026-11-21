@@ -20,7 +20,9 @@ use gpui_kit::{
 use hylki_mail_core::config;
 
 use crate::app::{
-    CloseOverlay, FocusSearch, HylkiApp, NewCompose, OpenCommandPalette, RefreshAllAccounts,
+    CloseOverlay, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose, OpenCommandPalette,
+    OpenPreferences, QuitApp, RefreshAllAccounts, SelectNextMessage, SelectPrevMessage,
+    SendCompose,
 };
 
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
@@ -157,6 +159,13 @@ fn main() {
                 KeyBinding::new("ctrl-k", OpenCommandPalette, None),
                 KeyBinding::new("ctrl-f", FocusSearch, None),
                 KeyBinding::new("ctrl-r", RefreshAllAccounts, None),
+                KeyBinding::new("f5", RefreshAllAccounts, None),
+                KeyBinding::new("ctrl-enter", SendCompose, None),
+                KeyBinding::new("ctrl-,", OpenPreferences, None),
+                KeyBinding::new("ctrl-q", QuitApp, None),
+                KeyBinding::new("delete", DeleteSelectedMessage, None),
+                KeyBinding::new("down", SelectNextMessage, None),
+                KeyBinding::new("up", SelectPrevMessage, None),
                 KeyBinding::new("escape", CloseOverlay, None),
             ]);
 
@@ -218,6 +227,8 @@ mod tests {
             IconName::CircleUser,
             IconName::LogOut,
             IconName::X,
+            IconName::Ban,
+            IconName::FolderClosed,
         ] {
             let bytes = HylkiAssets
                 .load(&icon.path())

@@ -287,6 +287,9 @@ pub fn move_message(
     remote_id: &str,
     dest_folder_id: &str,
 ) -> Result<(), String> {
+    if dest_folder_id.trim().is_empty() {
+        return Err("目标文件夹 ID 不能为空".to_string());
+    }
     let encoded_id = urlencoding_segment(remote_id);
     let url = format!("{GRAPH_BASE}/messages/{encoded_id}/move");
     ureq::post(&url)
