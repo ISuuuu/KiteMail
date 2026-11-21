@@ -110,11 +110,21 @@ pub fn sender_initials(name: &str) -> String {
     }
     let letters = word_initials(&trimmed.to_uppercase());
     let mut out = String::new();
-    if let Some(first) = letters.first() {
-        out.push(*first);
-    }
-    if letters.len() > 1 {
-        out.extend(letters.last());
+    if let Some(&first) = letters.first() {
+        out.push(first);
+        // 避免中英文混排拼出 "M帐" 这类怪异组合：首字母为 ASCII 时，
+        // 仅在后续词首同样为 ASCII 字母数字时取末词首字母。
+        if first.is_ascii_alphanumeric() {
+            if let Some(&last_ascii) = letters[1..]
+                .iter()
+                .rev()
+                .find(|c| c.is_ascii_alphanumeric())
+            {
+                out.push(last_ascii);
+            }
+        } else if letters.len() > 1 {
+            out.extend(letters.last());
+        }
     }
     if out.is_empty() {
         "?".to_string()
@@ -199,6 +209,7 @@ mod tests {
         assert_eq!(sender_initials("Apple"), "A");
         assert_eq!(sender_initials("张三"), "张");
         assert_eq!(sender_initials("  李雷  "), "李");
+        assert_eq!(sender_initials("Microsoft 帐户团队"), "M");
         assert_eq!(sender_initials("Marcus Chen <marcus@studio.dev>"), "MC");
         assert_eq!(sender_initials("Marco Trevisan (3v1n0)"), "MT");
         assert_eq!(sender_initials("--- ..."), "?");

@@ -1,7 +1,11 @@
 //! Deterministic demo dataset for `--demo` mode and list pagination verification.
 
+use std::collections::BTreeMap;
+
+use crate::cache::{CachedAttachment, KnownContact};
 use crate::{
-    AccountSummary, AttachmentMeta, FolderSummary, MailPage, MessageDetail, MessageSummary,
+    AccountSummary, AttachmentMeta, FolderSummary, MailPage, MessageDetail, MessageFilter,
+    MessageSummary,
 };
 
 pub const DEMO_INBOX_ID: u32 = 1;
@@ -147,7 +151,7 @@ impl DemoStore {
                 ),
                 date_display: format!("11-{day:02} {hour:02}:{minute:02}"),
                 unread: idx < 128,
-                flagged: false,
+                flagged: idx < 30 && idx % 7 == 0,
                 has_attachment: idx % 9 == 0,
             });
         }
@@ -240,9 +244,21 @@ impl DemoStore {
         offset: usize,
         limit: usize,
     ) -> MailPage {
+        self.list_messages_page_filtered(folder_id, query, MessageFilter::All, offset, limit)
+    }
+
+    /// Return a slice of messages in `folder_id` applying both `query` and `filter`.
+    pub fn list_messages_page_filtered(
+        &self,
+        folder_id: u32,
+        query: &str,
+        filter: MessageFilter,
+        offset: usize,
+        limit: usize,
+    ) -> MailPage {
         let all = self.messages_for_folder(folder_id);
         let q = query.trim().to_lowercase();
-        let filtered: Vec<MessageSummary> = if q.is_empty() {
+        if q.is_empty() && filter == MessageFilter::All {
             let total = all.len();
             let start = offset.min(total);
             let end = start.saturating_add(limit).min(total);
@@ -252,14 +268,18 @@ impl DemoStore {
                 total,
                 items: all[start..end].to_vec(),
             };
-        } else {
-            all.iter()
-                .filter(|m| {
-                    m.subject.to_lowercase().contains(&q) || m.sender.to_lowercase().contains(&q)
-                })
-                .cloned()
-                .collect()
-        };
+        }
+
+        let filtered: Vec<MessageSummary> = all
+            .iter()
+            .filter(|m| Self::matches_filter(m, filter))
+            .filter(|m| {
+                q.is_empty()
+                    || m.subject.to_lowercase().contains(&q)
+                    || m.sender.to_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect();
 
         let total = filtered.len();
         let start = offset.min(total);
@@ -269,6 +289,143 @@ impl DemoStore {
             offset: start,
             total,
             items: filtered[start..end].to_vec(),
+        }
+    }
+
+    /// Return a page of starred demo messages across all demo folders.
+    pub fn list_starred_page(
+        &self,
+        query: &str,
+        filter: MessageFilter,
+        offset: usize,
+        limit: usize,
+    ) -> MailPage {
+        let q = query.trim().to_lowercase();
+        let filtered: Vec<MessageSummary> = self
+            .inbox_messages
+            .iter()
+            .chain(self.sent_messages.iter())
+            .chain(self.archive_messages.iter())
+            .filter(|m| m.flagged && Self::matches_filter(m, filter))
+            .filter(|m| {
+                q.is_empty()
+                    || m.subject.to_lowercase().contains(&q)
+                    || m.sender.to_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect();
+
+        let total = filtered.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        MailPage {
+            folder_id: 0,
+            offset: start,
+            total,
+            items: filtered[start..end].to_vec(),
+        }
+    }
+
+    /// Return sample cached attachments for the gallery view in `--demo` mode.
+    pub fn list_cached_attachments(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<CachedAttachment> {
+        let q = query.trim().to_lowercase();
+        self.inbox_messages
+            .iter()
+            .take(120)
+            .filter(|m| m.has_attachment)
+            .flat_map(|m| {
+                [
+                    CachedAttachment {
+                        id: m.id * 10 + 1,
+                        message_id: m.id,
+                        account_id: 1,
+                        filename: "windows-baseline-notes.txt".to_string(),
+                        mime_type: "text/plain".to_string(),
+                        size_bytes: 12_288,
+                        sender: m.sender.clone(),
+                        subject: m.subject.clone(),
+                        date_display: m.date_display.clone(),
+                    },
+                    CachedAttachment {
+                        id: m.id * 10 + 2,
+                        message_id: m.id,
+                        account_id: 1,
+                        filename: "三栏布局截图.png".to_string(),
+                        mime_type: "image/png".to_string(),
+                        size_bytes: 188_416,
+                        sender: m.sender.clone(),
+                        subject: m.subject.clone(),
+                        date_display: m.date_display.clone(),
+                    },
+                ]
+            })
+            .filter(|att| {
+                q.is_empty()
+                    || att.filename.to_lowercase().contains(&q)
+                    || att.sender.to_lowercase().contains(&q)
+                    || att.subject.to_lowercase().contains(&q)
+            })
+            .skip(offset)
+            .take(limit)
+            .collect()
+    }
+
+    /// Return aggregated contacts for the contacts view in `--demo` mode.
+    pub fn list_known_contacts(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<KnownContact> {
+        let q = query.trim().to_lowercase();
+        let mut counts: BTreeMap<String, (String, usize)> = BTreeMap::new();
+        for msg in self.inbox_messages.iter().take(400) {
+            let (name, email) =
+                if let (Some(o), Some(c)) = (msg.sender.find('<'), msg.sender.rfind('>')) {
+                    (
+                        msg.sender[..o].trim().to_string(),
+                        msg.sender[o + 1..c].trim().to_lowercase(),
+                    )
+                } else {
+                    (msg.sender.clone(), msg.sender.to_lowercase())
+                };
+            if email.is_empty() {
+                continue;
+            }
+            let entry = counts.entry(email).or_insert_with(|| (name, 0));
+            entry.1 += 1;
+        }
+        let mut items: Vec<KnownContact> = counts
+            .into_iter()
+            .map(|(email, (name, message_count))| KnownContact {
+                name,
+                email,
+                message_count,
+            })
+            .filter(|c| {
+                q.is_empty()
+                    || c.name.to_lowercase().contains(&q)
+                    || c.email.to_lowercase().contains(&q)
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            b.message_count
+                .cmp(&a.message_count)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        items.into_iter().skip(offset).take(limit).collect()
+    }
+
+    fn matches_filter(m: &MessageSummary, filter: MessageFilter) -> bool {
+        match filter {
+            MessageFilter::All => true,
+            MessageFilter::Unread => m.unread,
+            MessageFilter::Starred => m.flagged,
         }
     }
 
@@ -360,5 +517,25 @@ mod tests {
             .expect("first demo message should exist");
         assert!(!detail.attachments.is_empty());
         assert!(detail.body_text.contains("Hylki Windows"));
+    }
+
+    #[test]
+    fn demo_store_supports_filters_starred_attachments_and_contacts() {
+        let store = DemoStore::new();
+        let unread =
+            store.list_messages_page_filtered(DEMO_INBOX_ID, "", MessageFilter::Unread, 0, 50);
+        assert_eq!(unread.total, 126);
+        assert!(unread.items.iter().all(|m| m.unread));
+
+        let starred = store.list_starred_page("", MessageFilter::All, 0, 50);
+        assert!(starred.total >= 2);
+        assert!(starred.items.iter().all(|m| m.flagged));
+
+        let attachments = store.list_cached_attachments("", 0, 50);
+        assert!(!attachments.is_empty());
+
+        let contacts = store.list_known_contacts("", 0, 50);
+        assert!(!contacts.is_empty());
+        assert!(contacts[0].message_count >= contacts.last().unwrap().message_count);
     }
 }

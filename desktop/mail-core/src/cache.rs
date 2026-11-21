@@ -6,8 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail, MessageSummary, OutboxItem,
-    OutboxStatus,
+    AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail, MessageFilter,
+    MessageSummary, OutboxItem, OutboxStatus,
 };
 
 /// Remote folder metadata returned by IMAP LIST/STATUS.
@@ -458,6 +458,15 @@ impl CacheStore {
         Ok(())
     }
 
+    /// SQL filter suffix for [`MessageFilter`].
+    fn filter_sql(filter: MessageFilter) -> &'static str {
+        match filter {
+            MessageFilter::All => "",
+            MessageFilter::Unread => " AND m.unread = 1",
+            MessageFilter::Starred => " AND m.flagged = 1",
+        }
+    }
+
     /// Query a page of cached message summaries for `folder_id`, optionally filtered by `query`.
     pub fn list_messages_page(
         &self,
@@ -466,12 +475,25 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
+        self.list_messages_page_filtered(folder_id, query, MessageFilter::All, offset, limit)
+    }
+
+    /// Query a page of cached message summaries for `folder_id`, applying both `query` and `filter`.
+    pub fn list_messages_page_filtered(
+        &self,
+        folder_id: u32,
+        query: &str,
+        filter: MessageFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
         let trimmed = query.trim();
+        let extra = Self::filter_sql(filter);
         let (total, items) = if trimmed.is_empty() {
             let total: i64 = self
                 .conn
                 .query_row(
-                    "SELECT COUNT(*) FROM messages WHERE folder_id = ?1",
+                    &format!("SELECT COUNT(*) FROM messages m WHERE m.folder_id = ?1{extra}"),
                     params![folder_id],
                     |row| row.get(0),
                 )
@@ -479,17 +501,17 @@ impl CacheStore {
 
             let mut stmt = self
                 .conn
-                .prepare(
+                .prepare(&format!(
                     "
                     SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
                            m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
-                    WHERE m.folder_id = ?1
+                    WHERE m.folder_id = ?1{extra}
                     ORDER BY m.date_ts DESC, m.uid DESC
                     LIMIT ?2 OFFSET ?3
-                    ",
-                )
+                    "
+                ))
                 .map_err(|e| format!("准备分页查询失败: {e}"))?;
 
             let rows = stmt
@@ -507,10 +529,12 @@ impl CacheStore {
             let total: i64 = self
                 .conn
                 .query_row(
-                    "
-                    SELECT COUNT(*) FROM messages
-                    WHERE folder_id = ?1 AND (subject LIKE ?2 OR sender LIKE ?2)
-                    ",
+                    &format!(
+                        "
+                        SELECT COUNT(*) FROM messages m
+                        WHERE m.folder_id = ?1{extra} AND (m.subject LIKE ?2 OR m.sender LIKE ?2)
+                        "
+                    ),
                     params![folder_id, pattern],
                     |row| row.get(0),
                 )
@@ -518,17 +542,17 @@ impl CacheStore {
 
             let mut stmt = self
                 .conn
-                .prepare(
+                .prepare(&format!(
                     "
                     SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
                            m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
-                    WHERE m.folder_id = ?1 AND (m.subject LIKE ?2 OR m.sender LIKE ?2)
+                    WHERE m.folder_id = ?1{extra} AND (m.subject LIKE ?2 OR m.sender LIKE ?2)
                     ORDER BY m.date_ts DESC, m.uid DESC
                     LIMIT ?3 OFFSET ?4
-                    ",
-                )
+                    "
+                ))
                 .map_err(|e| format!("准备搜索分页查询失败: {e}"))?;
 
             let rows = stmt
@@ -559,95 +583,25 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        let trimmed = query.trim();
-        let (total, items) = if trimmed.is_empty() {
-            let total: i64 = self
-                .conn
-                .query_row(
-                    "
-                    SELECT COUNT(*)
-                    FROM messages m
-                    JOIN folders f ON f.id = m.folder_id
-                    WHERE (UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)
-                    ",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("统计统一收件箱总数失败: {e}"))?;
+        self.list_unified_inbox_filtered(query, MessageFilter::All, offset, limit)
+    }
 
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "
-                    SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                           m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
-                    FROM messages m
-                    JOIN folders f ON f.id = m.folder_id
-                    WHERE (UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)
-                    ORDER BY m.date_ts DESC, m.uid DESC
-                    LIMIT ?1 OFFSET ?2
-                    ",
-                )
-                .map_err(|e| format!("准备统一收件箱分页查询失败: {e}"))?;
-
-            let rows = stmt
-                .query_map(params![limit as i64, offset as i64], map_summary_row)
-                .map_err(|e| format!("执行统一收件箱分页查询失败: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("解析统一收件箱结果失败: {e}"))?;
-
-            (total.max(0) as usize, rows)
-        } else {
-            let pattern = format!("%{trimmed}%");
-            let total: i64 = self
-                .conn
-                .query_row(
-                    "
-                    SELECT COUNT(*)
-                    FROM messages m
-                    JOIN folders f ON f.id = m.folder_id
-                    WHERE (UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)
-                      AND (m.subject LIKE ?1 OR m.sender LIKE ?1)
-                    ",
-                    params![pattern],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("统计统一收件箱搜索总数失败: {e}"))?;
-
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "
-                    SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
-                           m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
-                    FROM messages m
-                    JOIN folders f ON f.id = m.folder_id
-                    WHERE (UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)
-                      AND (m.subject LIKE ?1 OR m.sender LIKE ?1)
-                    ORDER BY m.date_ts DESC, m.uid DESC
-                    LIMIT ?2 OFFSET ?3
-                    ",
-                )
-                .map_err(|e| format!("准备统一收件箱搜索查询失败: {e}"))?;
-
-            let rows = stmt
-                .query_map(
-                    params![pattern, limit as i64, offset as i64],
-                    map_summary_row,
-                )
-                .map_err(|e| format!("执行统一收件箱搜索查询失败: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("解析统一收件箱搜索结果失败: {e}"))?;
-
-            (total.max(0) as usize, rows)
-        };
-
-        Ok(MailPage {
-            folder_id: 0,
+    /// Query a unified inbox page across all accounts with [`MessageFilter`].
+    pub fn list_unified_inbox_filtered(
+        &self,
+        query: &str,
+        filter: MessageFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages(
+            "(UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)",
+            "统一收件箱",
+            query,
+            filter,
             offset,
-            total,
-            items,
-        })
+            limit,
+        )
     }
 
     /// Query a page of starred (flagged) messages across all accounts and folders.
@@ -657,7 +611,18 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        self.list_role_messages("m.flagged = 1", "星标邮件", query, offset, limit)
+        self.list_starred_messages_filtered(query, MessageFilter::All, offset, limit)
+    }
+
+    /// Query a page of starred (flagged) messages with [`MessageFilter`].
+    pub fn list_starred_messages_filtered(
+        &self,
+        query: &str,
+        filter: MessageFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages("m.flagged = 1", "星标邮件", query, filter, offset, limit)
     }
 
     /// Query a page of messages aggregated across every account's Sent folder
@@ -668,7 +633,18 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        self.list_role_messages(SENT_FOLDER_MATCH, "已发送", query, offset, limit)
+        self.list_sent_messages_filtered(query, MessageFilter::All, offset, limit)
+    }
+
+    /// Query a page of sent messages across all accounts with [`MessageFilter`].
+    pub fn list_sent_messages_filtered(
+        &self,
+        query: &str,
+        filter: MessageFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages(SENT_FOLDER_MATCH, "已发送", query, filter, offset, limit)
     }
 
     /// Query a page of messages aggregated across every account's Archive folder.
@@ -678,7 +654,18 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
-        self.list_role_messages(ARCHIVE_FOLDER_MATCH, "归档", query, offset, limit)
+        self.list_archived_messages_filtered(query, MessageFilter::All, offset, limit)
+    }
+
+    /// Query a page of archived messages across all accounts with [`MessageFilter`].
+    pub fn list_archived_messages_filtered(
+        &self,
+        query: &str,
+        filter: MessageFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages(ARCHIVE_FOLDER_MATCH, "归档", query, filter, offset, limit)
     }
 
     /// Shared implementation for unified message pages: `predicate` is a trusted
@@ -688,10 +675,12 @@ impl CacheStore {
         predicate: &str,
         label: &str,
         query: &str,
+        filter: MessageFilter,
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
         let trimmed = query.trim();
+        let extra = Self::filter_sql(filter);
         let (total, items) = if trimmed.is_empty() {
             let total: i64 = self
                 .conn
@@ -701,7 +690,7 @@ impl CacheStore {
                         SELECT COUNT(*)
                         FROM messages m
                         JOIN folders f ON f.id = m.folder_id
-                        WHERE {predicate}
+                        WHERE {predicate}{extra}
                         "
                     ),
                     [],
@@ -717,7 +706,7 @@ impl CacheStore {
                            m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
-                    WHERE {predicate}
+                    WHERE {predicate}{extra}
                     ORDER BY m.date_ts DESC, m.uid DESC
                     LIMIT ?1 OFFSET ?2
                     "
@@ -741,7 +730,7 @@ impl CacheStore {
                         SELECT COUNT(*)
                         FROM messages m
                         JOIN folders f ON f.id = m.folder_id
-                        WHERE {predicate}
+                        WHERE {predicate}{extra}
                           AND (m.subject LIKE ?1 OR m.sender LIKE ?1)
                         "
                     ),
@@ -758,7 +747,7 @@ impl CacheStore {
                            m.preview, m.date_display, m.unread, m.flagged, m.has_attachment
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
-                    WHERE {predicate}
+                    WHERE {predicate}{extra}
                       AND (m.subject LIKE ?1 OR m.sender LIKE ?1)
                     ORDER BY m.date_ts DESC, m.uid DESC
                     LIMIT ?2 OFFSET ?3
@@ -2475,5 +2464,89 @@ mod tests {
 
         // Removing again is a no-op.
         assert_eq!(cache.remove_message(target_id).unwrap(), None);
+    }
+
+    #[test]
+    fn message_filter_queries_return_exact_totals_and_items() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[RemoteFolder {
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 0,
+                    total_count: 0,
+                }],
+            )
+            .unwrap();
+        let inbox = folders[0].id;
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                1,
+                &[
+                    CachedHeaderInput {
+                        uid: 1,
+                        message_id: "<1@test>".to_string(),
+                        sender: "Alice <a@test>".to_string(),
+                        recipients: "me@test".to_string(),
+                        subject: "未读且星标".to_string(),
+                        preview: String::new(),
+                        date_ts: 300,
+                        date_display: "10:00".to_string(),
+                        unread: true,
+                        flagged: true,
+                        has_attachment: false,
+                    },
+                    CachedHeaderInput {
+                        uid: 2,
+                        message_id: "<2@test>".to_string(),
+                        sender: "Bob <b@test>".to_string(),
+                        recipients: "me@test".to_string(),
+                        subject: "仅未读".to_string(),
+                        preview: String::new(),
+                        date_ts: 200,
+                        date_display: "09:00".to_string(),
+                        unread: true,
+                        flagged: false,
+                        has_attachment: false,
+                    },
+                    CachedHeaderInput {
+                        uid: 3,
+                        message_id: "<3@test>".to_string(),
+                        sender: "Carol <c@test>".to_string(),
+                        recipients: "me@test".to_string(),
+                        subject: "已读星标".to_string(),
+                        preview: String::new(),
+                        date_ts: 100,
+                        date_display: "08:00".to_string(),
+                        unread: false,
+                        flagged: true,
+                        has_attachment: false,
+                    },
+                ],
+                Some(&[1, 2, 3]),
+            )
+            .unwrap();
+
+        let unread = cache
+            .list_messages_page_filtered(inbox, "", MessageFilter::Unread, 0, 10)
+            .unwrap();
+        assert_eq!(unread.total, 2);
+        assert!(unread.items.iter().all(|m| m.unread));
+
+        let starred = cache
+            .list_unified_inbox_filtered("", MessageFilter::Starred, 0, 10)
+            .unwrap();
+        assert_eq!(starred.total, 2);
+        assert!(starred.items.iter().all(|m| m.flagged));
+
+        let unread_starred = cache
+            .list_starred_messages_filtered("", MessageFilter::Unread, 0, 10)
+            .unwrap();
+        assert_eq!(unread_starred.total, 1);
+        assert_eq!(unread_starred.items[0].subject, "未读且星标");
     }
 }

@@ -364,8 +364,6 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let selected_id = app.selected_message.as_ref().map(|m| m.id);
     // 本地草稿视图（真实账号）：从 self.drafts 合成列表行。
     let drafts_view = app.current_view == CurrentView::Drafts && !app.demo_mode;
-    // 演示模式不支持星标视图（DemoStore 无星标查询）。
-    let demo_unsupported = app.demo_mode && app.current_view == CurrentView::Starred;
     let show_account_tag = app.current_view.is_unified() && app.accounts.len() > 1;
     let current_filter = app.list_filter;
     let is_unified_list = !drafts_view;
@@ -400,18 +398,13 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         Vec::new()
     };
 
-    // 常规邮件行（按筛选过滤当前页）。
+    // 常规邮件行（过滤已下沉到 SQLite / DemoStore，current_page.items 即精准结果）。
     let filtered_rows: Vec<gpui_kit::AnyElement> = if drafts_view {
         Vec::new()
     } else {
         app.current_page
             .items
             .iter()
-            .filter(|msg| match current_filter {
-                ListFilter::All => true,
-                ListFilter::Unread => msg.unread,
-                ListFilter::Starred => msg.flagged,
-            })
             .map(|msg| {
                 let is_selected = selected_id == Some(msg.id);
                 message_row(app, msg, None, is_selected, show_account_tag, &p, cx)
@@ -438,16 +431,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let has_visible_rows = if drafts_view {
         !draft_rows.is_empty()
     } else {
-        !demo_unsupported
-            && app
-                .current_page
-                .items
-                .iter()
-                .any(|msg| match current_filter {
-                    ListFilter::All => true,
-                    ListFilter::Unread => msg.unread,
-                    ListFilter::Starred => msg.flagged,
-                })
+        !app.current_page.items.is_empty()
     };
 
     let count_text = if drafts_view {
@@ -462,19 +446,17 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         format!("{start}-{end} / {total}")
     };
 
-    // 空态文案：常规 / 草稿 / 演示不支持三种。
-    let (empty_icon, empty_title, empty_hint) = if demo_unsupported {
-        (
-            IconName::Star,
-            "演示模式不支持该视图",
-            "「已加星标」需要真实账号的本地缓存数据",
-        )
-    } else if drafts_view {
+    // 空态文案：草稿 / 常规筛选无结果。
+    let (empty_icon, empty_title, empty_hint) = if drafts_view {
         (
             IconName::FilePen,
             "暂无本地草稿",
             "在写信面板点击「存草稿」后显示在这里",
         )
+    } else if current_filter == ListFilter::Unread {
+        (IconName::Inbox, "暂无未读邮件", "")
+    } else if current_filter == ListFilter::Starred {
+        (IconName::Star, "暂无星标邮件", "")
     } else {
         (IconName::Inbox, "暂无邮件", "")
     };

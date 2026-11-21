@@ -463,20 +463,22 @@ pub fn html_to_readable_text(html: &str) -> String {
         if ch == '>' && in_tag {
             in_tag = false;
             let lower = tag_buf.trim().to_ascii_lowercase();
-            if lower.starts_with("script") || lower.starts_with("style") {
-                skip_block = true;
-            } else if lower.starts_with("/script") || lower.starts_with("/style") {
-                skip_block = false;
-            } else if lower == "br"
-                || lower == "br/"
-                || lower.starts_with("br ")
-                || lower.starts_with("/p")
-                || lower.starts_with("/div")
-                || lower.starts_with("/li")
+            // Skip HTML comments (`<!-- ... -->`).
+            if lower.starts_with("!--") {
+                continue;
+            }
+            if lower.starts_with("script")
+                || lower.starts_with("style")
+                || lower.starts_with("head") && !lower.starts_with("header")
             {
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
+                skip_block = true;
+            } else if lower.starts_with("/script")
+                || lower.starts_with("/style")
+                || lower.starts_with("/head") && !lower.starts_with("/header")
+            {
+                skip_block = false;
+            } else if is_block_break_tag(&lower) && !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
             }
             continue;
         }
@@ -489,13 +491,66 @@ pub fn html_to_readable_text(html: &str) -> String {
         }
     }
 
-    out.replace("&nbsp;", " ")
+    let decoded = out
+        .replace("&nbsp;", " ")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
         .replace("&quot;", "\"")
-        .trim()
-        .to_string()
+        .replace("&#39;", "'")
+        .replace("&apos;", "'");
+
+    // Trim trailing spaces per line and collapse 3+ consecutive blank lines into 2.
+    let mut normalized = String::with_capacity(decoded.len());
+    let mut empty_run = 0usize;
+    for line in decoded.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            empty_run += 1;
+            if empty_run <= 1 && !normalized.is_empty() {
+                normalized.push('\n');
+            }
+        } else {
+            if !normalized.is_empty() {
+                normalized.push('\n');
+            }
+            normalized.push_str(trimmed);
+            empty_run = 0;
+        }
+    }
+    normalized
+}
+
+fn is_block_break_tag(lower: &str) -> bool {
+    let name = lower
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+    let is_closing = lower.starts_with('/');
+    matches!(
+        (is_closing, name),
+        (_, "br" | "hr")
+            | (
+                true,
+                "p" | "div"
+                    | "li"
+                    | "tr"
+                    | "table"
+                    | "blockquote"
+                    | "section"
+                    | "article"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+            )
+            | (
+                false,
+                "p" | "div" | "tr" | "li" | "blockquote" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            )
+    )
 }
 
 #[cfg(test)]
@@ -509,5 +564,15 @@ mod tests {
         assert!(text.contains("你好，世界"));
         assert!(text.contains("第二行 & 测试"));
         assert!(!text.contains("color:red"));
+    }
+
+    #[test]
+    fn html_stripping_separates_adjacent_blocks_and_table_rows() {
+        let html = "<div>You authored the thread.</div><p>Message ID: &lt;abc@github.com&gt;</p>";
+        let text = html_to_readable_text(html);
+        assert_eq!(
+            text,
+            "You authored the thread.\nMessage ID: <abc@github.com>"
+        );
     }
 }

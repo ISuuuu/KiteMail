@@ -312,9 +312,10 @@ async fn handle_request(
 
         MailRequest::LoadUnifiedInbox {
             query,
+            filter,
             offset,
             limit,
-        } => match cache.list_unified_inbox(&query, offset, limit) {
+        } => match cache.list_unified_inbox_filtered(&query, filter, offset, limit) {
             Ok(page) => {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
@@ -329,9 +330,10 @@ async fn handle_request(
         MailRequest::LoadMessagesPage {
             folder_id,
             query,
+            filter,
             offset,
             limit,
-        } => match cache.list_messages_page(folder_id, &query, offset, limit) {
+        } => match cache.list_messages_page_filtered(folder_id, &query, filter, offset, limit) {
             Ok(page) => {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
@@ -660,13 +662,20 @@ async fn handle_request(
         MailRequest::LoadUnifiedView {
             view,
             query,
+            filter,
             offset,
             limit,
         } => {
             let result = match view {
-                UnifiedView::Starred => cache.list_starred_messages(&query, offset, limit),
-                UnifiedView::Sent => cache.list_sent_messages(&query, offset, limit),
-                UnifiedView::Archive => cache.list_archived_messages(&query, offset, limit),
+                UnifiedView::Starred => {
+                    cache.list_starred_messages_filtered(&query, filter, offset, limit)
+                }
+                UnifiedView::Sent => {
+                    cache.list_sent_messages_filtered(&query, filter, offset, limit)
+                }
+                UnifiedView::Archive => {
+                    cache.list_archived_messages_filtered(&query, filter, offset, limit)
+                }
             };
             match result {
                 Ok(page) => {

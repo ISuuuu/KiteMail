@@ -189,6 +189,15 @@ pub enum UnifiedView {
     Archive,
 }
 
+/// Server/cache-side filter applied to message list queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MessageFilter {
+    #[default]
+    All,
+    Unread,
+    Starred,
+}
+
 /// Commands sent from the GPUI frontend to the mail worker.
 #[derive(Clone, Debug)]
 pub enum MailRequest {
@@ -221,12 +230,14 @@ pub enum MailRequest {
     },
     LoadUnifiedInbox {
         query: String,
+        filter: MessageFilter,
         offset: usize,
         limit: usize,
     },
     LoadMessagesPage {
         folder_id: u32,
         query: String,
+        filter: MessageFilter,
         offset: usize,
         limit: usize,
     },
@@ -278,6 +289,7 @@ pub enum MailRequest {
     LoadUnifiedView {
         view: UnifiedView,
         query: String,
+        filter: MessageFilter,
         offset: usize,
         limit: usize,
     },

@@ -19,6 +19,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     actions, black, div, px, AppContext, ClipboardItem, Context, Entity, InteractiveElement,
     IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Window,
+    WindowAppearance,
 };
 use hylki_mail_core::cache::CachedAttachment;
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend, SecurityMode};
@@ -27,8 +28,8 @@ use hylki_mail_core::demo::{
 };
 use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
-    ComposeDraft, FolderSummary, LocalDraft, MailPage, MailRequest, MessageDetail, MessageSummary,
-    OutboxItem, UnifiedView, WorkerEvent,
+    ComposeDraft, FolderSummary, LocalDraft, MailPage, MailRequest, MessageDetail, MessageFilter,
+    MessageSummary, OutboxItem, UnifiedView, WorkerEvent,
 };
 
 use crate::theme;
@@ -148,7 +149,6 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
 pub(crate) enum RightPaneMode {
     Reader,
     Compose,
-    AccountSetup,
     /// 首次启动欢迎向导（无账号且非 demo 时默认进入，方案文档五.1）。
     Welcome,
 }
@@ -200,6 +200,14 @@ impl ListFilter {
             Self::Starred => "仅星标",
         }
     }
+
+    pub(crate) fn to_mail_filter(self) -> MessageFilter {
+        match self {
+            Self::All => MessageFilter::All,
+            Self::Unread => MessageFilter::Unread,
+            Self::Starred => MessageFilter::Starred,
+        }
+    }
 }
 
 // 全局快捷键动作（方案文档五.3）；键绑定注册在 main.rs，
@@ -224,11 +232,11 @@ pub(crate) enum MainContentView {
     Contacts,
 }
 
-/// 当前全局浮层（方案文档五.1）；账号管理沿用
-/// [`RightPaneMode::AccountSetup`]，不作为浮层。
+/// 当前全局浮层（方案文档五.1）：账号管理、偏好设置、命令面板均以居中模态展示。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActiveModal {
     None,
+    Accounts,
     Preferences,
     CommandPalette,
 }
@@ -290,10 +298,12 @@ pub(crate) struct HylkiApp {
     pub(crate) error_banner: Option<SharedString>,
 
     // 迭代 1 新增：纯视觉状态（不影响后端行为）
-    /// 当前主题（`theme::THEME_LIST` 中的 id），本轮固定 "default"。
+    /// 当前主题（`theme::THEME_LIST` 中的 id）。
     pub(crate) theme_id: &'static str,
     /// 亮 / 暗模式（菜单「切换亮/暗主题」即时生效）。
     pub(crate) dark_mode: bool,
+    /// 系统当前的深浅色外观（由 `window.appearance()` 检测，供 `dark_mode: None` 跟随系统使用）。
+    pub(crate) system_dark_mode: bool,
     /// 左栏是否隐藏（中栏顶部开关）。
     pub(crate) sidebar_hidden: bool,
     /// 中栏列表客户端过滤。
@@ -447,8 +457,16 @@ impl HylkiApp {
                 .default_value(first_cfg.oauth_client_id.clone())
         });
 
+        let system_dark_mode = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
         let initial_theme_id = theme::static_theme_id(&prefs.theme_id);
-        let initial_dark_mode = prefs.dark_mode.unwrap_or(false);
+        let initial_dark_mode = prefs.dark_mode.unwrap_or(system_dark_mode);
+        // 当偏好为「跟随系统」且系统是暗色时，补一次主题应用对齐 Windows 外观。
+        if prefs.dark_mode.is_none() && system_dark_mode {
+            theme::apply(initial_theme_id, true, cx);
+        }
 
         if demo_mode {
             let current_page = demo_store.list_messages_page(DEMO_INBOX_ID, "", 0, prefs.page_size);
@@ -512,6 +530,7 @@ impl HylkiApp {
                 error_banner: None,
                 theme_id: initial_theme_id,
                 dark_mode: initial_dark_mode,
+                system_dark_mode,
                 sidebar_hidden: false,
                 list_filter: ListFilter::All,
                 collapsed_accounts: HashSet::new(),
@@ -639,6 +658,7 @@ impl HylkiApp {
             error_banner: None,
             theme_id: initial_theme_id,
             dark_mode: initial_dark_mode,
+            system_dark_mode,
             sidebar_hidden: false,
             list_filter: ListFilter::All,
             collapsed_accounts: HashSet::new(),
@@ -695,6 +715,9 @@ impl HylkiApp {
                     self.compose_account_id = account.id;
                     self.pending_delete_account_id = None;
                     self.right_mode = RightPaneMode::Reader;
+                    if self.active_modal == ActiveModal::Accounts {
+                        self.active_modal = ActiveModal::None;
+                    }
                     self.error_banner = None;
                     self.status_line =
                         SharedString::from(format!("账号 {} 已保存，正在同步...", account.email));
@@ -709,7 +732,7 @@ impl HylkiApp {
                     self.pending_delete_account_id = None;
                     self.editing_account_id = self.accounts.first().map(|a| a.id);
                     self.right_mode = if self.accounts.is_empty() {
-                        RightPaneMode::AccountSetup
+                        RightPaneMode::Welcome
                     } else {
                         RightPaneMode::Reader
                     };
@@ -848,31 +871,35 @@ impl HylkiApp {
     }
 
     pub(crate) fn reload_current_page(&mut self, cx: &mut Context<Self>) {
+        let filter = self.list_filter.to_mail_filter();
         if self.demo_mode {
-            // 演示模式：统一视图映射到对应的演示文件夹；
-            // DemoStore 没有星标视图 → 空列表（中栏渲染「演示模式不支持该视图」提示）。
-            let folder_id = match self.current_view {
-                CurrentView::UnifiedInbox | CurrentView::AccountFolder => self.selected_folder_id,
-                CurrentView::Sent => DEMO_SENT_ID,
-                CurrentView::Drafts => DEMO_DRAFTS_ID,
-                CurrentView::Archive => DEMO_ARCHIVE_ID,
-                CurrentView::Starred => {
-                    self.current_page = MailPage {
-                        folder_id: 0,
-                        offset: 0,
-                        total: 0,
-                        items: Vec::new(),
+            // 演示模式：全部统一视图（含星标）与文件夹均支持筛选和分页。
+            self.current_page = match self.current_view {
+                CurrentView::Starred => self.demo_store.list_starred_page(
+                    &self.search_query,
+                    filter,
+                    self.page_offset,
+                    self.prefs.page_size,
+                ),
+                other => {
+                    let folder_id = match other {
+                        CurrentView::UnifiedInbox | CurrentView::AccountFolder => {
+                            self.selected_folder_id
+                        }
+                        CurrentView::Sent => DEMO_SENT_ID,
+                        CurrentView::Drafts => DEMO_DRAFTS_ID,
+                        CurrentView::Archive => DEMO_ARCHIVE_ID,
+                        CurrentView::Starred => DEMO_INBOX_ID,
                     };
-                    cx.notify();
-                    return;
+                    self.demo_store.list_messages_page_filtered(
+                        folder_id,
+                        &self.search_query,
+                        filter,
+                        self.page_offset,
+                        self.prefs.page_size,
+                    )
                 }
             };
-            self.current_page = self.demo_store.list_messages_page(
-                folder_id,
-                &self.search_query,
-                self.page_offset,
-                self.prefs.page_size,
-            );
             cx.notify();
             return;
         }
@@ -886,6 +913,7 @@ impl HylkiApp {
                 CurrentView::UnifiedInbox => {
                     w.send(MailRequest::LoadUnifiedInbox {
                         query: self.search_query.clone(),
+                        filter,
                         offset: self.page_offset,
                         limit: self.prefs.page_size,
                     });
@@ -896,6 +924,7 @@ impl HylkiApp {
                         w.send(MailRequest::LoadUnifiedView {
                             view,
                             query: self.search_query.clone(),
+                            filter,
                             offset: self.page_offset,
                             limit: self.prefs.page_size,
                         });
@@ -905,6 +934,7 @@ impl HylkiApp {
                     w.send(MailRequest::LoadMessagesPage {
                         folder_id: self.selected_folder_id,
                         query: self.search_query.clone(),
+                        filter,
                         offset: self.page_offset,
                         limit: self.prefs.page_size,
                     });
@@ -951,9 +981,10 @@ impl HylkiApp {
         self.main_view = MainContentView::Mail;
 
         if self.demo_mode {
-            self.current_page = self.demo_store.list_messages_page(
+            self.current_page = self.demo_store.list_messages_page_filtered(
                 folder_id,
                 &self.search_query,
+                self.list_filter.to_mail_filter(),
                 0,
                 self.prefs.page_size,
             );
@@ -1614,7 +1645,7 @@ impl HylkiApp {
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.cfg_feedback = None;
         self.cfg_auth_guide = None;
-        self.right_mode = RightPaneMode::AccountSetup;
+        self.active_modal = ActiveModal::Accounts;
         cx.notify();
     }
 
@@ -1667,11 +1698,10 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 打开账号管理页（菜单 / 欢迎页入口），保留当前表单选择。
+    /// 打开账号管理独立居中弹窗（菜单 / 欢迎页 / 命令面板入口），保留当前表单选择。
     pub(crate) fn open_account_manager(&mut self, cx: &mut Context<Self>) {
         self.pending_delete_account_id = None;
-        self.right_mode = RightPaneMode::AccountSetup;
-        self.main_view = MainContentView::Mail;
+        self.active_modal = ActiveModal::Accounts;
         cx.notify();
     }
 
@@ -1890,8 +1920,13 @@ impl HylkiApp {
     }
 
     pub(crate) fn set_list_filter(&mut self, filter: ListFilter, cx: &mut Context<Self>) {
-        self.list_filter = filter;
-        cx.notify();
+        if self.list_filter != filter {
+            self.list_filter = filter;
+            self.page_offset = 0;
+            self.reload_current_page(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     pub(crate) fn toggle_account_expanded(&mut self, account_id: u32, cx: &mut Context<Self>) {
@@ -1905,9 +1940,19 @@ impl HylkiApp {
 
     // ---- 阶段 3：全局路由、偏好、命令面板、快捷键（方案文档第五节）----
 
-    /// 附件总览数据请求（进入视图 / 搜索词变化时触发；demo 模式跳过）。
-    fn request_gallery_items(&mut self) {
+    /// 附件总览数据请求（进入视图 / 搜索词变化时触发；demo 模式直接加载模拟附件）。
+    fn request_gallery_items(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
+            let items = self
+                .demo_store
+                .list_cached_attachments(&self.gallery_query, 0, 200);
+            self.gallery_items = items.clone();
+            if let Some(ref g) = self.gallery {
+                g.update(cx, |state, cx| {
+                    state.set_items(items);
+                    cx.notify();
+                });
+            }
             return;
         }
         if let Some(ref w) = self.worker {
@@ -1929,7 +1974,7 @@ impl HylkiApp {
                 |this, _gallery, event: &GalleryEvent, _window, cx| match event {
                     GalleryEvent::QueryChanged(query) => {
                         this.gallery_query = query.clone();
-                        this.request_gallery_items();
+                        this.request_gallery_items(cx);
                     }
                     // 账号筛选由组件内部做客户端过滤，无需重新请求。
                     GalleryEvent::AccountFilterChanged(_) => {}
@@ -1961,10 +2006,7 @@ impl HylkiApp {
         if let Some(ref g) = self.gallery {
             g.update(cx, |state, _cx| state.set_accounts(accounts));
         }
-        self.request_gallery_items();
-        if self.demo_mode {
-            self.status_line = SharedString::from("演示模式：附件总览无本地缓存数据");
-        }
+        self.request_gallery_items(cx);
         cx.notify();
     }
 
@@ -1981,6 +2023,13 @@ impl HylkiApp {
 
     /// 附件总览「定位到原邮件」：切回三栏并加载该邮件正文。
     fn locate_gallery_message(&mut self, message_id: u32, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            self.main_view = MainContentView::Mail;
+            self.right_mode = RightPaneMode::Reader;
+            self.selected_message = self.demo_store.get_message_detail(message_id);
+            cx.notify();
+            return;
+        }
         let Some(item) = self
             .gallery_items
             .iter()
@@ -2000,9 +2049,18 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 联系人数据请求（进入视图 / 搜索词变化时触发；demo 模式跳过）。
-    fn request_known_contacts(&mut self) {
+    /// 联系人数据请求（进入视图 / 搜索词变化时触发；demo 模式直接聚合模拟发件人）。
+    fn request_known_contacts(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
+            let items = self
+                .demo_store
+                .list_known_contacts(&self.contacts_query, 0, 500);
+            if let Some(ref c) = self.contacts {
+                c.update(cx, |state, cx| {
+                    state.set_contacts(items);
+                    cx.notify();
+                });
+            }
             return;
         }
         if let Some(ref w) = self.worker {
@@ -2024,7 +2082,7 @@ impl HylkiApp {
                 |this, _contacts, event: &ContactsEvent, window, cx| match event {
                     ContactsEvent::QueryChanged(query) => {
                         this.contacts_query = query.clone();
-                        this.request_known_contacts();
+                        this.request_known_contacts(cx);
                     }
                     ContactsEvent::ComposeTo(email) => {
                         this.compose_to_contact(email.clone(), window, cx);
@@ -2035,10 +2093,7 @@ impl HylkiApp {
             self.contacts_sub = Some(sub);
         }
         self.main_view = MainContentView::Contacts;
-        self.request_known_contacts();
-        if self.demo_mode {
-            self.status_line = SharedString::from("演示模式：联系人视图无本地缓存数据");
-        }
+        self.request_known_contacts(cx);
         cx.notify();
     }
 
@@ -2099,7 +2154,7 @@ impl HylkiApp {
         }
         if theme_changed {
             self.theme_id = theme::static_theme_id(&self.prefs.theme_id);
-            self.dark_mode = self.prefs.dark_mode.unwrap_or(false);
+            self.dark_mode = self.prefs.dark_mode.unwrap_or(self.system_dark_mode);
             theme::apply(self.theme_id, self.dark_mode, cx);
         }
         if sync_changed {
@@ -2222,8 +2277,9 @@ impl HylkiApp {
                 self.select_unified_view(CurrentView::UnifiedInbox, cx);
             }
             PaletteCommand::OpenAccountSettings => {
-                self.main_view = MainContentView::Mail;
+                self.close_modal(cx);
                 self.open_account_manager(cx);
+                return;
             }
             PaletteCommand::OpenPreferences => {
                 // 先关闭命令面板再打开偏好设置，避免下方 close_modal 误关刚打开的偏好设置。
@@ -2328,7 +2384,6 @@ impl HylkiApp {
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         match self.right_mode {
             RightPaneMode::Compose => compose::render(self, cx),
-            RightPaneMode::AccountSetup => accounts::render(self, cx),
             RightPaneMode::Welcome => welcome::render(self, cx),
             RightPaneMode::Reader => reader::render(self, cx),
         }
@@ -2466,6 +2521,43 @@ impl Render for HylkiApp {
         // 全局浮层（方案文档五.1）：偏好设置为遮罩 + 居中卡片；
         // 命令面板组件自带遮罩 + 居中卡片，直接挂载即可。
         match self.active_modal {
+            ActiveModal::Accounts => {
+                let accounts_el = accounts::render(self, cx);
+                root = root.child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .size_full()
+                        .bg(black().opacity(0.4))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_modal(cx);
+                            }),
+                        )
+                        .child(
+                            h_flex().size_full().items_center().justify_center().child(
+                                v_flex()
+                                    .w(px(780.0))
+                                    .h(px(620.0))
+                                    .bg(p.surface)
+                                    .rounded(px(12.0))
+                                    .border_1()
+                                    .border_color(border)
+                                    .shadow_xl()
+                                    .overflow_hidden()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| {
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(accounts_el),
+                            ),
+                        ),
+                );
+            }
             ActiveModal::Preferences => {
                 if let Some(entity) = self.preferences.clone() {
                     root = root.child(

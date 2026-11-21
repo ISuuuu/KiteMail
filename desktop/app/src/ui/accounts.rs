@@ -7,12 +7,16 @@
 //!   指引横幅、IMAP / SMTP 配置（TLS / STARTTLS 切换、独立 SMTP 凭据）、
 //!   「测试连接」与「保存并同步」及实时反馈。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::{div, px, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled};
+use gpui_kit::{
+    div, px, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Styled,
+};
 use hylki_mail_core::config::{AccountConfig, AuthBackend};
 use hylki_mail_core::MailRequest;
 
@@ -218,13 +222,45 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .collect();
 
     v_flex()
-        .flex_1()
-        .min_w_0()
-        .h_full()
+        .size_full()
         .bg(p.canvas)
-        .p_5()
-        .gap_3()
-        .overflow_y_scrollbar()
+        // 顶部 48px 模态标题栏：标题 + 关闭按钮。
+        .child(
+            h_flex()
+                .h(px(48.0))
+                .flex_shrink_0()
+                .px_5()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(border)
+                .bg(p.surface)
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.text)
+                        .child("账号管理"),
+                )
+                .child(
+                    Button::new("accounts-modal-close")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::X)
+                        .tooltip("关闭账号管理 (Esc)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_modal(cx);
+                        })),
+                ),
+        )
+        .child(
+            v_flex()
+                .id("accounts-scroll")
+                .flex_1()
+                .min_h_0()
+                .p_5()
+                .gap_3()
+                .overflow_y_scrollbar()
         // 顶部：已添加账号卡片列表 +「+ 添加新账号」。
         .when(!app.accounts.is_empty(), |el| {
             el.child(
@@ -544,6 +580,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         )
                     })
                 }),
+        ),
         )
         .into_any_element()
 }
