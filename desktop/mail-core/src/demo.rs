@@ -509,7 +509,11 @@ impl DemoStore {
                 });
             }
             MessageSort::UnreadFirst => {
-                items.sort_by(|a, b| b.unread.cmp(&a.unread).then_with(|| b.date_ts.cmp(&a.date_ts)));
+                items.sort_by(|a, b| {
+                    b.unread
+                        .cmp(&a.unread)
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
             }
             MessageSort::StarredFirst => {
                 items.sort_by(|a, b| {

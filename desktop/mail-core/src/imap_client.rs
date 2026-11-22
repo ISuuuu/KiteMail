@@ -802,9 +802,12 @@ pub async fn search_folder_messages(
     let cap = limit.max(1);
     let start = uids.len().saturating_sub(cap);
     let target_uids = &uids[start..];
-    let headers = tokio::time::timeout(search_timeout, fetch_headers_for_uids(&mut session, target_uids))
-        .await
-        .map_err(|_| "拉取服务端搜索结果邮件头超时".to_string())??;
+    let headers = tokio::time::timeout(
+        search_timeout,
+        fetch_headers_for_uids(&mut session, target_uids),
+    )
+    .await
+    .map_err(|_| "拉取服务端搜索结果邮件头超时".to_string())??;
     let _ = session.logout().await;
     Ok(headers)
 }

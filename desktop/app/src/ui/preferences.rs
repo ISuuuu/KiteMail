@@ -410,7 +410,12 @@ impl Render for PreferencesState {
                 );
                 let sync_pills = option_pills(
                     "pref-sync",
-                    &[(0u32, "手动"), (1, "1 分钟"), (5, "5 分钟"), (15, "15 分钟")],
+                    &[
+                        (0u32, "手动"),
+                        (1, "1 分钟"),
+                        (5, "5 分钟"),
+                        (15, "15 分钟"),
+                    ],
                     prefs.auto_sync_minutes,
                     cx,
                     PreferencesState::set_auto_sync_minutes,

@@ -361,12 +361,15 @@ impl Render for GalleryState {
                             .pr(px(144.0))
                             .items_center()
                             .window_control_area(WindowControlArea::Drag)
-                            .child(div().text_xs().text_color(muted_fg).child(
-                                SharedString::from(format!(
-                                    "共 {total} 个附件，当前显示 {} 个",
-                                    visible.len()
-                                )),
-                            )),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(SharedString::from(format!(
+                                        "共 {total} 个附件，当前显示 {} 个",
+                                        visible.len()
+                                    ))),
+                            ),
                     ),
             )
             // 表头。

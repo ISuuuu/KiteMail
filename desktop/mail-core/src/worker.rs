@@ -187,7 +187,9 @@ async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<M
                                 let _ = secrets::save_oauth_refresh_token(account.id, new_rt);
                             }
                             let exp = Instant::now()
-                                + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
+                                + Duration::from_secs(
+                                    refreshed.expires_in_secs.saturating_sub(120),
+                                );
                             cached_imap_token = Some((refreshed.access_token.clone(), exp));
                             Some(refreshed.access_token)
                         } else {
@@ -228,10 +230,7 @@ async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<M
     }
 }
 
-async fn run_graph_fast_poll_fallback(
-    account: &AccountConfig,
-    req_tx: &mpsc::Sender<MailRequest>,
-) {
+async fn run_graph_fast_poll_fallback(account: &AccountConfig, req_tx: &mpsc::Sender<MailRequest>) {
     let mut cached_graph_token: Option<(String, Instant)> = None;
     let mut last_inbox_sig: Option<(u32, usize)> = None;
 
@@ -246,10 +245,9 @@ async fn run_graph_fast_poll_fallback(
                     return;
                 };
                 let cid = account.oauth_client_id.clone();
-                let Ok(Ok(refreshed)) = tokio::task::spawn_blocking(move || {
-                    oauth::refresh_microsoft_token(&cid, &rt)
-                })
-                .await
+                let Ok(Ok(refreshed)) =
+                    tokio::task::spawn_blocking(move || oauth::refresh_microsoft_token(&cid, &rt))
+                        .await
                 else {
                     return;
                 };
@@ -1153,10 +1151,8 @@ async fn handle_request(
                         .into_iter()
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
-                    let _ = evt_tx.send(WorkerEvent::ForwardAttachmentsExported {
-                        message_id,
-                        paths,
-                    });
+                    let _ =
+                        evt_tx.send(WorkerEvent::ForwardAttachmentsExported { message_id, paths });
                 }
                 Err(e) => {
                     let _ = evt_tx.send(WorkerEvent::Error {
@@ -1324,9 +1320,8 @@ async fn handle_request(
                 UnifiedView::Sent => {
                     cache.list_sent_messages_with_options(&query, effective, sort, offset, limit)
                 }
-                UnifiedView::Archive => {
-                    cache.list_archived_messages_with_options(&query, effective, sort, offset, limit)
-                }
+                UnifiedView::Archive => cache
+                    .list_archived_messages_with_options(&query, effective, sort, offset, limit),
             };
             match result {
                 Ok(page) => {

@@ -810,17 +810,12 @@ mod tests {
         assert_eq!(title, "Hylki 收到新邮件");
         assert_eq!(body, "Alice\n项目进度更新");
 
-        let (title, body) = format_new_mail_notification(
-            3,
-            Some("Bob"),
-            Some("周报"),
-            Some("work@example.com"),
-        );
+        let (title, body) =
+            format_new_mail_notification(3, Some("Bob"), Some("周报"), Some("work@example.com"));
         assert_eq!(title, "Hylki 收到 3 封新邮件");
         assert_eq!(body, "Bob: 周报（共 3 封新未读）");
 
-        let (title, body) =
-            format_new_mail_notification(2, None, None, Some("work@example.com"));
+        let (title, body) = format_new_mail_notification(2, None, None, Some("work@example.com"));
         assert_eq!(title, "Hylki 收到 2 封新邮件");
         assert_eq!(body, "work@example.com 有 2 封新未读邮件");
     }

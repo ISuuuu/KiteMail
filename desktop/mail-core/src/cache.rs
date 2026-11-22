@@ -398,7 +398,10 @@ impl CacheStore {
             .unwrap_or(0);
         if schema_version < 1 {
             self.conn
-                .execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')", [])
+                .execute(
+                    "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
+                    [],
+                )
                 .map_err(|e| format!("重建 FTS5 全文索引失败: {e}"))?;
             self.conn
                 .execute("PRAGMA user_version = 1", [])
@@ -3941,18 +3944,8 @@ mod tests {
             .unwrap();
 
         let inbox_page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
-        let reply2_id = inbox_page
-            .items
-            .iter()
-            .find(|m| m.uid == 12)
-            .unwrap()
-            .id;
-        let root_inbox_id = inbox_page
-            .items
-            .iter()
-            .find(|m| m.uid == 10)
-            .unwrap()
-            .id;
+        let reply2_id = inbox_page.items.iter().find(|m| m.uid == 12).unwrap().id;
+        let root_inbox_id = inbox_page.items.iter().find(|m| m.uid == 10).unwrap().id;
 
         // 降序：reply2 (3000) -> reply1 (2000) -> root (1000)，且 Trash 副本被去重。
         let desc = cache
