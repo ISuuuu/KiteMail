@@ -81,10 +81,15 @@ async fn worker_loop(
     };
     let mut tokens: TokenCache = HashMap::new();
     let mut watchers: IdleWatchers = HashMap::new();
+    let push_enabled = config::load_preferences_in(&data_dir)
+        .map(|p| p.push_enabled)
+        .unwrap_or(true);
 
-    if let Ok(accounts) = config::load_accounts_in(&data_dir) {
-        for acc in accounts {
-            spawn_account_idle_watcher(&mut watchers, acc, req_tx.clone());
+    if push_enabled {
+        if let Ok(accounts) = config::load_accounts_in(&data_dir) {
+            for acc in accounts {
+                spawn_account_idle_watcher(&mut watchers, acc, req_tx.clone());
+            }
         }
     }
 
@@ -351,7 +356,12 @@ async fn handle_request(
                 return;
             }
             let account_id = config.id;
-            spawn_account_idle_watcher(watchers, config.clone(), req_tx.clone());
+            let push_enabled = config::load_preferences_in(data_dir)
+                .map(|p| p.push_enabled)
+                .unwrap_or(true);
+            if push_enabled {
+                spawn_account_idle_watcher(watchers, config.clone(), req_tx.clone());
+            }
             let _ = evt_tx.send(WorkerEvent::AccountSaved { account: config });
             sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
         }
@@ -450,7 +460,12 @@ async fn handle_request(
                 ok: true,
                 message: "Outlook OAuth2 授权成功，正在同步邮件...".to_string(),
             });
-            spawn_account_idle_watcher(watchers, account.clone(), req_tx.clone());
+            let push_enabled = config::load_preferences_in(data_dir)
+                .map(|p| p.push_enabled)
+                .unwrap_or(true);
+            if push_enabled {
+                spawn_account_idle_watcher(watchers, account.clone(), req_tx.clone());
+            }
             let _ = evt_tx.send(WorkerEvent::AccountSaved { account });
             sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
         }
@@ -1511,6 +1526,30 @@ async fn handle_request(
                 });
             }
         },
+
+        MailRequest::SetPushEnabled { enabled } => {
+            if enabled {
+                if let Ok(accounts) = config::load_accounts_in(data_dir) {
+                    for acc in accounts {
+                        if !watchers.contains_key(&acc.id) {
+                            spawn_account_idle_watcher(watchers, acc, req_tx.clone());
+                        }
+                    }
+                }
+                let _ = evt_tx.send(WorkerEvent::Status {
+                    account_id: None,
+                    text: "即时推送收信已开启".to_string(),
+                });
+            } else {
+                for (_, handle) in watchers.drain() {
+                    handle.abort();
+                }
+                let _ = evt_tx.send(WorkerEvent::Status {
+                    account_id: None,
+                    text: "即时推送收信已关闭（将按定时同步）".to_string(),
+                });
+            }
+        }
     }
 }
 

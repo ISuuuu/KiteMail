@@ -23,7 +23,7 @@ use gpui_kit::{
     div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
-use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display};
+use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display_with_options};
 use hylki_mail_core::{AttachmentMeta, MailRequest, MessageDetail, ThreadMessage};
 
 use crate::app::{split_sender, HylkiApp, READER_OVERFLOW_BREAKPOINT};
@@ -288,15 +288,24 @@ fn render_message_card(
     sender: &str,
     recipients: &str,
     date_display: &str,
+    date_ts: i64,
+    date_style: &str,
+    clock_style: &str,
     body_text: &str,
     body_html: Option<&str>,
     body_loaded: bool,
     prefer_plain: bool,
     block_remote_images: bool,
+    clean_links: bool,
+    show_remote_banner: bool,
     is_collapsed: bool,
     show_raw_source: bool,
     zoom_percent: u32,
     bg_pick: Option<bool>,
+    forced_theme_bg: Option<bool>,
+    card_chrome: bool,
+    always_show_recipients: bool,
+    card_attachments: bool,
     attachments: &[AttachmentMeta],
     is_current: bool,
     unsubscribe_url: Option<&str>,
@@ -308,6 +317,8 @@ fn render_message_card(
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
     let (canvas, border, muted_fg, accent) = (p.canvas, p.border, p.text_muted, p.accent);
+    let formatted_date =
+        hylki_mail_core::format_message_datetime(date_ts, date_display, date_style, clock_style);
     let (sender_name, sender_email) = split_sender(sender);
     let display_name = if sender_name.is_empty() {
         sender.to_string()
@@ -377,7 +388,7 @@ fn render_message_card(
                             .flex_shrink_0()
                             .text_xs()
                             .text_color(muted_fg)
-                            .child(SharedString::from(date_display.to_string())),
+                            .child(SharedString::from(formatted_date.clone())),
                     ),
             )
             .child(more_menu)
@@ -396,7 +407,7 @@ fn render_message_card(
             rfc_message_id,
             sender,
             recipients,
-            date_display,
+            &formatted_date,
             subject,
             body_text,
             body_html,
@@ -404,7 +415,7 @@ fn render_message_card(
         (plain_text_to_html(&raw), 0)
     } else if !prefer_plain {
         if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
-            sanitize_html_for_display(raw_html, block_remote_images)
+            sanitize_html_for_display_with_options(raw_html, block_remote_images, clean_links)
         } else {
             (plain_text_to_html(body_text), 0)
         }
@@ -461,16 +472,19 @@ fn render_message_card(
         .collect();
 
     v_flex()
-        .bg(p.surface_raised)
-        .rounded(px(12.0))
-        .border_1()
-        .border_color(if is_current {
-            accent.opacity(0.45)
-        } else {
-            border
+        .when(card_chrome, |card| {
+            card.bg(p.surface_raised)
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(if is_current {
+                    accent.opacity(0.45)
+                } else {
+                    border
+                })
+                .shadow_xs()
+                .p(px(20.0))
         })
-        .shadow_xs()
-        .p(px(20.0))
+        .when(!card_chrome, |card| card.bg(canvas).py_2())
         .gap_3()
         .child(
             v_flex()
@@ -538,12 +552,12 @@ fn render_message_card(
                                         .flex_shrink_0()
                                         .text_xs()
                                         .text_color(muted_fg)
-                                        .child(SharedString::from(date_display.to_string())),
+                                        .child(SharedString::from(formatted_date)),
                                 ),
                         )
                         .child(more_menu),
                 )
-                .when(!recipient_list.is_empty(), |el| {
+                .when(always_show_recipients && !recipient_list.is_empty(), |el| {
                     el.child(
                         div()
                             .pl(px(CARD_AVATAR + 28.0))
@@ -583,52 +597,50 @@ fn render_message_card(
                     ),
             )
         })
-        .when(!show_raw_source && blocked_images > 0, |card| {
-            card.child(
-                h_flex()
-                    .px_3()
-                    .py_1p5()
-                    .gap_2()
-                    .items_center()
-                    .justify_between()
-                    .rounded(px(8.0))
-                    .bg(p.accent_soft())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(p.text)
-                            .child(SharedString::from(format!(
-                                "已拦截 {blocked_images} 张远程图片以保护隐私"
-                            ))),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .items_center()
-                            .child(
-                                Button::new(("allow-remote-img", msg_id))
-                                    .outline()
-                                    .compact()
-                                    .label("显示远程图片")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.allow_remote_images_for(msg_id, cx);
-                                    })),
-                            )
-                            .when(can_trust_sender, |el| {
-                                let trust_sender = sender_for_trust.clone();
-                                el.child(
-                                    Button::new(("trust-remote-sender", msg_id))
+        .when(
+            !show_raw_source && blocked_images > 0 && show_remote_banner,
+            |card| {
+                card.child(
+                    h_flex()
+                        .px_3()
+                        .py_1p5()
+                        .gap_2()
+                        .items_center()
+                        .justify_between()
+                        .rounded(px(8.0))
+                        .bg(p.accent_soft())
+                        .child(div().text_xs().text_color(p.text).child(SharedString::from(
+                            format!("已拦截 {blocked_images} 张远程图片以保护隐私"),
+                        )))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .items_center()
+                                .child(
+                                    Button::new(("allow-remote-img", msg_id))
                                         .outline()
                                         .compact()
-                                        .label("始终信任此发件人")
+                                        .label("显示远程图片")
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.trust_remote_sender(&trust_sender, cx);
+                                            this.allow_remote_images_for(msg_id, cx);
                                         })),
                                 )
-                            }),
-                    ),
-            )
-        })
+                                .when(can_trust_sender, |el| {
+                                    let trust_sender = sender_for_trust.clone();
+                                    el.child(
+                                        Button::new(("trust-remote-sender", msg_id))
+                                            .outline()
+                                            .compact()
+                                            .label("始终信任此发件人")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.trust_remote_sender(&trust_sender, cx);
+                                            })),
+                                    )
+                                }),
+                        ),
+                )
+            },
+        )
         // F-7 一键退订横幅：仅当邮件携带 List-Unsubscribe 头时显示在卡片头部下
         // 方（不触碰阅读器顶栏与标题区）；点击「退订」后进入卡内二次确认。
         .when(unsubscribe_url.is_some(), |card| {
@@ -710,8 +722,9 @@ fn render_message_card(
             )
         })
         .child({
-            // B-5：亮 / 暗背景覆盖只作用于正文块（卡片外壳保持主题配色）。
-            let (forced_bg, forced_fg) = match bg_pick {
+            // B-5：亮 / 暗背景覆盖优先使用单封会话覆盖，其次使用「正文外观主题」全局偏好。
+            let effective_bg_pick = bg_pick.or(forced_theme_bg);
+            let (forced_bg, forced_fg) = match effective_bg_pick {
                 Some(false) => (Some(FORCE_LIGHT_BG), Some(FORCE_LIGHT_FG)),
                 Some(true) => (Some(FORCE_DARK_BG), Some(FORCE_DARK_FG)),
                 None => (None, None),
@@ -744,7 +757,7 @@ fn render_message_card(
                             block_remote_images as u8,
                             show_raw_source as u8,
                             zoom_percent,
-                            bg_pick.map(|b| b as u8).unwrap_or(2)
+                            effective_bg_pick.map(|b| b as u8).unwrap_or(2)
                         )),
                         rendered_html,
                     )
@@ -770,7 +783,7 @@ fn render_message_card(
                 ),
             )
         })
-        .when(!attachment_rows.is_empty(), |card| {
+        .when(card_attachments && !attachment_rows.is_empty(), |card| {
             let show_save_all = card_attachment_ids.len() >= 2;
             let save_all_ids = card_attachment_ids;
             card.child(
@@ -809,8 +822,10 @@ pub(crate) fn render(
     let (canvas, border, muted_fg, accent) = (p.canvas, p.border, p.text_muted, p.accent);
     // L-6：阅读器在下方时列表顶栏即窗口顶栏，此处不再重复画窗口控制按钮。
     let pane_top = app.pane_at_window_top();
-    // B-5：窗口宽度低于阈值时顶栏低频动作收进「⋯」菜单。
-    let narrow_topbar = window.viewport_size().width.as_f32() < READER_OVERFLOW_BREAKPOINT;
+    // B-5：窗口宽度低于阈值、偏好「始终折叠」或专注模式偏好触发折叠时收进「⋯」菜单。
+    let narrow_topbar = app.prefs.reader_toolbar_fold_right
+        || (app.focus_mode && app.prefs.focus_fold_toolbar)
+        || window.viewport_size().width.as_f32() < READER_OVERFLOW_BREAKPOINT;
     let entity_for_overflow = cx.entity();
     let win_controls = window_controls::render_window_controls("reader-wc", window, cx);
 
@@ -884,6 +899,22 @@ pub(crate) fn render(
         .copied()
         .unwrap_or(app.dark_mode);
 
+    let date_style = app.prefs.date_style.clone();
+    let clock_style = app.prefs.clock_style.clone();
+    let clean_links = app.prefs.clean_links;
+    let show_remote_banner = app.prefs.show_remote_banner;
+    let forced_theme_bg = match app.prefs.message_theme.as_str() {
+        "light" => Some(false),
+        "dark" => Some(true),
+        _ => None,
+    };
+    let single_message_card = app.prefs.single_message_card;
+    let always_show_recipients = app.prefs.always_show_recipients;
+    let card_attachments = app.prefs.card_attachments;
+    let show_account_chip = app.prefs.reader_show_account_chip;
+    let show_view_switch = app.prefs.reader_show_view_switch;
+    let show_theme_switch = app.prefs.reader_show_theme_switch;
+
     // 构造单卡或多线程叠放卡片列表：每张卡片均带独立的 `...` 操作菜单与折叠/原文态。
     let cards: Vec<gpui_kit::AnyElement> = if thread_count > 1 {
         detail
@@ -917,6 +948,7 @@ pub(crate) fn render(
                     recipients: tm.recipients.clone(),
                     subject: card_subject.clone(),
                     date_display: tm.date_display.clone(),
+                    date_ts: tm.date_ts,
                     body_text: tm.body_text.clone(),
                     body_html: tm.body_html.clone(),
                     flagged: tm.flagged,
@@ -941,15 +973,24 @@ pub(crate) fn render(
                     &tm.sender,
                     &tm.recipients,
                     &tm.date_display,
+                    tm.date_ts,
+                    &date_style,
+                    &clock_style,
                     &tm.body_text,
                     tm.body_html.as_deref(),
                     tm.body_loaded,
                     prefer_plain,
                     block_remote,
+                    clean_links,
+                    show_remote_banner,
                     is_collapsed,
                     show_raw_source,
                     zoom_percent,
                     app.message_bg_picks.get(&tm.id).copied(),
+                    forced_theme_bg,
+                    true,
+                    always_show_recipients,
+                    card_attachments,
                     &tm.attachments,
                     is_current,
                     None,
@@ -983,15 +1024,24 @@ pub(crate) fn render(
             &detail.sender,
             &detail.recipients,
             &detail.date_display,
+            detail.date_ts,
+            &date_style,
+            &clock_style,
             &detail.body_text,
             detail.body_html.as_deref(),
             true,
             prefer_plain,
             block_remote,
+            clean_links,
+            show_remote_banner,
             is_collapsed,
             show_raw_source,
             zoom_percent,
             app.message_bg_picks.get(&detail.id).copied(),
+            forced_theme_bg,
+            single_message_card,
+            always_show_recipients,
+            card_attachments,
             &detail.attachments,
             false,
             detail.unsubscribe_url.as_deref(),
@@ -1241,7 +1291,7 @@ pub(crate) fn render(
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .when(!owner_email.is_empty(), |row| {
+                                .when(show_account_chip && !owner_email.is_empty(), |row| {
                                     row.child(
                                         div()
                                             .px_2()
@@ -1297,36 +1347,40 @@ pub(crate) fn render(
                                 .items_center()
                                 // B-5：阅读视图（复用现有 HTML/纯文本切换状态，
                                 // 以纯文本渲染剥离 HTML 花哨排版）。
-                                .child(
-                                    Button::new("reader-reading-view")
-                                        .ghost()
-                                        .compact()
-                                        .icon(IconName::BookText)
-                                        .selected(prefer_plain)
-                                        .tooltip(if prefer_plain {
-                                            "阅读视图已开启（点击恢复原始排版）"
-                                        } else {
-                                            "阅读视图（剥离花哨排版，以纯文本渲染）"
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.toggle_reader_plain_mode(cx);
-                                        })),
-                                )
+                                .when(show_view_switch, |row| {
+                                    row.child(
+                                        Button::new("reader-reading-view")
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::BookText)
+                                            .selected(prefer_plain)
+                                            .tooltip(if prefer_plain {
+                                                "阅读视图已开启（点击恢复原始排版）"
+                                            } else {
+                                                "阅读视图（剥离花哨排版，以纯文本渲染）"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_reader_plain_mode(cx);
+                                            })),
+                                    )
+                                })
                                 // B-5：单封邮件亮 / 暗背景切换（仅本会话，不持久化）。
-                                .child(
-                                    Button::new("reader-bg-toggle")
-                                        .ghost()
-                                        .compact()
-                                        .icon(if bg_msg_picked_dark {
-                                            IconName::Sun
-                                        } else {
-                                            IconName::Moon
-                                        })
-                                        .tooltip("切换此邮件亮 / 暗背景（仅本会话）")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.toggle_message_bg_pick(bg_msg_id, cx);
-                                        })),
-                                )
+                                .when(show_theme_switch, |row| {
+                                    row.child(
+                                        Button::new("reader-bg-toggle")
+                                            .ghost()
+                                            .compact()
+                                            .icon(if bg_msg_picked_dark {
+                                                IconName::Sun
+                                            } else {
+                                                IconName::Moon
+                                            })
+                                            .tooltip("切换此邮件亮 / 暗背景（仅本会话）")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle_message_bg_pick(bg_msg_id, cx);
+                                            })),
+                                    )
+                                })
                                 .when(save_all_count >= 2, |row| {
                                     row.child(
                                         Button::new("reader-save-all-attachments")

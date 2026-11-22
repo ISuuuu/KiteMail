@@ -101,11 +101,15 @@ pub struct ThreadMessage {
     pub subject: String,
     pub sender: String,
     pub recipients: String,
+    #[serde(default)]
+    pub date_ts: i64,
     pub date_display: String,
     pub body_text: String,
     #[serde(default)]
     pub body_html: Option<String>,
     pub body_loaded: bool,
+    #[serde(default)]
+    pub unread: bool,
     pub flagged: bool,
     pub attachments: Vec<AttachmentMeta>,
     /// 该会话卡片的 IMAP UID 与所在文件夹（供卡片 `...` 菜单的标记 / 导出操作）。
@@ -127,6 +131,8 @@ pub struct MessageDetail {
     pub sender: String,
     pub recipients: String,
     pub subject: String,
+    #[serde(default)]
+    pub date_ts: i64,
     pub date_display: String,
     pub body_text: String,
     #[serde(default)]
@@ -626,6 +632,10 @@ pub enum MailRequest {
     UnsubscribeOneClick {
         url: String,
     },
+    /// Enable or disable background IMAP IDLE / Graph pulse push watchers.
+    SetPushEnabled {
+        enabled: bool,
+    },
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.
@@ -762,6 +772,189 @@ pub enum WorkerEvent {
     },
 }
 
+/// Format a Unix timestamp for message list rows according to `date_style` and `clock_style`.
+///
+/// When both styles are `"system"` and `fallback` is non-empty, preserves `fallback` verbatim so
+/// existing display formatting stays untouched.
+pub fn format_message_date(
+    date_ts: i64,
+    fallback: &str,
+    date_style: &str,
+    clock_style: &str,
+    now_ts: i64,
+) -> String {
+    if date_style == "system" && clock_style == "system" && !fallback.is_empty() {
+        return fallback.to_string();
+    }
+    if date_ts <= 0 {
+        return fallback.to_string();
+    }
+    let Some(msg_dt) = chrono::DateTime::from_timestamp(date_ts, 0) else {
+        return fallback.to_string();
+    };
+    let Some(now_dt) = chrono::DateTime::from_timestamp(now_ts, 0) else {
+        return fallback.to_string();
+    };
+    let local_msg = msg_dt.with_timezone(&chrono::Local);
+    let local_now = now_dt.with_timezone(&chrono::Local);
+    if local_msg.date_naive() == local_now.date_naive() {
+        return format_clock_part(&local_msg, clock_style);
+    }
+    use chrono::Datelike;
+    if local_msg.year() == local_now.year() {
+        return format_month_day_part(&local_msg, date_style);
+    }
+    format_year_month_day_part(&local_msg, date_style)
+}
+
+/// Format a Unix timestamp with date and time for reading-pane headers.
+pub fn format_message_datetime(
+    date_ts: i64,
+    fallback: &str,
+    date_style: &str,
+    clock_style: &str,
+) -> String {
+    if date_style == "system" && clock_style == "system" && !fallback.is_empty() {
+        return fallback.to_string();
+    }
+    if date_ts <= 0 {
+        return fallback.to_string();
+    }
+    let Some(msg_dt) = chrono::DateTime::from_timestamp(date_ts, 0) else {
+        return fallback.to_string();
+    };
+    let local_msg = msg_dt.with_timezone(&chrono::Local);
+    let date_part = format_year_month_day_part(&local_msg, date_style);
+    let time_part = format_clock_part(&local_msg, clock_style);
+    format!("{date_part} {time_part}")
+}
+
+fn format_clock_part(dt: &chrono::DateTime<chrono::Local>, clock_style: &str) -> String {
+    use chrono::Timelike;
+    match clock_style {
+        "12h" => {
+            let (is_pm, hour12) = dt.hour12();
+            let suffix = if is_pm { "PM" } else { "AM" };
+            format!("{hour12}:{:02} {suffix}", dt.minute())
+        }
+        _ => dt.format("%H:%M").to_string(),
+    }
+}
+
+fn month_abbr(month: u32) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        _ => "Dec",
+    }
+}
+
+fn format_month_day_part(dt: &chrono::DateTime<chrono::Local>, date_style: &str) -> String {
+    use chrono::Datelike;
+    let m = dt.month();
+    let d = dt.day();
+    match date_style {
+        "month_first" => format!("{} {d}", month_abbr(m)),
+        "day_first" => format!("{d} {}", month_abbr(m)),
+        "year_first" => format!("{m:02}-{d:02}"),
+        _ => format!("{m:02}-{d:02}"),
+    }
+}
+
+fn format_year_month_day_part(dt: &chrono::DateTime<chrono::Local>, date_style: &str) -> String {
+    use chrono::Datelike;
+    let y = dt.year();
+    let m = dt.month();
+    let d = dt.day();
+    match date_style {
+        "month_first" => format!("{} {d}, {y}", month_abbr(m)),
+        "day_first" => format!("{d} {} {y}", month_abbr(m)),
+        "year_first" => format!("{y}-{m:02}-{d:02}"),
+        _ => format!("{y}-{m:02}-{d:02}"),
+    }
+}
+
+/// Detect whether subject or user-authored compose body mentions an attachment keyword
+/// without any attached files. Quoted reply/forward blocks and `>` quote lines are ignored.
+pub fn detect_attachment_reminder(subject: &str, body: &str, keywords_csv: &str) -> Option<String> {
+    let mut authored = String::with_capacity(subject.len() + body.len() + 2);
+    authored.push_str(subject);
+    authored.push('\n');
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed == "------------------ 原始邮件 ------------------"
+            || trimmed == "------------------ 转发邮件 ------------------"
+        {
+            break;
+        }
+        if trimmed.starts_with('>') {
+            continue;
+        }
+        authored.push_str(line);
+        authored.push('\n');
+    }
+    let hay = authored.to_lowercase();
+    keywords_csv
+        .split([',', '，'])
+        .map(str::trim)
+        .filter(|kw| !kw.is_empty())
+        .find(|kw| hay.contains(&kw.to_lowercase()))
+        .map(|kw| kw.to_string())
+}
+
+/// Format the attribution header placed above quoted messages in replies.
+///
+/// An empty template returns the built-in Chinese attribution block; custom templates
+/// substitute `{name}`, `{address}`, `{date}`, `{time}`, and `{subject}`.
+pub fn format_reply_header(
+    template: &str,
+    sender: &str,
+    date_display: &str,
+    subject: &str,
+) -> String {
+    let tpl = template.trim();
+    if tpl.is_empty() {
+        return format!(
+            "------------------ 原始邮件 ------------------\n发件人：{sender}\n时间：{date_display}\n主题：{subject}"
+        );
+    }
+    let (name, address) = if let (Some(open), Some(close)) = (sender.find('<'), sender.rfind('>')) {
+        if close > open {
+            (
+                sender[..open].trim().to_string(),
+                sender[open + 1..close].trim().to_string(),
+            )
+        } else {
+            (sender.trim().to_string(), sender.trim().to_string())
+        }
+    } else {
+        (sender.trim().to_string(), sender.trim().to_string())
+    };
+    let name_out = if name.is_empty() {
+        address.clone()
+    } else {
+        name
+    };
+    let (date_part, time_part) = match date_display.trim().rsplit_once(' ') {
+        Some((d, t)) if t.contains(':') => (d.trim(), t.trim()),
+        _ => (date_display.trim(), date_display.trim()),
+    };
+    tpl.replace("{name}", &name_out)
+        .replace("{address}", &address)
+        .replace("{date}", date_part)
+        .replace("{time}", time_part)
+        .replace("{subject}", subject)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,5 +1005,90 @@ mod tests {
         assert!(!MessageSort::SubjectAsc.uses_date_groups());
         assert!(!MessageSort::UnreadFirst.uses_date_groups());
         assert!(!MessageSort::StarredFirst.uses_date_groups());
+    }
+
+    #[test]
+    fn date_formatting_respects_system_fallback_and_explicit_styles() {
+        use chrono::TimeZone;
+        let dt = chrono::Local
+            .with_ymd_and_hms(2025, 8, 23, 17, 40, 0)
+            .single()
+            .unwrap();
+        let ts = dt.timestamp();
+        let now_same_day = chrono::Local
+            .with_ymd_and_hms(2025, 8, 23, 20, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let now_next_year = chrono::Local
+            .with_ymd_and_hms(2026, 1, 10, 9, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+
+        assert_eq!(
+            format_message_date(ts, "原始日期", "system", "system", now_next_year),
+            "原始日期"
+        );
+        assert_eq!(
+            format_message_date(ts, "fallback", "system", "12h", now_same_day),
+            "5:40 PM"
+        );
+        assert_eq!(
+            format_message_date(ts, "fallback", "system", "24h", now_same_day),
+            "17:40"
+        );
+        assert_eq!(
+            format_message_date(ts, "fallback", "month_first", "24h", now_next_year),
+            "Aug 23, 2025"
+        );
+        assert_eq!(
+            format_message_date(ts, "fallback", "day_first", "24h", now_next_year),
+            "23 Aug 2025"
+        );
+        assert_eq!(
+            format_message_date(ts, "fallback", "year_first", "24h", now_next_year),
+            "2025-08-23"
+        );
+        assert_eq!(
+            format_message_datetime(ts, "fallback", "day_first", "12h"),
+            "23 Aug 2025 5:40 PM"
+        );
+    }
+
+    #[test]
+    fn attachment_reminder_detects_authored_text_and_ignores_quotes() {
+        let kw = "附件, attachment, attached";
+        assert_eq!(
+            detect_attachment_reminder("汇报", "请查收附件。", kw).as_deref(),
+            Some("附件")
+        );
+        assert_eq!(
+            detect_attachment_reminder("See attached report", "Hello", kw).as_deref(),
+            Some("attached")
+        );
+        let quoted_only = "好的，收到。\n\n> See attachment below\n------------------ 原始邮件 ------------------\n请查收附件";
+        assert_eq!(
+            detect_attachment_reminder("Re: 汇报", quoted_only, kw),
+            None
+        );
+    }
+
+    #[test]
+    fn reply_header_formats_default_and_custom_templates() {
+        let def = format_reply_header("", "Alice <a@example.com>", "2026-08-23 14:05", "Hi");
+        assert!(def.contains("------------------ 原始邮件 ------------------"));
+        assert!(def.contains("发件人：Alice <a@example.com>"));
+
+        let custom = format_reply_header(
+            "On {date} at {time}, {name} <{address}> wrote:",
+            "Alice <a@example.com>",
+            "2026-08-23 14:05",
+            "Hi",
+        );
+        assert_eq!(
+            custom,
+            "On 2026-08-23 at 14:05, Alice <a@example.com> wrote:"
+        );
     }
 }

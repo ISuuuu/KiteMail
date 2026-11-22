@@ -264,6 +264,66 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     ),
             )
         })
+        // 遗漏附件发送前提醒横幅（主题或正文出现附件关键词但未添加附件时触发）。
+        .when_some(app.compose_attachment_reminder.as_ref(), |el, kw| {
+            let kw_label = kw.clone();
+            el.child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.accent_soft())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.text)
+                            .child(SharedString::from(format!(
+                                "正文中提到了「{kw_label}」，但尚未添加任何附件，是否仍要发送？"
+                            ))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(
+                                Button::new("compose-rem-attach")
+                                    .primary()
+                                    .compact()
+                                    .icon(IconName::Paperclip)
+                                    .label("添加附件")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.compose_attachment_reminder = None;
+                                        this.pick_attachments(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compose-rem-send")
+                                    .outline()
+                                    .compact()
+                                    .label("仍要发送")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.send_compose_forced(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compose-rem-dismiss")
+                                    .ghost()
+                                    .compact()
+                                    .label("取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.compose_attachment_reminder = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+        })
         // 信头表单区：发件人（多账号行内切换）+ 收件人（右侧「抄送 / 密送」小按钮）+ 可选 Cc / Bcc + 主题。
         .child(
             v_flex()

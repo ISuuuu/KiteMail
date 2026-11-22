@@ -74,6 +74,9 @@ struct AccountsFile {
     accounts: Vec<AccountConfig>,
 }
 
+pub const DEFAULT_ATTACHMENT_KEYWORDS: &str =
+    "附件, 附上, 随信, 见附, attachment, attached, enclose";
+
 /// User interface & sync preferences persisted in `preferences.toml`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -89,6 +92,9 @@ pub struct AppPreferences {
     pub page_size: usize,
     /// Background sync interval in minutes; `0` means manual sync only.
     pub auto_sync_minutes: u32,
+    /// Enable instant mail push (IMAP IDLE / fast Graph pulse).
+    #[serde(default = "default_true")]
+    pub push_enabled: bool,
     /// Block remote images in HTML mail bodies.
     pub block_remote_images: bool,
     /// Hide the window to the system tray instead of exiting when clicking close.
@@ -99,6 +105,77 @@ pub struct AppPreferences {
     /// Show desktop notifications when background sync finds new unread mail.
     #[serde(default = "default_true")]
     pub desktop_notifications: bool,
+    /// Show sender and subject in desktop notifications.
+    #[serde(default = "default_true")]
+    pub notification_show_content: bool,
+    /// UI text scale percentage (`90` / `100` / `110` / `120` / `135` / `150`).
+    #[serde(default = "default_ui_text_scale_percent")]
+    pub ui_text_scale_percent: u32,
+    /// Whether the settings window opens directly to Mail Accounts.
+    #[serde(default)]
+    pub settings_open_accounts: bool,
+    /// Always fold the right reader toolbar button group into overflow menu.
+    #[serde(default)]
+    pub reader_toolbar_fold_right: bool,
+    /// Start in Focus Mode on launch.
+    #[serde(default)]
+    pub focus_start_enabled: bool,
+    /// In Focus Mode, hide the left sidebar.
+    #[serde(default = "default_true")]
+    pub focus_hide_sidebar: bool,
+    /// In Focus Mode, hide the message list pane.
+    #[serde(default = "default_true")]
+    pub focus_hide_list: bool,
+    /// In Focus Mode, open messages in simplified Reader View.
+    #[serde(default)]
+    pub focus_reader_view: bool,
+    /// In Focus Mode, fold low-frequency reader toolbar buttons into overflow menu.
+    #[serde(default = "default_true")]
+    pub focus_fold_toolbar: bool,
+    /// Show accounts section in the sidebar.
+    #[serde(default = "default_true")]
+    pub show_accounts: bool,
+    /// Show Attachments entry in the sidebar footer.
+    #[serde(default = "default_true")]
+    pub sidebar_show_attachments: bool,
+    /// Show Contacts entry in the sidebar footer.
+    #[serde(default = "default_true")]
+    pub sidebar_show_contacts: bool,
+    /// Remember sidebar collapsed (icon rail) state across restarts.
+    #[serde(default)]
+    pub remember_sidebar_collapsed: bool,
+    /// Persisted sidebar collapsed (icon rail) state.
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+    /// Unified sidebar rows visibility.
+    #[serde(default = "default_true")]
+    pub unified_show_inbox: bool,
+    #[serde(default = "default_true")]
+    pub unified_show_starred: bool,
+    #[serde(default = "default_true")]
+    pub unified_show_sent: bool,
+    #[serde(default = "default_true")]
+    pub unified_show_drafts: bool,
+    #[serde(default = "default_true")]
+    pub unified_show_archive: bool,
+    /// Show unread dots instead of numeric counts in icon rail mode.
+    #[serde(default)]
+    pub rail_unread_dots: bool,
+    /// Show sender avatars in message list rows.
+    #[serde(default = "default_true")]
+    pub show_avatars: bool,
+    /// Group message list rows by date headers.
+    #[serde(default = "default_true")]
+    pub list_group_by_date: bool,
+    /// Keep the message list search bar always open.
+    #[serde(default)]
+    pub list_search_always_open: bool,
+    /// Place the message list search bar at the bottom instead of top.
+    #[serde(default)]
+    pub list_search_bottom: bool,
+    /// Place the multi-selection bulk bar at the bottom instead of top.
+    #[serde(default)]
+    pub list_bulk_bar_bottom: bool,
     /// Persisted window width in logical pixels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_width: Option<f32>,
@@ -125,6 +202,73 @@ pub struct AppPreferences {
     /// Automatically fold older messages when opening a multi-message thread.
     #[serde(default = "default_true")]
     pub fold_older_messages: bool,
+    /// Explicit thread fold mode: `"never"` / `"read"` / `"all_but_newest"`.
+    /// When `None`, derived from legacy [`Self::fold_older_messages`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold_messages_mode: Option<String>,
+    /// Show attachments directly on each conversation message card.
+    #[serde(default = "default_true")]
+    pub card_attachments: bool,
+    /// Automatic mark-as-read timing: `"shown"` / `"delay"` / `"manual"`.
+    #[serde(default = "default_read_mark_mode")]
+    pub read_mark_mode: String,
+    /// Message body appearance theme: `"system"` / `"light"` / `"dark"`.
+    #[serde(default = "default_message_theme")]
+    pub message_theme: String,
+    /// Show per-message Light/Dark toggle in the reader header.
+    #[serde(default = "default_true")]
+    pub reader_show_theme_switch: bool,
+    /// Show account email pill in the reader header.
+    #[serde(default = "default_true")]
+    pub reader_show_account_chip: bool,
+    /// Render standalone single messages inside a raised card.
+    #[serde(default = "default_true")]
+    pub single_message_card: bool,
+    /// Always expand the recipients line in reader message cards.
+    #[serde(default = "default_true")]
+    pub always_show_recipients: bool,
+    /// Show simplified Reader View toggle button in the reader header.
+    #[serde(default = "default_true")]
+    pub reader_show_view_switch: bool,
+    /// Default Reader View mode when opening messages: `"remember"` / `"on"` / `"off"`.
+    #[serde(default = "default_reader_default_mode")]
+    pub reader_default_mode: String,
+    /// Default sender account email for new messages (`""` = auto / current account).
+    #[serde(default)]
+    pub compose_default_from: String,
+    /// Place signature above quoted text when replying or forwarding.
+    #[serde(default)]
+    pub signature_above_quote: bool,
+    /// Insert standard `"-- "` separator before signatures.
+    #[serde(default = "default_true")]
+    pub signature_dashes: bool,
+    /// Undo send delay in seconds (`0` disables undo send).
+    #[serde(default = "default_undo_send_secs")]
+    pub undo_send_secs: u32,
+    /// Custom reply attribution header template (`""` uses built-in Chinese header).
+    #[serde(default)]
+    pub reply_header_template: String,
+    /// Comma-separated keywords that trigger missing-attachment reminder before sending.
+    #[serde(default = "default_attachment_keywords")]
+    pub attachment_reminder_keywords: String,
+    /// Show blocked remote content banner in reader cards.
+    #[serde(default = "default_true")]
+    pub show_remote_banner: bool,
+    /// Strip common tracking parameters from HTML links when rendering messages.
+    #[serde(default = "default_true")]
+    pub clean_links: bool,
+    /// Date display arrangement: `"system"` / `"month_first"` / `"day_first"` / `"year_first"`.
+    #[serde(default = "default_system_key")]
+    pub date_style: String,
+    /// Clock format: `"system"` / `"12h"` / `"24h"`.
+    #[serde(default = "default_system_key")]
+    pub clock_style: String,
+    /// Launch main window in fullscreen mode.
+    #[serde(default)]
+    pub start_fullscreen: bool,
+    /// Place the bottom status bar at the top of the main window.
+    #[serde(default)]
+    pub status_bar_top: bool,
     /// Lowercased sender email addresses always allowed to load remote images.
     #[serde(default)]
     pub allowed_remote_senders: Vec<String>,
@@ -153,6 +297,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_ui_text_scale_percent() -> u32 {
+    100
+}
+
 fn default_reader_zoom_percent() -> u32 {
     100
 }
@@ -161,9 +309,44 @@ fn default_reader_position() -> String {
     "right".to_string()
 }
 
+fn default_read_mark_mode() -> String {
+    "shown".to_string()
+}
+
+fn default_message_theme() -> String {
+    "system".to_string()
+}
+
+fn default_reader_default_mode() -> String {
+    "remember".to_string()
+}
+
+fn default_undo_send_secs() -> u32 {
+    5
+}
+
+fn default_attachment_keywords() -> String {
+    DEFAULT_ATTACHMENT_KEYWORDS.to_string()
+}
+
+fn default_system_key() -> String {
+    "system".to_string()
+}
+
 /// Clamp reader zoom percentage to the supported `70..=160` range.
 pub fn clamp_reader_zoom(percent: u32) -> u32 {
     percent.clamp(70, 160)
+}
+
+/// Supported interface text scale percentages.
+pub const UI_TEXT_SCALE_STEPS: &[u32] = &[90, 100, 110, 120, 135, 150];
+
+/// Snap/clamp UI text scale percentage to the nearest supported step (`90..=150`).
+pub fn clamp_ui_text_scale(percent: u32) -> u32 {
+    *UI_TEXT_SCALE_STEPS
+        .iter()
+        .min_by_key(|&&step| step.abs_diff(percent))
+        .unwrap_or(&100)
 }
 
 /// Extract a normalized (trimmed, lowercased) email address from a sender header
@@ -206,6 +389,45 @@ impl AppPreferences {
         }
         Some(email)
     }
+
+    /// Remove `sender`'s normalized email address from [`Self::allowed_remote_senders`].
+    /// Returns `true` if at least one entry was removed.
+    pub fn remove_remote_sender(&mut self, sender: &str) -> bool {
+        let email = normalize_sender_email(sender);
+        let before = self.allowed_remote_senders.len();
+        self.allowed_remote_senders
+            .retain(|existing| !existing.eq_ignore_ascii_case(&email));
+        self.allowed_remote_senders.len() != before
+    }
+
+    /// Resolve effective thread fold mode (`"never"`, `"read"`, or `"all_but_newest"`),
+    /// migrating seamlessly from legacy [`Self::fold_older_messages`] when unset.
+    pub fn effective_fold_messages_mode(&self) -> &'static str {
+        match self.fold_messages_mode.as_deref() {
+            Some("never") => "never",
+            Some("read") => "read",
+            Some("all_but_newest") => "all_but_newest",
+            _ => {
+                if self.fold_older_messages {
+                    "all_but_newest"
+                } else {
+                    "never"
+                }
+            }
+        }
+    }
+
+    /// Set thread fold mode (`"never"` / `"read"` / `"all_but_newest"`) and keep
+    /// legacy [`Self::fold_older_messages`] synchronized.
+    pub fn set_fold_messages_mode(&mut self, mode: &str) {
+        let normalized = match mode {
+            "never" => "never",
+            "read" => "read",
+            _ => "all_but_newest",
+        };
+        self.fold_messages_mode = Some(normalized.to_string());
+        self.fold_older_messages = normalized != "never";
+    }
 }
 
 impl Default for AppPreferences {
@@ -216,10 +438,36 @@ impl Default for AppPreferences {
             compact_list: false,
             page_size: 100,
             auto_sync_minutes: 5,
+            push_enabled: true,
             block_remote_images: true,
             close_to_minimize: true,
             minimize_to_tray: true,
             desktop_notifications: true,
+            notification_show_content: true,
+            ui_text_scale_percent: 100,
+            settings_open_accounts: false,
+            reader_toolbar_fold_right: false,
+            focus_start_enabled: false,
+            focus_hide_sidebar: true,
+            focus_hide_list: true,
+            focus_reader_view: false,
+            focus_fold_toolbar: true,
+            show_accounts: true,
+            sidebar_show_attachments: true,
+            sidebar_show_contacts: true,
+            remember_sidebar_collapsed: false,
+            sidebar_collapsed: false,
+            unified_show_inbox: true,
+            unified_show_starred: true,
+            unified_show_sent: true,
+            unified_show_drafts: true,
+            unified_show_archive: true,
+            rail_unread_dots: false,
+            show_avatars: true,
+            list_group_by_date: true,
+            list_search_always_open: false,
+            list_search_bottom: false,
+            list_bulk_bar_bottom: false,
             window_width: None,
             window_height: None,
             window_maximized: false,
@@ -228,6 +476,28 @@ impl Default for AppPreferences {
             last_folder: None,
             thread_newest_first: true,
             fold_older_messages: true,
+            fold_messages_mode: None,
+            card_attachments: true,
+            read_mark_mode: "shown".to_string(),
+            message_theme: "system".to_string(),
+            reader_show_theme_switch: true,
+            reader_show_account_chip: true,
+            single_message_card: true,
+            always_show_recipients: true,
+            reader_show_view_switch: true,
+            reader_default_mode: "remember".to_string(),
+            compose_default_from: String::new(),
+            signature_above_quote: false,
+            signature_dashes: true,
+            undo_send_secs: 5,
+            reply_header_template: String::new(),
+            attachment_reminder_keywords: DEFAULT_ATTACHMENT_KEYWORDS.to_string(),
+            show_remote_banner: true,
+            clean_links: true,
+            date_style: "system".to_string(),
+            clock_style: "system".to_string(),
+            start_fullscreen: false,
+            status_bar_top: false,
             allowed_remote_senders: Vec::new(),
             reader_zoom_percent: 100,
             single_key_shortcuts: true,
@@ -237,6 +507,39 @@ impl Default for AppPreferences {
             list_below_height: None,
         }
     }
+}
+
+/// Atomically write UTF-8 contents via a same-directory temp file.
+fn atomic_write_file(dir: &Path, target: &Path, content: &str, kind: &str) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败 ({}): {e}", dir.display()))?;
+    let file_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml");
+    let tmp_path = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    fs::write(&tmp_path, content)
+        .map_err(|e| format!("写入临时{kind}失败 ({}): {e}", tmp_path.display()))?;
+    if let Err(first_err) = fs::rename(&tmp_path, target) {
+        // Windows `MoveFileEx` via `std::fs::rename` replaces existing files on modern NTFS,
+        // but fallback gracefully if an existing target blocks direct rename.
+        if target.exists() {
+            let _ = fs::remove_file(target);
+            if let Err(second_err) = fs::rename(&tmp_path, target) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(format!(
+                    "替换{kind}失败 ({}): {second_err}",
+                    target.display()
+                ));
+            }
+        } else {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "写入{kind}失败 ({}): {first_err}",
+                target.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Return the Hylki Windows local data directory (`%LOCALAPPDATA%\Hylki`).
@@ -274,11 +577,9 @@ pub fn load_preferences_in(dir: &Path) -> Result<AppPreferences, String> {
 
 /// Persist user preferences into `dir`.
 pub fn save_preferences_in(dir: &Path, prefs: &AppPreferences) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败 ({}): {e}", dir.display()))?;
     let path = preferences_file_in(dir);
     let text = toml::to_string_pretty(prefs).map_err(|e| format!("序列化偏好设置失败: {e}"))?;
-    fs::write(&path, text).map_err(|e| format!("写入偏好设置失败 ({}): {e}", path.display()))?;
-    Ok(())
+    atomic_write_file(dir, &path, &text, "偏好设置")
 }
 
 /// Load saved non-sensitive account configurations from `dir`.
@@ -296,14 +597,61 @@ pub fn load_accounts_in(dir: &Path) -> Result<Vec<AccountConfig>, String> {
 
 /// Persist non-sensitive account configurations into `dir`.
 pub fn save_accounts_in(dir: &Path, accounts: &[AccountConfig]) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败 ({}): {e}", dir.display()))?;
     let path = accounts_file_in(dir);
     let data = AccountsFile {
         accounts: accounts.to_vec(),
     };
     let text = toml::to_string_pretty(&data).map_err(|e| format!("序列化账号配置失败: {e}"))?;
-    fs::write(&path, text).map_err(|e| format!("写入账号配置失败 ({}): {e}", path.display()))?;
-    Ok(())
+    atomic_write_file(dir, &path, &text, "账号配置")
+}
+
+/// Current portable settings backup bundle version.
+pub const SETTINGS_BACKUP_VERSION: u32 = 1;
+
+/// Portable TOML settings backup bundle (excludes passwords, OAuth tokens, and cached mail).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SettingsBackupBundle {
+    pub version: u32,
+    #[serde(default)]
+    pub preferences: AppPreferences,
+    #[serde(default)]
+    pub accounts: Vec<AccountConfig>,
+}
+
+/// Export current `preferences.toml` and `accounts.toml` in `dir` as a TOML backup string.
+pub fn export_settings_bundle_in(dir: &Path) -> Result<String, String> {
+    let preferences = load_preferences_in(dir)?;
+    let accounts = load_accounts_in(dir)?;
+    let bundle = SettingsBackupBundle {
+        version: SETTINGS_BACKUP_VERSION,
+        preferences,
+        accounts,
+    };
+    toml::to_string_pretty(&bundle).map_err(|e| format!("序列化设置备份失败: {e}"))
+}
+
+/// Parse and validate a settings backup TOML bundle (`version == 1`).
+pub fn parse_settings_bundle(text: &str) -> Result<SettingsBackupBundle, String> {
+    let bundle: SettingsBackupBundle =
+        toml::from_str(text).map_err(|e| format!("解析设置备份文件失败: {e}"))?;
+    if bundle.version != SETTINGS_BACKUP_VERSION {
+        return Err(format!("不支持的备份版本: {}", bundle.version));
+    }
+    Ok(bundle)
+}
+
+/// Import a validated [`SettingsBackupBundle`] into `dir` without touching credentials.
+/// Returns the number of restored accounts.
+pub fn import_settings_bundle_in(
+    dir: &Path,
+    bundle: &SettingsBackupBundle,
+) -> Result<usize, String> {
+    if bundle.version != SETTINGS_BACKUP_VERSION {
+        return Err(format!("不支持的备份版本: {}", bundle.version));
+    }
+    save_preferences_in(dir, &bundle.preferences)?;
+    save_accounts_in(dir, &bundle.accounts)?;
+    Ok(bundle.accounts.len())
 }
 
 /// Insert or replace an account in `accounts.toml` inside `dir`.
@@ -434,6 +782,7 @@ smtp_separate_credentials = false
             list_width: None,
             reader_position: "right".to_string(),
             list_below_height: None,
+            ..AppPreferences::default()
         };
         save_preferences_in(&base, &prefs).expect("save should succeed");
         let loaded = load_preferences_in(&base).expect("load should succeed");
@@ -604,5 +953,85 @@ smtp_separate_credentials = false
         assert_eq!(clamp_reader_zoom(50), 70);
         assert_eq!(clamp_reader_zoom(100), 100);
         assert_eq!(clamp_reader_zoom(220), 160);
+
+        // 移除发件人白名单（大小写不敏感与格式化邮箱）。
+        assert!(prefs.remove_remote_sender("Alice <ALICE@EXAMPLE.COM>"));
+        assert!(prefs.allowed_remote_senders.is_empty());
+        assert!(!prefs.remove_remote_sender("missing@example.com"));
+    }
+
+    #[test]
+    fn fold_mode_migration_and_ui_text_scale_clamp() {
+        let mut legacy_true = AppPreferences {
+            fold_older_messages: true,
+            fold_messages_mode: None,
+            ..AppPreferences::default()
+        };
+        assert_eq!(legacy_true.effective_fold_messages_mode(), "all_but_newest");
+
+        let legacy_false = AppPreferences {
+            fold_older_messages: false,
+            fold_messages_mode: None,
+            ..AppPreferences::default()
+        };
+        assert_eq!(legacy_false.effective_fold_messages_mode(), "never");
+
+        legacy_true.set_fold_messages_mode("read");
+        assert_eq!(legacy_true.effective_fold_messages_mode(), "read");
+        assert!(legacy_true.fold_older_messages);
+
+        legacy_true.set_fold_messages_mode("never");
+        assert_eq!(legacy_true.effective_fold_messages_mode(), "never");
+        assert!(!legacy_true.fold_older_messages);
+
+        assert_eq!(clamp_ui_text_scale(80), 90);
+        assert_eq!(clamp_ui_text_scale(102), 100);
+        assert_eq!(clamp_ui_text_scale(136), 135);
+        assert_eq!(clamp_ui_text_scale(200), 150);
+    }
+
+    #[test]
+    fn settings_backup_bundle_roundtrip_and_version_validation() {
+        let base = std::env::temp_dir().join("hylki test 设置备份往返");
+        let restore = std::env::temp_dir().join("hylki test 设置备份还原");
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&restore);
+
+        let mut prefs = AppPreferences::default();
+        prefs.theme_id = "midnight".to_string();
+        prefs.undo_send_secs = 10;
+        prefs.date_style = "year_first".to_string();
+        prefs.clock_style = "24h".to_string();
+        save_preferences_in(&base, &prefs).expect("save prefs");
+        upsert_account_in(
+            &base,
+            AccountConfig {
+                id: 1,
+                email: "alice@example.com".to_string(),
+                display_name: "Alice".to_string(),
+                ..AccountConfig::default()
+            },
+        )
+        .expect("save account");
+
+        let exported = export_settings_bundle_in(&base).expect("export bundle");
+        let parsed = parse_settings_bundle(&exported).expect("parse exported bundle");
+        assert_eq!(parsed.version, SETTINGS_BACKUP_VERSION);
+        assert_eq!(parsed.preferences.theme_id, "midnight");
+        assert_eq!(parsed.preferences.undo_send_secs, 10);
+        assert_eq!(parsed.accounts.len(), 1);
+
+        let count = import_settings_bundle_in(&restore, &parsed).expect("import bundle");
+        assert_eq!(count, 1);
+        assert_eq!(load_preferences_in(&restore).unwrap(), parsed.preferences);
+        assert_eq!(load_accounts_in(&restore).unwrap(), parsed.accounts);
+
+        // 版本不匹配或格式错误应拒绝。
+        let bad_ver = exported.replace("version = 1", "version = 99");
+        assert!(parse_settings_bundle(&bad_ver).is_err());
+        assert!(parse_settings_bundle("not = [valid").is_err());
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&restore);
     }
 }

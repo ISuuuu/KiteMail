@@ -1579,7 +1579,7 @@ impl CacheStore {
             .query_row(
                 "
                 SELECT m.id, m.account_id, m.folder_id, m.uid, m.message_id, m.sender, m.recipients,
-                       m.subject, m.date_display, m.body_text, m.body_html, m.flagged, f.path,
+                       m.subject, m.date_ts, m.date_display, m.body_text, m.body_html, m.flagged, f.path,
                        m.list_unsubscribe, m.list_unsubscribe_post
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
@@ -1587,9 +1587,9 @@ impl CacheStore {
                 ",
                 params![message_id],
                 |row| {
-                    let body: Option<String> = row.get(9)?;
-                    let body_html: Option<String> = row.get(10)?;
-                    let unsub: String = row.get(13)?;
+                    let body: Option<String> = row.get(10)?;
+                    let body_html: Option<String> = row.get(11)?;
+                    let unsub: String = row.get(14)?;
                     Ok((
                         row.get::<_, u32>(0)?,
                         row.get::<_, u32>(1)?,
@@ -1599,13 +1599,14 @@ impl CacheStore {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
                         body,
                         body_html,
-                        row.get::<_, i32>(11)? != 0,
-                        row.get::<_, String>(12)?,
+                        row.get::<_, i32>(12)? != 0,
+                        row.get::<_, String>(13)?,
                         (!unsub.trim().is_empty()).then_some(unsub),
-                        row.get::<_, i32>(14)? != 0,
+                        row.get::<_, i32>(15)? != 0,
                     ))
                 },
             )
@@ -1621,6 +1622,7 @@ impl CacheStore {
             sender,
             recipients,
             subject,
+            date_ts,
             date_display,
             body_opt,
             body_html,
@@ -1649,6 +1651,7 @@ impl CacheStore {
             sender,
             recipients,
             subject,
+            date_ts,
             date_display,
             body_text,
             body_html,
@@ -1713,6 +1716,7 @@ impl CacheStore {
             body_opt: Option<String>,
             body_html: Option<String>,
             preview: String,
+            unread: bool,
             flagged: bool,
         }
 
@@ -1824,7 +1828,7 @@ impl CacheStore {
                     SELECT m.id, m.folder_id, f.name, f.path, m.uid, m.message_id,
                            m.in_reply_to, m.references_header, m.sender, m.recipients,
                            m.subject, m.date_ts, m.date_display, m.body_text, m.body_html,
-                           m.preview, m.flagged
+                           m.preview, m.unread, m.flagged
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
                     WHERE m.id = ?1
@@ -1851,7 +1855,8 @@ impl CacheStore {
                             body_opt: row.get(13)?,
                             body_html: row.get(14)?,
                             preview: row.get(15)?,
-                            flagged: row.get::<_, i32>(16)? != 0,
+                            unread: row.get::<_, i32>(16)? != 0,
+                            flagged: row.get::<_, i32>(17)? != 0,
                         })
                     })
                     .optional()
@@ -1879,7 +1884,7 @@ impl CacheStore {
                     SELECT m.id, m.folder_id, f.name, f.path, m.uid, m.message_id,
                            m.in_reply_to, m.references_header, m.sender, m.recipients,
                            m.subject, m.date_ts, m.date_display, m.body_text, m.body_html,
-                           m.preview, m.flagged
+                           m.preview, m.unread, m.flagged
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
                     WHERE m.account_id = ?1 AND LOWER(m.subject) LIKE ?2
@@ -1908,7 +1913,8 @@ impl CacheStore {
                         body_opt: row.get(13)?,
                         body_html: row.get(14)?,
                         preview: row.get(15)?,
-                        flagged: row.get::<_, i32>(16)? != 0,
+                        unread: row.get::<_, i32>(16)? != 0,
+                        flagged: row.get::<_, i32>(17)? != 0,
                     })
                 })
                 .map_err(|e| format!("执行会话查询失败: {e}"))?
@@ -1989,10 +1995,12 @@ impl CacheStore {
                 subject: row.subject,
                 sender: row.sender,
                 recipients: row.recipients,
+                date_ts: row.date_ts,
                 date_display: row.date_display,
                 body_text,
                 body_html: row.body_html,
                 body_loaded,
+                unread: row.unread,
                 flagged: row.flagged,
                 attachments,
                 uid: row.uid,

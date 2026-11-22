@@ -1068,11 +1068,112 @@ fn is_block_break_tag(lower: &str) -> bool {
     )
 }
 
+/// Strip common tracking query parameters from `http(s)://` URLs while preserving
+/// legitimate parameters and URL fragments.
+pub fn strip_tracking_params(raw_url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(raw_url.trim()) else {
+        return raw_url.to_string();
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return raw_url.to_string();
+    }
+    let kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(k, _)| !is_tracking_param(k))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if parsed.query().is_none() {
+        return raw_url.to_string();
+    }
+    if kept.is_empty() {
+        parsed.set_query(None);
+    } else {
+        let mut ser = parsed.query_pairs_mut();
+        ser.clear();
+        for (k, v) in kept {
+            ser.append_pair(&k, &v);
+        }
+        drop(ser);
+    }
+    parsed.to_string()
+}
+
+fn is_tracking_param(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k.starts_with("utm_")
+        || matches!(
+            k.as_str(),
+            "fbclid"
+                | "gclid"
+                | "dclid"
+                | "msclkid"
+                | "mc_cid"
+                | "mc_eid"
+                | "igshid"
+                | "spm"
+                | "yclid"
+                | "ref_src"
+                | "_hsenc"
+                | "_hsmi"
+                | "mkt_tok"
+        )
+}
+
+fn clean_anchor_tag_href(raw_tag: &str) -> String {
+    let lower = raw_tag.to_ascii_lowercase();
+    let Some(href_pos) = lower.find("href") else {
+        return raw_tag.to_string();
+    };
+    let after_href = &raw_tag[href_pos + 4..];
+    let eq_offset = match after_href.find('=') {
+        Some(idx) if after_href[..idx].trim().is_empty() => idx,
+        _ => return raw_tag.to_string(),
+    };
+    let rest = &after_href[eq_offset + 1..];
+    let ws_len = rest.len() - rest.trim_start().len();
+    let val_start_slice = &rest[ws_len..];
+    let (quote, inner_start_in_rest, inner_end_in_rest) =
+        if let Some(stripped) = val_start_slice.strip_prefix('"') {
+            let Some(end_q) = stripped.find('"') else {
+                return raw_tag.to_string();
+            };
+            (Some('"'), ws_len + 1, ws_len + 1 + end_q)
+        } else if let Some(stripped) = val_start_slice.strip_prefix('\'') {
+            let Some(end_q) = stripped.find('\'') else {
+                return raw_tag.to_string();
+            };
+            (Some('\''), ws_len + 1, ws_len + 1 + end_q)
+        } else {
+            let end_u = val_start_slice
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .unwrap_or(val_start_slice.len());
+            (None, ws_len, ws_len + end_u)
+        };
+    let abs_start = href_pos + 4 + eq_offset + 1 + inner_start_in_rest;
+    let abs_end = href_pos + 4 + eq_offset + 1 + inner_end_in_rest;
+    let _ = quote;
+    let orig_url = &raw_tag[abs_start..abs_end];
+    let cleaned = strip_tracking_params(orig_url);
+    if cleaned == orig_url {
+        return raw_tag.to_string();
+    }
+    let mut out = String::with_capacity(raw_tag.len());
+    out.push_str(&raw_tag[..abs_start]);
+    out.push_str(&cleaned);
+    out.push_str(&raw_tag[abs_end..]);
+    out
+}
+
 /// Sanitize HTML email bodies for safe native display:
 /// strips `<script>`, `<style>`, `<head>`, `<iframe>`, and HTML comments,
-/// and optionally removes `<img>` elements referencing remote `http(s)://` URLs.
+/// optionally removes `<img>` elements referencing remote `http(s)://` URLs,
+/// and optionally strips tracking parameters from `<a href="...">` links.
 /// Returns `(sanitized_html, blocked_remote_image_count)`.
-pub fn sanitize_html_for_display(html: &str, block_remote_images: bool) -> (String, usize) {
+pub fn sanitize_html_for_display_with_options(
+    html: &str,
+    block_remote_images: bool,
+    clean_links: bool,
+) -> (String, usize) {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut skip_block: Option<&'static str> = None;
@@ -1125,7 +1226,11 @@ pub fn sanitize_html_for_display(html: &str, block_remote_images: bool) -> (Stri
                 continue;
             }
             out.push('<');
-            out.push_str(trimmed);
+            if clean_links && !is_closing && tag_name == "a" {
+                out.push_str(&clean_anchor_tag_href(trimmed));
+            } else {
+                out.push_str(trimmed);
+            }
             out.push('>');
             continue;
         }
@@ -1139,6 +1244,11 @@ pub fn sanitize_html_for_display(html: &str, block_remote_images: bool) -> (Stri
     }
 
     (out, blocked_images)
+}
+
+/// Sanitize HTML email bodies for safe native display (legacy default without link cleaning).
+pub fn sanitize_html_for_display(html: &str, block_remote_images: bool) -> (String, usize) {
+    sanitize_html_for_display_with_options(html, block_remote_images, false)
 }
 
 /// Convert plain text into escaped HTML paragraphs so it can be rendered in a
@@ -1250,5 +1360,29 @@ mod tests {
         assert!(is_netease_host("imap.yeah.net"));
         assert!(!is_netease_host("imap.gmail.com"));
         assert!(!is_netease_host("outlook.office365.com"));
+    }
+
+    #[test]
+    fn strip_tracking_params_keeps_legit_params_and_cleans_html_links() {
+        assert_eq!(
+            strip_tracking_params(
+                "https://example.com/post?id=42&utm_source=mail&fbclid=xyz#section"
+            ),
+            "https://example.com/post?id=42#section"
+        );
+        assert_eq!(
+            strip_tracking_params("https://example.com/post?gclid=123&utm_medium=email"),
+            "https://example.com/post"
+        );
+        assert_eq!(
+            strip_tracking_params("mailto:alice@example.com"),
+            "mailto:alice@example.com"
+        );
+
+        let raw = r#"<p><a href="https://example.com/doc?page=2&utm_campaign=spring&msclkid=9">Link</a></p>"#;
+        let (cleaned, _) = sanitize_html_for_display_with_options(raw, true, true);
+        assert!(cleaned.contains("https://example.com/doc?page=2\""));
+        assert!(!cleaned.contains("utm_campaign"));
+        assert!(!cleaned.contains("msclkid"));
     }
 }

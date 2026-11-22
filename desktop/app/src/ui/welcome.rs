@@ -53,8 +53,8 @@ pub(crate) fn render(
             Button::new(btn_id)
                 .outline()
                 .label(preset.label)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.start_preset_account(preset, window, cx);
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_settings_preset_account(preset.clone(), cx);
                 }))
                 .into_any_element()
         })
@@ -128,7 +128,7 @@ pub(crate) fn render(
                                 .hover(|s| s.bg(hx(OAUTH_BTN_HOVER)))
                                 .active(|s| s.bg(hx(OAUTH_BTN_ACTIVE)))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.start_outlook_oauth(cx);
+                                    this.start_outlook_oauth(String::new(), None, cx);
                                 }))
                                 .child("使用 Outlook / Microsoft 365 登录 (OAuth2)"),
                         )
@@ -157,8 +157,8 @@ pub(crate) fn render(
                                 .outline()
                                 .label("自定义 IMAP / SMTP...")
                                 .w_full()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.load_account_into_form(None, window, cx);
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_settings_edit_account(None, cx);
                                 })),
                         )
                         .child(Separator::horizontal())

@@ -222,9 +222,9 @@ fn account_section(
                             .compact()
                             .icon(IconName::Settings)
                             .tooltip("账号设置")
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 let cfg = this.accounts.iter().find(|a| a.id == acc_id).cloned();
-                                this.load_account_into_form(cfg.as_ref(), window, cx);
+                                this.open_settings_edit_account(cfg, cx);
                             })),
                     )
                 })
@@ -518,90 +518,100 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .flex_shrink_0()
                 .px_2()
                 .gap_0p5()
-                .child(
-                    nav_row(
-                        "nav-inbox",
-                        IconName::Inbox,
-                        "收件箱",
-                        Some((unified_unread, false)),
-                        is_unified_selected,
-                        &p,
+                .when(app.prefs.unified_show_inbox, |el| {
+                    el.child(
+                        nav_row(
+                            "nav-inbox",
+                            IconName::Inbox,
+                            "收件箱",
+                            Some((unified_unread, false)),
+                            is_unified_selected,
+                            &p,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.select_unified_view(CurrentView::UnifiedInbox, cx);
+                        }))
+                        // 统一视图行右键：仅「全部标为已读」（对所有账号收件箱批量）。
+                        .context_menu({
+                            let menu_entity = cx.entity();
+                            move |menu, _, _| {
+                                let menu_entity = menu_entity.clone();
+                                menu.item(
+                                    PopupMenuItem::new("全部标为已读（所有账号收件箱）")
+                                        .disabled(demo_mode)
+                                        .on_click(move |_, _, cx| {
+                                            menu_entity.update(cx, |this, cx| {
+                                                this.mark_all_inboxes_read(cx);
+                                            });
+                                        }),
+                                )
+                            }
+                        }),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_unified_view(CurrentView::UnifiedInbox, cx);
-                    }))
-                    // 统一视图行右键：仅「全部标为已读」（对所有账号收件箱批量）。
-                    .context_menu({
-                        let menu_entity = cx.entity();
-                        move |menu, _, _| {
-                            let menu_entity = menu_entity.clone();
-                            menu.item(
-                                PopupMenuItem::new("全部标为已读（所有账号收件箱）")
-                                    .disabled(demo_mode)
-                                    .on_click(move |_, _, cx| {
-                                        menu_entity.update(cx, |this, cx| {
-                                            this.mark_all_inboxes_read(cx);
-                                        });
-                                    }),
-                            )
-                        }
-                    }),
-                )
+                })
                 // 迭代 2：已加星标 / 已发送 / 归档接入 mail-core 统一视图查询。
-                .child(
-                    nav_row(
-                        "nav-starred",
-                        IconName::Star,
-                        "已加星标",
-                        None,
-                        is_starred_selected,
-                        &p,
+                .when(app.prefs.unified_show_starred, |el| {
+                    el.child(
+                        nav_row(
+                            "nav-starred",
+                            IconName::Star,
+                            "已加星标",
+                            None,
+                            is_starred_selected,
+                            &p,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.select_unified_view(CurrentView::Starred, cx);
+                        })),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_unified_view(CurrentView::Starred, cx);
-                    })),
-                )
-                .child(
-                    nav_row(
-                        "nav-sent",
-                        IconName::Send,
-                        "已发送",
-                        None,
-                        is_sent_selected,
-                        &p,
+                })
+                .when(app.prefs.unified_show_sent, |el| {
+                    el.child(
+                        nav_row(
+                            "nav-sent",
+                            IconName::Send,
+                            "已发送",
+                            None,
+                            is_sent_selected,
+                            &p,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.select_unified_view(CurrentView::Sent, cx);
+                        })),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_unified_view(CurrentView::Sent, cx);
-                    })),
-                )
+                })
                 // 草稿箱：真实账号展示本地草稿（中栏列表 + 侧栏条目），
                 // 演示模式映射到演示草稿箱文件夹。
-                .child(
-                    nav_row(
-                        "nav-drafts",
-                        IconName::FilePen,
-                        "草稿箱",
-                        Some((drafts_count, false)),
-                        is_drafts_selected,
-                        &p,
+                .when(app.prefs.unified_show_drafts, |el| {
+                    el.child(
+                        nav_row(
+                            "nav-drafts",
+                            IconName::FilePen,
+                            "草稿箱",
+                            Some((drafts_count, false)),
+                            is_drafts_selected,
+                            &p,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.select_unified_view(CurrentView::Drafts, cx);
+                        })),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_unified_view(CurrentView::Drafts, cx);
-                    })),
-                )
-                .child(
-                    nav_row(
-                        "nav-archive",
-                        IconName::Archive,
-                        "归档",
-                        None,
-                        is_archive_selected,
-                        &p,
+                })
+                .when(app.prefs.unified_show_archive, |el| {
+                    el.child(
+                        nav_row(
+                            "nav-archive",
+                            IconName::Archive,
+                            "归档",
+                            None,
+                            is_archive_selected,
+                            &p,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.select_unified_view(CurrentView::Archive, cx);
+                        })),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_unified_view(CurrentView::Archive, cx);
-                    })),
-                )
+                })
                 .when(!outbox_items.is_empty(), |el| {
                     el.child(
                         nav_row(
@@ -703,41 +713,54 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             )
         })
         // 底部固定区：联系人 / 附件入口。
-        .child(
-            v_flex()
-                .flex_shrink_0()
-                .px_2()
-                .py_2()
-                .gap_0p5()
-                .border_t_1()
-                .border_color(border)
-                // 联系人 / 附件总览主内容视图入口（阶段 3，保留左栏切换）。
-                .child(
-                    nav_row(
-                        "nav-contacts",
-                        IconName::CircleUser,
-                        "联系人",
-                        None,
-                        app.main_view == MainContentView::Contacts,
-                        &p,
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_contacts(window, cx);
-                    })),
+        .when(
+            app.prefs.sidebar_show_contacts || app.prefs.sidebar_show_attachments,
+            |el| {
+                el.child(
+                    v_flex()
+                        .flex_shrink_0()
+                        .px_2()
+                        .py_2()
+                        .gap_0p5()
+                        .border_t_1()
+                        .border_color(border)
+                        // 联系人 / 附件总览主内容视图入口（阶段 3，保留左栏切换）。
+                        .when(app.prefs.sidebar_show_contacts, |el| {
+                            el.child(
+                                nav_row(
+                                    "nav-contacts",
+                                    IconName::CircleUser,
+                                    "联系人",
+                                    None,
+                                    app.main_view == MainContentView::Contacts,
+                                    &p,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_contacts(window, cx);
+                                    },
+                                )),
+                            )
+                        })
+                        .when(app.prefs.sidebar_show_attachments, |el| {
+                            el.child(
+                                nav_row(
+                                    "nav-attachments",
+                                    IconName::Paperclip,
+                                    "附件",
+                                    None,
+                                    app.main_view == MainContentView::Gallery,
+                                    &p,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_gallery(window, cx);
+                                    },
+                                )),
+                            )
+                        }),
                 )
-                .child(
-                    nav_row(
-                        "nav-attachments",
-                        IconName::Paperclip,
-                        "附件",
-                        None,
-                        app.main_view == MainContentView::Gallery,
-                        &p,
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_gallery(window, cx);
-                    })),
-                ),
+            },
         )
         .into_any_element()
 }
@@ -991,7 +1014,21 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
                                 this.select_unified_view(CurrentView::UnifiedInbox, cx);
                             })),
                     )
-                    .when(unified_unread > 0, |el| {
+                    .when(unified_unread > 0 && app.prefs.rail_unread_dots, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top(px(-2.0))
+                                .right(px(-2.0))
+                                .rounded_full()
+                                .w(px(8.0))
+                                .h(px(8.0))
+                                .bg(accent)
+                                .border_1()
+                                .border_color(sidebar_bg),
+                        )
+                    })
+                    .when(unified_unread > 0 && !app.prefs.rail_unread_dots, |el| {
                         el.child(
                             div()
                                 .absolute()
@@ -1022,6 +1059,7 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
         // 账号头像滚动区（窄轨模式头像右上角未读角标始终显示）；
         // show_accounts 关闭时随宽栏一并隐藏（对齐原版 Show Accounts）。
         .when(app.show_accounts, |el| {
+            let rail_dots = app.prefs.rail_unread_dots;
             el.child(
                 v_flex()
                     .id("rail-scroll")
@@ -1054,6 +1092,7 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
                             .unwrap_or(0);
                         div()
                             .id(("rail-acc", acc_id))
+                            .relative()
                             .cursor_pointer()
                             .p(px(2.0))
                             .rounded(px(8.0))
@@ -1068,44 +1107,67 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
                                 &display_name,
                                 &acc.email,
                                 28.0,
-                                account_unread,
+                                if rail_dots { 0 } else { account_unread },
                                 accent,
                                 sidebar_bg,
                             ))
+                            .when(rail_dots && account_unread > 0, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .right(px(0.0))
+                                        .rounded_full()
+                                        .w(px(8.0))
+                                        .h(px(8.0))
+                                        .bg(accent)
+                                        .border_1()
+                                        .border_color(sidebar_bg),
+                                )
+                            })
                     })),
             )
         })
         // 底部固定：联系人 / 附件图标入口（现有入口的窄轨形态）。
-        .child(
-            v_flex()
-                .flex_shrink_0()
-                .py_2()
-                .items_center()
-                .gap_1()
-                .border_t_1()
-                .border_color(border)
-                .child(
-                    Button::new("rail-contacts")
-                        .ghost()
-                        .compact()
-                        .icon(IconName::CircleUser)
-                        .tooltip("联系人")
-                        .selected(app.main_view == MainContentView::Contacts)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_contacts(window, cx);
-                        })),
+        .when(
+            app.prefs.sidebar_show_contacts || app.prefs.sidebar_show_attachments,
+            |el| {
+                el.child(
+                    v_flex()
+                        .flex_shrink_0()
+                        .py_2()
+                        .items_center()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(border)
+                        .when(app.prefs.sidebar_show_contacts, |el| {
+                            el.child(
+                                Button::new("rail-contacts")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::CircleUser)
+                                    .tooltip("联系人")
+                                    .selected(app.main_view == MainContentView::Contacts)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_contacts(window, cx);
+                                    })),
+                            )
+                        })
+                        .when(app.prefs.sidebar_show_attachments, |el| {
+                            el.child(
+                                Button::new("rail-attachments")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::Paperclip)
+                                    .tooltip("附件")
+                                    .selected(app.main_view == MainContentView::Gallery)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_gallery(window, cx);
+                                    })),
+                            )
+                        }),
                 )
-                .child(
-                    Button::new("rail-attachments")
-                        .ghost()
-                        .compact()
-                        .icon(IconName::Paperclip)
-                        .tooltip("附件")
-                        .selected(app.main_view == MainContentView::Gallery)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_gallery(window, cx);
-                        })),
-                ),
+            },
         )
         .into_any_element()
 }

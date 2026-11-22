@@ -405,13 +405,15 @@ fn message_row(
                 }
             })
         })
-        // 左侧：36x36 圆形头像 + 固定 10px 宽未读圆点占位（确保已读/未读文字严格左对齐）。
+        // 左侧：可选 36x36 圆形头像 + 固定 10px 宽未读圆点占位（确保已读/未读文字严格左对齐）。
         .child(
             h_flex()
                 .flex_shrink_0()
                 .items_center()
                 .gap_1()
-                .child(avatar::avatar(&display_name, &avatar_key, 36.0))
+                .when(app.prefs.show_avatars, |el| {
+                    el.child(avatar::avatar(&display_name, &avatar_key, 36.0))
+                })
                 .child(
                     div()
                         .w(px(10.0))
@@ -473,12 +475,23 @@ fn message_row(
                                             .text_color(p.text_muted),
                                     )
                                 })
-                                .child(
+                                .child({
+                                    let now_ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0);
+                                    let date_text = hylki_mail_core::format_message_date(
+                                        msg.date_ts,
+                                        &msg.date_display,
+                                        &app.prefs.date_style,
+                                        &app.prefs.clock_style,
+                                        now_ts,
+                                    );
                                     div()
                                         .text_xs()
                                         .text_color(p.text_muted)
-                                        .child(SharedString::from(msg.date_display.clone())),
-                                )
+                                        .child(SharedString::from(date_text))
+                                })
                                 // B-4 会话计数胶囊（对齐原版 .thread-chip：仅 >1 封往来时显示，
                                 // 紧凑圆角、10px 粗体、主题色弱底）。
                                 .when(msg.thread_count > 1, |icons| {
@@ -652,8 +665,9 @@ pub(crate) fn render(
         }
     }
 
-    // 常规邮件行：按时间排序时在列表行之间插入轻量日期分组头（今天 / 昨天 / 本周 / 更早）。
-    let show_date_groups = !drafts_view && current_sort.uses_date_groups();
+    // 常规邮件行：按时间排序且未关闭分组偏好时在列表行之间插入日期分组头（今天 / 昨天 / 本周 / 更早）。
+    let show_date_groups =
+        !drafts_view && app.prefs.list_group_by_date && current_sort.uses_date_groups();
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -841,8 +855,13 @@ pub(crate) fn render(
     let search_scope = app.search_scope;
     let server_loading = app.server_search_loading;
     let search_open = app.search_open;
-    // 搜索栏行显示条件：点 🔍 / Ctrl+F 展开时，或已有搜索词时（保持范围胶囊可见）。
-    let show_search_bar = search_open || has_search_query;
+    // 搜索栏行显示条件：点 🔍 / Ctrl+F 展开时，已有搜索词时，或「始终显示搜索栏」偏好开启时。
+    let show_search_bar = search_open || has_search_query || app.prefs.list_search_always_open;
+    let search_bottom = app.prefs.list_search_bottom;
+    let bulk_bottom = app.prefs.list_bulk_bar_bottom;
+    let show_bulk_bar = !drafts_view && app.selected_message_ids.len() > 1;
+    let bulk_count = app.selected_message_ids.len();
+    let bulk_demo_mode = app.demo_mode;
     // L-6：阅读器在下方 / 关闭时列表顶栏即窗口顶栏（对齐原版 controls_in_list），
     // 需在此承载 Windows 窗口控制按钮（阅读器右侧时由阅读器顶栏承载）。
     let controls_in_list = !app.focus_mode
@@ -918,186 +937,21 @@ pub(crate) fn render(
                     ))
                 }),
         )
-        // 搜索栏行（顶栏下方）：搜索框 + 范围切换胶囊（当前视图 / 全部文件夹）
-        // + 服务端搜索按钮；Esc 清空并收起，Enter 触发服务端在线搜索。
-        .when(show_search_bar, |el| {
-            el.child(
-                h_flex()
-                    .h(px(34.0))
-                    .flex_shrink_0()
-                    .px_2()
-                    .gap_1()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(border)
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        // Esc 清空搜索并收起；Enter 在搜索词长度 >= 2 时触发服务端在线搜索。
-                        if event.keystroke.key == "escape" {
-                            this.search_open = false;
-                            this.search_input.update(cx, |s, cx| {
-                                s.set_value("", window, cx);
-                            });
-                            this.search_query = String::new();
-                            this.clear_server_search();
-                            this.reset_list_pagination();
-                            this.reload_current_page(cx);
-                        } else if event.keystroke.key == "enter" {
-                            this.trigger_server_search(cx);
-                        }
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&app.search_input)),
-                    )
-                    .child(
-                        div()
-                            .id("search-scope-this")
-                            .flex_shrink_0()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .text_xs()
-                            .cursor_pointer()
-                            .bg(if search_scope == SearchScope::ThisFolder {
-                                p.accent
-                            } else {
-                                p.accent_soft()
-                            })
-                            .text_color(if search_scope == SearchScope::ThisFolder {
-                                p.accent_fg
-                            } else {
-                                p.text
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_search_scope(SearchScope::ThisFolder, cx);
-                            }))
-                            .child("当前视图"),
-                    )
-                    .child(
-                        div()
-                            .id("search-scope-all")
-                            .flex_shrink_0()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .text_xs()
-                            .cursor_pointer()
-                            .bg(if search_scope == SearchScope::AllFolders {
-                                p.accent
-                            } else {
-                                p.accent_soft()
-                            })
-                            .text_color(if search_scope == SearchScope::AllFolders {
-                                p.accent_fg
-                            } else {
-                                p.text
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_search_scope(SearchScope::AllFolders, cx);
-                            }))
-                            .child("全部文件夹"),
-                    )
-                    .when(can_search_server, |bar| {
-                        bar.child(
-                            Button::new("search-server-btn")
-                                .ghost()
-                                .compact()
-                                .label(if server_loading {
-                                    "搜索中..."
-                                } else {
-                                    "搜服务器"
-                                })
-                                .disabled(server_loading)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.trigger_server_search(cx);
-                                })),
-                        )
-                    }),
-            )
+        // 搜索栏行（根据偏好置于顶部栏下方或列表底部）。
+        .when(show_search_bar && !search_bottom, |el| {
+            el.child(render_search_bar(
+                app,
+                search_scope,
+                can_search_server,
+                server_loading,
+                false,
+                &p,
+                cx,
+            ))
         })
-        // 多选批量操作条（Ctrl+点击选中 > 1 封邮件时出现）。
-        .when(!drafts_view && app.selected_message_ids.len() > 1, |el| {
-            let count = app.selected_message_ids.len();
-            let demo_mode = app.demo_mode;
-            el.child(
-                h_flex()
-                    .flex_shrink_0()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(border)
-                    .bg(p.accent_soft())
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(p.accent)
-                            .child(SharedString::from(format!("已选 {count} 封"))),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .items_center()
-                            .child(
-                                Button::new("batch-mark-read")
-                                    .ghost()
-                                    .compact()
-                                    .text_size(px(11.0))
-                                    .label("标为已读")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.batch_mark_read(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("batch-star")
-                                    .ghost()
-                                    .compact()
-                                    .text_size(px(11.0))
-                                    .label("加星标")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.batch_toggle_flagged(cx);
-                                    })),
-                            )
-                            .when(!demo_mode, |row| {
-                                row.child(
-                                    Button::new("batch-archive")
-                                        .ghost()
-                                        .compact()
-                                        .text_size(px(11.0))
-                                        .label("归档")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.batch_archive(cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("batch-delete")
-                                        .ghost()
-                                        .compact()
-                                        .text_size(px(11.0))
-                                        .label("删除")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.batch_delete(cx);
-                                        })),
-                                )
-                            })
-                            .child(
-                                Button::new("batch-clear")
-                                    .ghost()
-                                    .compact()
-                                    .text_size(px(11.0))
-                                    .label("取消选择")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.clear_message_selection(cx);
-                                    })),
-                            ),
-                    ),
-            )
+        // 多选批量操作条（Ctrl+点击选中 > 1 封邮件时出现，可配置置顶或置底）。
+        .when(show_bulk_bar && !bulk_bottom, |el| {
+            el.child(render_bulk_bar(bulk_count, bulk_demo_mode, false, &p, cx))
         })
         // 列表（滚到底部自动预加载下一批 100 条）。
         .child(
@@ -1198,6 +1052,212 @@ pub(crate) fn render(
                         ),
                 )
                 .child(Scrollbar::vertical(&app.list_scroll_handle)),
+        )
+        .when(show_bulk_bar && bulk_bottom, |el| {
+            el.child(render_bulk_bar(bulk_count, bulk_demo_mode, true, &p, cx))
+        })
+        .when(show_search_bar && search_bottom, |el| {
+            el.child(render_search_bar(
+                app,
+                search_scope,
+                can_search_server,
+                server_loading,
+                true,
+                &p,
+                cx,
+            ))
+        })
+        .into_any_element()
+}
+
+fn render_search_bar(
+    app: &HylkiApp,
+    search_scope: SearchScope,
+    can_search_server: bool,
+    server_loading: bool,
+    bottom: bool,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    h_flex()
+        .h(px(34.0))
+        .flex_shrink_0()
+        .px_2()
+        .gap_1()
+        .items_center()
+        .when(bottom, |el| el.border_t_1())
+        .when(!bottom, |el| el.border_b_1())
+        .border_color(p.border)
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            // Esc 清空搜索并收起；Enter 在搜索词长度 >= 2 时触发服务端在线搜索。
+            if event.keystroke.key == "escape" {
+                this.search_open = false;
+                this.search_input.update(cx, |s, cx| {
+                    s.set_value("", window, cx);
+                });
+                this.search_query = String::new();
+                this.clear_server_search();
+                this.reset_list_pagination();
+                this.reload_current_page(cx);
+            } else if event.keystroke.key == "enter" {
+                this.trigger_server_search(cx);
+            }
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(&app.search_input)),
+        )
+        .child(
+            div()
+                .id("search-scope-this")
+                .flex_shrink_0()
+                .px_2()
+                .py_0p5()
+                .rounded_full()
+                .text_xs()
+                .cursor_pointer()
+                .bg(if search_scope == SearchScope::ThisFolder {
+                    p.accent
+                } else {
+                    p.accent_soft()
+                })
+                .text_color(if search_scope == SearchScope::ThisFolder {
+                    p.accent_fg
+                } else {
+                    p.text
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_search_scope(SearchScope::ThisFolder, cx);
+                }))
+                .child("当前视图"),
+        )
+        .child(
+            div()
+                .id("search-scope-all")
+                .flex_shrink_0()
+                .px_2()
+                .py_0p5()
+                .rounded_full()
+                .text_xs()
+                .cursor_pointer()
+                .bg(if search_scope == SearchScope::AllFolders {
+                    p.accent
+                } else {
+                    p.accent_soft()
+                })
+                .text_color(if search_scope == SearchScope::AllFolders {
+                    p.accent_fg
+                } else {
+                    p.text
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_search_scope(SearchScope::AllFolders, cx);
+                }))
+                .child("全部文件夹"),
+        )
+        .when(can_search_server, |bar| {
+            bar.child(
+                Button::new("search-server-btn")
+                    .ghost()
+                    .compact()
+                    .label(if server_loading {
+                        "搜索中..."
+                    } else {
+                        "搜服务器"
+                    })
+                    .disabled(server_loading)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.trigger_server_search(cx);
+                    })),
+            )
+        })
+        .into_any_element()
+}
+
+fn render_bulk_bar(
+    count: usize,
+    demo_mode: bool,
+    bottom: bool,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    h_flex()
+        .flex_shrink_0()
+        .px_2()
+        .py_1()
+        .gap_1()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .when(bottom, |el| el.border_t_1())
+        .when(!bottom, |el| el.border_b_1())
+        .border_color(p.border)
+        .bg(p.accent_soft())
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(p.accent)
+                .child(SharedString::from(format!("已选 {count} 封"))),
+        )
+        .child(
+            h_flex()
+                .gap_0p5()
+                .items_center()
+                .child(
+                    Button::new("batch-mark-read")
+                        .ghost()
+                        .compact()
+                        .text_size(px(11.0))
+                        .label("标为已读")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.batch_mark_read(cx);
+                        })),
+                )
+                .child(
+                    Button::new("batch-star")
+                        .ghost()
+                        .compact()
+                        .text_size(px(11.0))
+                        .label("加星标")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.batch_toggle_flagged(cx);
+                        })),
+                )
+                .when(!demo_mode, |row| {
+                    row.child(
+                        Button::new("batch-archive")
+                            .ghost()
+                            .compact()
+                            .text_size(px(11.0))
+                            .label("归档")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.batch_archive(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("batch-delete")
+                            .ghost()
+                            .compact()
+                            .text_size(px(11.0))
+                            .label("删除")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.batch_delete(cx);
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("batch-clear")
+                        .ghost()
+                        .compact()
+                        .text_size(px(11.0))
+                        .label("取消选择")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.clear_message_selection(cx);
+                        })),
+                ),
         )
         .into_any_element()
 }

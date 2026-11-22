@@ -21,15 +21,15 @@ use gpui_kit::{
 use hylki_mail_core::config;
 
 use crate::app::{
-    CloseOverlay, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose, OpenCommandPalette,
-    OpenCommandPaletteActions, OpenPreferences, OpenShortcutsWindow, QuitApp, RefreshAllAccounts,
-    ReplyAllCurrent, ReplyCurrent, SelectNextMessage, SelectPrevMessage, SendCompose,
-    SetReaderPositionBelow, SetReaderPositionHidden, SetReaderPositionRight, SingleKeyArchive,
-    SingleKeyBackToList, SingleKeyCompose, SingleKeyDelete, SingleKeyForward, SingleKeyMarkSpam,
-    SingleKeyNextCard, SingleKeyNextMessage, SingleKeyPrevCard, SingleKeyPrevMessage,
-    SingleKeyReply, SingleKeyReplyAll, SingleKeyToggleRead, SingleKeyToggleStar,
-    ToggleAccountsList, ToggleFocusMode, ToggleFullscreen, UndoLastMove, ViewMessageSource,
-    ZoomIn, ZoomOut, ZoomReset,
+    CloseOverlay, CloseSettingsWindow, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose,
+    OpenCommandPalette, OpenCommandPaletteActions, OpenPreferences, OpenShortcutsWindow, QuitApp,
+    RefreshAllAccounts, ReplyAllCurrent, ReplyCurrent, SelectNextMessage, SelectPrevMessage,
+    SendCompose, SetReaderPositionBelow, SetReaderPositionHidden, SetReaderPositionRight,
+    SingleKeyArchive, SingleKeyBackToList, SingleKeyCompose, SingleKeyDelete, SingleKeyForward,
+    SingleKeyMarkSpam, SingleKeyNextCard, SingleKeyNextMessage, SingleKeyPrevCard,
+    SingleKeyPrevMessage, SingleKeyReply, SingleKeyReplyAll, SingleKeyToggleRead,
+    SingleKeyToggleStar, ToggleAccountsList, ToggleFocusMode, ToggleFullscreen, UndoLastMove,
+    ViewMessageSource, ZoomIn, ZoomOut, ZoomReset,
 };
 
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
@@ -84,7 +84,7 @@ impl AssetSource for HylkiAssets {
 /// 在 Windows 运行时把嵌入的 256×256 PNG 图标直接设置给当前 UI 线程的顶层窗口，
 /// 覆盖窗口左上角标题栏、任务栏与 Alt+Tab 图标（Vista+ CreateIconFromResourceEx 原生支持 PNG）。
 #[cfg(target_os = "windows")]
-fn apply_window_icon() {
+pub(crate) fn apply_window_icon() {
     type Hwnd = *mut core::ffi::c_void;
     type Hicon = *mut core::ffi::c_void;
     const WM_SETICON: u32 = 0x0080;
@@ -211,6 +211,7 @@ fn main() {
                 // 阶段二主菜单动作：显示/隐藏账号列表、全屏、快捷键帮助。
                 KeyBinding::new("ctrl-shift-a", ToggleAccountsList, None),
                 KeyBinding::new("f11", ToggleFullscreen, None),
+                KeyBinding::new("ctrl-w", CloseSettingsWindow, None),
                 // L-6：阅读器位置（右侧 / 下方 / 关闭）与专注模式（对齐原版 #475）。
                 KeyBinding::new("ctrl-alt-1", SetReaderPositionRight, None),
                 KeyBinding::new("ctrl-alt-2", SetReaderPositionBelow, None),
@@ -263,8 +264,12 @@ fn main() {
                 }),
                 ..Default::default()
             };
+            let start_fullscreen = prefs.start_fullscreen;
             let (_window_handle, app_entity) =
                 gpui_kit::open_window(options, cx, move |window, cx| {
+                    if start_fullscreen {
+                        window.toggle_fullscreen();
+                    }
                     cx.new(|cx| HylkiApp::new(demo_mode, prefs, window, cx))
                 })
                 .expect("failed to open Hylki Windows window");

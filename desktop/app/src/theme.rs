@@ -22,11 +22,11 @@ use gpui_kit::{black, rgb, white, App, Global, Hsla};
 /// 渲染色板选择器，持久化的 theme_id 经 [`static_theme_id`] 归一化。
 pub const THEME_LIST: &[(&str, &str)] = &[
     ("default", "经典蓝"),
-    ("rose", "玫瑰"),
-    ("forest", "森林"),
-    ("tidal", "海潮"),
-    ("earth", "大地"),
     ("midnight", "子夜"),
+    ("tidal", "海潮"),
+    ("rose", "玫瑰"),
+    ("earth", "大地"),
+    ("forest", "森林"),
 ];
 
 /// Hylki 语义色板（`Copy`，可在 render 开头整体复制为局部变量）。
@@ -267,11 +267,11 @@ const MIDNIGHT_DARK: PaletteHex = PaletteHex {
 /// 全部内置色板（id, 亮, 暗），顺序与 [`THEME_LIST`] 一致。
 const PALETTES: &[(&str, PaletteHex, PaletteHex)] = &[
     ("default", DEFAULT_LIGHT, DEFAULT_DARK),
-    ("rose", ROSE_LIGHT, ROSE_DARK),
-    ("forest", FOREST_LIGHT, FOREST_DARK),
-    ("tidal", TIDAL_LIGHT, TIDAL_DARK),
-    ("earth", EARTH_LIGHT, EARTH_DARK),
     ("midnight", MIDNIGHT_LIGHT, MIDNIGHT_DARK),
+    ("tidal", TIDAL_LIGHT, TIDAL_DARK),
+    ("rose", ROSE_LIGHT, ROSE_DARK),
+    ("earth", EARTH_LIGHT, EARTH_DARK),
+    ("forest", FOREST_LIGHT, FOREST_DARK),
 ];
 
 /// 按 id 与亮暗取语义色板；未知 id 回落到经典蓝。

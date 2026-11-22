@@ -20,21 +20,21 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    actions, black, div, point, px, AnyWindowHandle, AppContext, Axis, ClipboardItem, Context,
-    DragMoveEvent, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Render, ScrollHandle, SharedString, Styled, Subscription, Window, WindowAppearance,
-    WindowBounds,
+    actions, black, div, point, px, size, AnyWindowHandle, AppContext, Axis, Bounds, ClipboardItem,
+    Context, DragMoveEvent, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, TitlebarOptions,
+    Window, WindowAppearance, WindowBounds, WindowOptions,
 };
 use hylki_mail_core::cache::{sanitize_filename, CachedAttachment, KnownContact};
-use hylki_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend, SecurityMode};
+use hylki_mail_core::config::{self, AccountConfig, AppPreferences, SettingsBackupBundle};
 use hylki_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_SENT_ID,
 };
 use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
-    contacts_io, ComposeDraft, FolderSummary, LocalDraft, MailPage, MailRequest, MessageDetail,
-    MessageFilter, MessageSort, MessageSummary, OutboxItem, QuickFilterSet, SearchScope,
-    UnifiedView, UserContact, WorkerEvent,
+    contacts_io, detect_attachment_reminder, format_reply_header, ComposeDraft, FolderSummary,
+    LocalDraft, MailPage, MailRequest, MessageDetail, MessageFilter, MessageSort, MessageSummary,
+    OutboxItem, QuickFilterSet, SearchScope, UnifiedView, UserContact, WorkerEvent,
 };
 
 use crate::theme;
@@ -42,8 +42,8 @@ use crate::tray::{self, TrayCommand, TrayHandle};
 use crate::ui::command_palette::{CommandPaletteEvent, CommandPaletteState, PaletteCommand};
 use crate::ui::contacts::{ContactExportKind, ContactsEvent, ContactsState};
 use crate::ui::gallery::{GalleryEvent, GalleryState};
-use crate::ui::preferences::{PrefTab, PreferencesEvent, PreferencesState};
-use crate::ui::{compose, message_list, preferences, reader, sidebar, welcome, window_controls};
+use crate::ui::preferences::{PrefTab, SettingsWindow};
+use crate::ui::{compose, message_list, reader, sidebar, welcome, window_controls};
 
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
 
@@ -84,6 +84,7 @@ fn list_wide_next(current_wide: bool, width: f32) -> bool {
 }
 
 /// 邮箱服务商预设（原样迁自原型）。
+#[derive(Clone, Copy)]
 pub(crate) struct ProviderPreset {
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
@@ -335,7 +336,8 @@ actions!(
         SetReaderPositionRight,
         SetReaderPositionBelow,
         SetReaderPositionHidden,
-        ToggleFocusMode
+        ToggleFocusMode,
+        CloseSettingsWindow
     ]
 );
 
@@ -347,7 +349,7 @@ pub(crate) enum ComposeAddressField {
     Bcc,
 }
 
-/// 撤销发送（Undo Send）5 秒缓冲中的待投递邮件。
+/// 撤销发送（Undo Send）缓冲中的待投递邮件。
 #[derive(Clone, Debug)]
 pub(crate) struct PendingSend {
     pub(crate) token: u64,
@@ -366,11 +368,17 @@ pub(crate) enum MainContentView {
     Contacts,
 }
 
-/// 当前全局浮层（统一设置窗口、命令面板、快捷键、关于）。
+#[derive(Clone)]
+enum SettingsOpenTarget {
+    Tab(PrefTab),
+    EditAccount(Option<AccountConfig>),
+    PresetAccount(ProviderPreset),
+}
+
+/// 当前全局浮层（命令面板、快捷键、关于）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActiveModal {
     None,
-    Preferences,
     CommandPalette,
     /// 键盘快捷键速查（F1 / ?，对齐原版 win.shortcuts）。
     Shortcuts,
@@ -494,27 +502,12 @@ pub(crate) struct HylkiApp {
     /// 撤销发送（5 秒缓冲）状态。
     pub(crate) pending_send: Option<PendingSend>,
     next_send_token: u64,
+    /// 写信发送前检测到正文/主题提及附件关键词但未附带文件时触发的内联确认横幅（命中关键词）。
+    pub(crate) compose_attachment_reminder: Option<String>,
 
-    // Account configuration fields
-    pub(crate) editing_account_id: Option<u32>,
+    // Account management banner/confirmation state
     /// 账号管理页等待确认移除的账号 ID（内联二次确认）。
     pub(crate) pending_delete_account_id: Option<u32>,
-    pub(crate) cfg_display_name: Entity<InputState>,
-    pub(crate) cfg_email: Entity<InputState>,
-    pub(crate) cfg_imap_host: Entity<InputState>,
-    pub(crate) cfg_imap_port: Entity<InputState>,
-    pub(crate) cfg_imap_tls: bool,
-    pub(crate) cfg_imap_user: Entity<InputState>,
-    pub(crate) cfg_imap_pass: Entity<InputState>,
-    pub(crate) cfg_smtp_host: Entity<InputState>,
-    pub(crate) cfg_smtp_port: Entity<InputState>,
-    pub(crate) cfg_smtp_tls: bool,
-    pub(crate) cfg_smtp_separate: bool,
-    pub(crate) cfg_smtp_user: Entity<InputState>,
-    pub(crate) cfg_smtp_pass: Entity<InputState>,
-    pub(crate) cfg_oauth_client_id: Entity<InputState>,
-    pub(crate) cfg_signature: Entity<TextareaState>,
-    pub(crate) cfg_auth_guide: Option<SharedString>,
     pub(crate) cfg_feedback: Option<(bool, SharedString)>,
 
     pub(crate) status_line: SharedString,
@@ -569,11 +562,18 @@ pub(crate) struct HylkiApp {
     pub(crate) prefs: AppPreferences,
     /// 主内容区当前视图（Mail 三栏 / Gallery / Contacts）。
     pub(crate) main_view: MainContentView,
-    /// 当前全局浮层。
+    /// 主窗口 / 全局浮层。
     pub(crate) active_modal: ActiveModal,
-    /// 偏好设置模态实体（关闭时卸载）。
-    pub(crate) preferences: Option<Entity<PreferencesState>>,
-    preferences_sub: Option<Subscription>,
+    /// 独立非模态设置窗口单实例引用。
+    settings_window: Option<(AnyWindowHandle, Entity<SettingsWindow>)>,
+    /// 独立设置窗口异步打开防重入标记。
+    settings_window_opening: bool,
+    /// 进入专注模式并临时强制简化阅读视图前保存的原视图开关，退出专注时恢复。
+    focus_saved_prefer_plain: Option<bool>,
+    /// 选中邮件已读标记代际（用于 2 秒延迟标已读防抖）。
+    read_mark_generation: u64,
+    /// 上一次应用到主窗口 `window.set_rem_size` 的界面缩放百分比。
+    last_rem_scale: u32,
     /// 命令面板浮层实体（关闭时卸载）。
     palette: Option<Entity<CommandPaletteState>>,
     palette_sub: Option<Subscription>,
@@ -783,70 +783,19 @@ impl HylkiApp {
         })
         .detach();
 
-        let first_cfg = existing_accounts.first().cloned().unwrap_or_default();
-        let editing_account_id = existing_accounts.first().map(|c| c.id);
-
-        let cfg_display_name = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("显示名称（如：张三）")
-                .default_value(first_cfg.display_name.clone())
-        });
-        let cfg_email = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("邮箱地址（如：user@qq.com）")
-                .default_value(first_cfg.email.clone())
-        });
-        let cfg_imap_host = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("IMAP 主机（如：imap.qq.com）")
-                .default_value(first_cfg.imap_host.clone())
-        });
-        let cfg_imap_port = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("993")
-                .default_value(first_cfg.imap_port.to_string())
-        });
-        let cfg_imap_user = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("IMAP 用户名（留空默认使用邮箱地址）")
-                .default_value(first_cfg.imap_username.clone())
-        });
-        let cfg_imap_pass = cx.new(|cx| {
-            InputState::new(window, cx)
-                .masked(true)
-                .placeholder("客户端授权码 / 密码（存入 Windows 凭据管理器）")
-        });
-        let cfg_smtp_host = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("SMTP 主机（如：smtp.qq.com）")
-                .default_value(first_cfg.smtp_host.clone())
-        });
-        let cfg_smtp_port = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("465")
-                .default_value(first_cfg.smtp_port.to_string())
-        });
-        let cfg_smtp_user = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("SMTP 独立用户名（可选）")
-                .default_value(first_cfg.smtp_username.clone())
-        });
-        let cfg_smtp_pass = cx.new(|cx| {
-            InputState::new(window, cx)
-                .masked(true)
-                .placeholder("SMTP 独立授权码（启用独立凭据时填写）")
-        });
-        let cfg_oauth_client_id = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("可选：自定义 Microsoft Entra Client ID（留空使用内置）")
-                .default_value(first_cfg.oauth_client_id.clone())
-        });
-        let cfg_signature = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(3, 6)
-                .placeholder("可选：邮件签名（写信 / 回复 / 转发时自动以 -- 分隔插入正文末尾）")
-                .default_value(first_cfg.signature.clone())
-        });
+        let initial_rem_scale = config::clamp_ui_text_scale(prefs.ui_text_scale_percent);
+        window.set_rem_size(px(16.0 * initial_rem_scale as f32 / 100.0));
+        let initial_show_accounts = prefs.show_accounts;
+        let initial_sidebar_hidden = prefs.remember_sidebar_collapsed && prefs.sidebar_collapsed;
+        let initial_focus_mode = prefs.focus_start_enabled;
+        let initial_reader_prefer_plain =
+            (initial_focus_mode && prefs.focus_reader_view) || prefs.reader_default_mode == "on";
+        let focus_saved_prefer_plain = if initial_focus_mode && prefs.focus_reader_view {
+            Some(prefs.reader_default_mode == "on")
+        } else {
+            None
+        };
+        let initial_fold_mode = prefs.effective_fold_messages_mode().to_string();
 
         let system_dark_mode = matches!(
             window.appearance(),
@@ -893,7 +842,7 @@ impl HylkiApp {
                     compute_default_collapsed_cards(
                         d,
                         prefs.thread_newest_first,
-                        prefs.fold_older_messages,
+                        &initial_fold_mode,
                     )
                 })
                 .unwrap_or_default();
@@ -946,31 +895,15 @@ impl HylkiApp {
                 known_contacts: demo_contacts,
                 pending_send: None,
                 next_send_token: 1,
-                editing_account_id: Some(1),
+                compose_attachment_reminder: None,
                 pending_delete_account_id: None,
-                cfg_display_name,
-                cfg_email,
-                cfg_imap_host,
-                cfg_imap_port,
-                cfg_imap_tls: true,
-                cfg_imap_user,
-                cfg_imap_pass,
-                cfg_smtp_host,
-                cfg_smtp_port,
-                cfg_smtp_tls: true,
-                cfg_smtp_separate: false,
-                cfg_smtp_user,
-                cfg_smtp_pass,
-                cfg_oauth_client_id,
-                cfg_signature,
-                cfg_auth_guide: None,
                 cfg_feedback: None,
                 status_line: SharedString::from("演示模式 (--demo)：已加载 10,000 封模拟邮件"),
                 error_banner: None,
                 theme_id: initial_theme_id,
                 dark_mode: initial_dark_mode,
                 system_dark_mode,
-                sidebar_hidden: false,
+                sidebar_hidden: initial_sidebar_hidden,
                 search_open: false,
                 list_sort: MessageSort::DateNewest,
                 quick_filters: QuickFilterSet::default(),
@@ -979,9 +912,9 @@ impl HylkiApp {
                 server_search_query: String::new(),
                 server_search_results: Vec::new(),
                 collapsed_accounts: HashSet::new(),
-                show_accounts: true,
+                show_accounts: initial_show_accounts,
                 pending_empty_folder: None,
-                reader_prefer_plain: false,
+                reader_prefer_plain: initial_reader_prefer_plain,
                 allowed_remote_image_ids: HashSet::new(),
                 collapsed_thread_cards: initial_collapsed,
                 raw_source_message_ids: HashSet::new(),
@@ -992,8 +925,11 @@ impl HylkiApp {
                 prefs,
                 main_view: MainContentView::Mail,
                 active_modal: ActiveModal::None,
-                preferences: None,
-                preferences_sub: None,
+                settings_window: None,
+                settings_window_opening: false,
+                focus_saved_prefer_plain,
+                read_mark_generation: 0,
+                last_rem_scale: initial_rem_scale,
                 palette: None,
                 palette_sub: None,
                 gallery: None,
@@ -1015,7 +951,7 @@ impl HylkiApp {
                 layout_save_deadline: None,
                 layout_save_scheduled: false,
                 reader_position: initial_reader_position,
-                focus_mode: false,
+                focus_mode: initial_focus_mode,
                 list_below_height: initial_list_below_height,
                 message_bg_picks: HashMap::new(),
             };
@@ -1125,31 +1061,15 @@ impl HylkiApp {
             known_contacts: Vec::new(),
             pending_send: None,
             next_send_token: 1,
-            editing_account_id,
+            compose_attachment_reminder: None,
             pending_delete_account_id: None,
-            cfg_display_name,
-            cfg_email,
-            cfg_imap_host,
-            cfg_imap_port,
-            cfg_imap_tls: first_cfg.imap_security == SecurityMode::Tls,
-            cfg_imap_user,
-            cfg_imap_pass,
-            cfg_smtp_host,
-            cfg_smtp_port,
-            cfg_smtp_tls: first_cfg.smtp_security == SecurityMode::Tls,
-            cfg_smtp_separate: first_cfg.smtp_separate_credentials,
-            cfg_smtp_user,
-            cfg_smtp_pass,
-            cfg_oauth_client_id,
-            cfg_signature,
-            cfg_auth_guide: None,
             cfg_feedback: None,
             status_line,
             error_banner: None,
             theme_id: initial_theme_id,
             dark_mode: initial_dark_mode,
             system_dark_mode,
-            sidebar_hidden: false,
+            sidebar_hidden: initial_sidebar_hidden,
             search_open: false,
             list_sort: MessageSort::DateNewest,
             quick_filters: QuickFilterSet::default(),
@@ -1158,9 +1078,9 @@ impl HylkiApp {
             server_search_query: String::new(),
             server_search_results: Vec::new(),
             collapsed_accounts: HashSet::new(),
-            show_accounts: true,
+            show_accounts: initial_show_accounts,
             pending_empty_folder: None,
-            reader_prefer_plain: false,
+            reader_prefer_plain: initial_reader_prefer_plain,
             allowed_remote_image_ids: HashSet::new(),
             collapsed_thread_cards: HashSet::new(),
             raw_source_message_ids: HashSet::new(),
@@ -1171,8 +1091,11 @@ impl HylkiApp {
             prefs,
             main_view: MainContentView::Mail,
             active_modal: ActiveModal::None,
-            preferences: None,
-            preferences_sub: None,
+            settings_window: None,
+            settings_window_opening: false,
+            focus_saved_prefer_plain,
+            read_mark_generation: 0,
+            last_rem_scale: initial_rem_scale,
             palette: None,
             palette_sub: None,
             gallery: None,
@@ -1194,7 +1117,7 @@ impl HylkiApp {
             layout_save_deadline: None,
             layout_save_scheduled: false,
             reader_position: initial_reader_position,
-            focus_mode: false,
+            focus_mode: initial_focus_mode,
             list_below_height: initial_list_below_height,
             message_bg_picks: HashMap::new(),
         };
@@ -1236,14 +1159,30 @@ impl HylkiApp {
                     } else {
                         self.accounts.push(account.clone());
                     }
-                    self.editing_account_id = Some(account.id);
                     self.compose_account_id = account.id;
                     self.pending_delete_account_id = None;
                     self.right_mode = RightPaneMode::Reader;
-                    if self.active_modal == ActiveModal::Preferences
-                        && self.is_settings_mail_accounts_active(cx)
-                    {
-                        self.close_modal(cx);
+                    self.cfg_feedback = Some((
+                        true,
+                        SharedString::from(format!("账号 {} 已保存，正在同步...", account.email)),
+                    ));
+                    if let Some((handle, entity)) = self.settings_window.clone() {
+                        let account_for_win = account.clone();
+                        cx.spawn(async move |_, cx| {
+                            cx.update(|cx| {
+                                let _ = handle.update(cx, |_, window, cx| {
+                                    let _ = entity.update(cx, |win, cx| {
+                                        win.account_form.load_account(
+                                            Some(&account_for_win),
+                                            window,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    });
+                                });
+                            });
+                        })
+                        .detach();
                     }
                     self.error_banner = None;
                     self.status_line =
@@ -1259,7 +1198,26 @@ impl HylkiApp {
                     self.current_view = CurrentView::UnifiedInbox;
                     self.selected_message = None;
                     self.pending_delete_account_id = None;
-                    self.editing_account_id = self.accounts.first().map(|a| a.id);
+                    if let Some((handle, entity)) = self.settings_window.clone() {
+                        let next_cfg = self.accounts.first().cloned();
+                        cx.spawn(async move |_, cx| {
+                            cx.update(|cx| {
+                                let _ = handle.update(cx, |_, window, cx| {
+                                    let _ = entity.update(cx, |win, cx| {
+                                        if win.account_form.editing_account_id == Some(account_id) {
+                                            win.account_form.load_account(
+                                                next_cfg.as_ref(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        cx.notify();
+                                    });
+                                });
+                            });
+                        })
+                        .detach();
+                    }
                     self.right_mode = if self.accounts.is_empty() {
                         RightPaneMode::Welcome
                     } else {
@@ -1590,6 +1548,7 @@ impl HylkiApp {
                         sender,
                         subject,
                         account_label,
+                        self.prefs.notification_show_content,
                     );
                     tray.show_notification(&title, &body);
                 }
@@ -1619,15 +1578,17 @@ impl HylkiApp {
             }
         }
         if self.selected_message.is_none() {
-            if let Some(first) = self.current_page.items.first() {
-                // L-6：阅读器关闭时首屏自动选中同样不标已读（对齐「未展示不标读」语义）。
-                let mark_read = first.unread && self.reader_position != ReaderPosition::Hidden;
+            if let Some(first) = self.current_page.items.first().cloned() {
+                // L-6：阅读器关闭或设为仅手动标已读时，首屏自动选中不立即标已读。
+                let mark_now = first.unread
+                    && self.reader_position != ReaderPosition::Hidden
+                    && self.prefs.read_mark_mode == "shown";
                 self.request_message_detail(
                     first.account_id,
                     first.id,
                     first.uid,
-                    mark_read,
-                    &first.folder_path.clone(),
+                    mark_now,
+                    &first.folder_path,
                 );
             }
         }
@@ -1923,6 +1884,9 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) {
         self.right_mode = RightPaneMode::Reader;
+        self.read_mark_generation = self.read_mark_generation.wrapping_add(1);
+        let gen = self.read_mark_generation;
+
         // L-6：阅读器关闭时点击邮件仅选中不展示（对齐原版 select_without_reader 语义），
         // 状态栏提示如何重新打开；正文仍拉取以支撑回复 / 复制等动作，但不自动标已读。
         let reader_hidden = self.reader_position == ReaderPosition::Hidden;
@@ -1930,39 +1894,81 @@ impl HylkiApp {
             self.status_line =
                 SharedString::from("阅读器已关闭：邮件已选中，按 Ctrl+Alt+1 重新打开");
         }
+
+        let mark_mode = self.prefs.read_mark_mode.as_str();
+        let should_mark_now = unread && !reader_hidden && mark_mode == "shown";
+        let should_mark_delay = unread && !reader_hidden && mark_mode == "delay";
+
         if self.demo_mode {
             if let Some(detail) = self.demo_message_detail(message_id) {
                 self.set_selected_message(detail);
             } else {
                 self.selected_message = None;
             }
+            if should_mark_now {
+                self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+            } else if should_mark_delay {
+                self.schedule_delayed_read_mark(
+                    gen,
+                    account_id,
+                    message_id,
+                    uid,
+                    folder_path.to_string(),
+                    cx,
+                );
+            }
             cx.notify();
             return;
         }
-        self.request_message_detail(
-            account_id,
-            message_id,
-            uid,
-            unread && !reader_hidden,
-            folder_path,
-        );
+        self.request_message_detail(account_id, message_id, uid, should_mark_now, folder_path);
+        if should_mark_delay {
+            self.schedule_delayed_read_mark(
+                gen,
+                account_id,
+                message_id,
+                uid,
+                folder_path.to_string(),
+                cx,
+            );
+        }
         cx.notify();
     }
 
-    fn request_message_detail(
+    fn schedule_delayed_read_mark(
+        &self,
+        generation: u64,
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        folder_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.read_mark_generation == generation
+                    && app
+                        .selected_message
+                        .as_ref()
+                        .is_some_and(|m| m.id == message_id)
+                {
+                    app.mark_message_seen_now(account_id, message_id, uid, &folder_path);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn mark_message_seen_now(
         &mut self,
         account_id: u32,
         message_id: u32,
         uid: u32,
-        unread: bool,
         folder_path: &str,
     ) {
-        if let Some(ref w) = self.worker {
-            w.send(MailRequest::LoadMessageBody {
-                account_id,
-                message_id,
-            });
-            if unread {
+        if !self.demo_mode {
+            if let Some(ref w) = self.worker {
                 w.send(MailRequest::SetSeen {
                     account_id,
                     folder_path: folder_path.to_string(),
@@ -1970,14 +1976,33 @@ impl HylkiApp {
                     uid,
                     seen: true,
                 });
-                if let Some(item) = self
-                    .current_page
-                    .items
-                    .iter_mut()
-                    .find(|m| m.id == message_id)
-                {
-                    item.unread = false;
-                }
+            }
+        }
+        if let Some(item) = self
+            .current_page
+            .items
+            .iter_mut()
+            .find(|m| m.id == message_id)
+        {
+            item.unread = false;
+        }
+    }
+
+    fn request_message_detail(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        mark_seen: bool,
+        folder_path: &str,
+    ) {
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::LoadMessageBody {
+                account_id,
+                message_id,
+            });
+            if mark_seen {
+                self.mark_message_seen_now(account_id, message_id, uid, folder_path);
             }
         }
     }
@@ -2080,10 +2105,19 @@ impl HylkiApp {
             self.raw_source_message_ids.clear();
             // F-7：切换会话时清除未确认的退订横幅。
             self.pending_unsubscribe = None;
+            if self.focus_mode && self.prefs.focus_reader_view {
+                self.reader_prefer_plain = true;
+            } else {
+                match self.prefs.reader_default_mode.as_str() {
+                    "on" => self.reader_prefer_plain = true,
+                    "off" => self.reader_prefer_plain = false,
+                    _ => {}
+                }
+            }
             self.collapsed_thread_cards = compute_default_collapsed_cards(
                 &detail,
                 self.prefs.thread_newest_first,
-                self.prefs.fold_older_messages,
+                self.prefs.effective_fold_messages_mode(),
             );
         }
         self.selected_message = Some(detail);
@@ -2890,15 +2924,33 @@ impl HylkiApp {
 
     pub(crate) fn start_new_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.main_view = MainContentView::Mail;
-        self.compose_account_id = self.accounts.first().map(|a| a.id).unwrap_or(1);
+        let preferred_id = if !self.prefs.compose_default_from.trim().is_empty() {
+            self.accounts
+                .iter()
+                .find(|a| {
+                    a.email
+                        .eq_ignore_ascii_case(self.prefs.compose_default_from.trim())
+                })
+                .map(|a| a.id)
+        } else {
+            None
+        };
+        self.compose_account_id = preferred_id
+            .or_else(|| self.accounts.first().map(|a| a.id))
+            .unwrap_or(1);
         self.compose_draft_id = None;
         self.compose_in_reply_to.clear();
         self.compose_attachments.clear();
         self.compose_confirm_discard = false;
+        self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
-        let initial_body = append_signature("", &self.account_signature(self.compose_account_id));
+        let initial_body = append_signature_with_dashes(
+            "",
+            &self.account_signature(self.compose_account_id),
+            self.prefs.signature_dashes,
+        );
         self.compose_to
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.compose_cc
@@ -3018,13 +3070,19 @@ impl HylkiApp {
             "\n\n------------------ 转发邮件 ------------------\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
             detail.sender, detail.date_display, detail.subject, detail.body_text
         );
-        let body_with_sig = append_signature(&quoted, &self.account_signature(detail.account_id));
+        let body_with_sig = insert_signature_with_quote(
+            &quoted,
+            &self.account_signature(detail.account_id),
+            self.prefs.signature_above_quote,
+            self.prefs.signature_dashes,
+        );
 
         self.compose_account_id = detail.account_id;
         self.compose_draft_id = None;
         self.compose_in_reply_to.clear();
         self.compose_attachments.clear();
         self.compose_confirm_discard = false;
+        self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = Some(detail.id);
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
@@ -3079,17 +3137,26 @@ impl HylkiApp {
         } else {
             format!("{} {}", prefix, detail.subject)
         };
-        let quoted = format!(
-            "\n\n------------------ 原始邮件 ------------------\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
-            detail.sender, detail.date_display, detail.subject, detail.body_text
+        let header = format_reply_header(
+            &self.prefs.reply_header_template,
+            &detail.sender,
+            &detail.date_display,
+            &detail.subject,
         );
-        let body_with_sig = append_signature(&quoted, &self.account_signature(detail.account_id));
+        let quoted = format!("\n\n{header}\n\n{}", detail.body_text);
+        let body_with_sig = insert_signature_with_quote(
+            &quoted,
+            &self.account_signature(detail.account_id),
+            self.prefs.signature_above_quote,
+            self.prefs.signature_dashes,
+        );
 
         self.compose_account_id = detail.account_id;
         self.compose_draft_id = None;
         self.compose_in_reply_to = detail.rfc_message_id.clone();
         self.compose_attachments.clear();
         self.compose_confirm_discard = false;
+        self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
@@ -3147,6 +3214,7 @@ impl HylkiApp {
             self.compose_autosaved_at = None;
         }
         self.compose_confirm_discard = false;
+        self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.right_mode = RightPaneMode::Reader;
@@ -3158,6 +3226,7 @@ impl HylkiApp {
         self.cancel_draft_autosave();
         self.save_local_draft(cx);
         self.compose_confirm_discard = false;
+        self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.right_mode = RightPaneMode::Reader;
@@ -3303,6 +3372,14 @@ impl HylkiApp {
     }
 
     pub(crate) fn send_compose(&mut self, cx: &mut Context<Self>) {
+        self.send_compose_inner(true, cx);
+    }
+
+    pub(crate) fn send_compose_forced(&mut self, cx: &mut Context<Self>) {
+        self.send_compose_inner(false, cx);
+    }
+
+    fn send_compose_inner(&mut self, check_attachments: bool, cx: &mut Context<Self>) {
         let to = self.compose_to.read(cx).value().to_string();
         let cc = self.compose_cc.read(cx).value().to_string();
         let bcc = self.compose_bcc.read(cx).value().to_string();
@@ -3319,12 +3396,25 @@ impl HylkiApp {
             cx.notify();
             return;
         }
+        if check_attachments && self.compose_attachments.is_empty() {
+            if let Some(keyword) = detect_attachment_reminder(
+                &subject,
+                &body,
+                &self.prefs.attachment_reminder_keywords,
+            ) {
+                self.compose_attachment_reminder = Some(keyword);
+                cx.notify();
+                return;
+            }
+        }
+        self.compose_attachment_reminder = None;
 
         // 若已有正在倒计时的待发邮件，先立即投递，避免覆盖丢信。
         if let Some(prev) = self.pending_send.as_ref().map(|p| p.token) {
             self.commit_pending_send(prev, cx);
         }
 
+        let delay_secs = self.prefs.undo_send_secs.min(15) as u8;
         let token = self.next_send_token;
         self.next_send_token = self.next_send_token.wrapping_add(1).max(1);
         let pending = PendingSend {
@@ -3340,7 +3430,7 @@ impl HylkiApp {
                 attachment_paths: self.compose_attachments.clone(),
             },
             local_draft_id: self.compose_draft_id,
-            remaining_secs: 5,
+            remaining_secs: delay_secs,
         };
         self.pending_send = Some(pending);
         self.compose_confirm_discard = false;
@@ -3353,10 +3443,18 @@ impl HylkiApp {
         self.pending_unsubscribe = None;
         self.right_mode = RightPaneMode::Reader;
         self.error_banner = None;
-        self.status_line = SharedString::from("邮件将在 5 秒后发出，可随时点击「撤销发送」");
+
+        if delay_secs == 0 {
+            self.commit_pending_send(token, cx);
+            return;
+        }
+
+        self.status_line = SharedString::from(format!(
+            "邮件将在 {delay_secs} 秒后发出，可随时点击「撤销发送」"
+        ));
 
         cx.spawn(async move |this, cx| {
-            for _ in 0..5 {
+            for _ in 0..delay_secs {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let keep_going = this
                     .update(cx, |app, cx| {
@@ -3454,53 +3552,26 @@ impl HylkiApp {
         cx.notify();
     }
 
-    pub(crate) fn load_account_into_form(
+    /// 在独立设置窗口编辑或新建指定账号。
+    pub(crate) fn open_settings_edit_account(
         &mut self,
-        cfg: Option<&AccountConfig>,
-        window: &mut Window,
+        cfg: Option<AccountConfig>,
         cx: &mut Context<Self>,
     ) {
-        let c = cfg.cloned().unwrap_or_default();
-        self.editing_account_id = cfg.map(|a| a.id);
-        self.cfg_display_name
-            .update(cx, |s, cx| s.set_value(c.display_name, window, cx));
-        self.cfg_email
-            .update(cx, |s, cx| s.set_value(c.email, window, cx));
-        self.cfg_imap_host
-            .update(cx, |s, cx| s.set_value(c.imap_host, window, cx));
-        self.cfg_imap_port
-            .update(cx, |s, cx| s.set_value(c.imap_port.to_string(), window, cx));
-        self.cfg_imap_tls = c.imap_security == SecurityMode::Tls;
-        self.cfg_imap_user
-            .update(cx, |s, cx| s.set_value(c.imap_username, window, cx));
-        self.cfg_imap_pass
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        self.cfg_smtp_host
-            .update(cx, |s, cx| s.set_value(c.smtp_host, window, cx));
-        self.cfg_smtp_port
-            .update(cx, |s, cx| s.set_value(c.smtp_port.to_string(), window, cx));
-        self.cfg_smtp_tls = c.smtp_security == SecurityMode::Tls;
-        self.cfg_smtp_separate = c.smtp_separate_credentials;
-        self.cfg_smtp_user
-            .update(cx, |s, cx| s.set_value(c.smtp_username, window, cx));
-        self.cfg_smtp_pass
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        self.cfg_signature
-            .update(cx, |s, cx| s.set_value(c.signature, window, cx));
+        self.pending_delete_account_id = None;
         self.cfg_feedback = None;
-        self.cfg_auth_guide = None;
-        self.open_settings_on_tab(PrefTab::MailAccounts, cx);
+        self.open_settings_window(SettingsOpenTarget::EditAccount(cfg), cx);
     }
 
-    /// 欢迎页服务商预设入口：载入空白表单并自动带入主机 / 端口 / 加密与指引。
-    pub(crate) fn start_preset_account(
+    /// 欢迎页 / 账号页服务商预设入口：在设置窗口「邮箱账号」载入空白表单并套用主机 / 端口 / 加密与指引。
+    pub(crate) fn open_settings_preset_account(
         &mut self,
-        preset: &ProviderPreset,
-        window: &mut Window,
+        preset: ProviderPreset,
         cx: &mut Context<Self>,
     ) {
-        self.load_account_into_form(None, window, cx);
-        self.apply_preset(preset, window, cx);
+        self.pending_delete_account_id = None;
+        self.cfg_feedback = None;
+        self.open_settings_window(SettingsOpenTarget::PresetAccount(preset), cx);
     }
 
     /// 运行时进入演示模式（欢迎页入口 3）：复用 `--demo` 启动路径的初始化。
@@ -3536,7 +3607,6 @@ impl HylkiApp {
         self.current_view = CurrentView::UnifiedInbox;
         self.reset_list_pagination();
         self.compose_account_id = 1;
-        self.editing_account_id = Some(1);
         self.pending_delete_account_id = None;
         self.right_mode = RightPaneMode::Reader;
         self.main_view = MainContentView::Mail;
@@ -3545,7 +3615,7 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 打开统一设置窗口并定位到「邮件账号」页（菜单 / 欢迎页 / 命令面板入口），保留当前表单选择。
+    /// 打开统一设置窗口并定位到「邮箱账号」页（菜单 / 欢迎页 / 命令面板入口），保留当前表单选择。
     pub(crate) fn open_account_manager(&mut self, cx: &mut Context<Self>) {
         self.pending_delete_account_id = None;
         self.open_settings_on_tab(PrefTab::MailAccounts, cx);
@@ -3576,91 +3646,15 @@ impl HylkiApp {
         cx.notify();
     }
 
-    pub(crate) fn apply_preset(
+    pub(crate) fn start_outlook_oauth(
         &mut self,
-        preset: &ProviderPreset,
-        window: &mut Window,
+        custom_client_id: String,
+        editing_account_id: Option<u32>,
         cx: &mut Context<Self>,
     ) {
-        self.cfg_imap_host
-            .update(cx, |s, cx| s.set_value(preset.imap_host, window, cx));
-        self.cfg_imap_port
-            .update(cx, |s, cx| s.set_value(preset.imap_port, window, cx));
-        self.cfg_smtp_host
-            .update(cx, |s, cx| s.set_value(preset.smtp_host, window, cx));
-        self.cfg_smtp_port
-            .update(cx, |s, cx| s.set_value(preset.smtp_port, window, cx));
-        self.cfg_imap_tls = preset.imap_tls;
-        self.cfg_smtp_tls = preset.smtp_tls;
-        self.cfg_auth_guide = Some(SharedString::from(preset.guide));
-        cx.notify();
-    }
-
-    fn collect_account_form(&self, cx: &Context<Self>) -> (AccountConfig, String, Option<String>) {
-        let email = self.cfg_email.read(cx).value().trim().to_string();
-        let imap_user = self.cfg_imap_user.read(cx).value().trim().to_string();
-        let smtp_user = self.cfg_smtp_user.read(cx).value().trim().to_string();
-        let imap_port = self
-            .cfg_imap_port
-            .read(cx)
-            .value()
-            .trim()
-            .parse::<u16>()
-            .unwrap_or(993);
-        let smtp_port = self
-            .cfg_smtp_port
-            .read(cx)
-            .value()
-            .trim()
-            .parse::<u16>()
-            .unwrap_or(465);
-        let id = self
-            .editing_account_id
-            .unwrap_or_else(|| config::next_account_id(&self.accounts));
-
-        let config = AccountConfig {
-            id,
-            auth_backend: AuthBackend::Password,
-            oauth_client_id: String::new(),
-            display_name: self.cfg_display_name.read(cx).value().trim().to_string(),
-            email: email.clone(),
-            imap_host: self.cfg_imap_host.read(cx).value().trim().to_string(),
-            imap_port,
-            imap_security: if self.cfg_imap_tls {
-                SecurityMode::Tls
-            } else {
-                SecurityMode::StartTls
-            },
-            imap_username: if imap_user.is_empty() {
-                email
-            } else {
-                imap_user
-            },
-            smtp_host: self.cfg_smtp_host.read(cx).value().trim().to_string(),
-            smtp_port,
-            smtp_security: if self.cfg_smtp_tls {
-                SecurityMode::Tls
-            } else {
-                SecurityMode::StartTls
-            },
-            smtp_username: smtp_user,
-            smtp_separate_credentials: self.cfg_smtp_separate,
-            signature: self.cfg_signature.read(cx).value().to_string(),
-        };
-        let imap_pwd = self.cfg_imap_pass.read(cx).value().to_string();
-        let smtp_pwd = if self.cfg_smtp_separate {
-            Some(self.cfg_smtp_pass.read(cx).value().to_string())
-        } else {
-            None
-        };
-        (config, imap_pwd, smtp_pwd)
-    }
-
-    pub(crate) fn start_outlook_oauth(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
             return;
         }
-        let custom_client_id = self.cfg_oauth_client_id.read(cx).value().trim().to_string();
         self.cfg_feedback = Some((
             true,
             SharedString::from("正在打开系统浏览器，请在微软页面完成 Outlook 授权..."),
@@ -3668,14 +3662,19 @@ impl HylkiApp {
         if let Some(ref w) = self.worker {
             w.send(MailRequest::StartMicrosoftOAuth {
                 custom_client_id,
-                editing_account_id: self.editing_account_id,
+                editing_account_id,
             });
         }
         cx.notify();
     }
 
-    pub(crate) fn verify_account_form(&mut self, cx: &mut Context<Self>) {
-        let (config, imap_password, smtp_password) = self.collect_account_form(cx);
+    pub(crate) fn verify_account_config(
+        &mut self,
+        config: AccountConfig,
+        imap_password: String,
+        smtp_password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.cfg_feedback = Some((true, SharedString::from("正在验证 IMAP / SMTP 连接...")));
         if let Some(ref w) = self.worker {
             w.send(MailRequest::VerifyAccount {
@@ -3687,8 +3686,13 @@ impl HylkiApp {
         cx.notify();
     }
 
-    pub(crate) fn save_account_form(&mut self, cx: &mut Context<Self>) {
-        let (config, imap_password, smtp_password) = self.collect_account_form(cx);
+    pub(crate) fn save_account_config(
+        &mut self,
+        config: AccountConfig,
+        imap_password: String,
+        smtp_password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.cfg_feedback = Some((true, SharedString::from("正在保存凭据并启动同步...")));
         if let Some(ref w) = self.worker {
             w.send(MailRequest::SaveAndSyncAccount {
@@ -3827,6 +3831,10 @@ impl HylkiApp {
 
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_hidden = !self.sidebar_hidden;
+        if self.prefs.remember_sidebar_collapsed {
+            self.prefs.sidebar_collapsed = self.sidebar_hidden;
+            let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
+        }
         cx.notify();
     }
 
@@ -3947,14 +3955,21 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 切换专注模式（会话级）：隐藏左栏与列表只留阅读器，再按一次恢复原布局。
+    /// 切换专注模式（会话级）：按专注模式偏好控制侧栏、列表、简化阅读视图及工具栏。
     pub(crate) fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
         self.focus_mode = !self.focus_mode;
-        self.status_line = SharedString::from(if self.focus_mode {
-            "专注模式已开启：左栏与列表已隐藏（Ctrl+Shift+F 恢复）"
+        if self.focus_mode {
+            if self.prefs.focus_reader_view {
+                self.focus_saved_prefer_plain = Some(self.reader_prefer_plain);
+                self.reader_prefer_plain = true;
+            }
+            self.status_line = SharedString::from("专注模式已开启（Ctrl+Shift+F 恢复）");
         } else {
-            "专注模式已关闭"
-        });
+            if let Some(prev) = self.focus_saved_prefer_plain.take() {
+                self.reader_prefer_plain = prev;
+            }
+            self.status_line = SharedString::from("专注模式已关闭");
+        }
         cx.notify();
     }
 
@@ -4071,13 +4086,8 @@ impl HylkiApp {
     /// `app.show-accounts`——隐藏或恢复侧栏的账号区段（统一导航保持不动，
     /// 不是隐藏整个侧栏，故不复用 toggle_sidebar）。
     pub(crate) fn toggle_accounts_list(&mut self, cx: &mut Context<Self>) {
-        self.show_accounts = !self.show_accounts;
-        self.status_line = SharedString::from(if self.show_accounts {
-            "已显示账号列表"
-        } else {
-            "已隐藏账号列表"
-        });
-        cx.notify();
+        let next = !self.show_accounts;
+        self.set_show_accounts(next, cx);
     }
 
     /// F11 全屏切换（对齐原版 `win.fullscreen`）。
@@ -4668,94 +4678,144 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 打开统一设置窗口（侧栏菜单 / 命令面板 / Ctrl+,，默认进入「常规」页）。
+    /// 打开统一设置窗口（侧栏菜单 / 命令面板 / Ctrl+,）。
     pub(crate) fn open_preferences(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.open_settings_on_tab(PrefTab::General, cx);
+        let tab = if self.prefs.settings_open_accounts {
+            PrefTab::MailAccounts
+        } else {
+            PrefTab::General
+        };
+        self.open_settings_on_tab(tab, cx);
     }
 
-    /// 打开统一设置窗口并切换到指定分类页。
+    /// 打开独立设置窗口并切换到指定分类页。
     pub(crate) fn open_settings_on_tab(&mut self, tab: PrefTab, cx: &mut Context<Self>) {
-        self.active_modal = ActiveModal::Preferences;
-        if self.preferences.is_none() {
-            let entity = cx.new(|_| PreferencesState::new(self.prefs.clone()));
-            let sub = cx.subscribe(
-                &entity,
-                |this, _prefs, event: &PreferencesEvent, cx| match event {
-                    PreferencesEvent::Changed(prefs) => this.apply_preferences(prefs.clone(), cx),
-                    PreferencesEvent::ClearBodyCache => {
-                        if let Some(ref w) = this.worker {
-                            this.status_line = SharedString::from("正在清理正文缓存...");
-                            w.send(MailRequest::ClearBodyCaches);
-                        }
-                        cx.notify();
-                    }
-                    PreferencesEvent::SetFocusMode(enabled) => {
-                        if this.focus_mode != *enabled {
-                            this.toggle_focus_mode(cx);
-                        }
-                    }
-                    PreferencesEvent::SetShowAccounts(visible) => {
-                        if this.show_accounts != *visible {
-                            this.toggle_accounts_list(cx);
-                        }
-                    }
-                },
-            );
-            self.preferences = Some(entity);
-            self.preferences_sub = Some(sub);
+        self.open_settings_window(SettingsOpenTarget::Tab(tab), cx);
+    }
+
+    fn open_settings_window(&mut self, target: SettingsOpenTarget, cx: &mut Context<Self>) {
+        if self.settings_window_opening {
+            return;
         }
-        // 打开时刷新草稿 / 发件箱统计、会话级布局开关与目标分类。
-        let drafts = self.drafts.len();
-        let outbox: usize = self
-            .outbox_by_account
-            .values()
-            .map(|items| items.len())
-            .sum();
-        let show_accounts = self.show_accounts;
-        let focus_mode = self.focus_mode;
-        if let Some(ref p) = self.preferences {
-            p.update(cx, |state, cx| {
-                state.set_storage_stats(drafts, outbox);
-                state.sync_session_flags(show_accounts, focus_mode);
-                state.set_active_tab(tab, cx);
+        self.settings_window_opening = true;
+        let existing = self.settings_window.clone();
+        let initial_prefs = self.prefs.clone();
+        let fallback_account = self.accounts.first().cloned();
+        let app_entity = cx.entity();
+
+        cx.spawn(async move |this, cx| {
+            let outcome: Option<(AnyWindowHandle, Entity<SettingsWindow>)> = cx.update(|cx| {
+                if let Some((handle, entity)) = existing {
+                    let target_copy = target.clone();
+                    let ok = handle.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        let _ = entity.update(cx, |win, cx| match target_copy {
+                            SettingsOpenTarget::Tab(tab) => win.select_tab(tab, window, cx),
+                            SettingsOpenTarget::EditAccount(ref cfg) => {
+                                win.edit_account_in_form(cfg.as_ref(), window, cx);
+                            }
+                            SettingsOpenTarget::PresetAccount(ref preset) => {
+                                win.edit_account_in_form(None, window, cx);
+                                win.apply_account_preset(preset, window, cx);
+                            }
+                        });
+                    });
+                    if ok.is_ok() {
+                        return Some((handle, entity));
+                    }
+                }
+
+                let (initial_tab, edit_acc, preset) = match target {
+                    SettingsOpenTarget::Tab(tab) => (tab, fallback_account, None),
+                    SettingsOpenTarget::EditAccount(cfg) => (PrefTab::MailAccounts, cfg, None),
+                    SettingsOpenTarget::PresetAccount(p) => (PrefTab::MailAccounts, None, Some(p)),
+                };
+
+                let centered = Bounds::centered(None, size(px(920.0), px(848.0)), cx);
+                let options = WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(centered)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("偏好设置".into()),
+                        appears_transparent: true,
+                        traffic_light_position: None,
+                    }),
+                    ..Default::default()
+                };
+                match gpui_kit::open_window(options, cx, move |window, cx| {
+                    window.set_window_title("偏好设置");
+                    cx.new(|cx| {
+                        SettingsWindow::new(
+                            app_entity,
+                            initial_prefs,
+                            initial_tab,
+                            edit_acc,
+                            preset,
+                            window,
+                            cx,
+                        )
+                    })
+                }) {
+                    Ok((handle, entity)) => {
+                        #[cfg(target_os = "windows")]
+                        crate::apply_window_icon();
+                        Some((handle.into(), entity))
+                    }
+                    Err(_) => None,
+                }
             });
-        }
-        cx.notify();
-    }
 
-    /// 在统一设置窗口内切换左侧分类。
-    pub(crate) fn set_settings_tab(&mut self, tab: PrefTab, cx: &mut Context<Self>) {
-        if let Some(ref p) = self.preferences {
-            p.update(cx, |state, cx| {
-                state.set_active_tab(tab, cx);
+            let _ = this.update(cx, |app, cx| {
+                app.settings_window_opening = false;
+                app.settings_window = outcome;
+                cx.notify();
             });
-        }
-        cx.notify();
+        })
+        .detach();
     }
 
-    fn is_settings_mail_accounts_active(&self, cx: &Context<Self>) -> bool {
-        self.preferences
-            .as_ref()
-            .is_some_and(|p| p.read(cx).active_tab() == PrefTab::MailAccounts)
+    pub(crate) fn clear_settings_window_ref(&mut self) {
+        self.settings_window = None;
+        self.settings_window_opening = false;
     }
 
-    /// 应用偏好变更（`PreferencesEvent::Changed`）：落盘 + 主题 / 列表 / 定时器即时生效。
-    fn apply_preferences(&mut self, prefs: AppPreferences, cx: &mut Context<Self>) {
-        let page_size_changed = prefs.page_size != self.prefs.page_size;
-        let sync_changed = prefs.auto_sync_minutes != self.prefs.auto_sync_minutes;
-        let theme_changed =
-            prefs.theme_id != self.prefs.theme_id || prefs.dark_mode != self.prefs.dark_mode;
-        let thread_order_changed = prefs.thread_newest_first != self.prefs.thread_newest_first;
-        let fold_changed = prefs.fold_older_messages != self.prefs.fold_older_messages;
-        let reader_pos_changed = prefs.reader_position != self.prefs.reader_position;
+    /// 应用偏好变更并统一触发对应副作用与原子落盘。
+    pub(crate) fn mutate_preferences(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut AppPreferences),
+    ) {
+        let prev = self.prefs.clone();
+        f(&mut self.prefs);
+        self.apply_preferences_snapshot(&prev, cx);
+    }
 
-        self.prefs = prefs;
+    fn apply_preferences_snapshot(&mut self, prev: &AppPreferences, cx: &mut Context<Self>) {
+        self.prefs.ui_text_scale_percent =
+            config::clamp_ui_text_scale(self.prefs.ui_text_scale_percent);
+        self.prefs.reader_zoom_percent = config::clamp_reader_zoom(self.prefs.reader_zoom_percent);
+
         if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
             self.error_banner = Some(SharedString::from(e));
         }
+
+        let page_size_changed = self.prefs.page_size != prev.page_size;
+        let sync_changed = self.prefs.auto_sync_minutes != prev.auto_sync_minutes;
+        let theme_changed =
+            self.prefs.theme_id != prev.theme_id || self.prefs.dark_mode != prev.dark_mode;
+        let thread_order_changed = self.prefs.thread_newest_first != prev.thread_newest_first;
+        let fold_changed =
+            self.prefs.effective_fold_messages_mode() != prev.effective_fold_messages_mode();
+        let reader_pos_changed = self.prefs.reader_position != prev.reader_position;
+        let show_accounts_changed = self.prefs.show_accounts != prev.show_accounts;
+        let default_reader_mode_changed =
+            self.prefs.reader_default_mode != prev.reader_default_mode;
+
         if reader_pos_changed {
-            self.reader_position =
-                ReaderPosition::from_key(&self.prefs.reader_position).unwrap_or(ReaderPosition::Right);
+            self.reader_position = ReaderPosition::from_key(&self.prefs.reader_position)
+                .unwrap_or(ReaderPosition::Right);
+        }
+        if show_accounts_changed {
+            self.show_accounts = self.prefs.show_accounts;
         }
         if theme_changed {
             self.theme_id = theme::static_theme_id(&self.prefs.theme_id);
@@ -4763,7 +4823,6 @@ impl HylkiApp {
             theme::apply(self.theme_id, self.dark_mode, cx);
         }
         if sync_changed {
-            // 间隔变更：重置后台刷新定时（auto_sync_deadline 由下一次 tick 重算）。
             self.auto_sync_deadline = None;
         }
         if page_size_changed {
@@ -4778,23 +4837,85 @@ impl HylkiApp {
             }
         }
         if fold_changed || thread_order_changed {
+            let fold_mode = self.prefs.effective_fold_messages_mode().to_string();
             if let Some(ref detail) = self.selected_message {
                 self.collapsed_thread_cards = compute_default_collapsed_cards(
                     detail,
                     self.prefs.thread_newest_first,
-                    self.prefs.fold_older_messages,
+                    &fold_mode,
                 );
             }
         }
-        self.status_line = SharedString::from("偏好设置已保存");
+        if default_reader_mode_changed && !(self.focus_mode && self.prefs.focus_reader_view) {
+            match self.prefs.reader_default_mode.as_str() {
+                "on" => self.reader_prefer_plain = true,
+                "off" => self.reader_prefer_plain = false,
+                _ => {}
+            }
+        }
         cx.notify();
     }
 
-    /// 关闭当前浮层并卸载对应实体（偏好设置 / 命令面板）。
+    pub(crate) fn set_push_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.mutate_preferences(cx, |p| p.push_enabled = enabled);
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::SetPushEnabled { enabled });
+        }
+        self.status_line = SharedString::from(if enabled {
+            "已启用实时邮件推送"
+        } else {
+            "已关闭实时邮件推送"
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn set_show_accounts(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.show_accounts = visible;
+        self.mutate_preferences(cx, |p| p.show_accounts = visible);
+        self.status_line = SharedString::from(if visible {
+            "已显示账号列表"
+        } else {
+            "已隐藏账号列表"
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn clear_body_caches(&mut self, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            self.status_line = SharedString::from("正在清理正文缓存...");
+            w.send(MailRequest::ClearBodyCaches);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn apply_imported_backup(
+        &mut self,
+        bundle: SettingsBackupBundle,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        let count = config::import_settings_bundle_in(&config::data_dir(), &bundle)?;
+        let prev = self.prefs.clone();
+        self.prefs = bundle.preferences;
+        if !self.demo_mode {
+            self.accounts = bundle.accounts;
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::SetPushEnabled {
+                    enabled: self.prefs.push_enabled,
+                });
+                w.send(MailRequest::LoadAllCached);
+            }
+        }
+        self.apply_preferences_snapshot(&prev, cx);
+        self.status_line = SharedString::from(format!("已导入配置备份（{count} 个账号配置）"));
+        Ok(count)
+    }
+
+    /// 关闭当前浮层并卸载对应实体（命令面板 / 快捷键 / 关于）。
     pub(crate) fn close_modal(&mut self, cx: &mut Context<Self>) {
         self.active_modal = ActiveModal::None;
-        self.preferences = None;
-        self.preferences_sub = None;
         self.palette = None;
         self.palette_sub = None;
         cx.notify();
@@ -5093,18 +5214,6 @@ impl HylkiApp {
             || self.compose_bcc.focus_handle(cx).is_focused(window)
             || self.compose_subject.focus_handle(cx).is_focused(window)
             || self.compose_body.focus_handle(cx).is_focused(window)
-            || self.cfg_display_name.focus_handle(cx).is_focused(window)
-            || self.cfg_email.focus_handle(cx).is_focused(window)
-            || self.cfg_imap_host.focus_handle(cx).is_focused(window)
-            || self.cfg_imap_port.focus_handle(cx).is_focused(window)
-            || self.cfg_imap_user.focus_handle(cx).is_focused(window)
-            || self.cfg_imap_pass.focus_handle(cx).is_focused(window)
-            || self.cfg_smtp_host.focus_handle(cx).is_focused(window)
-            || self.cfg_smtp_port.focus_handle(cx).is_focused(window)
-            || self.cfg_smtp_user.focus_handle(cx).is_focused(window)
-            || self.cfg_smtp_pass.focus_handle(cx).is_focused(window)
-            || self.cfg_oauth_client_id.focus_handle(cx).is_focused(window)
-            || self.cfg_signature.focus_handle(cx).is_focused(window)
     }
 
     /// 键盘方向键切换中栏下一封 (`delta = 1`) / 上一封 (`delta = -1`) 邮件。
@@ -5183,9 +5292,20 @@ impl HylkiApp {
         let list_el = message_list::render(self, window, cx);
 
         if self.focus_mode {
+            let show_list = !self.prefs.focus_hide_list;
             return h_flex()
                 .flex_1()
                 .min_h_0()
+                .children(sidebar_el)
+                .when(show_list, |el| {
+                    el.child(
+                        div()
+                            .w(px(self.list_width))
+                            .h_full()
+                            .flex_shrink_0()
+                            .child(list_el),
+                    )
+                })
                 .child(self.render_right_pane(window, cx))
                 .into_any_element();
         }
@@ -5371,14 +5491,71 @@ impl HylkiApp {
             RightPaneMode::Reader => reader::render(self, window, cx),
         }
     }
+    fn render_status_bar(
+        &self,
+        top: bool,
+        p: &theme::HylkiPalette,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let border = p.border;
+        let muted_fg = p.text_muted;
+        h_flex()
+            .h(px(24.0))
+            .flex_shrink_0()
+            .px_3()
+            .items_center()
+            .when(top, |el| el.border_b_1())
+            .when(!top, |el| el.border_t_1())
+            .border_color(border)
+            .bg(p.sidebar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .truncate()
+                    .child(self.status_line.clone()),
+            )
+            .when_some(self.last_move_undo.clone(), |el, record| {
+                el.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(p.text)
+                                .child(record.action_label.clone()),
+                        )
+                        .child(
+                            Button::new("undo-last-move")
+                                .ghost()
+                                .compact()
+                                .text_size(px(11.0))
+                                .label("撤销")
+                                .tooltip("撤销最近一次移动 / 删除 / 归档（Ctrl+Z）")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.undo_last_move(cx);
+                                })),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
 }
 
 impl Render for HylkiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.last_rem_scale != self.prefs.ui_text_scale_percent {
+            let scale = config::clamp_ui_text_scale(self.prefs.ui_text_scale_percent);
+            window.set_rem_size(px(16.0 * scale as f32 / 100.0));
+            self.last_rem_scale = scale;
+        }
         // 避坑清单第 4 条：先把语义色 Copy 成局部变量再构建 UI。
         let p = theme::current(cx);
         let border = p.border;
-        let muted_fg = p.text_muted;
         // F-3：撤销条过期（15 秒）时顺手清理（定时器负责主动通知）。
         if self
             .last_move_undo
@@ -5388,8 +5565,8 @@ impl Render for HylkiApp {
             self.last_move_undo = None;
         }
 
-        let sidebar_el = if self.focus_mode {
-            // L-6 专注模式：左栏整体隐藏（用户自己的窄轨选择在退出专注后原样恢复）。
+        let hide_sidebar = self.focus_mode && self.prefs.focus_hide_sidebar;
+        let sidebar_el = if hide_sidebar {
             None
         } else if self.sidebar_hidden {
             // 折叠为 80px 图标窄轨（对齐原版 rail），不再整体移除左栏。
@@ -5464,11 +5641,15 @@ impl Render for HylkiApp {
             }
         };
 
+        let status_top = self.prefs.status_bar_top;
         let mut root = v_flex()
             .relative()
             .size_full()
             .bg(p.canvas)
             .text_color(p.text)
+            .when(status_top && !self.status_line.is_empty(), |el| {
+                el.child(self.render_status_bar(true, &p, cx))
+            })
             .when_some(self.error_banner.as_ref(), |el, err| {
                 el.child(
                     h_flex()
@@ -5602,52 +5783,8 @@ impl Render for HylkiApp {
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<BelowDrag>, _, cx| {
                 this.on_below_drag_move(event, cx);
             }))
-            .when(!self.status_line.is_empty(), |el| {
-                el.child(
-                    h_flex()
-                        .h(px(24.0))
-                        .flex_shrink_0()
-                        .px_3()
-                        .items_center()
-                        .border_t_1()
-                        .border_color(border)
-                        .bg(p.sidebar)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .truncate()
-                                .child(self.status_line.clone()),
-                        )
-                        // F-3：右侧轻量撤销条「已删除 / 已归档 / 已移动 — 撤销」。
-                        .when_some(self.last_move_undo.clone(), |el, record| {
-                            el.child(
-                                h_flex()
-                                    .flex_shrink_0()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(p.text)
-                                            .child(record.action_label.clone()),
-                                    )
-                                    .child(
-                                        Button::new("undo-last-move")
-                                            .ghost()
-                                            .compact()
-                                            .text_size(px(11.0))
-                                            .label("撤销")
-                                            .tooltip("撤销最近一次移动 / 删除 / 归档（Ctrl+Z）")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.undo_last_move(cx);
-                                            })),
-                                    ),
-                            )
-                        }),
-                )
+            .when(!status_top && !self.status_line.is_empty(), |el| {
+                el.child(self.render_status_bar(false, &p, cx))
             })
             // 全局快捷键动作（键绑定注册在 main.rs，方案文档五.3）。
             .on_action(cx.listener(|this, _: &NewCompose, window, cx| {
@@ -6033,46 +6170,8 @@ impl Render for HylkiApp {
                 }
             }));
 
-        // 全局浮层（方案文档五.1）：偏好设置为遮罩 + 居中卡片；
-        // 命令面板组件自带遮罩 + 居中卡片，直接挂载即可。
+        // 全局浮层：快捷键速查 / 关于 / 命令面板。
         match self.active_modal {
-            ActiveModal::Preferences => {
-                let settings_el = preferences::render_settings_modal(self, cx);
-                root = root.child(
-                    div()
-                        .absolute()
-                        .top(px(0.0))
-                        .left(px(0.0))
-                        .size_full()
-                        .bg(black().opacity(0.4))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.close_modal(cx);
-                            }),
-                        )
-                        .child(
-                            h_flex().size_full().items_center().justify_center().child(
-                                v_flex()
-                                    .w(px(900.0))
-                                    .h(px(660.0))
-                                    .bg(p.surface)
-                                    .rounded(px(12.0))
-                                    .border_1()
-                                    .border_color(border)
-                                    .shadow_xl()
-                                    .overflow_hidden()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| {
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .child(settings_el),
-                            ),
-                        ),
-                );
-            }
             ActiveModal::CommandPalette => {
                 if let Some(entity) = self.palette.clone() {
                     root = root.child(entity);
@@ -6478,13 +6577,15 @@ pub(crate) fn capture_window_geometry(prefs: &mut AppPreferences, bounds: Window
 }
 
 /// 计算多封会话打开时默认折叠的卡片 ID 集合：
-/// 当会话有 >=2 封邮件且 `fold_older_messages == true` 时，默认展开最新一封与当前选中封，其余折叠。
+/// - `"never"`: 全部展开；
+/// - `"read"`: 折叠已读非当前、非最新的历史邮件；
+/// - `"all_but_newest"`: 折叠除最新一封与当前选中封之外的全部邮件。
 fn compute_default_collapsed_cards(
     detail: &MessageDetail,
     thread_newest_first: bool,
-    fold_older_messages: bool,
+    fold_mode: &str,
 ) -> HashSet<u32> {
-    if !fold_older_messages || detail.thread_messages.len() < 2 {
+    if fold_mode == "never" || detail.thread_messages.len() < 2 {
         return HashSet::new();
     }
     let newest_id = if thread_newest_first {
@@ -6495,8 +6596,18 @@ fn compute_default_collapsed_cards(
     detail
         .thread_messages
         .iter()
+        .filter(|m| {
+            let keep_open = m.id == detail.id || Some(m.id) == newest_id;
+            if keep_open {
+                return false;
+            }
+            if fold_mode == "read" {
+                !m.unread
+            } else {
+                true
+            }
+        })
         .map(|m| m.id)
-        .filter(|&id| id != detail.id && Some(id) != newest_id)
         .collect()
 }
 
@@ -6513,16 +6624,54 @@ pub(crate) fn split_sender(sender: &str) -> (String, String) {
     (sender.trim().to_string(), String::new())
 }
 
-/// 若账号配置了非空签名，则使用标准 `-- \n` 分隔符将其插入正文末尾。
-pub(crate) fn append_signature(body: &str, signature: &str) -> String {
+/// 若账号配置了非空签名，则按是否需要 `-- ` 分隔符格式化后插入正文末尾（新建草稿用）。
+pub(crate) fn append_signature_with_dashes(
+    body: &str,
+    signature: &str,
+    with_dashes: bool,
+) -> String {
     let sig = signature.trim_end();
     if sig.trim().is_empty() {
         return body.to_string();
     }
-    if body.is_empty() {
-        format!("\n\n-- \n{sig}")
+    let block = if with_dashes {
+        format!("-- \n{sig}")
     } else {
-        format!("{}\n\n-- \n{sig}", body.trim_end_matches('\n'))
+        sig.to_string()
+    };
+    if body.is_empty() {
+        format!("\n\n{block}")
+    } else {
+        format!("{}\n\n{block}", body.trim_end_matches('\n'))
+    }
+}
+
+/// 若账号配置了非空签名，则使用标准 `-- \n` 分隔符将其插入正文末尾。
+#[cfg(test)]
+pub(crate) fn append_signature(body: &str, signature: &str) -> String {
+    append_signature_with_dashes(body, signature, true)
+}
+
+/// 回复/转发时按设置决定将签名置于引用正文之前或邮件最末尾。
+pub(crate) fn insert_signature_with_quote(
+    quote_block: &str,
+    signature: &str,
+    above_quote: bool,
+    with_dashes: bool,
+) -> String {
+    let sig = signature.trim_end();
+    if sig.trim().is_empty() {
+        return quote_block.to_string();
+    }
+    let block = if with_dashes {
+        format!("-- \n{sig}")
+    } else {
+        sig.to_string()
+    };
+    if above_quote {
+        format!("\n\n{block}\n\n{}", quote_block.trim_start_matches('\n'))
+    } else {
+        format!("{}\n\n{block}", quote_block.trim_end_matches('\n'))
     }
 }
 
@@ -6796,13 +6945,15 @@ mod tests {
 
     #[test]
     fn compute_default_collapsed_cards_keeps_newest_and_current_expanded() {
-        let make_tm = |id: u32| hylki_mail_core::ThreadMessage {
+        let make_tm = |id: u32, unread: bool| hylki_mail_core::ThreadMessage {
             id,
             rfc_message_id: format!("<{id}@test>"),
             subject: "Test".to_string(),
             sender: "a@test".to_string(),
             recipients: "b@test".to_string(),
             date_display: "10:00".to_string(),
+            date_ts: 0,
+            unread,
             body_text: "body".to_string(),
             body_html: None,
             body_loaded: true,
@@ -6822,22 +6973,36 @@ mod tests {
             recipients: "b@test".to_string(),
             subject: "Test".to_string(),
             date_display: "10:00".to_string(),
+            date_ts: 0,
             body_text: "body".to_string(),
             body_html: None,
             flagged: false,
             attachments: Vec::new(),
-            // 降序：3 最新，2 当前，1 最早。
-            thread_messages: vec![make_tm(3), make_tm(2), make_tm(1)],
+            // 降序：4 最新，3 未读，2 当前，1 已读最早。
+            thread_messages: vec![
+                make_tm(4, false),
+                make_tm(3, true),
+                make_tm(2, false),
+                make_tm(1, false),
+            ],
             unsubscribe_url: None,
             unsubscribe_one_click: false,
         };
 
-        let folded_desc = compute_default_collapsed_cards(&detail, true, true);
-        assert!(folded_desc.contains(&1));
-        assert!(!folded_desc.contains(&2));
-        assert!(!folded_desc.contains(&3));
+        let folded_all = compute_default_collapsed_cards(&detail, true, "all_but_newest");
+        assert!(folded_all.contains(&1));
+        assert!(folded_all.contains(&3));
+        assert!(!folded_all.contains(&2));
+        assert!(!folded_all.contains(&4));
 
-        let unfolded = compute_default_collapsed_cards(&detail, true, false);
+        // 仅折叠已读模式应保留未读邮件 #3 展开。
+        let folded_read = compute_default_collapsed_cards(&detail, true, "read");
+        assert!(folded_read.contains(&1));
+        assert!(!folded_read.contains(&3));
+        assert!(!folded_read.contains(&2));
+        assert!(!folded_read.contains(&4));
+
+        let unfolded = compute_default_collapsed_cards(&detail, true, "never");
         assert!(unfolded.is_empty());
     }
 
@@ -6853,6 +7018,14 @@ mod tests {
             append_signature("\n\n--- 原始邮件 ---\n正文\n", "Best,\nAlice  "),
             "\n\n--- 原始邮件 ---\n正文\n\n-- \nBest,\nAlice"
         );
+        assert_eq!(
+            append_signature_with_dashes("", "Alice", false),
+            "\n\nAlice"
+        );
+        let above = insert_signature_with_quote("\n\n--- 引用 ---\n原文", "Alice", true, true);
+        assert!(above.starts_with("\n\n-- \nAlice\n\n--- 引用 ---"));
+        let below = insert_signature_with_quote("\n\n--- 引用 ---\n原文", "Alice", false, false);
+        assert!(below.ends_with("--- 引用 ---\n原文\n\nAlice"));
     }
 
     #[test]
@@ -6981,7 +7154,7 @@ mod tests {
         assert!(!ok(true, true));
         // 浮层打开 / 非阅读态 / 非邮件视图均不生效。
         assert!(!single_key_guard_allows(
-            ActiveModal::Preferences,
+            ActiveModal::Shortcuts,
             MainContentView::Mail,
             RightPaneMode::Reader,
             false,
@@ -7089,6 +7262,7 @@ mod tests {
             recipients: "demo@hylki.example".to_string(),
             subject: "周报".to_string(),
             date_display: "11-21 09:30".to_string(),
+            date_ts: 0,
             body_text: "正文第一行".to_string(),
             body_html: None,
             flagged: false,

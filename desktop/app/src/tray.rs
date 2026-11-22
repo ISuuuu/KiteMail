@@ -25,18 +25,24 @@ pub(crate) fn format_tray_tooltip(unread: u32) -> String {
     }
 }
 
-/// 构造新邮件气球通知的 `(标题, 正文)`。
+/// 构造新邮件气球通知的 `(标题, 正文)`；当 `show_content == false` 时仅展示未读数量而不泄露摘要。
 pub(crate) fn format_new_mail_notification(
     delta: u32,
     latest_sender: Option<&str>,
     latest_subject: Option<&str>,
     account_label: Option<&str>,
+    show_content: bool,
 ) -> (String, String) {
     let title = if delta <= 1 {
         "Hylki 收到新邮件".to_string()
     } else {
         format!("Hylki 收到 {delta} 封新邮件")
     };
+    if !show_content {
+        let count = delta.max(1);
+        let body = format!("您有 {count} 封新未读邮件");
+        return (title, body);
+    }
     let sender = latest_sender.map(str::trim).filter(|s| !s.is_empty());
     let subject = latest_subject.map(str::trim).filter(|s| !s.is_empty());
     let body = match (sender, subject) {
@@ -806,6 +812,7 @@ mod tests {
             Some("Alice"),
             Some("项目进度更新"),
             Some("work@example.com"),
+            true,
         );
         assert_eq!(title, "Hylki 收到新邮件");
         assert_eq!(body, "Alice\n项目进度更新");
@@ -815,14 +822,36 @@ mod tests {
             Some("Bob"),
             Some("周报"),
             Some("work@example.com"),
+            true,
         );
         assert_eq!(title, "Hylki 收到 3 封新邮件");
         assert_eq!(body, "Bob: 周报（共 3 封新未读）");
 
         let (title, body) =
-            format_new_mail_notification(2, None, None, Some("work@example.com"));
+            format_new_mail_notification(2, None, None, Some("work@example.com"), true);
         assert_eq!(title, "Hylki 收到 2 封新邮件");
         assert_eq!(body, "work@example.com 有 2 封新未读邮件");
+
+        // 关闭内容隐私展示时不得泄露发件人、主题与账号信息。
+        let (title, body) = format_new_mail_notification(
+            1,
+            Some("Alice"),
+            Some("机密合同"),
+            Some("work@example.com"),
+            false,
+        );
+        assert_eq!(title, "Hylki 收到新邮件");
+        assert_eq!(body, "您有 1 封新未读邮件");
+
+        let (title, body) = format_new_mail_notification(
+            4,
+            Some("Bob"),
+            Some("财报"),
+            Some("work@example.com"),
+            false,
+        );
+        assert_eq!(title, "Hylki 收到 4 封新邮件");
+        assert_eq!(body, "您有 4 封新未读邮件");
     }
 
     #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
