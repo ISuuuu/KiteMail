@@ -1,14 +1,10 @@
-//! 偏好设置页（方案文档第三节页面 5 + 第五节 2）：
-//! - 左分类 180px：常规 / 外观 / 阅读 / 数据与存储（可点击切换）。
-//! - 右设置卡片 max-width 600px：
-//!   - 常规：默认启动视图（unified / last）、后台自动刷新间隔（0 / 5 / 15 分钟）。
-//!   - 外观：亮色 / 暗色 / 跟随系统（dark_mode）、主题色板（theme_id，全部
-//!     [`crate::theme::THEME_LIST`]）、列表密度（compact_list）。
-//!   - 阅读：每页加载数量（page_size）、远程图片默认关闭（block_remote_images）。
-//!   - 数据与存储：数据目录路径、SQLite 缓存大小、草稿 / Outbox 数量、
-//!     「清理正文缓存」与「关闭」按钮。
+//! 统一设置页（对齐原版 Linux Settings 窗口）：
+//! - 左分类栏 200px，分「账号」与「设置」两大分组：
+//!   - 账号：邮件账号
+//!   - 设置：常规 / 外观 / 专注模式 / 侧边栏 / 邮件列表 / 会话 / 阅读 / 数据与存储
+//! - 右内容区 max-width 600px（邮件账号页复用 `accounts::render_content`）。
 //!
-//! 自包含组件：内部持有 [`AppPreferences`] 副本，任何改动都更新副本并发
+//! `PreferencesState` 内部持有 [`AppPreferences`] 副本，任何改动都更新副本并发
 //! [`PreferencesEvent::Changed`]（携带完整新值）；**不**直接修改全局主题，
 //! 由集成者负责应用与持久化。
 
@@ -27,38 +23,60 @@ use gpui_kit::{
 };
 use hylki_mail_core::config::{self, AppPreferences};
 
+use crate::app::HylkiApp;
 use crate::theme;
+use crate::ui::accounts;
 
 /// 左分类栏宽度。
-const CATEGORY_WIDTH: f32 = 180.0;
+const CATEGORY_WIDTH: f32 = 200.0;
 /// 分类行高度。
-const CATEGORY_ROW_HEIGHT: f32 = 36.0;
+const CATEGORY_ROW_HEIGHT: f32 = 34.0;
 /// 顶部栏高度。
 const HEADER_HEIGHT: f32 = 48.0;
 /// 设置卡片最大宽度。
 const CARD_MAX_WIDTH: f32 = 600.0;
 
-/// 设置分类（左栏可切换）。
+/// 设置分类（左栏可切换，对齐原版 Settings 左侧分组）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PrefTab {
+pub(crate) enum PrefTab {
+    MailAccounts,
     General,
     Appearance,
+    FocusMode,
+    Sidebar,
+    MessageList,
+    Conversations,
     Reading,
     Storage,
 }
 
 impl PrefTab {
-    const ALL: [PrefTab; 4] = [
-        PrefTab::General,
-        PrefTab::Appearance,
-        PrefTab::Reading,
-        PrefTab::Storage,
+    const GROUPS: [(&'static str, &'static [PrefTab]); 2] = [
+        ("账号", &[PrefTab::MailAccounts]),
+        (
+            "设置",
+            &[
+                PrefTab::General,
+                PrefTab::Appearance,
+                PrefTab::FocusMode,
+                PrefTab::Sidebar,
+                PrefTab::MessageList,
+                PrefTab::Conversations,
+                PrefTab::Reading,
+                PrefTab::Storage,
+            ],
+        ),
     ];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
+            PrefTab::MailAccounts => "邮件账号",
             PrefTab::General => "常规",
             PrefTab::Appearance => "外观",
+            PrefTab::FocusMode => "专注模式",
+            PrefTab::Sidebar => "侧边栏",
+            PrefTab::MessageList => "邮件列表",
+            PrefTab::Conversations => "会话",
             PrefTab::Reading => "阅读",
             PrefTab::Storage => "数据与存储",
         }
@@ -66,8 +84,13 @@ impl PrefTab {
 
     fn icon(self) -> IconName {
         match self {
+            PrefTab::MailAccounts => IconName::CircleUser,
             PrefTab::General => IconName::Settings,
             PrefTab::Appearance => IconName::Palette,
+            PrefTab::FocusMode => IconName::Eye,
+            PrefTab::Sidebar => IconName::PanelLeft,
+            PrefTab::MessageList => IconName::List,
+            PrefTab::Conversations => IconName::MailOpen,
             PrefTab::Reading => IconName::BookOpen,
             PrefTab::Storage => IconName::HardDrive,
         }
@@ -77,12 +100,14 @@ impl PrefTab {
 /// 偏好设置事件。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreferencesEvent {
-    /// 任一设置改动（携带完整新值，集成者负责应用与持久化）。
+    /// 任一持久化设置改动（携带完整新值，集成者负责应用与持久化）。
     Changed(AppPreferences),
-    /// 用户点击「关闭」。
-    Closed,
     /// 用户点击「清理正文缓存」（保留账号与配置）。
     ClearBodyCache,
+    /// 会话级开关：专注模式。
+    SetFocusMode(bool),
+    /// 会话级开关：侧栏显示账号列表。
+    SetShowAccounts(bool),
 }
 
 /// 偏好设置视图状态（独立 Entity，由 HylkiApp 挂载）。
@@ -95,6 +120,10 @@ pub struct PreferencesState {
     drafts: usize,
     /// 发件箱待处理数量（同上）。
     outbox: usize,
+    /// 会话级：侧栏是否显示账号列表。
+    show_accounts: bool,
+    /// 会话级：专注模式是否开启。
+    focus_mode: bool,
     /// 数据目录（构造时确定）。
     data_dir: PathBuf,
 }
@@ -102,18 +131,33 @@ pub struct PreferencesState {
 impl EventEmitter<PreferencesEvent> for PreferencesState {}
 
 impl PreferencesState {
-    pub fn new(
-        _window: &mut gpui_kit::Window,
-        _cx: &mut Context<Self>,
-        prefs: AppPreferences,
-    ) -> Self {
+    pub fn new(prefs: AppPreferences) -> Self {
         Self {
             prefs,
             active_tab: PrefTab::General,
             drafts: 0,
             outbox: 0,
+            show_accounts: true,
+            focus_mode: false,
             data_dir: config::data_dir(),
         }
+    }
+
+    pub(crate) fn active_tab(&self) -> PrefTab {
+        self.active_tab
+    }
+
+    pub(crate) fn set_active_tab(&mut self, tab: PrefTab, cx: &mut Context<Self>) {
+        if self.active_tab != tab {
+            self.active_tab = tab;
+            cx.notify();
+        }
+    }
+
+    /// 同步会话级布局状态（打开设置时从 HylkiApp 注入）。
+    pub fn sync_session_flags(&mut self, show_accounts: bool, focus_mode: bool) {
+        self.show_accounts = show_accounts;
+        self.focus_mode = focus_mode;
     }
 
     /// 填充草稿 / 发件箱数量统计（数据与存储页展示）。
@@ -189,6 +233,13 @@ impl PreferencesState {
         let clamped = config::clamp_reader_zoom(zoom);
         if self.prefs.reader_zoom_percent != clamped {
             self.prefs.reader_zoom_percent = clamped;
+            self.emit_changed(cx);
+        }
+    }
+
+    fn set_reader_position(&mut self, position: &'static str, cx: &mut Context<Self>) {
+        if self.prefs.reader_position != position {
+            self.prefs.reader_position = position.to_string();
             self.emit_changed(cx);
         }
     }
@@ -320,82 +371,14 @@ impl Render for PreferencesState {
     ) -> impl IntoElement {
         // 避坑清单第 4 条：render 开头先把语义色 Copy 成局部变量。
         let p = theme::current(cx);
-        let (canvas, sidebar_bg, border, text, muted_fg, accent) = (
-            p.canvas,
-            p.sidebar,
-            p.border,
-            p.text,
-            p.text_muted,
-            p.accent,
-        );
+        let (border, text, muted_fg, accent) = (p.border, p.text, p.text_muted, p.accent);
 
         let active_tab = self.active_tab;
         let prefs = self.prefs.clone();
 
-        // 左分类栏。
-        let categories = v_flex()
-            .w(px(CATEGORY_WIDTH))
-            .h_full()
-            .flex_shrink_0()
-            .bg(sidebar_bg)
-            .border_r_1()
-            .border_color(border)
-            .child(
-                h_flex()
-                    .h(px(HEADER_HEIGHT))
-                    .flex_shrink_0()
-                    .px_3()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .text_color(text)
-                            .child("偏好设置"),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .id("prefs-categories")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scrollbar()
-                    .px_2()
-                    .py_2()
-                    .gap_0p5()
-                    .children(PrefTab::ALL.map(|tab| {
-                        let is_active = tab == active_tab;
-                        h_flex()
-                            .id(SharedString::from(format!("prefs-tab-{}", tab.label())))
-                            .h(px(CATEGORY_ROW_HEIGHT))
-                            .px_2()
-                            .gap_2()
-                            .items_center()
-                            .rounded(px(8.0))
-                            .cursor_pointer()
-                            .text_color(if is_active { accent } else { text })
-                            .when(is_active, |row| {
-                                row.bg(p.accent_soft())
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            })
-                            .when(!is_active, |row| row.hover(|s| s.bg(p.accent_soft())))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.active_tab = tab;
-                                cx.notify();
-                            }))
-                            .child(
-                                Icon::new(tab.icon())
-                                    .with_size(px(16.0))
-                                    .text_color(if is_active { accent } else { muted_fg }),
-                            )
-                            .child(div().text_sm().child(SharedString::from(tab.label())))
-                    })),
-            );
-
-        // 右侧按分类渲染设置卡片。
+        // 按分类渲染右侧设置卡片（邮件账号页由 render_settings_modal 直接挂载 accounts::render_content）。
         let content: gpui_kit::AnyElement = match active_tab {
+            PrefTab::MailAccounts => div().into_any_element(),
             PrefTab::General => {
                 let default_view_pills = option_pills(
                     "pref-default-view",
@@ -549,13 +532,6 @@ impl Render for PreferencesState {
                     cx,
                     PreferencesState::set_dark_mode,
                 );
-                let density_pills = option_pills(
-                    "pref-density",
-                    &[(false, "标准"), (true, "紧凑")],
-                    prefs.compact_list,
-                    cx,
-                    PreferencesState::set_compact_list,
-                );
                 v_flex()
                     .w_full()
                     .max_w(px(CARD_MAX_WIDTH))
@@ -571,17 +547,62 @@ impl Render for PreferencesState {
                                 &p,
                             ),
                             setting_row("主题色板", Some("选择内置主题配色"), swatches, &p),
-                            setting_row(
-                                "列表密度",
-                                Some("紧凑模式显示更多邮件行"),
-                                density_pills,
-                                &p,
-                            ),
                         ],
                     ))
                     .into_any_element()
             }
-            PrefTab::Reading => {
+            PrefTab::FocusMode => {
+                let entity_focus = cx.entity();
+                let focus_switch = Switch::new("pref-focus-mode")
+                    .checked(self.focus_mode)
+                    .on_click(move |checked, _, cx| {
+                        entity_focus.update(cx, |this, cx| {
+                            this.focus_mode = *checked;
+                            cx.emit(PreferencesEvent::SetFocusMode(*checked));
+                            cx.notify();
+                        });
+                    });
+                setting_card(
+                    "专注模式",
+                    &p,
+                    vec![setting_row(
+                        "启用专注模式",
+                        Some("隐藏左侧边栏与邮件列表，仅保留阅读器（快捷键 Ctrl+Shift+F）"),
+                        focus_switch,
+                        &p,
+                    )],
+                )
+            }
+            PrefTab::Sidebar => {
+                let entity_accounts = cx.entity();
+                let accounts_switch = Switch::new("pref-show-accounts")
+                    .checked(self.show_accounts)
+                    .on_click(move |checked, _, cx| {
+                        entity_accounts.update(cx, |this, cx| {
+                            this.show_accounts = *checked;
+                            cx.emit(PreferencesEvent::SetShowAccounts(*checked));
+                            cx.notify();
+                        });
+                    });
+                setting_card(
+                    "侧边栏",
+                    &p,
+                    vec![setting_row(
+                        "在侧边栏显示账号列表",
+                        Some("控制左侧边栏是否展开各邮箱账号与文件夹（快捷键 Ctrl+Shift+A）"),
+                        accounts_switch,
+                        &p,
+                    )],
+                )
+            }
+            PrefTab::MessageList => {
+                let density_pills = option_pills(
+                    "pref-density",
+                    &[(false, "标准"), (true, "紧凑")],
+                    prefs.compact_list,
+                    cx,
+                    PreferencesState::set_compact_list,
+                );
                 let page_size_pills = option_pills(
                     "pref-page-size",
                     &[(50usize, "50 条"), (100, "100 条"), (200, "200 条")],
@@ -589,12 +610,73 @@ impl Render for PreferencesState {
                     cx,
                     PreferencesState::set_page_size,
                 );
+                setting_card(
+                    "邮件列表",
+                    &p,
+                    vec![
+                        setting_row(
+                            "列表密度",
+                            Some("紧凑模式显示更多邮件行"),
+                            density_pills,
+                            &p,
+                        ),
+                        setting_row(
+                            "每页加载数量",
+                            Some("邮件列表一次从缓存加载的邮件数"),
+                            page_size_pills,
+                            &p,
+                        ),
+                    ],
+                )
+            }
+            PrefTab::Conversations => {
                 let thread_order_pills = option_pills(
                     "pref-thread-order",
                     &[(true, "最新在前（降序）"), (false, "最早在前（升序）")],
                     prefs.thread_newest_first,
                     cx,
                     PreferencesState::set_thread_newest_first,
+                );
+                let entity_fold = cx.entity();
+                let fold_switch = Switch::new("pref-fold-older-messages")
+                    .checked(prefs.fold_older_messages)
+                    .on_click(move |checked, _, cx| {
+                        entity_fold.update(cx, |this, cx| {
+                            this.prefs.fold_older_messages = *checked;
+                            this.emit_changed(cx);
+                        });
+                    });
+                setting_card(
+                    "会话",
+                    &p,
+                    vec![
+                        setting_row(
+                            "会话邮件排序",
+                            Some("选择多封往来会话在阅读器中的排列顺序"),
+                            thread_order_pills,
+                            &p,
+                        ),
+                        setting_row(
+                            "自动折叠较早会话邮件",
+                            Some("打开多封往来会话时，默认折叠较早的邮件卡片"),
+                            fold_switch,
+                            &p,
+                        ),
+                    ],
+                )
+            }
+            PrefTab::Reading => {
+                let reader_pos_current = match prefs.reader_position.as_str() {
+                    "below" => "below",
+                    "off" => "off",
+                    _ => "right",
+                };
+                let reader_pos_pills = option_pills(
+                    "pref-reader-pos",
+                    &[("right", "右侧"), ("below", "下方"), ("off", "关闭")],
+                    reader_pos_current,
+                    cx,
+                    PreferencesState::set_reader_position,
                 );
                 let zoom_pills = option_pills(
                     "pref-reader-zoom",
@@ -612,41 +694,20 @@ impl Render for PreferencesState {
                             this.emit_changed(cx);
                         });
                     });
-                let entity_fold = cx.entity();
-                let fold_switch = Switch::new("pref-fold-older-messages")
-                    .checked(prefs.fold_older_messages)
-                    .on_click(move |checked, _, cx| {
-                        entity_fold.update(cx, |this, cx| {
-                            this.prefs.fold_older_messages = *checked;
-                            this.emit_changed(cx);
-                        });
-                    });
                 setting_card(
                     "阅读",
                     &p,
                     vec![
                         setting_row(
-                            "会话邮件排序",
-                            Some("选择多封往来会话在阅读器中的排列顺序"),
-                            thread_order_pills,
-                            &p,
-                        ),
-                        setting_row(
-                            "自动折叠较早会话邮件",
-                            Some("打开多封往来会话时，默认折叠较早的邮件卡片"),
-                            fold_switch,
+                            "阅读器位置",
+                            Some("选择阅读窗格相对邮件列表的停靠位置（Ctrl+Alt+1/2/3）"),
+                            reader_pos_pills,
                             &p,
                         ),
                         setting_row(
                             "默认阅读字号",
                             Some("调整阅读器正文默认缩放比例"),
                             zoom_pills,
-                            &p,
-                        ),
-                        setting_row(
-                            "每页加载数量",
-                            Some("邮件列表一次从缓存加载的邮件数"),
-                            page_size_pills,
                             &p,
                         ),
                         setting_row(
@@ -710,54 +771,160 @@ impl Render for PreferencesState {
             }
         };
 
-        v_flex().size_full().bg(canvas).child(
-            h_flex().flex_1().min_h_0().child(categories).child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    // 顶部 48px 栏：当前分类标题 + 全局关闭按钮（任意 Tab 均可直接关闭）。
-                    .child(
-                        h_flex()
-                            .h(px(HEADER_HEIGHT))
-                            .flex_shrink_0()
-                            .px_6()
-                            .items_center()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(border)
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                    .text_color(text)
-                                    .child(SharedString::from(active_tab.label())),
-                            )
-                            .child(
-                                Button::new("pref-close")
-                                    .ghost()
-                                    .compact()
-                                    .icon(IconName::X)
-                                    .tooltip("关闭偏好设置 (Esc)")
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(PreferencesEvent::Closed);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .id("prefs-content")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scrollbar()
-                            .px_6()
-                            .py_4()
-                            .gap_4()
-                            .child(content),
-                    ),
-            ),
-        )
+        v_flex()
+            .id("prefs-content")
+            .size_full()
+            .overflow_y_scrollbar()
+            .px_6()
+            .py_4()
+            .gap_4()
+            .child(content)
     }
+}
+
+/// 统一「设置」窗口外壳（左分组导航 + 右标题栏 + 邮件账号或偏好内容）。
+pub(crate) fn render_settings_modal(
+    app: &HylkiApp,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let p = theme::current(cx);
+    let (canvas, sidebar_bg, text, muted_fg, border, accent) = (
+        p.canvas,
+        p.sidebar,
+        p.text,
+        p.text_muted,
+        p.border,
+        p.accent,
+    );
+
+    let active_tab = app
+        .preferences
+        .as_ref()
+        .map(|e| e.read(cx).active_tab())
+        .unwrap_or(PrefTab::General);
+
+    let sidebar = v_flex()
+        .w(px(CATEGORY_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .bg(sidebar_bg)
+        .border_r_1()
+        .border_color(border)
+        .child(
+            h_flex()
+                .h(px(HEADER_HEIGHT))
+                .flex_shrink_0()
+                .px_4()
+                .items_center()
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(gpui_kit::FontWeight::BOLD)
+                        .text_color(text)
+                        .child("设置"),
+                ),
+        )
+        .child(
+            v_flex()
+                .id("prefs-categories")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .px_2()
+                .py_2()
+                .gap_3()
+                .children(PrefTab::GROUPS.iter().map(|(group_title, tabs)| {
+                    v_flex()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .px_2()
+                                .pt_1()
+                                .pb_1()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(muted_fg)
+                                .child(SharedString::from(*group_title)),
+                        )
+                        .children(tabs.iter().copied().map(|tab| {
+                            let is_active = tab == active_tab;
+                            h_flex()
+                                .id(SharedString::from(format!("prefs-tab-{}", tab.label())))
+                                .h(px(CATEGORY_ROW_HEIGHT))
+                                .px_2()
+                                .gap_2()
+                                .items_center()
+                                .rounded(px(8.0))
+                                .cursor_pointer()
+                                .text_color(if is_active { accent } else { text })
+                                .when(is_active, |row| {
+                                    row.bg(p.accent_soft())
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                })
+                                .when(!is_active, |row| row.hover(|s| s.bg(p.accent_soft())))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_settings_tab(tab, cx);
+                                }))
+                                .child(
+                                    Icon::new(tab.icon())
+                                        .with_size(px(16.0))
+                                        .text_color(if is_active { accent } else { muted_fg }),
+                                )
+                                .child(div().text_sm().child(SharedString::from(tab.label())))
+                        }))
+                })),
+        );
+
+    let right_body: gpui_kit::AnyElement = if active_tab == PrefTab::MailAccounts {
+        accounts::render_content(app, cx)
+    } else if let Some(entity) = app.preferences.clone() {
+        div().flex_1().min_h_0().child(entity).into_any_element()
+    } else {
+        div().flex_1().into_any_element()
+    };
+
+    h_flex()
+        .size_full()
+        .bg(canvas)
+        .child(sidebar)
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                // 顶部 48px 栏：当前分类标题 + 全局关闭按钮。
+                .child(
+                    h_flex()
+                        .h(px(HEADER_HEIGHT))
+                        .flex_shrink_0()
+                        .px_6()
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(text)
+                                .child(SharedString::from(active_tab.label())),
+                        )
+                        .child(
+                            Button::new("pref-close")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::X)
+                                .tooltip("关闭设置 (Esc)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_modal(cx);
+                                })),
+                        ),
+                )
+                .child(right_body),
+        )
+        .into_any_element()
 }
 
 /// 字节数 → 人类可读大小（B / KB / MB，进率 1024）。
@@ -806,5 +973,21 @@ mod tests {
         assert!(theme::THEME_LIST
             .iter()
             .any(|(id, _)| *id == prefs.theme_id));
+    }
+
+    #[test]
+    fn settings_groups_include_accounts_and_settings() {
+        assert_eq!(PrefTab::GROUPS.len(), 2);
+        assert_eq!(PrefTab::GROUPS[0].0, "账号");
+        assert_eq!(PrefTab::GROUPS[0].1, &[PrefTab::MailAccounts]);
+        assert_eq!(PrefTab::GROUPS[1].0, "设置");
+        assert!(PrefTab::GROUPS[1].1.contains(&PrefTab::General));
+        assert!(PrefTab::GROUPS[1].1.contains(&PrefTab::Appearance));
+        assert!(PrefTab::GROUPS[1].1.contains(&PrefTab::FocusMode));
+        assert!(PrefTab::GROUPS[1].1.contains(&PrefTab::Sidebar));
+        assert!(PrefTab::GROUPS[1].1.contains(&PrefTab::MessageList));
+        assert!(PrefTab::GROUPS[1].1.contains(&PrefTab::Conversations));
+        assert!(PrefTab::GROUPS[1].1.contains(&PrefTab::Reading));
+        assert!(PrefTab::GROUPS[1].1.contains(&PrefTab::Storage));
     }
 }

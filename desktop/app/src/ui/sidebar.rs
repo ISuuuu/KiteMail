@@ -862,7 +862,7 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
                 }),
             )
             .item(
-                PopupMenuItem::new("偏好设置")
+                PopupMenuItem::new("设置  Ctrl+,")
                     .icon(Icon::new(IconName::Settings2))
                     .on_click(move |_, window, cx| {
                         entity_for_prefs.update(cx, |app, cx| {

@@ -42,8 +42,8 @@ use crate::tray::{self, TrayCommand, TrayHandle};
 use crate::ui::command_palette::{CommandPaletteEvent, CommandPaletteState, PaletteCommand};
 use crate::ui::contacts::{ContactExportKind, ContactsEvent, ContactsState};
 use crate::ui::gallery::{GalleryEvent, GalleryState};
-use crate::ui::preferences::{PreferencesEvent, PreferencesState};
-use crate::ui::{accounts, compose, message_list, reader, sidebar, welcome, window_controls};
+use crate::ui::preferences::{PrefTab, PreferencesEvent, PreferencesState};
+use crate::ui::{compose, message_list, preferences, reader, sidebar, welcome, window_controls};
 
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
 
@@ -366,11 +366,10 @@ pub(crate) enum MainContentView {
     Contacts,
 }
 
-/// 当前全局浮层（方案文档五.1）：账号管理、偏好设置、命令面板均以居中模态展示。
+/// 当前全局浮层（统一设置窗口、命令面板、快捷键、关于）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActiveModal {
     None,
-    Accounts,
     Preferences,
     CommandPalette,
     /// 键盘快捷键速查（F1 / ?，对齐原版 win.shortcuts）。
@@ -573,7 +572,7 @@ pub(crate) struct HylkiApp {
     /// 当前全局浮层。
     pub(crate) active_modal: ActiveModal,
     /// 偏好设置模态实体（关闭时卸载）。
-    preferences: Option<Entity<PreferencesState>>,
+    pub(crate) preferences: Option<Entity<PreferencesState>>,
     preferences_sub: Option<Subscription>,
     /// 命令面板浮层实体（关闭时卸载）。
     palette: Option<Entity<CommandPaletteState>>,
@@ -1241,8 +1240,10 @@ impl HylkiApp {
                     self.compose_account_id = account.id;
                     self.pending_delete_account_id = None;
                     self.right_mode = RightPaneMode::Reader;
-                    if self.active_modal == ActiveModal::Accounts {
-                        self.active_modal = ActiveModal::None;
+                    if self.active_modal == ActiveModal::Preferences
+                        && self.is_settings_mail_accounts_active(cx)
+                    {
+                        self.close_modal(cx);
                     }
                     self.error_banner = None;
                     self.status_line =
@@ -3488,8 +3489,7 @@ impl HylkiApp {
             .update(cx, |s, cx| s.set_value(c.signature, window, cx));
         self.cfg_feedback = None;
         self.cfg_auth_guide = None;
-        self.active_modal = ActiveModal::Accounts;
-        cx.notify();
+        self.open_settings_on_tab(PrefTab::MailAccounts, cx);
     }
 
     /// 欢迎页服务商预设入口：载入空白表单并自动带入主机 / 端口 / 加密与指引。
@@ -3545,11 +3545,10 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 打开账号管理独立居中弹窗（菜单 / 欢迎页 / 命令面板入口），保留当前表单选择。
+    /// 打开统一设置窗口并定位到「邮件账号」页（菜单 / 欢迎页 / 命令面板入口），保留当前表单选择。
     pub(crate) fn open_account_manager(&mut self, cx: &mut Context<Self>) {
         self.pending_delete_account_id = None;
-        self.active_modal = ActiveModal::Accounts;
-        cx.notify();
+        self.open_settings_on_tab(PrefTab::MailAccounts, cx);
     }
 
     /// 账号卡片「移除账号」：先进入内联确认态（含确认）。
@@ -4669,16 +4668,20 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 打开偏好设置模态（侧栏菜单 / 命令面板）。
-    pub(crate) fn open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 打开统一设置窗口（侧栏菜单 / 命令面板 / Ctrl+,，默认进入「常规」页）。
+    pub(crate) fn open_preferences(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_on_tab(PrefTab::General, cx);
+    }
+
+    /// 打开统一设置窗口并切换到指定分类页。
+    pub(crate) fn open_settings_on_tab(&mut self, tab: PrefTab, cx: &mut Context<Self>) {
         self.active_modal = ActiveModal::Preferences;
         if self.preferences.is_none() {
-            let entity = cx.new(|cx| PreferencesState::new(window, cx, self.prefs.clone()));
+            let entity = cx.new(|_| PreferencesState::new(self.prefs.clone()));
             let sub = cx.subscribe(
                 &entity,
                 |this, _prefs, event: &PreferencesEvent, cx| match event {
                     PreferencesEvent::Changed(prefs) => this.apply_preferences(prefs.clone(), cx),
-                    PreferencesEvent::Closed => this.close_modal(cx),
                     PreferencesEvent::ClearBodyCache => {
                         if let Some(ref w) = this.worker {
                             this.status_line = SharedString::from("正在清理正文缓存...");
@@ -4686,22 +4689,54 @@ impl HylkiApp {
                         }
                         cx.notify();
                     }
+                    PreferencesEvent::SetFocusMode(enabled) => {
+                        if this.focus_mode != *enabled {
+                            this.toggle_focus_mode(cx);
+                        }
+                    }
+                    PreferencesEvent::SetShowAccounts(visible) => {
+                        if this.show_accounts != *visible {
+                            this.toggle_accounts_list(cx);
+                        }
+                    }
                 },
             );
             self.preferences = Some(entity);
             self.preferences_sub = Some(sub);
         }
-        // 打开时刷新草稿 / 发件箱统计。
+        // 打开时刷新草稿 / 发件箱统计、会话级布局开关与目标分类。
         let drafts = self.drafts.len();
         let outbox: usize = self
             .outbox_by_account
             .values()
             .map(|items| items.len())
             .sum();
+        let show_accounts = self.show_accounts;
+        let focus_mode = self.focus_mode;
         if let Some(ref p) = self.preferences {
-            p.update(cx, |state, _cx| state.set_storage_stats(drafts, outbox));
+            p.update(cx, |state, cx| {
+                state.set_storage_stats(drafts, outbox);
+                state.sync_session_flags(show_accounts, focus_mode);
+                state.set_active_tab(tab, cx);
+            });
         }
         cx.notify();
+    }
+
+    /// 在统一设置窗口内切换左侧分类。
+    pub(crate) fn set_settings_tab(&mut self, tab: PrefTab, cx: &mut Context<Self>) {
+        if let Some(ref p) = self.preferences {
+            p.update(cx, |state, cx| {
+                state.set_active_tab(tab, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn is_settings_mail_accounts_active(&self, cx: &Context<Self>) -> bool {
+        self.preferences
+            .as_ref()
+            .is_some_and(|p| p.read(cx).active_tab() == PrefTab::MailAccounts)
     }
 
     /// 应用偏好变更（`PreferencesEvent::Changed`）：落盘 + 主题 / 列表 / 定时器即时生效。
@@ -4712,10 +4747,15 @@ impl HylkiApp {
             prefs.theme_id != self.prefs.theme_id || prefs.dark_mode != self.prefs.dark_mode;
         let thread_order_changed = prefs.thread_newest_first != self.prefs.thread_newest_first;
         let fold_changed = prefs.fold_older_messages != self.prefs.fold_older_messages;
+        let reader_pos_changed = prefs.reader_position != self.prefs.reader_position;
 
         self.prefs = prefs;
         if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
             self.error_banner = Some(SharedString::from(e));
+        }
+        if reader_pos_changed {
+            self.reader_position =
+                ReaderPosition::from_key(&self.prefs.reader_position).unwrap_or(ReaderPosition::Right);
         }
         if theme_changed {
             self.theme_id = theme::static_theme_id(&self.prefs.theme_id);
@@ -5996,8 +6036,8 @@ impl Render for HylkiApp {
         // 全局浮层（方案文档五.1）：偏好设置为遮罩 + 居中卡片；
         // 命令面板组件自带遮罩 + 居中卡片，直接挂载即可。
         match self.active_modal {
-            ActiveModal::Accounts => {
-                let accounts_el = accounts::render(self, cx);
+            ActiveModal::Preferences => {
+                let settings_el = preferences::render_settings_modal(self, cx);
                 root = root.child(
                     div()
                         .absolute()
@@ -6014,8 +6054,8 @@ impl Render for HylkiApp {
                         .child(
                             h_flex().size_full().items_center().justify_center().child(
                                 v_flex()
-                                    .w(px(780.0))
-                                    .h(px(620.0))
+                                    .w(px(900.0))
+                                    .h(px(660.0))
                                     .bg(p.surface)
                                     .rounded(px(12.0))
                                     .border_1()
@@ -6028,48 +6068,10 @@ impl Render for HylkiApp {
                                             cx.stop_propagation();
                                         }),
                                     )
-                                    .child(accounts_el),
+                                    .child(settings_el),
                             ),
                         ),
                 );
-            }
-            ActiveModal::Preferences => {
-                if let Some(entity) = self.preferences.clone() {
-                    root = root.child(
-                        div()
-                            .absolute()
-                            .top(px(0.0))
-                            .left(px(0.0))
-                            .size_full()
-                            .bg(black().opacity(0.4))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.close_modal(cx);
-                                }),
-                            )
-                            .child(
-                                h_flex().size_full().items_center().justify_center().child(
-                                    v_flex()
-                                        .w(px(760.0))
-                                        .h(px(560.0))
-                                        .bg(p.surface)
-                                        .rounded(px(12.0))
-                                        .border_1()
-                                        .border_color(border)
-                                        .shadow_xl()
-                                        .overflow_hidden()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _, _, cx| {
-                                                cx.stop_propagation();
-                                            }),
-                                        )
-                                        .child(entity),
-                                ),
-                            ),
-                    );
-                }
             }
             ActiveModal::CommandPalette => {
                 if let Some(entity) = self.palette.clone() {

@@ -7,7 +7,6 @@
 //!   指引横幅、IMAP / SMTP 配置（TLS / STARTTLS 切换、独立 SMTP 凭据）、
 //!   「测试连接」与「保存并同步」及实时反馈。
 
-use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::scroll::ScrollableElement;
@@ -209,11 +208,46 @@ fn labeled_field(
         .child(input)
 }
 
-pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
+pub(crate) fn render_content(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 成局部变量。
     let p = theme::current(cx);
     let (border, muted_fg, accent_soft, primary, danger) =
         (p.border, p.text_muted, p.accent_soft(), p.accent, p.danger);
+
+    if app.demo_mode {
+        return v_flex()
+            .id("accounts-scroll")
+            .flex_1()
+            .min_h_0()
+            .px_6()
+            .py_4()
+            .gap_3()
+            .overflow_y_scrollbar()
+            .child(
+                v_flex()
+                    .max_w(px(600.0))
+                    .gap_2()
+                    .p_4()
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(border)
+                    .bg(p.surface_raised)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text)
+                            .child("当前处于演示模式"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child("演示模式下使用内置模拟邮件数据，无法添加或编辑真实邮箱账号。"),
+                    ),
+            )
+            .into_any_element();
+    }
 
     let account_cards: Vec<gpui_kit::AnyElement> = app
         .accounts
@@ -222,45 +256,13 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .collect();
 
     v_flex()
-        .size_full()
-        .bg(p.canvas)
-        // 顶部 48px 模态标题栏：标题 + 关闭按钮。
-        .child(
-            h_flex()
-                .h(px(48.0))
-                .flex_shrink_0()
-                .px_5()
-                .items_center()
-                .justify_between()
-                .border_b_1()
-                .border_color(border)
-                .bg(p.surface)
-                .child(
-                    div()
-                        .text_base()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(p.text)
-                        .child("账号管理"),
-                )
-                .child(
-                    Button::new("accounts-modal-close")
-                        .ghost()
-                        .compact()
-                        .icon(IconName::X)
-                        .tooltip("关闭账号管理 (Esc)")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.close_modal(cx);
-                        })),
-                ),
-        )
-        .child(
-            v_flex()
-                .id("accounts-scroll")
-                .flex_1()
-                .min_h_0()
-                .p_5()
-                .gap_3()
-                .overflow_y_scrollbar()
+        .id("accounts-scroll")
+        .flex_1()
+        .min_h_0()
+        .px_6()
+        .py_4()
+        .gap_3()
+        .overflow_y_scrollbar()
         // 顶部：已添加账号卡片列表 +「+ 添加新账号」。
         .when(!app.accounts.is_empty(), |el| {
             el.child(
@@ -592,7 +594,6 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         )
                     })
                 }),
-        ),
         )
         .into_any_element()
 }
