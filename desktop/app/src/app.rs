@@ -181,6 +181,20 @@ pub(crate) struct ListDrag;
 /// 列表与下方阅读器之间的水平分隔把手载荷（Below 模式）。
 pub(crate) struct BelowDrag;
 
+/// WP-08：宽表列头分隔线拖拽载荷。
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnResizeDrag {
+    pub(crate) column: hylki_mail_core::config::ListColumn,
+    pub(crate) start_x: f32,
+    pub(crate) start_width: f32,
+}
+
+impl Render for ColumnResizeDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 impl Render for SidebarDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -359,6 +373,7 @@ pub(crate) enum PendingRowAction {
     Reply,
     ReplyAll,
     Forward,
+    EditAsNew,
     CopyBody,
     ViewSource,
 }
@@ -562,6 +577,12 @@ pub(crate) struct HylkiApp {
 
     // ---- B-5：单封邮件亮 / 暗背景覆盖（msg_id → true=暗 / false=亮，会话级不持久化）----
     pub(crate) message_bg_picks: HashMap<u32, bool>,
+
+    // ---- WP-08：宽表列宽、内联会话展开、日期分组折叠 ----
+    pub(crate) list_column_widths: HashMap<hylki_mail_core::config::ListColumn, f32>,
+    pub(crate) expanded_threads: HashSet<u32>,
+    pub(crate) thread_children_cache: HashMap<u32, Vec<MessageSummary>>,
+    pub(crate) collapsed_day_groups: HashSet<String>,
 }
 
 impl HylkiApp {
@@ -899,6 +920,10 @@ impl HylkiApp {
                 focus_mode: initial_focus_mode,
                 list_below_height: initial_list_below_height,
                 message_bg_picks: HashMap::new(),
+                list_column_widths: HashMap::new(),
+                expanded_threads: HashSet::new(),
+                thread_children_cache: HashMap::new(),
+                collapsed_day_groups: HashSet::new(),
             };
         }
 
@@ -1071,6 +1096,10 @@ impl HylkiApp {
             focus_mode: initial_focus_mode,
             list_below_height: initial_list_below_height,
             message_bg_picks: HashMap::new(),
+            list_column_widths: HashMap::new(),
+            expanded_threads: HashSet::new(),
+            thread_children_cache: HashMap::new(),
+            collapsed_day_groups: HashSet::new(),
         };
 
         // 启动视图非统一收件箱时立即请求对应列表（LoadAllCached 只覆盖收件箱）。
@@ -1665,6 +1694,49 @@ impl HylkiApp {
                     self.status_line = SharedString::from(format!(
                         "联系人导入完成：新增 {added} 个，跳过 {skipped} 个（重复或无效）"
                     ));
+                    cx.notify();
+                }
+                WorkerEvent::ThreadChildrenLoaded {
+                    head_message_id,
+                    children,
+                    ..
+                } => {
+                    self.thread_children_cache.insert(head_message_id, children);
+                    cx.notify();
+                }
+                WorkerEvent::MessageTagsUpdated {
+                    message_id, tags, ..
+                } => {
+                    for m in &mut self.current_page.items {
+                        if m.id == message_id {
+                            m.tags = tags.clone();
+                        }
+                    }
+                    self.status_line = SharedString::from("已更新邮件标签");
+                    cx.notify();
+                }
+                WorkerEvent::MessageSnoozed {
+                    message_id,
+                    until_ts,
+                    ..
+                } => {
+                    for m in &mut self.current_page.items {
+                        if m.id == message_id {
+                            m.snoozed_until_ts = until_ts;
+                        }
+                    }
+                    self.status_line = SharedString::from(if until_ts > 0 {
+                        "已设置稍后提醒"
+                    } else {
+                        "已取消稍后提醒"
+                    });
+                    cx.notify();
+                }
+                WorkerEvent::MessageCopied {
+                    target_folder_path, ..
+                } => {
+                    self.status_line =
+                        SharedString::from(format!("已复制邮件到 {target_folder_path}"));
                     cx.notify();
                 }
                 // F-6：附件总览图片预览字节到达（仅等待中的附件生效）。
@@ -2693,6 +2765,7 @@ impl HylkiApp {
             PendingRowAction::Reply => self.start_reply(detail, window, cx),
             PendingRowAction::ReplyAll => self.start_reply_all(detail, window, cx),
             PendingRowAction::Forward => self.start_forward(detail, window, cx),
+            PendingRowAction::EditAsNew => self.start_edit_as_new(detail, window, cx),
             PendingRowAction::CopyBody => {
                 let text = detail.body_text.clone();
                 self.copy_text_to_clipboard(text, cx);
@@ -3091,6 +3164,11 @@ impl HylkiApp {
             // B-6：草稿视图列表行显示「致：收件人」。
             recipients: draft.to_addr.clone(),
             thread_count: 1,
+            importance: 0,
+            tags: Vec::new(),
+            answered: false,
+            forwarded: false,
+            snoozed_until_ts: 0,
         }
     }
 
@@ -3325,6 +3403,36 @@ impl HylkiApp {
                 });
             }
         }
+        cx.notify();
+    }
+
+    /// WP-08：作为新邮件编辑（保留原主题、收件人与正文，打开新写信面板）。
+    pub(crate) fn start_edit_as_new(
+        &mut self,
+        detail: &MessageDetail,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.compose_account_id = detail.account_id;
+        self.compose_draft_id = None;
+        self.compose_in_reply_to.clear();
+        self.compose_attachments.clear();
+        self.compose_confirm_discard = false;
+        self.compose_attachment_reminder = None;
+        self.pending_forward_msg_id = None;
+        self.compose_autocomplete_field = None;
+        self.begin_compose_autosave_tracking();
+        self.compose_to.update(cx, |s, cx| {
+            s.set_value(detail.recipients.clone(), window, cx)
+        });
+        self.clear_compose_cc_bcc(window, cx);
+        self.compose_subject
+            .update(cx, |s, cx| s.set_value(detail.subject.clone(), window, cx));
+        self.compose_body.update(cx, |s, cx| {
+            s.set_value(detail.body_text.clone(), window, cx)
+        });
+        self.right_mode = RightPaneMode::Compose;
+        self.ensure_contacts_loaded();
         cx.notify();
     }
 
@@ -4521,6 +4629,284 @@ impl HylkiApp {
         self.quick_filters.today = !self.quick_filters.today;
         self.reset_list_pagination();
         self.reload_current_page(cx);
+    }
+
+    pub(crate) fn toggle_quick_filter_to_me(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.to_me = !self.quick_filters.to_me;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn toggle_quick_filter_from_contacts(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.from_contacts = !self.quick_filters.from_contacts;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn toggle_quick_filter_high_importance(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.high_importance = !self.quick_filters.high_importance;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn toggle_quick_filter_tagged(&mut self, cx: &mut Context<Self>) {
+        self.quick_filters.tagged = !self.quick_filters.tagged;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    pub(crate) fn set_quick_filter_date_range(
+        &mut self,
+        from_ts: Option<i64>,
+        to_ts: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.quick_filters.date_from_ts = from_ts;
+        self.quick_filters.date_to_ts = to_ts;
+        self.reset_list_pagination();
+        self.reload_current_page(cx);
+    }
+
+    /// WP-08：宽表列宽查询（带默认宽度）。
+    pub(crate) fn column_width(&self, col: hylki_mail_core::config::ListColumn) -> f32 {
+        use hylki_mail_core::config::ListColumn;
+        if let Some(&w) = self.list_column_widths.get(&col) {
+            return w;
+        }
+        match col {
+            ListColumn::Star => 22.0,
+            ListColumn::Replied => 28.0,
+            ListColumn::Attachment => 22.0,
+            ListColumn::Importance => 22.0,
+            ListColumn::Sender | ListColumn::Recipients => 140.0,
+            ListColumn::Correspondents => 150.0,
+            ListColumn::Account => 96.0,
+            ListColumn::Tags => 96.0,
+            ListColumn::Date | ListColumn::Due => 86.0,
+            ListColumn::Subject => 220.0,
+        }
+    }
+
+    /// WP-08：拖拽列分隔线实时调整列宽（32px..=500px）。
+    pub(crate) fn on_column_drag_move(
+        &mut self,
+        event: &DragMoveEvent<ColumnResizeDrag>,
+        cx: &mut Context<Self>,
+    ) {
+        let drag = event.drag(cx);
+        let delta = event.event.position.x.as_f32() - drag.start_x;
+        let next = (drag.start_width + delta).clamp(32.0, 500.0);
+        self.list_column_widths.insert(drag.column, next);
+        cx.notify();
+    }
+
+    /// WP-08：展开 / 收起会话内联子邮件树。
+    pub(crate) fn toggle_thread_expand(&mut self, msg: &MessageSummary, cx: &mut Context<Self>) {
+        if self.expanded_threads.contains(&msg.id) {
+            self.expanded_threads.remove(&msg.id);
+            cx.notify();
+            return;
+        }
+        self.expanded_threads.insert(msg.id);
+        if self.demo_mode {
+            let children = self.demo_store.list_thread_summaries(msg.id);
+            self.thread_children_cache.insert(msg.id, children);
+            cx.notify();
+        } else if !self.thread_children_cache.contains_key(&msg.id) {
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::LoadThreadChildren {
+                    account_id: msg.account_id,
+                    message_id: msg.id,
+                    subject: msg.subject.clone(),
+                });
+            }
+            cx.notify();
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// WP-08：切换日期分组折叠/展开。
+    pub(crate) fn toggle_day_group(&mut self, label: &str, cx: &mut Context<Self>) {
+        if self.collapsed_day_groups.contains(label) {
+            self.collapsed_day_groups.remove(label);
+        } else {
+            self.collapsed_day_groups.insert(label.to_string());
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn collapse_all_day_groups(&mut self, cx: &mut Context<Self>) {
+        for label in hylki_mail_core::DATE_GROUP_LABELS {
+            self.collapsed_day_groups.insert(label.to_string());
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn expand_all_day_groups(&mut self, cx: &mut Context<Self>) {
+        self.collapsed_day_groups.clear();
+        cx.notify();
+    }
+
+    /// WP-08：快捷打标签（1..9）。
+    pub(crate) fn toggle_message_tag(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        tag: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let mut next_tags = self
+            .current_page
+            .items
+            .iter()
+            .find(|m| m.id == message_id)
+            .map(|m| m.tags.clone())
+            .unwrap_or_default();
+        if let Some(pos) = next_tags.iter().position(|t| t == tag) {
+            next_tags.remove(pos);
+        } else {
+            next_tags.push(tag.to_string());
+        }
+        for m in &mut self.current_page.items {
+            if m.id == message_id {
+                m.tags = next_tags.clone();
+            }
+        }
+        if !self.demo_mode {
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::SetMessageTags {
+                    account_id,
+                    message_id,
+                    tags: next_tags,
+                });
+            }
+        } else {
+            self.status_line = SharedString::from(format!("已更新标签：{tag}"));
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn clear_message_tags(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        for m in &mut self.current_page.items {
+            if m.id == message_id {
+                m.tags.clear();
+            }
+        }
+        if !self.demo_mode {
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::SetMessageTags {
+                    account_id,
+                    message_id,
+                    tags: Vec::new(),
+                });
+            }
+        } else {
+            self.status_line = SharedString::from("已清除邮件标签");
+        }
+        cx.notify();
+    }
+
+    /// WP-08：稍后提醒（Snooze）。
+    pub(crate) fn snooze_message(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        until_ts: i64,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        for m in &mut self.current_page.items {
+            if m.id == message_id {
+                m.snoozed_until_ts = until_ts;
+            }
+        }
+        if !self.demo_mode {
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::SnoozeMessage {
+                    account_id,
+                    message_id,
+                    until_ts,
+                });
+            }
+        }
+        self.status_line = SharedString::from(if until_ts > 0 {
+            format!("已设置稍后提醒：{label}")
+        } else {
+            "已取消稍后提醒".to_string()
+        });
+        cx.notify();
+    }
+
+    /// WP-08：跨账号复制到文件夹。
+    pub(crate) fn copy_message_to(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        target_account_id: u32,
+        target_folder_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            self.status_line =
+                SharedString::from(format!("演示模式：已模拟复制到 {target_folder_path}"));
+            cx.notify();
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::CopyMessage {
+                account_id,
+                message_id,
+                target_account_id,
+                target_folder_path,
+            });
+        }
+        cx.notify();
+    }
+
+    /// WP-08：将发件人添加到通讯录。
+    pub(crate) fn add_sender_to_contacts(&mut self, sender: &str, cx: &mut Context<Self>) {
+        let (name, email) = split_sender(sender);
+        let target_email = if email.is_empty() {
+            sender.trim().to_string()
+        } else {
+            email
+        };
+        if target_email.is_empty() {
+            return;
+        }
+        let display_name = if name.is_empty() {
+            target_email.clone()
+        } else {
+            name
+        };
+        self.save_user_contact(None, target_email.clone(), display_name, String::new(), cx);
+        self.status_line = SharedString::from(format!("已将 {target_email} 添加到通讯录"));
+        cx.notify();
+    }
+
+    /// WP-08：以此邮件创建过滤器。
+    pub(crate) fn create_filter_from_message(
+        &mut self,
+        sender: &str,
+        subject: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let (_, email) = split_sender(sender);
+        let addr = if email.is_empty() {
+            sender.trim().to_string()
+        } else {
+            email
+        };
+        self.status_line = SharedString::from(format!(
+            "已生成过滤条件模板：发件人={addr}，主题包含「{subject}」"
+        ));
+        cx.notify();
     }
 
     pub(crate) fn clear_quick_filters(&mut self, cx: &mut Context<Self>) {

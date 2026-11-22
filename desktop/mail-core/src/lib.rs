@@ -80,6 +80,20 @@ pub struct MessageSummary {
     /// 同一会话（按归一化主题聚合）的邮件总数，`> 1` 时列表行显示计数胶囊（B-4）。
     #[serde(default)]
     pub thread_count: u32,
+    /// 邮件重要性：`0` 普通、`1` 高优先级、`-1` 低优先级。
+    #[serde(default)]
+    pub importance: i8,
+    /// 邮件标签列表（WP-08）。
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 是否已回复 / 已转发。
+    #[serde(default)]
+    pub answered: bool,
+    #[serde(default)]
+    pub forwarded: bool,
+    /// 稍后提醒到期时间戳（`0` 表示未设置）。
+    #[serde(default)]
+    pub snoozed_until_ts: i64,
 }
 
 /// Cached attachment metadata shown in the reading pane.
@@ -284,6 +298,18 @@ pub struct QuickFilterSet {
     pub starred: bool,
     pub has_attachment: bool,
     pub today: bool,
+    #[serde(default)]
+    pub to_me: bool,
+    #[serde(default)]
+    pub from_contacts: bool,
+    #[serde(default)]
+    pub high_importance: bool,
+    #[serde(default)]
+    pub tagged: bool,
+    #[serde(default)]
+    pub date_from_ts: Option<i64>,
+    #[serde(default)]
+    pub date_to_ts: Option<i64>,
 }
 
 impl QuickFilterSet {
@@ -304,7 +330,16 @@ impl QuickFilterSet {
 
     /// True when no quick filter condition is enabled.
     pub fn is_empty(self) -> bool {
-        !self.unread && !self.starred && !self.has_attachment && !self.today
+        !self.unread
+            && !self.starred
+            && !self.has_attachment
+            && !self.today
+            && !self.to_me
+            && !self.from_contacts
+            && !self.high_importance
+            && !self.tagged
+            && self.date_from_ts.is_none()
+            && self.date_to_ts.is_none()
     }
 
     /// Number of active quick filter conditions.
@@ -313,6 +348,11 @@ impl QuickFilterSet {
             + usize::from(self.starred)
             + usize::from(self.has_attachment)
             + usize::from(self.today)
+            + usize::from(self.to_me)
+            + usize::from(self.from_contacts)
+            + usize::from(self.high_importance)
+            + usize::from(self.tagged)
+            + usize::from(self.date_from_ts.is_some() || self.date_to_ts.is_some())
     }
 
     /// Clear all active quick filter conditions.
@@ -332,8 +372,23 @@ impl QuickFilterSet {
         if self.has_attachment {
             out.push("含附件");
         }
+        if self.to_me {
+            out.push("直接发给我");
+        }
+        if self.from_contacts {
+            out.push("来自联系人");
+        }
+        if self.high_importance {
+            out.push("高优先级");
+        }
+        if self.tagged {
+            out.push("含标签");
+        }
         if self.today {
             out.push("今天");
+        }
+        if self.date_from_ts.is_some() || self.date_to_ts.is_some() {
+            out.push("日期范围");
         }
         out
     }
@@ -346,9 +401,16 @@ pub enum MessageSort {
     DateNewest,
     DateOldest,
     SenderAsc,
+    SenderDesc,
     SubjectAsc,
+    SubjectDesc,
     UnreadFirst,
     StarredFirst,
+    AccountAsc,
+    AccountDesc,
+    AttachmentFirst,
+    ImportanceFirst,
+    TagsAsc,
 }
 
 impl MessageSort {
@@ -368,13 +430,20 @@ impl MessageSort {
             Self::DateNewest => "日期（最新优先）",
             Self::DateOldest => "日期（最早优先）",
             Self::SenderAsc => "发件人（A-Z）",
+            Self::SenderDesc => "发件人（Z-A）",
             Self::SubjectAsc => "主题（A-Z）",
+            Self::SubjectDesc => "主题（Z-A）",
             Self::UnreadFirst => "未读优先",
             Self::StarredFirst => "星标优先",
+            Self::AccountAsc => "账号（A-Z）",
+            Self::AccountDesc => "账号（Z-A）",
+            Self::AttachmentFirst => "含附件优先",
+            Self::ImportanceFirst => "高优先级优先",
+            Self::TagsAsc => "标签（A-Z）",
         }
     }
 
-    /// Whether date-group headers (`今天` / `昨天` / `本周` / `更早`) should be shown.
+    /// Whether date-group headers (`今天` / `昨天` / `最近 7 天` / `最近 14 天` / `更早`) should be shown.
     pub fn uses_date_groups(self) -> bool {
         matches!(self, Self::DateNewest | Self::DateOldest)
     }
@@ -399,8 +468,11 @@ pub fn start_of_today_ts() -> i64 {
         .unwrap_or(0)
 }
 
-/// Classify a message's Unix timestamp into a date-group header (`今天`, `昨天`, `本周`, `更早`)
-/// relative to `now_ts` in the local timezone.
+/// All 5 collapsible date-group labels in chronological order.
+pub const DATE_GROUP_LABELS: [&str; 5] = ["今天", "昨天", "最近 7 天", "最近 14 天", "更早"];
+
+/// Classify a message's Unix timestamp into a 5-tier date-group header
+/// (`今天`, `昨天`, `最近 7 天`, `最近 14 天`, `更早`) relative to `now_ts` in the local timezone.
 pub fn date_group_label(date_ts: i64, now_ts: i64) -> &'static str {
     if date_ts <= 0 {
         return "更早";
@@ -419,7 +491,9 @@ pub fn date_group_label(date_ts: i64, now_ts: i64) -> &'static str {
     } else if delta_days == 1 {
         "昨天"
     } else if delta_days <= 6 {
-        "本周"
+        "最近 7 天"
+    } else if delta_days <= 13 {
+        "最近 14 天"
     } else {
         "更早"
     }
@@ -667,6 +741,31 @@ pub enum MailRequest {
         account_id: u32,
         enabled: bool,
     },
+    /// WP-08: Load lightweight summaries for all messages in a conversation thread.
+    LoadThreadChildren {
+        account_id: u32,
+        message_id: u32,
+        subject: String,
+    },
+    /// WP-08: Replace tags on a cached message.
+    SetMessageTags {
+        account_id: u32,
+        message_id: u32,
+        tags: Vec<String>,
+    },
+    /// WP-08: Snooze or unsnooze a message until `until_ts` (`0` = clear snooze).
+    SnoozeMessage {
+        account_id: u32,
+        message_id: u32,
+        until_ts: i64,
+    },
+    /// WP-08: Copy a message to another folder (same account or cross-account).
+    CopyMessage {
+        account_id: u32,
+        message_id: u32,
+        target_account_id: u32,
+        target_folder_path: String,
+    },
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.
@@ -804,6 +903,30 @@ pub enum WorkerEvent {
     /// Aggregated known contacts were loaded for the contacts view.
     KnownContactsLoaded {
         items: Vec<KnownContact>,
+    },
+    /// WP-08: Thread children summaries loaded for inline list expansion.
+    ThreadChildrenLoaded {
+        account_id: u32,
+        head_message_id: u32,
+        children: Vec<MessageSummary>,
+    },
+    /// WP-08: Message tags updated.
+    MessageTagsUpdated {
+        account_id: u32,
+        message_id: u32,
+        tags: Vec<String>,
+    },
+    /// WP-08: Message snoozed or unsnoozed.
+    MessageSnoozed {
+        account_id: u32,
+        message_id: u32,
+        until_ts: i64,
+    },
+    /// WP-08: Message copied to target folder.
+    MessageCopied {
+        message_id: u32,
+        target_account_id: u32,
+        target_folder_path: String,
     },
     /// F-4 草稿落库完成（含新增分配的本地 ID；写信页据此绑定 `compose_draft_id`
     /// 并在自动保存后显示「草稿已自动保存 HH:MM」）。
@@ -1089,9 +1212,11 @@ mod tests {
         assert_eq!(date_group_label(now_ts, now_ts), "今天");
         assert_eq!(date_group_label(now_ts + 3600, now_ts), "今天");
         assert_eq!(date_group_label(noon(1), now_ts), "昨天");
-        assert_eq!(date_group_label(noon(2), now_ts), "本周");
-        assert_eq!(date_group_label(noon(6), now_ts), "本周");
-        assert_eq!(date_group_label(noon(7), now_ts), "更早");
+        assert_eq!(date_group_label(noon(2), now_ts), "最近 7 天");
+        assert_eq!(date_group_label(noon(6), now_ts), "最近 7 天");
+        assert_eq!(date_group_label(noon(7), now_ts), "最近 14 天");
+        assert_eq!(date_group_label(noon(13), now_ts), "最近 14 天");
+        assert_eq!(date_group_label(noon(14), now_ts), "更早");
         assert_eq!(date_group_label(noon(30), now_ts), "更早");
         assert_eq!(date_group_label(0, now_ts), "更早");
     }

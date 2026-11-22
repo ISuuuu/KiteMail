@@ -143,8 +143,21 @@ impl DemoStore {
                 unread: *unread,
                 flagged: idx == 0,
                 has_attachment: *has_attachment,
-                recipients: String::new(),
+                recipients: if idx == 0 {
+                    "demo@hylki.example".to_string()
+                } else {
+                    String::new()
+                },
                 thread_count: Self::demo_thread_count(id),
+                importance: if idx == 0 { 1 } else { 0 },
+                tags: if idx == 0 {
+                    vec!["重要".to_string()]
+                } else {
+                    Vec::new()
+                },
+                answered: idx == 1,
+                forwarded: false,
+                snoozed_until_ts: 0,
             });
         }
 
@@ -175,8 +188,21 @@ impl DemoStore {
                 unread: idx < 128,
                 flagged: idx < 30 && idx % 7 == 0,
                 has_attachment: idx % 9 == 0,
-                recipients: String::new(),
+                recipients: if idx == 0 {
+                    "demo@hylki.example".to_string()
+                } else {
+                    String::new()
+                },
                 thread_count: Self::demo_thread_count(id),
+                importance: if idx == 0 { 1 } else { 0 },
+                tags: if idx == 0 {
+                    vec!["重要".to_string()]
+                } else {
+                    Vec::new()
+                },
+                answered: idx == 1,
+                forwarded: false,
+                snoozed_until_ts: 0,
             });
         }
 
@@ -200,6 +226,11 @@ impl DemoStore {
                     // B-6：已发送视图列表行显示「致：收件人」。
                     recipients: format!("收件人 #{i:02} <to{i:02}@example.com>"),
                     thread_count: Self::demo_thread_count(id),
+                    importance: 0,
+                    tags: Vec::new(),
+                    answered: false,
+                    forwarded: false,
+                    snoozed_until_ts: 0,
                 }
             })
             .collect();
@@ -228,6 +259,11 @@ impl DemoStore {
                         String::new()
                     },
                     thread_count: Self::demo_thread_count(id),
+                    importance: 0,
+                    tags: Vec::new(),
+                    answered: false,
+                    forwarded: false,
+                    snoozed_until_ts: 0,
                 }
             })
             .collect();
@@ -251,6 +287,11 @@ impl DemoStore {
                     has_attachment: false,
                     recipients: String::new(),
                     thread_count: Self::demo_thread_count(id),
+                    importance: 0,
+                    tags: Vec::new(),
+                    answered: false,
+                    forwarded: false,
+                    snoozed_until_ts: 0,
                 }
             })
             .collect();
@@ -478,10 +519,23 @@ impl DemoStore {
         filters: QuickFilterSet,
         today_start_ts: i64,
     ) -> bool {
+        let sender_lower = m.sender.to_lowercase();
+        let recip_lower = m.recipients.to_lowercase();
         (!filters.unread || m.unread)
             && (!filters.starred || m.flagged)
             && (!filters.has_attachment || m.has_attachment)
             && (!filters.today || m.date_ts >= today_start_ts)
+            && (!filters.to_me
+                || recip_lower.contains("demo@hylki.example")
+                || recip_lower.contains("you@"))
+            && (!filters.from_contacts
+                || sender_lower.contains("zhangwei")
+                || sender_lower.contains("billing")
+                || sender_lower.contains("wangwu"))
+            && (!filters.high_importance || m.importance > 0)
+            && (!filters.tagged || !m.tags.is_empty())
+            && filters.date_from_ts.is_none_or(|from| m.date_ts >= from)
+            && filters.date_to_ts.is_none_or(|to| m.date_ts < to)
     }
 
     fn sort_summaries(items: &mut [MessageSummary], sort: MessageSort) {
@@ -500,11 +554,27 @@ impl DemoStore {
                         .then_with(|| b.date_ts.cmp(&a.date_ts))
                 });
             }
+            MessageSort::SenderDesc => {
+                items.sort_by(|a, b| {
+                    b.sender
+                        .to_lowercase()
+                        .cmp(&a.sender.to_lowercase())
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
             MessageSort::SubjectAsc => {
                 items.sort_by(|a, b| {
                     a.subject
                         .to_lowercase()
                         .cmp(&b.subject.to_lowercase())
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
+            MessageSort::SubjectDesc => {
+                items.sort_by(|a, b| {
+                    b.subject
+                        .to_lowercase()
+                        .cmp(&a.subject.to_lowercase())
                         .then_with(|| b.date_ts.cmp(&a.date_ts))
                 });
             }
@@ -521,6 +591,118 @@ impl DemoStore {
                         .cmp(&a.flagged)
                         .then_with(|| b.date_ts.cmp(&a.date_ts))
                 });
+            }
+            MessageSort::AccountAsc => {
+                items.sort_by(|a, b| {
+                    a.account_id
+                        .cmp(&b.account_id)
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
+            MessageSort::AccountDesc => {
+                items.sort_by(|a, b| {
+                    b.account_id
+                        .cmp(&a.account_id)
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
+            MessageSort::AttachmentFirst => {
+                items.sort_by(|a, b| {
+                    b.has_attachment
+                        .cmp(&a.has_attachment)
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
+            MessageSort::ImportanceFirst => {
+                items.sort_by(|a, b| {
+                    b.importance
+                        .cmp(&a.importance)
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
+            MessageSort::TagsAsc => {
+                items.sort_by(|a, b| {
+                    a.tags
+                        .join(",")
+                        .to_lowercase()
+                        .cmp(&b.tags.join(",").to_lowercase())
+                        .then_with(|| b.date_ts.cmp(&a.date_ts))
+                });
+            }
+        }
+    }
+
+    /// WP-08: Return thread child summaries for inline expansion in demo mode.
+    pub fn list_thread_summaries(&self, head_message_id: u32) -> Vec<MessageSummary> {
+        let Some(detail) = self.get_message_detail(head_message_id) else {
+            return Vec::new();
+        };
+        if detail.thread_messages.len() <= 1 {
+            return Vec::new();
+        }
+        detail
+            .thread_messages
+            .iter()
+            .skip(1)
+            .map(|tm| MessageSummary {
+                id: tm.id,
+                account_id: detail.account_id,
+                folder_id: detail.folder_id,
+                folder_path: if tm.folder_path.is_empty() {
+                    detail.folder_path.clone()
+                } else {
+                    tm.folder_path.clone()
+                },
+                uid: tm.uid,
+                sender: tm.sender.clone(),
+                subject: if tm.subject.is_empty() {
+                    detail.subject.clone()
+                } else {
+                    tm.subject.clone()
+                },
+                preview: tm.body_text.lines().next().unwrap_or("").trim().to_string(),
+                date_ts: tm.date_ts,
+                date_display: tm.date_display.clone(),
+                unread: tm.unread,
+                flagged: tm.flagged,
+                has_attachment: !tm.attachments.is_empty(),
+                recipients: tm.recipients.clone(),
+                thread_count: 1,
+                importance: 0,
+                tags: Vec::new(),
+                answered: false,
+                forwarded: false,
+                snoozed_until_ts: 0,
+            })
+            .collect()
+    }
+
+    /// WP-08: Update tags on a demo message.
+    pub fn set_message_tags(&mut self, message_id: u32, tags: Vec<String>) {
+        for list in [
+            &mut self.inbox_messages,
+            &mut self.sent_messages,
+            &mut self.draft_messages,
+            &mut self.archive_messages,
+        ] {
+            if let Some(m) = list.iter_mut().find(|m| m.id == message_id) {
+                m.tags = tags;
+                return;
+            }
+        }
+    }
+
+    /// WP-08: Snooze or unsnooze a demo message.
+    pub fn snooze_message(&mut self, message_id: u32, until_ts: i64) {
+        for list in [
+            &mut self.inbox_messages,
+            &mut self.sent_messages,
+            &mut self.draft_messages,
+            &mut self.archive_messages,
+        ] {
+            if let Some(m) = list.iter_mut().find(|m| m.id == message_id) {
+                m.snoozed_until_ts = until_ts;
+                return;
             }
         }
     }

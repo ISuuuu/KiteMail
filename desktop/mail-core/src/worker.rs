@@ -112,6 +112,7 @@ async fn worker_loop(
     let mut backfill = BackfillIndexState::default();
 
     if let Ok(accounts) = config::load_accounts_in(&data_dir) {
+        cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
         for acc in &accounts {
             refresh_account_watcher(&mut watchers, &data_dir, acc, &req_tx);
         }
@@ -2021,6 +2022,88 @@ async fn handle_request(
                 }
             }
             Ok(None) => {}
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: e,
+                });
+            }
+        },
+
+        MailRequest::LoadThreadChildren {
+            account_id,
+            message_id,
+            subject,
+        } => match cache.list_thread_summaries(account_id, message_id, &subject) {
+            Ok(children) => {
+                let _ = evt_tx.send(WorkerEvent::ThreadChildrenLoaded {
+                    account_id,
+                    head_message_id: message_id,
+                    children,
+                });
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: e,
+                });
+            }
+        },
+
+        MailRequest::SetMessageTags {
+            account_id,
+            message_id,
+            tags,
+        } => match cache.set_message_tags(message_id, &tags) {
+            Ok(()) => {
+                let _ = evt_tx.send(WorkerEvent::MessageTagsUpdated {
+                    account_id,
+                    message_id,
+                    tags,
+                });
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: e,
+                });
+            }
+        },
+
+        MailRequest::SnoozeMessage {
+            account_id,
+            message_id,
+            until_ts,
+        } => match cache.snooze_message(message_id, until_ts) {
+            Ok(()) => {
+                let _ = evt_tx.send(WorkerEvent::MessageSnoozed {
+                    account_id,
+                    message_id,
+                    until_ts,
+                });
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: e,
+                });
+            }
+        },
+
+        MailRequest::CopyMessage {
+            account_id,
+            message_id,
+            target_account_id,
+            target_folder_path,
+        } => match cache.copy_message_to_folder(message_id, target_account_id, &target_folder_path)
+        {
+            Ok(()) => {
+                let _ = evt_tx.send(WorkerEvent::MessageCopied {
+                    message_id,
+                    target_account_id,
+                    target_folder_path,
+                });
+            }
             Err(e) => {
                 let _ = evt_tx.send(WorkerEvent::Error {
                     account_id: Some(account_id),

@@ -196,6 +196,11 @@ mod tests {
             has_attachment: true,
             recipients: String::new(),
             thread_count: 1,
+            importance: 0,
+            tags: Vec::new(),
+            answered: false,
+            forwarded: false,
+            snoozed_until_ts: 0,
         }
     }
 
