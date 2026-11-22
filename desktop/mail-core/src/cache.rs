@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::search_query::SearchQuery;
 use crate::{
-    start_of_today_ts, AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail,
-    MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet,
-    ThreadMessage, UserContact,
+    start_of_today_ts, AttachmentMeta, FolderSummary, LocalDraft, MailPage, MailTemplate,
+    MessageDetail, MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus,
+    QuickFilterSet, ThreadMessage, UserContact,
 };
 
 /// Remote folder metadata returned by IMAP LIST/STATUS.
@@ -91,6 +91,19 @@ pub struct KnownContact {
     /// 是否为用户自定义联系人（列表中标注来源徽标并开放编辑 / 删除）。
     #[serde(default)]
     pub custom: bool,
+    /// WP-10：电话、组织、职位、生日、分组标签与发信历史统计。
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub organization: String,
+    #[serde(default)]
+    pub job_title: String,
+    #[serde(default)]
+    pub birthday: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub sent_count: usize,
 }
 
 /// SQL predicate matching every account's Sent folder by friendly name or raw path.
@@ -451,6 +464,15 @@ impl CacheStore {
         self.ensure_column("outbox", "send_at", "INTEGER")?;
         self.ensure_column("drafts", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
+        // WP-10 第 2 项：自定义发件人（From）与 Reply-To 信头；旧库补列，
+        // 历史数据视为空（= 用账号默认身份、不写 Reply-To）。
+        self.ensure_column("drafts", "from_addr", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("drafts", "reply_to", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("outbox", "from_addr", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("outbox", "reply_to", "TEXT NOT NULL DEFAULT ''")?;
+        // WP-10 第 3 项：投递用的 HTML 正文（NULL = 只发纯文本）与草稿正文格式。
+        self.ensure_column("outbox", "body_html", "TEXT")?;
+        self.ensure_column("drafts", "body_format", "TEXT NOT NULL DEFAULT ''")?;
         // HTML 正文（迭代 3）：旧库无列时补充，历史数据视为 NULL。
         self.ensure_column("messages", "body_html", "TEXT")?;
         self.ensure_column("messages", "index_text", "TEXT")?;
@@ -484,6 +506,11 @@ impl CacheStore {
                     email TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL DEFAULT '',
                     notes TEXT NOT NULL DEFAULT '',
+                    phone TEXT NOT NULL DEFAULT '',
+                    organization TEXT NOT NULL DEFAULT '',
+                    job_title TEXT NOT NULL DEFAULT '',
+                    birthday TEXT NOT NULL DEFAULT '',
+                    groups_json TEXT NOT NULL DEFAULT '[]',
                     created_at INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL DEFAULT 0
                 );
@@ -493,9 +520,31 @@ impl CacheStore {
                     color TEXT NOT NULL DEFAULT '#3584e4',
                     shortcut INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    to_addr TEXT NOT NULL DEFAULT '',
+                    cc_addr TEXT NOT NULL DEFAULT '',
+                    bcc_addr TEXT NOT NULL DEFAULT '',
+                    subject TEXT NOT NULL DEFAULT '',
+                    body_text TEXT NOT NULL DEFAULT '',
+                    body_format TEXT NOT NULL DEFAULT '',
+                    attachment_paths_json TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL
+                );
                 ",
             )
             .map_err(|e| format!("初始化用户联系人与标签表失败: {e}"))?;
+        // WP-10：兼容旧库迁移，按需补齐 user_contacts 扩展列。
+        for col_sql in [
+            "ALTER TABLE user_contacts ADD COLUMN phone TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE user_contacts ADD COLUMN organization TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE user_contacts ADD COLUMN job_title TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE user_contacts ADD COLUMN birthday TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE user_contacts ADD COLUMN groups_json TEXT NOT NULL DEFAULT '[]'",
+        ] {
+            let _ = self.conn.execute(col_sql, []);
+        }
         self.conn
             .execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_account_msgid ON messages(account_id, message_id)",
@@ -2657,21 +2706,33 @@ impl CacheStore {
     ) -> Result<Vec<KnownContact>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT sender, recipients FROM messages")
+            .prepare(&format!(
+                "
+                SELECT m.sender, m.recipients, CASE WHEN {SENT_FOLDER_MATCH} THEN 1 ELSE 0 END AS is_sent
+                FROM messages m
+                LEFT JOIN folders f ON f.id = m.folder_id
+                "
+            ))
             .map_err(|e| format!("查询联系人来源失败: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
             })
             .map_err(|e| format!("读取联系人来源失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析联系人来源失败: {e}"))?;
 
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut sent_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut emails: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        for (sender, recipients) in rows {
+        for (sender, recipients, is_sent) in rows {
             // Count each contact once per message, even if listed twice in it.
             let mut seen_in_message: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
@@ -2693,7 +2754,10 @@ impl CacheStore {
                 if name_slot.is_empty() && !name.is_empty() {
                     *name_slot = name;
                 }
-                *counts.entry(key).or_insert(0) += 1;
+                *counts.entry(key.clone()).or_insert(0) += 1;
+                if is_sent {
+                    *sent_counts.entry(key).or_insert(0) += 1;
+                }
             }
         }
 
@@ -2702,13 +2766,14 @@ impl CacheStore {
             .into_iter()
             .map(|(key, message_count)| KnownContact {
                 name: names.get(&key).cloned().unwrap_or_default(),
-                email: emails.get(&key).cloned().unwrap_or(key.clone()),
+                email: emails.get(&key).cloned().unwrap_or_else(|| key.clone()),
                 message_count,
+                sent_count: sent_counts.get(&key).copied().unwrap_or(0),
                 ..KnownContact::default()
             })
             .collect();
 
-        // F-5：叠加用户自定义联系人（邮箱冲突时覆盖聚合行的姓名 / 备注）。
+        // F-5：叠加用户自定义联系人（邮箱冲突时覆盖聚合行的姓名 / 备注 / 详情）。
         for user in self.list_user_contacts()? {
             let key = user.email.trim().to_lowercase();
             if key.is_empty() {
@@ -2717,6 +2782,11 @@ impl CacheStore {
             if let Some(existing) = contacts.iter_mut().find(|c| c.email.to_lowercase() == key) {
                 existing.id = user.id;
                 existing.notes = user.notes;
+                existing.phone = user.phone;
+                existing.organization = user.organization;
+                existing.job_title = user.job_title;
+                existing.birthday = user.birthday;
+                existing.groups = user.groups;
                 existing.custom = true;
                 if !user.display_name.trim().is_empty() {
                     existing.name = user.display_name;
@@ -2729,6 +2799,12 @@ impl CacheStore {
                     id: user.id,
                     notes: user.notes,
                     custom: true,
+                    phone: user.phone,
+                    organization: user.organization,
+                    job_title: user.job_title,
+                    birthday: user.birthday,
+                    groups: user.groups,
+                    sent_count: 0,
                 });
             }
         }
@@ -2758,7 +2834,7 @@ impl CacheStore {
             .conn
             .prepare(
                 "
-                SELECT id, email, display_name, notes
+                SELECT id, email, display_name, notes, phone, organization, job_title, birthday, groups_json
                 FROM user_contacts
                 ORDER BY id ASC
                 ",
@@ -2766,11 +2842,18 @@ impl CacheStore {
             .map_err(|e| format!("查询用户联系人失败: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
+                let groups_json: String = row.get(8)?;
+                let groups: Vec<String> = serde_json::from_str(&groups_json).unwrap_or_default();
                 Ok(UserContact {
                     id: row.get::<_, i64>(0)? as u32,
                     email: row.get(1)?,
                     display_name: row.get(2)?,
                     notes: row.get(3)?,
+                    phone: row.get(4)?,
+                    organization: row.get(5)?,
+                    job_title: row.get(6)?,
+                    birthday: row.get(7)?,
+                    groups,
                 })
             })
             .map_err(|e| format!("读取用户联系人失败: {e}"))?
@@ -2789,14 +2872,33 @@ impl CacheStore {
         let now = chrono::Utc::now().timestamp();
         let display_name = contact.display_name.trim().to_string();
         let notes = contact.notes.clone();
+        let phone = contact.phone.trim().to_string();
+        let organization = contact.organization.trim().to_string();
+        let job_title = contact.job_title.trim().to_string();
+        let birthday = contact.birthday.trim().to_string();
+        let groups_json =
+            serde_json::to_string(&contact.groups).unwrap_or_else(|_| "[]".to_string());
         if contact.id == 0 {
             self.conn
                 .execute(
                     "
-                    INSERT INTO user_contacts (email, display_name, notes, created_at, updated_at)
-                    VALUES (?1, ?2, ?3, ?4, ?4)
+                    INSERT INTO user_contacts (
+                        email, display_name, notes, phone, organization, job_title, birthday, groups_json,
+                        created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
                     ",
-                    params![email, display_name, notes, now],
+                    params![
+                        email,
+                        display_name,
+                        notes,
+                        phone,
+                        organization,
+                        job_title,
+                        birthday,
+                        groups_json,
+                        now
+                    ],
                 )
                 .map_err(|e| {
                     if format!("{e}").contains("UNIQUE") {
@@ -2811,10 +2913,23 @@ impl CacheStore {
                 .execute(
                     "
                     UPDATE user_contacts
-                    SET email = ?1, display_name = ?2, notes = ?3, updated_at = ?4
-                    WHERE id = ?5
+                    SET email = ?1, display_name = ?2, notes = ?3,
+                        phone = ?4, organization = ?5, job_title = ?6, birthday = ?7, groups_json = ?8,
+                        updated_at = ?9
+                    WHERE id = ?10
                     ",
-                    params![email, display_name, notes, now, contact.id],
+                    params![
+                        email,
+                        display_name,
+                        notes,
+                        phone,
+                        organization,
+                        job_title,
+                        birthday,
+                        groups_json,
+                        now,
+                        contact.id
+                    ],
                 )
                 .map_err(|e| {
                     if format!("{e}").contains("UNIQUE") {
@@ -3110,15 +3225,27 @@ impl CacheStore {
                 skipped += 1;
                 continue;
             }
+            let groups_json =
+                serde_json::to_string(&contact.groups).unwrap_or_else(|_| "[]".to_string());
             let affected = self
                 .conn
                 .execute(
                     "
                     INSERT OR IGNORE INTO user_contacts
-                        (email, display_name, notes, created_at, updated_at)
-                    VALUES (?1, ?2, ?3, ?4, ?4)
+                        (email, display_name, notes, phone, organization, job_title, birthday, groups_json, created_at, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
                     ",
-                    params![email, contact.display_name.trim(), contact.notes, now],
+                    params![
+                        email,
+                        contact.display_name.trim(),
+                        contact.notes,
+                        contact.phone.trim(),
+                        contact.organization.trim(),
+                        contact.job_title.trim(),
+                        contact.birthday.trim(),
+                        groups_json,
+                        now
+                    ],
                 )
                 .map_err(|e| format!("导入联系人失败: {e}"))?;
             if affected > 0 {
@@ -3450,6 +3577,9 @@ impl CacheStore {
             subject,
             body_text,
             in_reply_to,
+            "",
+            "",
+            None,
             attachment_paths,
             created_at,
             send_at,
@@ -3467,6 +3597,9 @@ impl CacheStore {
         subject: &str,
         body_text: &str,
         in_reply_to: &str,
+        from_addr: &str,
+        reply_to: &str,
+        body_html: Option<&str>,
         attachment_paths: &[String],
         created_at: i64,
         send_at: Option<i64>,
@@ -3482,9 +3615,10 @@ impl CacheStore {
             "
                 INSERT INTO outbox (
                     account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to,
-                    attachment_paths_json, status, last_error, created_at, send_at
+                    from_addr, reply_to, body_html, attachment_paths_json, status, last_error,
+                    created_at, send_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', '', ?9, ?10)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', '', ?12, ?13)
                 ",
             params![
                 account_id,
@@ -3494,6 +3628,9 @@ impl CacheStore {
                 subject,
                 body_text,
                 in_reply_to,
+                from_addr,
+                reply_to,
+                body_html,
                 paths_json,
                 created_at,
                 send_at
@@ -3587,7 +3724,8 @@ impl CacheStore {
             .prepare(
                 "
                 SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
-                       in_reply_to, attachment_paths_json, status, last_error
+                       in_reply_to, from_addr, reply_to, attachment_paths_json, status, last_error,
+                       body_html
                 FROM outbox
                 WHERE id = ?1
                 ",
@@ -3595,10 +3733,10 @@ impl CacheStore {
             .map_err(|e| format!("查询发件箱失败: {e}"))?;
         let rows = stmt
             .query_map(params![outbox_id], |row| {
-                let paths_json: String = row.get(8)?;
+                let paths_json: String = row.get(10)?;
                 let attachment_paths: Vec<String> =
                     serde_json::from_str(&paths_json).unwrap_or_default();
-                let status_str: String = row.get(9)?;
+                let status_str: String = row.get(11)?;
                 Ok(OutboxItem {
                     id: row.get(0)?,
                     account_id: row.get(1)?,
@@ -3608,9 +3746,12 @@ impl CacheStore {
                     subject: row.get(5)?,
                     body_text: row.get(6)?,
                     in_reply_to: row.get(7)?,
+                    from_addr: row.get(8)?,
+                    reply_to: row.get(9)?,
                     attachment_paths,
                     status: OutboxStatus::from_str(&status_str),
-                    last_error: row.get(10)?,
+                    last_error: row.get(12)?,
+                    body_html: row.get(13)?,
                 })
             })
             .map_err(|e| format!("读取发件箱失败: {e}"))?
@@ -3650,6 +3791,25 @@ impl CacheStore {
         Ok(rows)
     }
 
+    /// 仍排在未来（`send_at > now`）的最早一条 Queued 记录的到期时间。
+    ///
+    /// WP-10-5 定时发送：worker 主循环据此决定下一次巡检的等待时长——有更近的
+    /// 到期记录就等到那一刻，否则按固定间隔轮询。已过期却没发出去的记录
+    /// （例如账号被停用）**不参与**，否则会把「闹钟」永久压在过去的时刻。
+    pub fn next_queued_send_at(&self, now: i64) -> Result<Option<i64>, String> {
+        self.conn
+            .query_row(
+                "
+                SELECT MIN(send_at)
+                FROM outbox
+                WHERE status = 'queued' AND send_at IS NOT NULL AND send_at > ?1
+                ",
+                params![now],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| format!("查询下一个定时发送时间失败: {e}"))
+    }
+
     pub fn expire_queued_outbox(&mut self) -> Result<(), String> {
         self.conn
             .execute(
@@ -3671,8 +3831,8 @@ impl CacheStore {
             .transaction()
             .map_err(|e| format!("撤销发送事务失败: {e}"))?;
         let inserted = tx.execute(
-            "INSERT INTO drafts (account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, attachment_paths_json, updated_at)
-             SELECT account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, attachment_paths_json, ?3
+            "INSERT INTO drafts (account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, body_format, attachment_paths_json, updated_at)
+             SELECT account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, '', attachment_paths_json, ?3
              FROM outbox WHERE id = ?1 AND account_id = ?2 AND status = 'queued'",
             params![outbox_id, account_id, chrono::Utc::now().timestamp()],
         ).map_err(|e| format!("恢复草稿失败: {e}"))?;
@@ -3708,7 +3868,8 @@ impl CacheStore {
             .prepare(
                 "
                 SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
-                       in_reply_to, attachment_paths_json, status, last_error
+                       in_reply_to, from_addr, reply_to, attachment_paths_json, status, last_error,
+                       body_html
                 FROM outbox
                 WHERE account_id = ?1
                 ORDER BY id DESC
@@ -3718,10 +3879,10 @@ impl CacheStore {
 
         let rows = stmt
             .query_map(params![account_id], |row| {
-                let paths_json: String = row.get(8)?;
+                let paths_json: String = row.get(10)?;
                 let attachment_paths: Vec<String> =
                     serde_json::from_str(&paths_json).unwrap_or_default();
-                let status_str: String = row.get(9)?;
+                let status_str: String = row.get(11)?;
                 Ok(OutboxItem {
                     id: row.get(0)?,
                     account_id: row.get(1)?,
@@ -3731,9 +3892,12 @@ impl CacheStore {
                     subject: row.get(5)?,
                     body_text: row.get(6)?,
                     in_reply_to: row.get(7)?,
+                    from_addr: row.get(8)?,
+                    reply_to: row.get(9)?,
                     attachment_paths,
                     status: OutboxStatus::from_str(&status_str),
-                    last_error: row.get(10)?,
+                    last_error: row.get(12)?,
+                    body_html: row.get(13)?,
                 })
             })
             .map_err(|e| format!("读取发件箱失败: {e}"))?
@@ -3752,9 +3916,10 @@ impl CacheStore {
                     "
                     INSERT INTO drafts (
                         account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
-                        in_reply_to, attachment_paths_json, updated_at
+                        in_reply_to, from_addr, reply_to, body_format,
+                        attachment_paths_json, updated_at
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                     ",
                     params![
                         draft.account_id,
@@ -3764,6 +3929,9 @@ impl CacheStore {
                         draft.subject,
                         draft.body_text,
                         draft.in_reply_to,
+                        draft.from_addr,
+                        draft.reply_to,
+                        draft.body_format,
                         paths_json,
                         draft.updated_at
                     ],
@@ -3777,8 +3945,9 @@ impl CacheStore {
                     UPDATE drafts
                     SET account_id = ?1, to_addr = ?2, cc_addr = ?3, bcc_addr = ?4,
                         subject = ?5, body_text = ?6, in_reply_to = ?7,
-                        attachment_paths_json = ?8, updated_at = ?9
-                    WHERE id = ?10
+                        from_addr = ?8, reply_to = ?9, body_format = ?10,
+                        attachment_paths_json = ?11, updated_at = ?12
+                    WHERE id = ?13
                     ",
                     params![
                         draft.account_id,
@@ -3788,6 +3957,9 @@ impl CacheStore {
                         draft.subject,
                         draft.body_text,
                         draft.in_reply_to,
+                        draft.from_addr,
+                        draft.reply_to,
+                        draft.body_format,
                         paths_json,
                         draft.updated_at,
                         draft.id
@@ -3805,7 +3977,8 @@ impl CacheStore {
             .prepare(
                 "
                 SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
-                       in_reply_to, attachment_paths_json, updated_at
+                       in_reply_to, from_addr, reply_to, attachment_paths_json, updated_at,
+                       body_format
                 FROM drafts
                 ORDER BY updated_at DESC, id DESC
                 ",
@@ -3814,7 +3987,7 @@ impl CacheStore {
 
         let rows = stmt
             .query_map([], |row| {
-                let paths_json: String = row.get(8)?;
+                let paths_json: String = row.get(10)?;
                 let attachment_paths: Vec<String> =
                     serde_json::from_str(&paths_json).unwrap_or_default();
                 Ok(LocalDraft {
@@ -3826,14 +3999,118 @@ impl CacheStore {
                     subject: row.get(5)?,
                     body_text: row.get(6)?,
                     in_reply_to: row.get(7)?,
+                    from_addr: row.get(8)?,
+                    reply_to: row.get(9)?,
                     attachment_paths,
-                    updated_at: row.get(9)?,
+                    updated_at: row.get(11)?,
+                    body_format: row.get(12)?,
                 })
             })
             .map_err(|e| format!("读取本地草稿失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析本地草稿失败: {e}"))?;
         Ok(rows)
+    }
+
+    /// 列出全部写信模板（WP-10-5 `Save as Template`），新建的在前。
+    pub fn list_templates(&self) -> Result<Vec<MailTemplate>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, name, to_addr, cc_addr, bcc_addr, subject, body_text,
+                       body_format, attachment_paths_json, created_at
+                FROM templates
+                ORDER BY created_at DESC, id DESC
+                ",
+            )
+            .map_err(|e| format!("查询写信模板失败: {e}"))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let paths_json: String = row.get(8)?;
+                let attachment_paths: Vec<String> =
+                    serde_json::from_str(&paths_json).unwrap_or_default();
+                Ok(MailTemplate {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    to_addr: row.get(2)?,
+                    cc_addr: row.get(3)?,
+                    bcc_addr: row.get(4)?,
+                    subject: row.get(5)?,
+                    body_text: row.get(6)?,
+                    body_format: row.get(7)?,
+                    attachment_paths,
+                    created_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| format!("读取写信模板失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析写信模板失败: {e}"))?;
+        Ok(rows)
+    }
+
+    /// 保存写信模板：`id == 0` 新建，否则按 ID 覆盖（返回最终 ID）。
+    pub fn upsert_template(&mut self, template: &MailTemplate) -> Result<u32, String> {
+        let paths_json =
+            serde_json::to_string(&template.attachment_paths).unwrap_or_else(|_| "[]".to_string());
+        if template.id == 0 {
+            self.conn
+                .execute(
+                    "
+                    INSERT INTO templates (
+                        name, to_addr, cc_addr, bcc_addr, subject, body_text,
+                        body_format, attachment_paths_json, created_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    ",
+                    params![
+                        template.name,
+                        template.to_addr,
+                        template.cc_addr,
+                        template.bcc_addr,
+                        template.subject,
+                        template.body_text,
+                        template.body_format,
+                        paths_json,
+                        template.created_at
+                    ],
+                )
+                .map_err(|e| format!("保存写信模板失败: {e}"))?;
+            return Ok(self.conn.last_insert_rowid() as u32);
+        }
+        self.conn
+            .execute(
+                "
+                UPDATE templates
+                SET name = ?2, to_addr = ?3, cc_addr = ?4, bcc_addr = ?5, subject = ?6,
+                    body_text = ?7, body_format = ?8, attachment_paths_json = ?9,
+                    created_at = ?10
+                WHERE id = ?1
+                ",
+                params![
+                    template.id,
+                    template.name,
+                    template.to_addr,
+                    template.cc_addr,
+                    template.bcc_addr,
+                    template.subject,
+                    template.body_text,
+                    template.body_format,
+                    paths_json,
+                    template.created_at
+                ],
+            )
+            .map_err(|e| format!("更新写信模板失败: {e}"))?;
+        Ok(template.id)
+    }
+
+    /// 删除一条写信模板。
+    pub fn delete_template(&mut self, template_id: u32) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM templates WHERE id = ?1", params![template_id])
+            .map_err(|e| format!("删除写信模板失败: {e}"))?;
+        Ok(())
     }
 
     /// Delete a local draft by ID.
@@ -4209,6 +4486,49 @@ mod tests {
     }
 
     #[test]
+    fn templates_round_trip_and_delete() {
+        // WP-10-5：模板保存 / 覆盖 / 列表 / 删除的完整往返。
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        assert!(cache.list_templates().unwrap().is_empty());
+
+        let id = cache
+            .upsert_template(&MailTemplate {
+                id: 0,
+                name: "客户回访".into(),
+                to_addr: "a@x.com".into(),
+                cc_addr: String::new(),
+                bcc_addr: String::new(),
+                subject: "回访".into(),
+                body_text: "您好".into(),
+                body_format: "markdown".into(),
+                attachment_paths: vec!["C:////tmp////a.pdf".into()],
+                created_at: 100,
+            })
+            .unwrap();
+        assert!(id > 0);
+
+        let list = cache.list_templates().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "客户回访");
+        assert_eq!(list[0].body_format, "markdown");
+        assert_eq!(
+            list[0].attachment_paths,
+            vec!["C:////tmp////a.pdf".to_string()]
+        );
+
+        // 同 ID 覆盖更新，不新增行。
+        let mut updated = list[0].clone();
+        updated.name = "新名字".into();
+        assert_eq!(cache.upsert_template(&updated).unwrap(), id);
+        let list = cache.list_templates().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "新名字");
+
+        cache.delete_template(id).unwrap();
+        assert!(cache.list_templates().unwrap().is_empty());
+    }
+
+    #[test]
     fn outbox_preserves_uncertain_state_without_auto_resend() {
         let mut cache = CacheStore::open_in_memory().expect("open memory db");
         let id = cache
@@ -4328,6 +4648,78 @@ mod tests {
     }
 
     #[test]
+    fn next_queued_send_at_tracks_earliest_pending() {
+        // WP-10-5：worker 主循环按「最早的定时记录」决定巡检等待时长。
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let now = 1_700_000_000i64;
+        // 没有任何定时记录 -> None（主循环退回 30 秒固定轮询）。
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), None);
+
+        let later = cache
+            .enqueue_outbox(
+                1,
+                "late@x.com",
+                "",
+                "",
+                "晚上发",
+                "正文",
+                "",
+                &[],
+                now,
+                Some(now + 3600),
+            )
+            .unwrap();
+        let sooner = cache
+            .enqueue_outbox(
+                1,
+                "soon@x.com",
+                "",
+                "",
+                "一小时后发",
+                "正文",
+                "",
+                &[],
+                now,
+                Some(now + 600),
+            )
+            .unwrap();
+        // 取最早的一个，而不是最后写入的。
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), Some(now + 600));
+
+        // 到了到期时刻领取投递后，该记录不再算作待发（只剩较晚的一条）。
+        assert!(cache
+            .claim_outbox_for_delivery(sooner, now + 600)
+            .unwrap()
+            .is_some());
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), Some(now + 3600));
+
+        // 撤销（删除）后彻底没有定时记录。
+        cache.delete_outbox(later).unwrap();
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), None);
+
+        // 已过期却没发出去的记录（账号停用）不算「未来闹钟」，不会让主循环空转。
+        let stale = cache
+            .enqueue_outbox(
+                1,
+                "stale@x.com",
+                "",
+                "",
+                "过期未发",
+                "正文",
+                "",
+                &[],
+                now,
+                Some(now - 30),
+            )
+            .unwrap();
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), None);
+        assert_eq!(
+            cache.list_due_queued_ids(None, now).unwrap(),
+            vec![(1, stale)]
+        );
+    }
+
+    #[test]
     fn outbox_disabled_account_stays_queued_and_resumes() {
         // 任务一：停用账号的待发记录保持 Queued（不标 Failed），保留发件身份
         // 与正文；恢复 Queued 后可再次领取（重新启用账号后续发）。
@@ -4416,6 +4808,9 @@ mod tests {
             subject: "subject".into(),
             body_text: "body".into(),
             in_reply_to: "ref".into(),
+            from_addr: "Me <me@example.com>".into(),
+            reply_to: "replies@example.com".into(),
+            body_format: "rich".into(),
             attachment_paths: vec!["file".into()],
             updated_at: 10,
         };
@@ -4430,6 +4825,9 @@ mod tests {
                 "subject",
                 "body",
                 "ref",
+                "Me <me@example.com>",
+                "replies@example.com",
+                None,
                 &["file".into()],
                 10,
                 Some(20),
@@ -4451,6 +4849,9 @@ mod tests {
                 "subject",
                 "body",
                 "ref",
+                "Me <me@example.com>",
+                "replies@example.com",
+                None,
                 &["file".into()],
                 10,
                 Some(20),
@@ -4458,7 +4859,11 @@ mod tests {
             )
             .unwrap();
         assert!(cache.list_drafts().unwrap().is_empty());
-        assert_eq!(cache.list_outbox(1).unwrap().len(), 1);
+        let outbox = cache.list_outbox(1).unwrap();
+        assert_eq!(outbox.len(), 1);
+        // 交接后发件箱记录仍保留自定义 From / Reply-To。
+        assert_eq!(outbox[0].from_addr, "Me <me@example.com>");
+        assert_eq!(outbox[0].reply_to, "replies@example.com");
     }
 
     #[test]
@@ -4774,6 +5179,9 @@ mod tests {
                 subject: "草稿主题".to_string(),
                 body_text: "第一版内容".to_string(),
                 in_reply_to: String::new(),
+                from_addr: "别名 <alias@example.com>".to_string(),
+                reply_to: "reply@example.com".to_string(),
+                body_format: "markdown".to_string(),
                 attachment_paths: vec!["C:\\tmp\\report.pdf".to_string()],
                 updated_at: 100,
             })
@@ -4784,6 +5192,9 @@ mod tests {
         assert_eq!(drafts[0].id, id);
         assert_eq!(drafts[0].cc_addr, "bob@example.com");
         assert_eq!(drafts[0].bcc_addr, "");
+        // WP-10 第 2 项：自定义发件人与 Reply-To 随草稿持久化。
+        assert_eq!(drafts[0].from_addr, "别名 <alias@example.com>");
+        assert_eq!(drafts[0].reply_to, "reply@example.com");
         assert_eq!(drafts[0].attachment_paths, vec!["C:\\tmp\\report.pdf"]);
 
         // 更新 cc/bcc 也走同一 upsert 链路。
@@ -6638,6 +7049,7 @@ mod tests {
                 email: "custom@example.com".to_string(),
                 display_name: "自定义联系人".to_string(),
                 notes: "备注 A".to_string(),
+                ..Default::default()
             })
             .unwrap();
         assert!(id_new > 0);
@@ -6648,6 +7060,7 @@ mod tests {
                 email: alice_email.clone(),
                 display_name: "Alice 手工版".to_string(),
                 notes: String::new(),
+                ..Default::default()
             })
             .unwrap();
 
@@ -6658,6 +7071,7 @@ mod tests {
                 email: alice_email.clone(),
                 display_name: "重复".to_string(),
                 notes: String::new(),
+                ..Default::default()
             })
             .is_err());
 
@@ -6688,6 +7102,7 @@ mod tests {
                 email: "custom@example.com".to_string(),
                 display_name: "改名".to_string(),
                 notes: String::new(),
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(updated, id_new);
@@ -6712,18 +7127,21 @@ mod tests {
                     email: "alice@example.com".to_string(),
                     display_name: String::new(),
                     notes: String::new(),
+                    ..Default::default()
                 },
                 UserContact {
                     id: 0,
                     email: "batch1@example.com".to_string(),
                     display_name: "批量一".to_string(),
                     notes: String::new(),
+                    ..Default::default()
                 },
                 UserContact {
                     id: 0,
                     email: "not-an-email".to_string(),
                     display_name: String::new(),
                     notes: String::new(),
+                    ..Default::default()
                 },
             ])
             .unwrap();
@@ -6806,6 +7224,7 @@ mod tests {
                 email: "new@example.com".to_string(),
                 display_name: "新联系人".to_string(),
                 notes: String::new(),
+                ..UserContact::default()
             })
             .unwrap();
         assert!(id > 0);

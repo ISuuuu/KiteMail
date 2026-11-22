@@ -15,6 +15,9 @@
 //! [`GalleryState::set_accounts`] 注入，交互通过 [`GalleryEvent`] 通知集成者，
 //! 组件内部同时对当前数据做客户端过滤以便即时反馈。
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -32,6 +35,8 @@ use hylki_mail_core::cache::CachedAttachment;
 
 /// 顶部栏高度。
 const HEADER_HEIGHT: f32 = 48.0;
+/// 底部 ActionBar 高度。
+const FOOTER_HEIGHT: f32 = 40.0;
 /// 附件行高度。
 const ROW_HEIGHT: f32 = 44.0;
 /// 表格列宽（与表头、数据行共用）。
@@ -40,9 +45,115 @@ const COL_SUBJECT_W: f32 = 200.0;
 const COL_SIZE_W: f32 = 80.0;
 const COL_DATE_W: f32 = 120.0;
 const COL_ACTIONS_W: f32 = 210.0;
-/// F-6 网格卡片尺寸。
-const GRID_CARD_W: f32 = 150.0;
-const GRID_CARD_H: f32 = 112.0;
+/// F-6 网格卡片默认尺寸与缩略图滑块范围。
+const THUMB_SIZE_DEFAULT: f32 = 150.0;
+const THUMB_SIZE_MIN: f32 = 110.0;
+const THUMB_SIZE_MAX: f32 = 230.0;
+const THUMB_SIZE_STEP: f32 = 20.0;
+
+/// WP-10 附件画廊 7 种文件类型筛选（对齐原版 `src/ui/attachments_gallery.rs:439-447`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GalleryTypeFilter {
+    #[default]
+    All,
+    Images,
+    Pdfs,
+    Documents,
+    Archives,
+    AudioVideo,
+    Other,
+}
+
+impl GalleryTypeFilter {
+    pub const ALL: [Self; 7] = [
+        Self::All,
+        Self::Images,
+        Self::Pdfs,
+        Self::Documents,
+        Self::Archives,
+        Self::AudioVideo,
+        Self::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部类型",
+            Self::Images => "图片",
+            Self::Pdfs => "PDF",
+            Self::Documents => "文档",
+            Self::Archives => "压缩包",
+            Self::AudioVideo => "音视频",
+            Self::Other => "其他",
+        }
+    }
+
+    /// 判断附件是否匹配当前类型筛选。
+    pub fn matches(self, mime_type: &str, filename: &str) -> bool {
+        if self == Self::All {
+            return true;
+        }
+        let mime = mime_type.to_ascii_lowercase();
+        let ext = filename
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_image = mime.starts_with("image/")
+            || matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+            );
+        let is_pdf = mime == "application/pdf" || ext == "pdf";
+        let is_archive = mime.contains("zip")
+            || mime.contains("compressed")
+            || mime.contains("tar")
+            || mime.contains("rar")
+            || mime.contains("7z")
+            || matches!(
+                ext.as_str(),
+                "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz"
+            );
+        let is_av = mime.starts_with("audio/")
+            || mime.starts_with("video/")
+            || matches!(
+                ext.as_str(),
+                "mp3" | "wav" | "flac" | "ogg" | "mp4" | "mkv" | "mov" | "avi" | "webm"
+            );
+        let is_doc = !is_pdf
+            && (mime.starts_with("text/")
+                || mime.contains("word")
+                || mime.contains("excel")
+                || mime.contains("spreadsheet")
+                || mime.contains("presentation")
+                || mime.contains("opendocument")
+                || matches!(
+                    ext.as_str(),
+                    "doc"
+                        | "docx"
+                        | "xls"
+                        | "xlsx"
+                        | "ppt"
+                        | "pptx"
+                        | "txt"
+                        | "md"
+                        | "csv"
+                        | "rtf"
+                        | "odt"
+                        | "ods"
+                        | "odp"
+                ));
+
+        match self {
+            Self::All => true,
+            Self::Images => is_image,
+            Self::Pdfs => is_pdf,
+            Self::Documents => is_doc,
+            Self::Archives => is_archive,
+            Self::AudioVideo => is_av,
+            Self::Other => !is_image && !is_pdf && !is_doc && !is_archive && !is_av,
+        }
+    }
+}
 
 /// F-6 可排序的表头列。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +195,8 @@ pub enum GalleryEvent {
     LocateMessage(u32),
     /// F-6 请求预览图片附件（参数为附件 id；字节由集成者回传）。
     PreviewImage(u32),
+    /// WP-10 请求加载网格图片缩略图（参数为附件 id）。
+    RequestThumbnail(u32),
 }
 
 /// 附件总览视图状态（独立 Entity，由 HylkiApp 挂载）。
@@ -93,6 +206,15 @@ pub struct GalleryState {
     query: String,
     /// 当前账号筛选。
     account_filter: Option<u32>,
+    /// WP-10 7 种文件类型筛选。
+    type_filter: GalleryTypeFilter,
+    /// WP-10 文件夹范围：包含归档 / 包含其他文件夹（收件箱始终包含）。
+    include_archive: bool,
+    include_other: bool,
+    /// WP-10 文件夹范围 Popover 开关。
+    folders_popover_open: bool,
+    /// WP-10 网格缩略图尺寸（px）。
+    thumb_size: f32,
     /// F-6 表头排序（`None` = 默认按日期倒序的服务端次序）。
     sort_column: Option<GallerySortColumn>,
     /// F-6 当前排序方向。
@@ -101,6 +223,10 @@ pub struct GalleryState {
     view_grid: bool,
     /// F-6 当前打开的图片预览浮层。
     preview: Option<GalleryPreview>,
+    /// WP-10 网格图片真实缩略图缓存。
+    thumbnails: HashMap<u32, Arc<gpui_kit::Image>>,
+    /// WP-10 已请求过缩略图的附件 ID（避免重复请求）。
+    requested_thumbnails: HashSet<u32>,
     /// 集成者注入的账号列表 `(account_id, 显示名)`。
     accounts: Vec<(u32, String)>,
     /// 集成者注入的附件列表。
@@ -126,10 +252,17 @@ impl GalleryState {
             search_input,
             query: String::new(),
             account_filter: None,
+            type_filter: GalleryTypeFilter::All,
+            include_archive: true,
+            include_other: true,
+            folders_popover_open: false,
+            thumb_size: THUMB_SIZE_DEFAULT,
             sort_column: None,
             sort_asc: true,
             view_grid: false,
             preview: None,
+            thumbnails: HashMap::new(),
+            requested_thumbnails: HashSet::new(),
             accounts: Vec::new(),
             items: Vec::new(),
         }
@@ -145,13 +278,35 @@ impl GalleryState {
         self.accounts = accounts;
     }
 
+    /// WP-10 回填网格图片缩略图。
+    pub fn set_thumbnail(&mut self, attachment_id: u32, mime_type: &str, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(format) = image_format_for_mime(mime_type) {
+            self.thumbnails.insert(
+                attachment_id,
+                Arc::new(gpui_kit::Image::from_bytes(format, bytes)),
+            );
+        }
+    }
+
     /// F-6 回填图片预览字节：MIME 非图片或字节为空时保持占位态。
     pub fn set_preview_image(&mut self, filename: &str, mime_type: &str, bytes: Vec<u8>) {
         let format = image_format_for_mime(mime_type);
         let preview = self.preview.as_mut();
         if let Some(preview) = preview {
             preview.filename = filename.to_string();
-            preview.image = format.filter(|_| !bytes.is_empty()).map(|f| (f, bytes));
+            let img_opt = format
+                .filter(|_| !bytes.is_empty())
+                .map(|f| (f, bytes.clone()));
+            if let Some((fmt, raw)) = img_opt.as_ref() {
+                self.thumbnails.insert(
+                    preview.attachment_id,
+                    Arc::new(gpui_kit::Image::from_bytes(*fmt, raw.clone())),
+                );
+            }
+            preview.image = img_opt;
         }
     }
 
@@ -159,6 +314,27 @@ impl GalleryState {
     pub fn set_preview_unavailable(&mut self) {
         if let Some(preview) = self.preview.as_mut() {
             preview.image = None;
+        }
+    }
+
+    /// WP-10 为当前可见图片附件请求缩略图（避免重复请求）。
+    fn request_visible_thumbnails(&mut self, cx: &mut Context<Self>) {
+        if !self.view_grid {
+            return;
+        }
+        let ids: Vec<u32> = self
+            .visible_items()
+            .into_iter()
+            .filter(|item| item.mime_type.to_ascii_lowercase().starts_with("image/"))
+            .map(|item| item.id)
+            .filter(|id| {
+                !self.thumbnails.contains_key(id) && !self.requested_thumbnails.contains(id)
+            })
+            .take(40)
+            .collect();
+        for id in ids {
+            self.requested_thumbnails.insert(id);
+            cx.emit(GalleryEvent::RequestThumbnail(id));
         }
     }
 
@@ -179,7 +355,7 @@ impl GalleryState {
     }
 
     /// 客户端过滤 + F-6 表头排序：搜索词匹配文件名 / 发件人 / 主题，
-    /// 命中账号筛选；按所选列升 / 降序（默认服务端日期倒序）。
+    /// 命中账号筛选与 WP-10 7 种文件类型筛选；按所选列升 / 降序（默认服务端日期倒序）。
     fn visible_items(&self) -> Vec<&CachedAttachment> {
         let query = self.query.trim().to_lowercase();
         let mut items: Vec<&CachedAttachment> = self
@@ -187,6 +363,7 @@ impl GalleryState {
             .iter()
             .filter(|item| {
                 self.account_filter.is_none_or(|id| item.account_id == id)
+                    && self.type_filter.matches(&item.mime_type, &item.filename)
                     && (query.is_empty()
                         || item.filename.to_lowercase().contains(&query)
                         || item.sender.to_lowercase().contains(&query)
@@ -747,7 +924,10 @@ impl Render for GalleryState {
                         )
                     })
                     .when(self.view_grid, |el| {
-                        // F-6 网格视图：卡片流式布局（类型图标 + 文件名 + 大小）。
+                        // F-6 + WP-10 网格视图：真实图片缩略图 + 尺寸滑块动态宽高。
+                        let card_w = self.thumb_size;
+                        let card_h = (self.thumb_size * 0.82).max(96.0);
+                        let thumb_h = (card_h - 46.0).max(44.0);
                         let cards: Vec<gpui_kit::Stateful<gpui_kit::Div>> = visible
                             .iter()
                             .map(|item| {
@@ -758,11 +938,12 @@ impl Render for GalleryState {
                                 let size_text = format_size(item.size_bytes);
                                 let attachment_id = item.id;
                                 let message_id = item.message_id;
+                                let thumb = self.thumbnails.get(&attachment_id).cloned();
                                 h_flex()
                                     .id(("gallery-card", attachment_id))
                                     .flex_col()
-                                    .w(px(GRID_CARD_W))
-                                    .h(px(GRID_CARD_H))
+                                    .w(px(card_w))
+                                    .h(px(card_h))
                                     .p_2()
                                     .gap_1()
                                     .rounded(px(10.0))
@@ -772,7 +953,7 @@ impl Render for GalleryState {
                                     .cursor_pointer()
                                     .hover(move |s| s.bg(accent_soft))
                                     .items_center()
-                                    .justify_center()
+                                    .justify_between()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if is_image {
                                             // F-6：先打开占位浮层，字节回传后显示大图。
@@ -787,21 +968,52 @@ impl Render for GalleryState {
                                         }
                                         cx.notify();
                                     }))
-                                    .child(Icon::new(icon).with_size(px(32.0)).text_color(muted_fg))
-                                    .child(
+                                    .child(if let Some(img_arc) = thumb {
                                         div()
                                             .w_full()
-                                            .text_xs()
-                                            .text_color(text)
-                                            .text_center()
-                                            .truncate()
-                                            .child(SharedString::from(filename)),
-                                    )
+                                            .h(px(thumb_h))
+                                            .rounded(px(6.0))
+                                            .overflow_hidden()
+                                            .child(
+                                                img(img_arc)
+                                                    .size_full()
+                                                    .object_fit(ObjectFit::Cover),
+                                            )
+                                            .into_any_element()
+                                    } else {
+                                        h_flex()
+                                            .w_full()
+                                            .h(px(thumb_h))
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                Icon::new(icon)
+                                                    .with_size(px(
+                                                        (thumb_h * 0.55).clamp(24.0, 44.0)
+                                                    ))
+                                                    .text_color(muted_fg),
+                                            )
+                                            .into_any_element()
+                                    })
                                     .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted_fg)
-                                            .child(SharedString::from(size_text)),
+                                        v_flex()
+                                            .w_full()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .text_xs()
+                                                    .text_color(text)
+                                                    .text_center()
+                                                    .truncate()
+                                                    .child(SharedString::from(filename)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted_fg)
+                                                    .child(SharedString::from(size_text)),
+                                            ),
                                     )
                             })
                             .collect();
@@ -817,6 +1029,218 @@ impl Render for GalleryState {
                     })
                     .when(!self.view_grid, |el| el.children(rows)),
             )
+            // WP-10：底部 ActionBar（对齐原版 `src/ui/attachments_gallery.rs:329-485`）：
+            // 视图切换 + 账号筛选 + 文件夹范围 Popover + 7 种文件类型筛选 + 缩略图尺寸滑块 + 数量统计。
+            .child(
+                h_flex()
+                    .h(px(FOOTER_HEIGHT))
+                    .flex_shrink_0()
+                    .px_3()
+                    .gap_2()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(border)
+                    .bg(surface)
+                    .child(
+                        Button::new("gallery-footer-grid")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::LayoutGrid)
+                            .tooltip("缩略图网格")
+                            .selected(self.view_grid)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view_grid = true;
+                                this.request_visible_thumbnails(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("gallery-footer-list")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::List)
+                            .tooltip("列表表格")
+                            .selected(!self.view_grid)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view_grid = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("gallery-folders-scope")
+                            .outline()
+                            .compact()
+                            .icon(IconName::Folder)
+                            .label(if self.include_archive && self.include_other {
+                                "全部文件夹"
+                            } else if self.include_archive {
+                                "收件箱 + 归档"
+                            } else {
+                                "仅收件箱"
+                            })
+                            .selected(self.folders_popover_open)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.folders_popover_open = !this.folders_popover_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child({
+                        let current_type = self.type_filter;
+                        let entity_type = entity.clone();
+                        Button::new("gallery-type-filter")
+                            .outline()
+                            .compact()
+                            .label(current_type.label())
+                            .icon(IconName::ChevronDown)
+                            .dropdown_menu(move |mut menu, _, _| {
+                                for kind in GalleryTypeFilter::ALL {
+                                    let entity_item = entity_type.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(kind.label())
+                                            .when(current_type == kind, |item| {
+                                                item.icon(Icon::new(IconName::Check))
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                entity_item.update(cx, |this, cx| {
+                                                    this.type_filter = kind;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    );
+                                }
+                                menu
+                            })
+                    })
+                    .when(self.view_grid, |bar| {
+                        let ratio = ((self.thumb_size - THUMB_SIZE_MIN)
+                            / (THUMB_SIZE_MAX - THUMB_SIZE_MIN))
+                            .clamp(0.0, 1.0);
+                        bar.child(
+                            h_flex()
+                                .ml_2()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    Button::new("gallery-thumb-smaller")
+                                        .ghost()
+                                        .compact()
+                                        .label("－")
+                                        .tooltip("缩小缩略图")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.thumb_size = (this.thumb_size - THUMB_SIZE_STEP)
+                                                .clamp(THUMB_SIZE_MIN, THUMB_SIZE_MAX);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(72.0))
+                                        .h(px(6.0))
+                                        .rounded(px(9999.0))
+                                        .bg(border)
+                                        .overflow_hidden()
+                                        .child(div().w(px(72.0 * ratio)).h_full().bg(p.accent)),
+                                )
+                                .child(
+                                    Button::new("gallery-thumb-larger")
+                                        .ghost()
+                                        .compact()
+                                        .label("＋")
+                                        .tooltip("放大缩略图")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.thumb_size = (this.thumb_size + THUMB_SIZE_STEP)
+                                                .clamp(THUMB_SIZE_MIN, THUMB_SIZE_MAX);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    SharedString::from(format!("{:.0}px", self.thumb_size)),
+                                )),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(SharedString::from(format!(
+                                "显示 {} / 共 {} 个附件",
+                                visible.len(),
+                                total
+                            ))),
+                    ),
+            )
+            // WP-10 文件夹范围 Popover（位于左下角 ActionBar 上方）。
+            .when(self.folders_popover_open, |root| {
+                root.child(
+                    v_flex()
+                        .absolute()
+                        .bottom(px(FOOTER_HEIGHT + 8.0))
+                        .left(px(96.0))
+                        .w(px(260.0))
+                        .p_3()
+                        .gap_2()
+                        .rounded(px(10.0))
+                        .border_1()
+                        .border_color(border)
+                        .bg(p.surface_raised)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(text)
+                                        .child("附件扫描文件夹范围"),
+                                )
+                                .child(
+                                    Button::new("gallery-folders-close")
+                                        .ghost()
+                                        .compact()
+                                        .icon(IconName::Close)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.folders_popover_open = false;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            Button::new("gallery-scope-archive")
+                                .outline()
+                                .compact()
+                                .w_full()
+                                .selected(self.include_archive)
+                                .label(if self.include_archive {
+                                    "✓ 包含「归档」文件夹"
+                                } else {
+                                    "包含「归档」文件夹"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.include_archive = !this.include_archive;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("gallery-scope-other")
+                                .outline()
+                                .compact()
+                                .w_full()
+                                .selected(self.include_other)
+                                .label(if self.include_other {
+                                    "✓ 包含其他自定义文件夹"
+                                } else {
+                                    "包含其他自定义文件夹"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.include_other = !this.include_other;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             // F-6 图片预览浮层（页内居中，遮罩点击关闭）。
             .relative()
             .when(self.preview.is_some(), |root| root.child(preview_overlay))
@@ -863,5 +1287,16 @@ mod tests {
         // SVG 不支持预览渲染，回退占位说明。
         assert_eq!(image_format_for_mime("image/svg+xml"), None);
         assert_eq!(image_format_for_mime("application/pdf"), None);
+    }
+
+    #[test]
+    fn type_filter_categorizes_seven_types() {
+        assert!(GalleryTypeFilter::Images.matches("image/png", "photo.png"));
+        assert!(GalleryTypeFilter::Pdfs.matches("application/pdf", "doc.pdf"));
+        assert!(GalleryTypeFilter::Documents.matches("text/plain", "notes.txt"));
+        assert!(GalleryTypeFilter::Archives.matches("application/zip", "bundle.zip"));
+        assert!(GalleryTypeFilter::AudioVideo.matches("video/mp4", "clip.mp4"));
+        assert!(GalleryTypeFilter::Other.matches("application/octet-stream", "data.bin"));
+        assert!(!GalleryTypeFilter::Images.matches("application/pdf", "doc.pdf"));
     }
 }

@@ -8,6 +8,7 @@
 
 mod app;
 mod autostart;
+mod compose_schedule;
 mod theme;
 mod tray;
 mod ui;

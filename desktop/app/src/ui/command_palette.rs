@@ -148,6 +148,30 @@ impl PaletteCommand {
             _ => None,
         }
     }
+
+    /// 命令详情/检索辅助标签（与标题共同参与多词分词匹配，对齐原版 `title + detail`）。
+    pub fn detail(self) -> &'static str {
+        match self {
+            PaletteCommand::NewCompose => "操作 compose new message",
+            PaletteCommand::RefreshAll => "操作 refresh sync 同步",
+            PaletteCommand::ToggleUnifiedInbox => "操作 unified inbox 视图",
+            PaletteCommand::OpenAccountSettings => "操作 accounts settings 设置",
+            PaletteCommand::OpenPreferences => "操作 preferences settings 偏好",
+            PaletteCommand::ToggleTheme => "操作 dark light theme 外观",
+            PaletteCommand::GoFolder { .. } => "文件夹 folder move 移动",
+            PaletteCommand::GoStarred => "视图 starred 星标",
+            PaletteCommand::GoSent => "视图 sent 已发送",
+            PaletteCommand::GoDrafts => "视图 drafts 草稿",
+            PaletteCommand::GoArchive => "视图 archive 归档",
+            PaletteCommand::OpenContacts => "视图 contacts 通讯录",
+            PaletteCommand::OpenGallery => "视图 attachments gallery 画廊",
+            PaletteCommand::ReplySelected => "操作 reply 回复",
+            PaletteCommand::ArchiveSelected => "操作 archive 归档",
+            PaletteCommand::DeleteSelected => "操作 delete trash 删除",
+            PaletteCommand::MarkUnreadSelected => "操作 unread 未读",
+            PaletteCommand::ToggleStarSelected => "操作 star 星标",
+        }
+    }
 }
 
 /// 命令面板事件。
@@ -281,6 +305,9 @@ impl CommandPaletteState {
 }
 
 /// 纯过滤逻辑（便于单元测试）：见 [`CommandPaletteState::filtered_commands`]。
+///
+/// 对齐原版 `src/ui/command_palette.rs:35-52`：将 `query.split_whitespace()`
+/// 拆分为多个 token，要求每个 token 在 `title + detail` 拼接串中均命中（`tokens.all(...)`）。
 fn filter_commands(
     commands: &[PaletteCommand],
     query: &str,
@@ -292,12 +319,13 @@ fn filter_commands(
         Some(rest) => (true, rest.trim().to_lowercase()),
         None => (false, query.to_lowercase()),
     };
+    let tokens: Vec<&str> = keyword.split_whitespace().collect();
     commands
         .iter()
         .copied()
         .filter(|command| !actions_only || (!command.is_folder() && !command.is_view()))
         .filter(|command| {
-            keyword.is_empty() || {
+            tokens.is_empty() || {
                 let name = match command {
                     PaletteCommand::GoFolder {
                         account_id,
@@ -309,7 +337,8 @@ fn filter_commands(
                         .unwrap_or_else(|| command.label().to_string()),
                     _ => command.label().to_string(),
                 };
-                name.to_lowercase().contains(&keyword)
+                let haystack = format!("{name} {}", command.detail()).to_lowercase();
+                tokens.iter().all(|token| haystack.contains(token))
             }
         })
         .collect()
@@ -713,5 +742,24 @@ mod tests {
         );
         assert!(!PaletteCommand::ReplySelected.is_view());
         assert!(PaletteCommand::OpenGallery.is_view());
+    }
+
+    #[test]
+    fn filter_multi_token_matches_title_and_detail() {
+        let folders = vec![(1u32, 7u32, "收件箱".to_string())];
+        let result = filter_commands(&extended_commands(), "dark theme", &folders);
+        assert_eq!(result, vec![PaletteCommand::ToggleTheme]);
+
+        let result = filter_commands(&extended_commands(), "移动 收件箱", &folders);
+        assert_eq!(
+            result,
+            vec![PaletteCommand::GoFolder {
+                account_id: 1,
+                folder_id: 7
+            }]
+        );
+
+        let result = filter_commands(&extended_commands(), "> 星标 切换", &folders);
+        assert_eq!(result, vec![PaletteCommand::ToggleStarSelected]);
     }
 }

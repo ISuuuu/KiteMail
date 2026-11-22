@@ -334,6 +334,13 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     },
     PrefSearchItem {
         tab: PrefTab::Composing,
+        row_id: "pref-compose-inline",
+        title: "回复与转发在阅读器内联分屏",
+        subtitle: "写信面板贴在下半部分，原邮件留在上半部分对照；点 ↗ 可弹出为独立窗口",
+        keywords: "compose inline split reader reply forward window pop out 内联 分屏 写信 独立窗口",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Composing,
         row_id: "pref-signature-above-quote",
         title: "回复与转发时的签名位置",
         subtitle: "选择签名位于引用正文上方或下方（默认上方）",

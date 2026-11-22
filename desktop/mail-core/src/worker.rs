@@ -121,14 +121,29 @@ async fn worker_loop(
     }
     wake_due_snoozed_messages(&mut cache, &evt_tx);
 
+    // 主循环不再无限阻塞等请求：按「下一条定时记录的到期时刻」限时等待（clamp 到
+    // [`OUTBOX_TICK_MIN`]..[`OUTBOX_TICK_MAX`]，即最长 30s），醒来先投递已到期的
+    // 定时件。这样「明天早上 8 点发」不依赖用户任何操作也能按时发出；同时间隔上限
+    // 30s 也顺带承担了稍后提醒（snooze）的巡检粒度。
     loop {
-        let req = match req_rx.recv_timeout(std::time::Duration::from_secs(30)) {
-            Ok(req) => req,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                wake_due_snoozed_messages(&mut cache, &evt_tx);
-                continue;
-            }
+        // 请求通道是标准库 mpsc（阻塞式），这里用 `recv_timeout` 替代直接
+        // `recv`：worker 独占自己的 runtime 线程，限时阻塞不影响 IDLE 推送。
+        let req = match req_rx.recv_timeout(next_outbox_wait(&cache)) {
+            Ok(req) => Some(req),
+            // 没有新请求：落到下面做一次到期巡检。
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            // 发送端已释放：退出主循环。
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        // 定时发送投递：内部先查有无到期记录，没有就立刻返回（不读盘），
+        // 所以每次唤醒都调用也不影响交互请求的响应速度。
+        deliver_due_outbox_tick(&data_dir, &mut cache, &mut tokens, &evt_tx).await;
+
+        let Some(req) = req else {
+            // 空闲唤醒才巡检稍后提醒，避免在交互请求路径上多加一次查库。
+            wake_due_snoozed_messages(&mut cache, &evt_tx);
+            continue;
         };
         if matches!(req, MailRequest::PrepareQuit) {
             let result = cache.expire_queued_outbox();
@@ -1990,6 +2005,36 @@ async fn handle_request(
             }
         }
 
+        // WP-10-5 写信模板：保存 / 删除都回推整份列表，UI 无需自行合并。
+        MailRequest::SaveTemplate { template } => match cache.upsert_template(&template) {
+            Ok(_) => {
+                if let Ok(templates) = cache.list_templates() {
+                    let _ = evt_tx.send(WorkerEvent::TemplatesUpdated { templates });
+                }
+            }
+            Err(message) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message,
+                });
+            }
+        },
+        MailRequest::DeleteTemplate { template_id } => {
+            if let Err(message) = cache.delete_template(template_id) {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message,
+                });
+            } else if let Ok(templates) = cache.list_templates() {
+                let _ = evt_tx.send(WorkerEvent::TemplatesUpdated { templates });
+            }
+        }
+        MailRequest::LoadTemplates => {
+            if let Ok(templates) = cache.list_templates() {
+                let _ = evt_tx.send(WorkerEvent::TemplatesUpdated { templates });
+            }
+        }
+
         MailRequest::SendDraft {
             account_id,
             draft,
@@ -2006,6 +2051,9 @@ async fn handle_request(
                 &draft.subject,
                 &draft.body,
                 &draft.in_reply_to,
+                &draft.from_addr,
+                &draft.reply_to,
+                draft.body_html.as_deref(),
                 &draft.attachment_paths,
                 now,
                 send_at.map(|delay| now + delay),
@@ -2023,6 +2071,9 @@ async fn handle_request(
                             subject: draft.subject.clone(),
                             body_text: draft.body.clone(),
                             in_reply_to: draft.in_reply_to.clone(),
+                            from_addr: draft.from_addr.clone(),
+                            reply_to: draft.reply_to.clone(),
+                            body_format: draft.body_format.clone(),
                             attachment_paths: draft.attachment_paths.clone(),
                             updated_at: now,
                         })
@@ -3430,6 +3481,53 @@ async fn backfill_history_batch_inner(
 /// 启动恢复（对齐 Linux 退出落盘语义）：扫描发件箱中已到期的 Queued 记录直接进入
 /// 投递；Sending / Uncertain / Failed 保持不动，避免重复投递或让用户误以为已投递。
 /// 停用账号的记录保持 Queued 排队，等重新启用后由 `SetAccountEnabled` 触发续发。
+/// 定时发送巡检的最长间隔：没有待发记录时，主循环仍每 30 秒醒一次。
+const OUTBOX_TICK_MAX: Duration = Duration::from_secs(30);
+/// 巡检的最短间隔：到期却没能投递（账号停用等）的记录会把「下次到期时间」压在
+/// 过去，给个下限避免主循环空转。
+const OUTBOX_TICK_MIN: Duration = Duration::from_secs(1);
+
+/// WP-10-5：主循环本次该等多久——等到下一条定时记录到期，最多
+/// [`OUTBOX_TICK_MAX`]。
+fn next_outbox_wait(cache: &CacheStore) -> Duration {
+    let now = chrono::Utc::now().timestamp();
+    let wait = match cache.next_queued_send_at(now) {
+        // 等到那一刻；已过期却没发出去的记录（例如账号被停用）不会出现在这里，
+        // 于是自然退回固定间隔，避免空转查库。
+        Ok(Some(at)) => Duration::from_secs((at - now).max(1) as u64),
+        _ => OUTBOX_TICK_MAX,
+    };
+    wait.clamp(OUTBOX_TICK_MIN, OUTBOX_TICK_MAX)
+}
+
+/// WP-10-5：主循环每次醒来做一次到期巡检。只有确实存在到期记录时才读账号配置
+/// 并投递，避免每 30 秒白读一次磁盘。
+async fn deliver_due_outbox_tick(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let has_due = cache
+        .list_due_queued_ids(None, now)
+        .map(|ids| !ids.is_empty())
+        .unwrap_or(false);
+    if !has_due {
+        return;
+    }
+    let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
+    deliver_due_outbox(data_dir, cache, tokens, &accounts, evt_tx).await;
+    for acc in accounts.iter().filter(|a| a.enabled) {
+        if let Ok(items) = cache.list_outbox(acc.id) {
+            let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                account_id: acc.id,
+                items,
+            });
+        }
+    }
+}
+
 async fn deliver_due_outbox(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -3577,10 +3675,18 @@ async fn deliver_outbox_item(
                 let bcc_addrs = item.bcc_addr.clone();
                 let subject = item.subject.clone();
                 let body = item.body_text.clone();
+                let body_html = item.body_html.clone();
                 let atts = item.attachment_paths.clone();
                 let out = tokio::task::spawn_blocking(move || {
                     graph_client::send_message(
-                        &token, &to_addr, &cc_addrs, &bcc_addrs, &subject, &body, &atts,
+                        &token,
+                        &to_addr,
+                        &cc_addrs,
+                        &bcc_addrs,
+                        &subject,
+                        &body,
+                        body_html.as_deref(),
+                        &atts,
                     )
                 })
                 .await
@@ -3608,6 +3714,9 @@ async fn deliver_outbox_item(
                     &item.subject,
                     &item.body_text,
                     &item.in_reply_to,
+                    &item.from_addr,
+                    &item.reply_to,
+                    item.body_html.as_deref(),
                     &item.attachment_paths,
                 )
                 .await;

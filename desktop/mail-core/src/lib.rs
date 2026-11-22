@@ -13,6 +13,7 @@ pub mod invite;
 pub mod jmap;
 pub mod link_clean;
 pub mod local;
+pub mod markup;
 pub mod merge;
 pub mod mime;
 pub mod oauth;
@@ -198,6 +199,16 @@ pub struct UserContact {
     pub email: String,
     pub display_name: String,
     pub notes: String,
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub organization: String,
+    #[serde(default)]
+    pub job_title: String,
+    #[serde(default)]
+    pub birthday: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 /// Persisted local compose draft recoverable across restarts.
@@ -213,8 +224,31 @@ pub struct LocalDraft {
     pub subject: String,
     pub body_text: String,
     pub in_reply_to: String,
+    /// 自定义发件人（`Name <addr>` 或纯地址）；空表示使用账号默认身份。
+    pub from_addr: String,
+    /// `Reply-To` 行（WP-10 第 2 项）；空表示不写该信头。
+    pub reply_to: String,
+    /// 正文格式（`ComposeFormat::as_str`，WP-10 第 3 项）；空 / 未知按富文本处理。
+    pub body_format: String,
     pub attachment_paths: Vec<String>,
     pub updated_at: i64,
+}
+
+/// WP-10-5 写信模板（`Save as Template`）：收件人 + 主题 + 正文的整套快照，
+/// 选中后直接填回写信器。与草稿不同，模板不绑定账号、不参与自动保存。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailTemplate {
+    pub id: u32,
+    pub name: String,
+    pub to_addr: String,
+    pub cc_addr: String,
+    pub bcc_addr: String,
+    pub subject: String,
+    pub body_text: String,
+    /// 正文格式（`ComposeFormat::as_str`）；空 / 未知按富文本处理。
+    pub body_format: String,
+    pub attachment_paths: Vec<String>,
+    pub created_at: i64,
 }
 
 /// One page of message summaries returned from the cache or demo store.
@@ -237,6 +271,15 @@ pub struct ComposeDraft {
     pub subject: String,
     pub body: String,
     pub in_reply_to: String,
+    /// 自定义发件人（`Name <addr>` 或纯地址）；空表示使用账号默认身份。
+    pub from_addr: String,
+    /// `Reply-To` 行；空表示不写该信头。
+    pub reply_to: String,
+    /// 正文格式（`ComposeFormat::as_str`，WP-10 第 3 项）；空 / 未知按富文本处理。
+    pub body_format: String,
+    /// WP-10-3 按正文格式预先算好的 HTML（`Some` 时发 multipart/alternative，
+    /// 纯文本模式为 `None`）。草稿本身仍只存源文本 + 会话级格式。
+    pub body_html: Option<String>,
     pub attachment_paths: Vec<String>,
 }
 
@@ -283,6 +326,12 @@ pub struct OutboxItem {
     pub subject: String,
     pub body_text: String,
     pub in_reply_to: String,
+    /// 自定义发件人（`Name <addr>` 或纯地址）；空表示使用账号默认身份。
+    pub from_addr: String,
+    /// `Reply-To` 行；空表示不写该信头。
+    pub reply_to: String,
+    /// 投递用的 HTML 正文（`Some` 时发 multipart/alternative）。
+    pub body_html: Option<String>,
     pub attachment_paths: Vec<String>,
     pub status: OutboxStatus,
     pub last_error: String,
@@ -653,6 +702,16 @@ pub enum MailRequest {
     DeleteLocalDraft {
         draft_id: u32,
     },
+    /// WP-10-5 保存 / 覆盖一条写信模板（`template.id == 0` 为新建）。
+    SaveTemplate {
+        template: MailTemplate,
+    },
+    /// WP-10-5 删除一条写信模板。
+    DeleteTemplate {
+        template_id: u32,
+    },
+    /// WP-10-5 重新加载模板列表（启动与读写后刷新 UI）。
+    LoadTemplates,
     SendDraft {
         account_id: u32,
         draft: ComposeDraft,
@@ -825,6 +884,10 @@ pub enum WorkerEvent {
     OutboxUpdated {
         account_id: u32,
         items: Vec<OutboxItem>,
+    },
+    /// WP-10-5 写信模板列表（加载 / 保存 / 删除后推送）。
+    TemplatesUpdated {
+        templates: Vec<MailTemplate>,
     },
     /// 撤销发送缓冲：待发记录已持久化到发件箱（Queued + 到期时间），
     /// UI 据此绑定撤销 / 立即发送目标，并确认原草稿已交接落盘。

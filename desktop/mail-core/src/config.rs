@@ -489,6 +489,11 @@ pub struct AppPreferences {
     /// Default sender account email for new messages (`""` = auto / current account).
     #[serde(default)]
     pub compose_default_from: String,
+    /// Whether reply / reply-all / forward open as an inline split under the
+    /// reader (original `compose_inline` / `reply_inline`, default on) instead
+    /// of taking over the whole reading pane.
+    #[serde(default = "default_true")]
+    pub compose_inline: bool,
     /// Place signature above quoted text when replying or forwarding.
     #[serde(default = "default_true")]
     pub signature_above_quote: bool,
@@ -1134,6 +1139,7 @@ impl Default for AppPreferences {
             reader_show_view_switch: true,
             reader_default_mode: "remember".to_string(),
             compose_default_from: String::new(),
+            compose_inline: true,
             signature_above_quote: true,
             signature_dashes: false,
             undo_send_secs: 5,

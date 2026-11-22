@@ -1118,11 +1118,24 @@ pub(crate) fn render(
     window: &Window,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
+    // L-6：阅读器在下方时列表顶栏即窗口顶栏，此处不再重复画窗口控制按钮。
+    let pane_top = app.pane_at_window_top();
+    render_with_pane_top(app, window, cx, pane_top)
+}
+
+/// 同 [`render`]，但由调用方决定是否在阅读器顶栏画窗口控制按钮。
+///
+/// WP-10-4：内联分屏回复时阅读器独占窗格上半部分、位于窗格顶端，
+/// 无论阅读器位置偏好如何都应当画出窗口控制按钮。
+pub(crate) fn render_with_pane_top(
+    app: &mut HylkiApp,
+    window: &Window,
+    cx: &mut Context<HylkiApp>,
+    pane_top: bool,
+) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 出来。
     let p = theme::current(cx);
     let (canvas, border, muted_fg, accent) = (p.canvas, p.border, p.text_muted, p.accent);
-    // L-6：阅读器在下方时列表顶栏即窗口顶栏，此处不再重复画窗口控制按钮。
-    let pane_top = app.pane_at_window_top();
     // B-5：窗口宽度低于阈值、偏好「始终折叠」或专注模式偏好触发折叠时收进「⋯」菜单。
     let narrow_topbar = app.prefs.reader_toolbar_fold_right
         || (app.focus_mode && app.prefs.focus_fold_toolbar)
@@ -1131,8 +1144,6 @@ pub(crate) fn render(
     let win_controls = window_controls::render_window_controls("reader-wc", window, cx);
 
     let Some(detail) = app.selected_message.clone() else {
-        // L-6：阅读器在下方 / 关闭时列表顶栏即窗口顶栏，此处不再重复画窗口控制按钮。
-        let pane_top = app.pane_at_window_top();
         return v_flex()
             .flex_1()
             .min_w_0()

@@ -9,6 +9,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{h_flex, v_flex, Icon, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -16,8 +17,11 @@ use gpui_kit::{
     ParentElement, SharedString, Styled,
 };
 
-use crate::app::{filter_contact_suggestions, ComposeAddressField, HylkiApp};
+use crate::app::{
+    filter_contact_suggestions, ComposeAddressField, ComposeMarkup, HylkiApp, RecipientPill,
+};
 use crate::theme;
+use hylki_mail_core::markup::ComposeFormat;
 
 /// 信头行标签宽度。
 const LABEL_WIDTH: f32 = 56.0;
@@ -43,6 +47,130 @@ fn header_row(
                 .child(label),
         )
         .child(div().flex_1().min_w_0().child(Input::new(input)))
+}
+
+/// 收件人胶囊（对齐 Linux `src/ui/recipient_row.rs` 的 `.recipient-pill`）：
+/// 点击主体把地址放回输入框继续编辑，`⇄` 移到下一个收件人字段，`×` 删除；
+/// 非法地址渲染红色 `.invalid` 边框。
+fn recipient_pill_view(
+    field: ComposeAddressField,
+    idx: usize,
+    pill: &RecipientPill,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let (bg, fg, border) = if pill.valid {
+        (p.accent_soft(), p.text, p.border)
+    } else {
+        (p.danger.opacity(0.12), p.danger, p.danger)
+    };
+    let pill_id = field.index() * 1000 + idx;
+    let label = pill.label.clone();
+    h_flex()
+        .id(("recipient-pill", pill_id))
+        .items_center()
+        .gap_1()
+        .pl_2()
+        .pr_1()
+        .py_0p5()
+        .rounded(px(9999.0))
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                this.edit_recipient_pill(field, idx, window, cx);
+            }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(fg)
+                .max_w(px(220.0))
+                .truncate()
+                .child(SharedString::from(label)),
+        )
+        .child(
+            div()
+                .id(("recipient-pill-move", pill_id))
+                .px_1()
+                .rounded(px(4.0))
+                .text_xs()
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(move |s| s.bg(bg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.move_recipient_pill(field, idx, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(SharedString::from("⇄")),
+        )
+        .child(
+            div()
+                .id(("recipient-pill-remove", pill_id))
+                .px_1()
+                .rounded(px(4.0))
+                .text_xs()
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(move |s| s.bg(bg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.remove_recipient_pill(field, idx, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(SharedString::from("×")),
+        )
+        .into_any_element()
+}
+
+/// 收件人信头行：左侧标签 + 胶囊流 + 输入框（输入框承载「正在输入的这一段」）。
+fn recipient_row(
+    field: ComposeAddressField,
+    app: &HylkiApp,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::Div {
+    let pills: Vec<gpui_kit::AnyElement> = app
+        .compose_pills(field)
+        .iter()
+        .enumerate()
+        .map(|(idx, pill)| recipient_pill_view(field, idx, pill, p, cx))
+        .collect();
+    let input = app.compose_field_input(field);
+    let border = p.border;
+    let muted_fg = p.text_muted;
+    h_flex()
+        .items_center()
+        .gap_2()
+        .border_b_1()
+        .border_color(border)
+        .py_1()
+        .child(
+            div()
+                .w(px(LABEL_WIDTH))
+                .flex_shrink_0()
+                .text_sm()
+                .text_color(muted_fg)
+                .child(field.label()),
+        )
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .children(pills)
+                .child(div().flex_1().min_w(px(120.0)).child(Input::new(&input))),
+        )
 }
 
 /// 附件芯片（圆角胶囊：📎 文件名 (大小) ×，点击移除）。
@@ -87,7 +215,17 @@ fn render_autocomplete_dropdown(
     if app.compose_autocomplete_field != Some(field) {
         return None;
     }
-    let suggestions = filter_contact_suggestions(input_value, &app.known_contacts, 5);
+    // 已收进胶囊的地址不再出现在建议里（输入框现在只承载「正在输入的这一段」）。
+    let taken: std::collections::HashSet<String> = app
+        .compose_pills(field)
+        .iter()
+        .map(|p| p.address.to_lowercase())
+        .collect();
+    let suggestions: Vec<_> = filter_contact_suggestions(input_value, &app.known_contacts, 8)
+        .into_iter()
+        .filter(|c| !taken.contains(&c.email.to_lowercase()))
+        .take(5)
+        .collect();
     if suggestions.is_empty() {
         return None;
     }
@@ -159,6 +297,198 @@ fn render_autocomplete_dropdown(
             .children(rows)
             .into_any_element(),
     )
+}
+
+/// WP-10-2 发件身份控件（对齐 Linux `adw::ComboRow` + `custom_from_row`）：
+/// 默认渲染「账号默认身份 + 别名」下拉，选中后写进 `compose_from_addr`；
+/// 点菜单里的「自定义发件人…」切换为手输框，手输框旁的按钮退回下拉。
+fn compose_from_control(
+    app: &HylkiApp,
+    entity: Entity<HylkiApp>,
+    p: &theme::HylkiPalette,
+    _cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    if app.compose_from_custom {
+        let ent_back = entity.clone();
+        return h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&app.compose_from)),
+            )
+            .child(
+                Button::new("compose-from-back")
+                    .ghost()
+                    .compact()
+                    .text_size(px(12.0))
+                    .label("用账号身份")
+                    .on_click(move |_, _, cx| {
+                        ent_back.update(cx, |this, cx| this.end_custom_compose_from(cx));
+                    }),
+            )
+            .into_any_element();
+    }
+
+    let choices = app.compose_from_choices();
+    let current_from = app.compose_from_addr.clone();
+    let accent = p.accent;
+    let ent_menu = entity.clone();
+    Button::new("compose-from-identity")
+        .ghost()
+        .compact()
+        .label(app.compose_from_display())
+        .icon(IconName::ChevronDown)
+        .dropdown_menu(move |mut menu, _, _| {
+            for choice in choices.iter() {
+                let selected = choice.from_addr == current_from;
+                let from_addr = choice.from_addr.clone();
+                let reply_to = choice.reply_to.clone();
+                let ent_item = ent_menu.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(choice.label.clone())
+                        .when(selected, |item| {
+                            item.icon(Icon::new(IconName::Check).text_color(accent))
+                        })
+                        .on_click(move |_, window, cx| {
+                            ent_item.update(cx, |this, cx| {
+                                this.select_compose_from(
+                                    from_addr.clone(),
+                                    reply_to.clone(),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }),
+                );
+            }
+            let ent_custom = ent_menu.clone();
+            menu.item(
+                PopupMenuItem::new("自定义发件人…")
+                    .icon(Icon::new(IconName::Pencil))
+                    .on_click(move |_, window, cx| {
+                        ent_custom
+                            .update(cx, |this, cx| this.begin_custom_compose_from(window, cx));
+                    }),
+            )
+        })
+        .into_any_element()
+}
+
+/// WP-10-3：工具条按钮对应的图标。
+fn markup_icon(kind: ComposeMarkup) -> IconName {
+    match kind {
+        ComposeMarkup::Bold => IconName::Bold,
+        ComposeMarkup::Italic => IconName::Italic,
+        ComposeMarkup::Strike => IconName::Strikethrough,
+        ComposeMarkup::InlineCode => IconName::Code,
+        ComposeMarkup::BulletList => IconName::List,
+        ComposeMarkup::NumberedList => IconName::ListOrdered,
+        ComposeMarkup::Quote => IconName::TextQuote,
+        ComposeMarkup::CodeBlock => IconName::SquareCode,
+        ComposeMarkup::Link => IconName::Link,
+    }
+}
+
+/// 格式在菜单里的图标（富文本 / Markdown 用书写类图标，HTML 用代码类）。
+fn format_icon(format: ComposeFormat) -> IconName {
+    match format {
+        ComposeFormat::Rich => IconName::Type,
+        ComposeFormat::Markdown => IconName::FileText,
+        ComposeFormat::Html => IconName::CodeXml,
+        ComposeFormat::Plain => IconName::Pilcrow,
+    }
+}
+
+/// WP-10-3：正文区底部「格式切换 + 格式化工具条」。
+///
+/// 左侧是四档格式菜单（当前格式 + 一行说明），右侧是加粗 / 斜体 / 列表 /
+/// 引用 / 代码块 / 链接等语法插入按钮；HTML 与纯文本模式不显示工具条，
+/// 因为这两种模式下插入 Markdown 标记只会污染正文。
+fn compose_format_bar(
+    app: &HylkiApp,
+    entity: Entity<HylkiApp>,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let current = app.compose_format;
+    let accent = p.accent;
+    let muted_fg = p.text_muted;
+
+    let ent_menu = entity.clone();
+    let menu_button = Button::new("compose-format-menu")
+        .ghost()
+        .compact()
+        .text_size(px(12.0))
+        .icon(format_icon(current))
+        .label(current.label())
+        .dropdown_menu(move |mut menu, _, _| {
+            for format in ComposeFormat::ALL {
+                let selected = format == current;
+                let ent_item = ent_menu.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format.label())
+                        .when(selected, |item| {
+                            item.icon(Icon::new(IconName::Check).text_color(accent))
+                        })
+                        .on_click(move |_, window, cx| {
+                            ent_item
+                                .update(cx, |this, cx| this.set_compose_format(format, window, cx));
+                        }),
+                );
+            }
+            menu
+        });
+
+    let toolbar: Vec<gpui_kit::AnyElement> = if current.has_format_toolbar() {
+        ComposeMarkup::ALL
+            .iter()
+            .map(|kind| {
+                let kind = *kind;
+                Button::new(("compose-markup", kind as usize))
+                    .ghost()
+                    .compact()
+                    .icon(markup_icon(kind))
+                    .tooltip(kind.hint())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.insert_compose_markup(kind, window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    h_flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .border_t_1()
+        .border_color(p.border)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .child(menu_button)
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(SharedString::from(current.hint())),
+                ),
+        )
+        .child(h_flex().items_center().gap_0p5().children(toolbar))
+        .into_any_element()
 }
 
 pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
@@ -389,34 +719,22 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                     .flex_wrap()
                                     .gap_1()
                                     .children(account_pills),
-                            ),
+                            )
+                            // WP-10-2：发件身份下拉（账号默认身份 + 别名 + 自定义）。
+                            .child(compose_from_control(app, cx.entity(), &p, cx)),
                     )
                 })
                 .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(p.border)
-                        .py_1()
-                        .child(
-                            div()
-                                .w(px(LABEL_WIDTH))
-                                .flex_shrink_0()
-                                .text_sm()
-                                .text_color(muted_fg)
-                                .child("收件人"),
-                        )
-                        .child(div().flex_1().min_w_0().child(Input::new(&app.compose_to)))
+                    recipient_row(ComposeAddressField::To, app, &p, cx)
                         .child(
                             Button::new("toggle-cc-bcc")
                                 .ghost()
                                 .compact()
                                 .text_size(px(12.0))
                                 .label(if app.compose_show_cc_bcc {
-                                    "收起抄送/密送"
+                                    "收起抄送/密送/Reply-To"
                                 } else {
-                                    "抄送 / 密送"
+                                    "抄送 / 密送 / Reply-To"
                                 })
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.toggle_compose_cc_bcc(cx);
@@ -515,13 +833,108 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 )
                 .children(to_suggestions)
                 .when(app.compose_show_cc_bcc, |el| {
-                    el.child(header_row("抄送", &app.compose_cc, &p))
+                    el.child(recipient_row(ComposeAddressField::Cc, app, &p, cx))
                         .children(cc_suggestions)
-                        .child(header_row("密送", &app.compose_bcc, &p))
+                        .child(recipient_row(ComposeAddressField::Bcc, app, &p, cx))
                         .children(bcc_suggestions)
+                        // WP-10-2：Reply-To 行（对应原版 `reply_to_row`，默认折叠）。
+                        .child(header_row("Reply-To", &app.compose_reply_to, &p))
                 })
                 .child(header_row("主题", &app.compose_subject, &p)),
         )
+        // WP-10-5 定时发送：自定义时间输入行（预设时间直接从顶栏时钟下拉里选）。
+        .when(app.compose_schedule_open, |el| {
+            el.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .w(px(LABEL_WIDTH))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .text_color(p.text_muted)
+                            .child("定时发送"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&app.compose_schedule_input)),
+                    )
+                    .child(
+                        Button::new("compose-schedule-confirm")
+                            .primary()
+                            .compact()
+                            .label("确定")
+                            .tooltip("按这个时间排入发件箱（YYYY-MM-DD HH:MM）")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_custom_compose_schedule(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("compose-schedule-cancel")
+                            .ghost()
+                            .compact()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_custom_compose_schedule(cx);
+                            })),
+                    ),
+            )
+        })
+        .when_some(app.compose_schedule_error.clone(), |el, message| {
+            el.child(
+                div()
+                    .pl(px(LABEL_WIDTH + 8.0))
+                    .pb_1()
+                    .text_xs()
+                    .text_color(p.danger)
+                    .child(message),
+            )
+        })
+        // WP-10-5 存为模板：名称输入行（保存后出现在顶栏书签下拉里）。
+        .when(app.compose_template_save_open, |el| {
+            el.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .w(px(LABEL_WIDTH))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .text_color(p.text_muted)
+                            .child("模板名称"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&app.compose_template_name)),
+                    )
+                    .child(
+                        Button::new("compose-template-save-confirm")
+                            .primary()
+                            .compact()
+                            .label("保存")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_save_compose_template(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("compose-template-save-cancel")
+                            .ghost()
+                            .compact()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_save_compose_template(cx);
+                            })),
+                    ),
+            )
+        })
         // F-4：草稿自动保存常驻小字提示（右对齐，自动保存成功后出现）。
         .when_some(app.compose_autosaved_at.clone(), |el, saved_at| {
             el.child(
@@ -546,17 +959,27 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .when(!app.compose_attachments.is_empty(), |el| {
             el.child(h_flex().gap_2().flex_wrap().children(attachment_chips))
         })
-        // 正文编辑区（flex-1 撑满剩余高度）。
+        // 正文编辑区（flex-1 撑满剩余高度）+ WP-10-3 底部格式 / 格式化工具条。
+        // WP-10-5：整块正文区同时是外部文件拖放入口（DropZones）。
         .child(
-            div()
+            v_flex()
                 .flex_1()
                 .min_h_0()
                 .rounded(px(8.0))
                 .border_1()
                 .border_color(p.border)
                 .bg(p.surface)
-                .p_2()
-                .child(Textarea::new(&app.compose_body)),
+                .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                    this.attach_dropped_files(paths.0.iter().cloned().collect(), cx);
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .p_2()
+                        .child(Textarea::new(&app.compose_body)),
+                )
+                .child(compose_format_bar(app, cx.entity(), &p, cx)),
         )
         .into_any_element()
 }

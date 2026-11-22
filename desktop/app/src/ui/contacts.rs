@@ -16,7 +16,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Disableable, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     black, div, px, AppContext, Context, Div, EventEmitter, InteractiveElement, IntoElement,
@@ -53,6 +53,11 @@ pub enum ContactsEvent {
         email: String,
         display_name: String,
         notes: String,
+        phone: String,
+        organization: String,
+        job_title: String,
+        birthday: String,
+        groups: Vec<String>,
     },
     /// F-5 删除自定义联系人（参数为 user_contacts 行 ID）。
     DeleteContact(u32),
@@ -72,6 +77,11 @@ struct ContactEditor {
     /// 原邮箱（去重校验时排除自身）。
     name_input: gpui_kit::Entity<InputState>,
     email_input: gpui_kit::Entity<InputState>,
+    phone_input: gpui_kit::Entity<InputState>,
+    org_input: gpui_kit::Entity<InputState>,
+    title_input: gpui_kit::Entity<InputState>,
+    birthday_input: gpui_kit::Entity<InputState>,
+    groups_input: gpui_kit::Entity<InputState>,
     notes_input: gpui_kit::Entity<InputState>,
     /// 校验错误提示（邮箱为空 / 缺少 @ / 重复）。
     error: Option<SharedString>,
@@ -82,6 +92,8 @@ pub struct ContactsState {
     search_input: gpui_kit::Entity<InputState>,
     /// 当前搜索词。
     query: String,
+    /// WP-10 当前选中的分组筛选（`None` = 全部）。
+    selected_group: Option<String>,
     /// 集成者注入的联系人（set_contacts 时按自定义优先 + 邮件数降序排列）。
     contacts: Vec<KnownContact>,
     /// 当前选中的联系人下标（指向过滤后的列表）。
@@ -99,7 +111,7 @@ impl EventEmitter<ContactsEvent> for ContactsState {}
 impl ContactsState {
     pub fn new(window: &mut gpui_kit::Window, cx: &mut Context<Self>) -> Self {
         let search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索姓名或邮箱..."));
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索姓名、邮箱、组织或分组..."));
         cx.subscribe(&search_input, |this, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 let query = input.read(cx).value().to_string();
@@ -113,6 +125,7 @@ impl ContactsState {
         Self {
             search_input,
             query: String::new(),
+            selected_group: None,
             contacts: Vec::new(),
             selected: 0,
             demo_mode: false,
@@ -141,6 +154,14 @@ impl ContactsState {
             email_input: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("邮箱地址（必填，如 user@example.com）")
             }),
+            phone_input: cx.new(|cx| InputState::new(window, cx).placeholder("电话号码（可选）")),
+            org_input: cx.new(|cx| InputState::new(window, cx).placeholder("公司 / 组织（可选）")),
+            title_input: cx.new(|cx| InputState::new(window, cx).placeholder("职位（可选）")),
+            birthday_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("生日，如 1995-01-02")),
+            groups_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("分组标签，逗号分隔（如 工作, 客户）")
+            }),
             notes_input: cx.new(|cx| InputState::new(window, cx).placeholder("备注（可选）")),
             error: None,
         });
@@ -155,6 +176,7 @@ impl ContactsState {
         cx: &mut Context<Self>,
     ) {
         self.confirm_delete = None;
+        let groups_str = contact.groups.join(", ");
         self.editor = Some(ContactEditor {
             id: Some(contact.id),
             name_input: cx.new(|cx| {
@@ -166,6 +188,31 @@ impl ContactsState {
                 InputState::new(window, cx)
                     .placeholder("邮箱地址（必填）")
                     .default_value(contact.email.clone())
+            }),
+            phone_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("电话号码（可选）")
+                    .default_value(contact.phone.clone())
+            }),
+            org_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("公司 / 组织（可选）")
+                    .default_value(contact.organization.clone())
+            }),
+            title_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("职位（可选）")
+                    .default_value(contact.job_title.clone())
+            }),
+            birthday_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("生日，如 1995-01-02")
+                    .default_value(contact.birthday.clone())
+            }),
+            groups_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("分组标签，逗号分隔")
+                    .default_value(groups_str)
             }),
             notes_input: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -184,6 +231,18 @@ impl ContactsState {
         };
         let email = editor.email_input.read(cx).value().trim().to_string();
         let name = editor.name_input.read(cx).value().trim().to_string();
+        let phone = editor.phone_input.read(cx).value().trim().to_string();
+        let organization = editor.org_input.read(cx).value().trim().to_string();
+        let job_title = editor.title_input.read(cx).value().trim().to_string();
+        let birthday = editor.birthday_input.read(cx).value().trim().to_string();
+        let groups: Vec<String> = editor
+            .groups_input
+            .read(cx)
+            .value()
+            .split([',', '，'])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         let notes = editor.notes_input.read(cx).value().trim().to_string();
         let error = if email.is_empty() || !email.contains('@') {
             Some(SharedString::from("请填写有效的邮箱地址（需包含 @）"))
@@ -210,15 +269,39 @@ impl ContactsState {
             email,
             display_name: name,
             notes,
+            phone,
+            organization,
+            job_title,
+            birthday,
+            groups,
         });
         cx.notify();
     }
 
-    /// 过滤后的联系人（搜索词匹配姓名或邮箱，忽略大小写）。
+    /// 收集所有去重后的分组标签。
+    fn all_groups(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in &self.contacts {
+            for g in &c.groups {
+                if !g.is_empty() && !out.iter().any(|existing| existing == g) {
+                    out.push(g.clone());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// 过滤后的联系人（搜索词 + 分组筛选）。
     fn visible_contacts(&self) -> Vec<&KnownContact> {
         self.contacts
             .iter()
-            .filter(|c| contact_matches(c, &self.query))
+            .filter(|c| {
+                self.selected_group
+                    .as_ref()
+                    .is_none_or(|g| c.groups.iter().any(|cg| cg == g))
+                    && contact_matches(c, &self.query)
+            })
             .collect()
     }
 }
@@ -234,12 +317,15 @@ fn sort_contacts_desc(mut items: Vec<KnownContact>) -> Vec<KnownContact> {
     items
 }
 
-/// 搜索词匹配：空串匹配全部；否则忽略大小写的子串匹配姓名或邮箱。
+/// 搜索词匹配：空串匹配全部；否则忽略大小写的子串匹配姓名、邮箱、组织、电话或分组。
 fn contact_matches(contact: &KnownContact, query: &str) -> bool {
     let q = query.trim().to_lowercase();
     q.is_empty()
         || contact.name.to_lowercase().contains(&q)
         || contact.email.to_lowercase().contains(&q)
+        || contact.organization.to_lowercase().contains(&q)
+        || contact.phone.to_lowercase().contains(&q)
+        || contact.groups.iter().any(|g| g.to_lowercase().contains(&q))
 }
 
 /// 联系人行（头像 + 姓名/邮箱 + 邮件数胶囊）。
@@ -437,15 +523,27 @@ impl Render for ContactsState {
                     let name = contact.name.clone();
                     let email = contact.email.clone();
                     let count = contact.message_count;
+                    let sent_count = contact.sent_count;
                     let notes = contact.notes.clone();
+                    let phone = contact.phone.clone();
+                    let organization = contact.organization.clone();
+                    let job_title = contact.job_title.clone();
+                    let birthday = contact.birthday.clone();
+                    let groups = contact.groups.clone();
                     let is_custom = contact.custom && contact.id > 0;
                     let compose_email = email.clone();
                     let edit_contact = contact.clone();
                     let delete_id = contact.id;
                     let delete_name = contact.name.clone();
+                    let org_line = match (organization.is_empty(), job_title.is_empty()) {
+                        (false, false) => format!("{organization} · {job_title}"),
+                        (false, true) => organization,
+                        (true, false) => job_title,
+                        (true, true) => String::new(),
+                    };
                     v_flex()
-                        .w(px(420.0))
-                        .px_4()
+                        .w(px(440.0))
+                        .px_5()
                         .py_5()
                         .gap_3()
                         .bg(surface)
@@ -469,8 +567,10 @@ impl Render for ContactsState {
                         )
                         .child(
                             h_flex()
-                                .gap_1()
+                                .gap_1p5()
                                 .items_center()
+                                .flex_wrap()
+                                .justify_center()
                                 .child(
                                     Icon::new(IconName::Mail)
                                         .with_size(px(14.0))
@@ -488,21 +588,119 @@ impl Render for ContactsState {
                                             .child("自定义"),
                                     )
                                 })
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted_fg)
-                                        .child(SharedString::from(format!("往来邮件 {count} 封"))),
-                                ),
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    SharedString::from(format!(
+                                        "往来 {count} 封 · 发信 {sent_count} 封"
+                                    )),
+                                )),
                         )
-                        .when(!notes.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(SharedString::from(notes)),
-                            )
+                        .when(!groups.is_empty(), |el| {
+                            el.child(h_flex().gap_1().flex_wrap().justify_center().children(
+                                groups.into_iter().map(|g| {
+                                    div()
+                                        .rounded_full()
+                                        .px_2()
+                                        .py_0p5()
+                                        .bg(accent_soft)
+                                        .text_xs()
+                                        .text_color(text)
+                                        .child(SharedString::from(g))
+                                }),
+                            ))
                         })
+                        .when(
+                            !phone.is_empty()
+                                || !org_line.is_empty()
+                                || !birthday.is_empty()
+                                || !notes.is_empty(),
+                            |el| {
+                                el.child(
+                                    v_flex()
+                                        .w_full()
+                                        .p_3()
+                                        .gap_1p5()
+                                        .rounded(px(8.0))
+                                        .border_1()
+                                        .border_color(border)
+                                        .when(!org_line.is_empty(), |card| {
+                                            card.child(
+                                                h_flex()
+                                                    .justify_between()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(muted_fg)
+                                                            .child("组织 / 职位"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(text)
+                                                            .child(SharedString::from(org_line)),
+                                                    ),
+                                            )
+                                        })
+                                        .when(!phone.is_empty(), |card| {
+                                            card.child(
+                                                h_flex()
+                                                    .justify_between()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(muted_fg)
+                                                            .child("电话"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(text)
+                                                            .child(SharedString::from(phone)),
+                                                    ),
+                                            )
+                                        })
+                                        .when(!birthday.is_empty(), |card| {
+                                            card.child(
+                                                h_flex()
+                                                    .justify_between()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(muted_fg)
+                                                            .child("生日"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(text)
+                                                            .child(SharedString::from(birthday)),
+                                                    ),
+                                            )
+                                        })
+                                        .when(!notes.is_empty(), |card| {
+                                            card.child(
+                                                h_flex()
+                                                    .justify_between()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(muted_fg)
+                                                            .child("备注"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(text)
+                                                            .child(SharedString::from(notes)),
+                                                    ),
+                                            )
+                                        }),
+                                )
+                            },
+                        )
                         .child(
                             Button::new("contact-compose")
                                 .primary()
@@ -654,6 +852,73 @@ impl Render for ContactsState {
                                             .child(Input::new(&editor.name_input)),
                                     )
                                     .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(p.text_muted)
+                                                            .child("电话"),
+                                                    )
+                                                    .child(Input::new(&editor.phone_input)),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(p.text_muted)
+                                                            .child("生日"),
+                                                    )
+                                                    .child(Input::new(&editor.birthday_input)),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(p.text_muted)
+                                                            .child("组织 / 公司"),
+                                                    )
+                                                    .child(Input::new(&editor.org_input)),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(p.text_muted)
+                                                            .child("职位"),
+                                                    )
+                                                    .child(Input::new(&editor.title_input)),
+                                            ),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(p.text_muted)
+                                                    .child("分组标签（逗号分隔）"),
+                                            )
+                                            .child(Input::new(&editor.groups_input)),
+                                    )
+                                    .child(
                                         v_flex()
                                             .gap_1()
                                             .child(
@@ -772,6 +1037,44 @@ impl Render for ContactsState {
                                     .flex_shrink_0()
                                     .child(Input::new(&self.search_input)),
                             )
+                            .when(!self.all_groups().is_empty(), |col| {
+                                let groups = self.all_groups();
+                                let selected_group = self.selected_group.clone();
+                                col.child(
+                                    h_flex()
+                                        .px_2()
+                                        .pb_2()
+                                        .gap_1()
+                                        .flex_wrap()
+                                        .child(
+                                            Button::new("contact-group-all")
+                                                .ghost()
+                                                .compact()
+                                                .selected(selected_group.is_none())
+                                                .label("全部")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.selected_group = None;
+                                                    this.selected = 0;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .children(groups.into_iter().enumerate().map(|(i, g)| {
+                                            let is_sel =
+                                                selected_group.as_deref() == Some(g.as_str());
+                                            let g_click = g.clone();
+                                            Button::new(("contact-group", i))
+                                                .ghost()
+                                                .compact()
+                                                .selected(is_sel)
+                                                .label(g)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.selected_group = Some(g_click.clone());
+                                                    this.selected = 0;
+                                                    cx.notify();
+                                                }))
+                                        })),
+                                )
+                            })
                             .child(
                                 v_flex()
                                     .id("contacts-list")
