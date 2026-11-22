@@ -7,10 +7,12 @@ pub mod contacts_io;
 pub mod demo;
 pub mod graph_client;
 pub mod imap_client;
+pub mod mime;
 pub mod oauth;
 pub mod search_query;
 pub mod secrets;
 pub mod smtp_client;
+pub mod strip;
 pub mod worker;
 
 pub use search_query::SearchQuery;
@@ -550,6 +552,15 @@ pub enum MailRequest {
         attachment_ids: Vec<u32>,
         dest_dir: std::path::PathBuf,
     },
+    /// Strip an attachment from a message on the IMAP server (#289), replacing
+    /// its MIME part with a `text/x-moz-deleted` placeholder to reclaim quota.
+    StripAttachment {
+        account_id: u32,
+        message_id: u32,
+        attachment_id: u32,
+        attachment_name: String,
+        size_bytes: usize,
+    },
     SaveLocalDraft {
         draft: LocalDraft,
     },
@@ -745,6 +756,20 @@ pub enum WorkerEvent {
     AttachmentsSaved {
         count: usize,
         dest_dir: std::path::PathBuf,
+    },
+    /// An attachment was stripped from its message on the server (#289).
+    AttachmentStripped {
+        account_id: u32,
+        message_id: u32,
+        attachment_id: u32,
+        attachments: Vec<AttachmentMeta>,
+    },
+    /// Stripping an attachment from the server failed.
+    AttachmentStripFailed {
+        account_id: u32,
+        message_id: u32,
+        attachment_id: u32,
+        message: String,
     },
     /// A message was moved to the account's archive folder on the server and
     /// removed from the local cache; the UI should refresh its lists.

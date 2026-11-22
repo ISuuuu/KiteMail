@@ -549,7 +549,9 @@ pub async fn fetch_message_body(
         .parse(&bytes)
         .ok_or_else(|| "解析邮件 MIME 内容失败".to_string())?;
 
-    let body_html = parsed.body_html(0).map(|h| h.into_owned());
+    let body_html = parsed
+        .body_html(0)
+        .map(|h| crate::mime::resolve_cid_inline_images(&parsed, h.into_owned()));
     let body_text = if let Some(text) = parsed.body_text(0) {
         text.into_owned()
     } else if let Some(ref html) = body_html {
@@ -856,6 +858,146 @@ pub async fn append_sent_message(
     .map_err(|e| format!("保存已发副本到 {sent_folder_path} 失败: {e}"))?;
     let _ = session.logout().await;
     Ok(())
+}
+
+/// Strip an attachment from message `uid` in `folder_path` on the IMAP server
+/// (#289): fetches raw RFC822 + flags/internaldate, rewrites the MIME part to
+/// `text/x-moz-deleted`, appends the rewritten copy, finds its new UID, and
+/// expunges the original message.
+pub async fn strip_imap_attachment(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+    name: &str,
+    size: u64,
+) -> Result<(Option<u32>, Vec<u8>), String> {
+    let mut session = connect_imap(account, password).await?;
+    let mailbox = session
+        .select(folder_path)
+        .await
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+    let uid_next = mailbox.uid_next;
+
+    let mut fetches = session
+        .uid_fetch(
+            uid.to_string(),
+            "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] RFC822)",
+        )
+        .await
+        .map_err(|e| format!("拉取原邮件失败 (UID {uid}): {e}"))?;
+
+    let mut raw_body: Option<Vec<u8>> = None;
+    let mut flags_str: Option<String> = None;
+    let mut date_str: Option<String> = None;
+    let mut msgid = String::new();
+
+    while let Some(fetch_res) = fetches.next().await {
+        if let Ok(fetch) = fetch_res {
+            if fetch.uid == Some(uid) || raw_body.is_none() {
+                if let Some(body) = fetch.body() {
+                    raw_body = Some(body.to_vec());
+                }
+                let kept: Vec<String> = fetch
+                    .flags()
+                    .filter_map(|f| match f {
+                        async_imap::types::Flag::Seen => Some("\\Seen".to_string()),
+                        async_imap::types::Flag::Answered => Some("\\Answered".to_string()),
+                        async_imap::types::Flag::Flagged => Some("\\Flagged".to_string()),
+                        async_imap::types::Flag::Draft => Some("\\Draft".to_string()),
+                        async_imap::types::Flag::Custom(c) => Some(c.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                if !kept.is_empty() {
+                    flags_str = Some(format!("({})", kept.join(" ")));
+                }
+                date_str = fetch
+                    .internal_date()
+                    .map(|d| format!("\"{}\"", d.format("%d-%b-%Y %H:%M:%S %z")));
+                if let Some(hdr) = fetch.header() {
+                    let text = String::from_utf8_lossy(hdr);
+                    if let Some(val) = text.split(':').nth(1) {
+                        msgid = val.trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+    drop(fetches);
+
+    let raw = raw_body.ok_or_else(|| format!("服务器未返回 UID {uid} 的邮件内容"))?;
+    let stripped = crate::strip::without_attachment(&raw, name, size, &crate::strip::note_date())
+        .map_err(|e| e.text().to_string())?;
+
+    tokio::time::timeout(
+        IO_TIMEOUT,
+        session.append(
+            folder_path,
+            flags_str.as_deref(),
+            date_str.as_deref(),
+            &stripped,
+        ),
+    )
+    .await
+    .map_err(|_| "上传剥离附件后的邮件副本超时".to_string())?
+    .map_err(|e| format!("上传剥离附件后的邮件副本失败: {e}"))?;
+
+    // Find newly appended UID at or above uid_next / uid + 1.
+    let from_uid = uid_next.unwrap_or(0).max(uid + 1);
+    let mut new_uid = None;
+    if let Ok(mut search_fetches) = session
+        .uid_fetch(
+            format!("{from_uid}:*"),
+            "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+        )
+        .await
+    {
+        let mut candidates: Vec<(u32, String)> = Vec::new();
+        while let Some(res) = search_fetches.next().await {
+            if let Ok(f) = res {
+                if let Some(u) = f.uid.filter(|&u| u >= from_uid) {
+                    let mid = f
+                        .header()
+                        .and_then(|h| {
+                            String::from_utf8_lossy(h)
+                                .split(':')
+                                .nth(1)
+                                .map(|v| v.trim().to_string())
+                        })
+                        .unwrap_or_default();
+                    candidates.push((u, mid));
+                }
+            }
+        }
+        candidates.sort();
+        new_uid = if msgid.is_empty() {
+            candidates.first().map(|(u, _)| *u)
+        } else {
+            candidates
+                .iter()
+                .find(|(_, m)| m == &msgid)
+                .map(|(u, _)| *u)
+                .or_else(|| candidates.first().map(|(u, _)| *u))
+        };
+    }
+
+    // Purge original message.
+    let mut stores = session
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .await
+        .map_err(|e| format!("标记原邮件删除失败: {e}"))?;
+    while stores.next().await.is_some() {}
+    drop(stores);
+    {
+        let mut expunged = std::pin::pin!(session
+            .expunge()
+            .await
+            .map_err(|e| format!("执行 EXPUNGE 失败: {e}"))?);
+        while expunged.as_mut().next().await.is_some() {}
+    }
+    let _ = session.logout().await;
+    Ok((new_uid, stripped))
 }
 
 /// Escape a string for an IMAP quoted search argument.
