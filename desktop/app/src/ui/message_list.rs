@@ -369,6 +369,13 @@ fn message_row(
     // 偏好「列表密度」：紧凑模式行高约 64px 且隐藏摘要行（方案文档五.2）；
     // L-2：列表拖宽 ≥600px 时自动切换单行表格模式（对齐原版 LIST_WIDE_ON，迟滞在 app.rs）。
     let compact = app.prefs.compact_list || app.list_wide;
+    // WP-01：选中行双态（对齐 Linux theme.rs install_scheme_css 高优先级动态
+    // 样式与 styles.css row:selected 区块）：列表持焦点时选中行是 100% accent
+    // 纯色底，行上文字 / 图标全部反白 accent_fg；焦点离开列表（阅读器 / 写信
+    // 器 / 文本输入）时选中行退为中性灰 alpha(@window_fg_color, 0.14)，文字保
+    // 持正文色（dimming, never vanishing，如同侧栏选中项）。
+    let active_sel = is_selected && list_focused;
+    let inactive_sel = is_selected && !list_focused;
 
     let row = h_flex()
         .id(("msg", msg_id))
@@ -391,35 +398,39 @@ fn message_row(
         .rounded(px(12.0))
         .cursor_pointer()
         .overflow_hidden()
-        // P3 状态底色矩阵（对齐 Linux styles.css .message-row 区块）：
+        // WP-01 状态底色矩阵（对齐 Linux theme.rs install_scheme_css 与
+        // styles.css .message-row 区块）：
         // - 悬停未选中：中性微灰（原版 alpha(currentColor, 0.05)）；
-        // - 选中且列表持焦点（或悬停经过）：accent 0.5 药丸（原版 focus-within
-        //   与 :selected:hover 同为 alpha(accent_bg_color, 0.5)）；
-        // - 选中但焦点离开列表（阅读器）：变暗为 0.3，不清除（dimming, never
-        //   vanishing）。
+        // - 聚焦选中行（含悬停经过）：100% accent 纯色药丸（原版
+        //   install_scheme_css：selected / :hover / :active 均为
+        //   @accent_bg_color，非半透明 0.5）；
+        // - 失焦选中行：中性灰 alpha(@window_fg_color, 0.14)，不清除（dimming,
+        //   never vanishing），不是淡蓝。
         .hover(move |s| {
-            if is_selected {
-                s.bg(p.accent.opacity(0.50))
+            if active_sel {
+                s.bg(p.accent)
+            } else if inactive_sel {
+                s.bg(p.text.opacity(0.18))
             } else {
                 s.bg(p.text.opacity(0.05))
             }
         })
         .when(is_selected, |row| {
-            row.bg(if list_focused {
-                p.accent.opacity(0.50)
+            row.bg(if active_sel {
+                p.accent
             } else {
-                p.accent.opacity(0.30)
+                p.text.opacity(0.14)
             })
         })
         // P3：键盘游标行（原版 .kbd-cursor，列表持焦点时才画）：非选中行加
-        // accent 0.1 底 + accent 0.85 内描边；选中行药丸上改用 正文色 0.8
+        // accent 0.1 底 + accent 内描边；聚焦选中行药丸上改用 accent_fg 0.8
         // 内描边（accent-on-accent 会消失）。gpui 无 inset box-shadow，用 2px
         // 圆角边框近似（行盒内绘制，不改布局）。
         .when(kbd_cursor && list_focused, |row| {
-            let ring = if is_selected {
-                p.text.opacity(0.8)
+            let ring = if active_sel {
+                p.accent_fg.opacity(0.80)
             } else {
-                p.accent.opacity(0.85)
+                p.accent.opacity(0.45)
             };
             row.border_2()
                 .border_color(ring)
@@ -463,14 +474,14 @@ fn message_row(
                         .items_center()
                         .justify_center()
                         .when(unread, |dot| {
-                            // 未读圆点 10x10（原版 .unread-dot）：选中行在 accent 药丸上
-                            // 使用正文色以保证浅色选中背景上的对比度。
+                            // 未读圆点 10x10（原版 .unread-dot）：聚焦选中行上反白为
+                            // accent_fg（accent-on-accent 会隐形），其余保持 accent。
                             dot.child(
                                 div()
                                     .w(px(10.0))
                                     .h(px(10.0))
                                     .rounded_full()
-                                    .bg(if is_selected { p.text } else { p.accent }),
+                                    .bg(if active_sel { p.accent_fg } else { p.accent }),
                             )
                         }),
                 ),
@@ -501,8 +512,9 @@ fn message_row(
                                 } else {
                                     gpui_kit::FontWeight::MEDIUM
                                 })
-                                // 半透明选中背景使用正文色，兼顾亮色与暗色主题。
-                                .text_color(p.text)
+                                // WP-01：聚焦选中行（100% accent 纯色底）上反白为
+                                // accent_fg（原版 row:selected label 全量反色）。
+                                .text_color(if active_sel { p.accent_fg } else { p.text })
                                 .child(SharedString::from(first_line)),
                         )
                         .child(
@@ -521,9 +533,9 @@ fn message_row(
                                     icons.child(
                                         Icon::new(IconName::Paperclip)
                                             .with_size(px(13.0))
-                                            // P3：选中行附件图标使用正文色。
-                                            .text_color(if is_selected {
-                                                p.text
+                                            // WP-01：聚焦选中行附件图标反白 accent_fg。
+                                            .text_color(if active_sel {
+                                                p.accent_fg
                                             } else {
                                                 p.text_muted
                                             }),
@@ -543,12 +555,18 @@ fn message_row(
                                     );
                                     div()
                                         .text_xs()
-                                        // P3：选中行时间使用正文色。
-                                        .text_color(if is_selected { p.text } else { p.text_muted })
+                                        // WP-01：聚焦选中行时间反白 accent_fg。
+                                        .text_color(if active_sel {
+                                            p.accent_fg
+                                        } else {
+                                            p.text_muted
+                                        })
                                         .child(SharedString::from(date_text))
                                 })
                                 // B-4 会话计数胶囊（对齐原版 .thread-chip：仅 >1 封往来时显示，
-                                // 紧凑圆角、10px 粗体、主题色弱底）；选中时使用卡片底色和正文色。
+                                // 紧凑圆角、10px 粗体）。WP-01：聚焦选中行反色为白底蓝字
+                                // （bg accent_fg / 文字 accent，原版 row:selected 规则）；
+                                // 其余为中性弱底 alpha(currentColor, 0.10)。
                                 .when(msg.thread_count > 1, |icons| {
                                     icons.child(
                                         div()
@@ -556,14 +574,20 @@ fn message_row(
                                             .px(px(7.0))
                                             .py(px(2.0))
                                             .rounded_full()
-                                            .bg(if is_selected {
-                                                p.surface_raised
+                                            .bg(if active_sel {
+                                                p.accent_fg
                                             } else {
-                                                p.accent_soft()
+                                                p.text.opacity(0.10)
                                             })
                                             .text_size(px(10.0))
                                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .text_color(if is_selected { p.text } else { p.accent })
+                                            .text_color(if active_sel {
+                                                p.accent
+                                            } else if inactive_sel {
+                                                p.text
+                                            } else {
+                                                p.text.opacity(0.70)
+                                            })
                                             .child(SharedString::from(format!(
                                                 "{} ▸",
                                                 msg.thread_count
@@ -573,7 +597,7 @@ fn message_row(
                         ),
                 )
                 // 第 2 行：主题（未读加粗；已读 85% 透明度，复刻原版 .message-subject 层次；
-                // P3：选中行使用正文色，覆盖已读的 85% 透明度）。
+                // WP-01：聚焦选中行反白 accent_fg，覆盖已读的 85% 透明度）。
                 .child(
                     div()
                         .text_sm()
@@ -583,8 +607,8 @@ fn message_row(
                         } else {
                             gpui_kit::FontWeight::NORMAL
                         })
-                        .text_color(if is_selected {
-                            p.text
+                        .text_color(if active_sel {
+                            p.accent_fg
                         } else if unread {
                             p.text
                         } else {
@@ -606,9 +630,9 @@ fn message_row(
                                     .text_xs()
                                     .truncate()
                                     // 摘要 50% 透明度（原版 .message-preview）；
-                                    // P3：选中行使用正文色。
-                                    .text_color(if is_selected {
-                                        p.text
+                                    // WP-01：聚焦选中行反白 accent_fg。
+                                    .text_color(if active_sel {
+                                        p.accent_fg
                                     } else {
                                         p.text.opacity(0.5)
                                     })
@@ -688,9 +712,13 @@ pub(crate) fn render(
     let quick_filters = app.quick_filters;
     let is_unified_list = !drafts_view;
     // P3：「列表持焦点」近似态（gpui 没有列表级 focus-within）：最近一次列表
-    // 交互（点击行 / 键盘导航）且当前无文本输入持焦点时视为聚焦，驱动选中行
-    // 药丸 0.5 / 0.3 两档与键盘游标轮廓；点击阅读器由 reader 的 mouse_down 清除。
-    let list_focused = app.list_focused && !app.is_text_input_focused(window, cx);
+    // 交互（点击行 / 键盘导航）且当前无文本输入持焦点、右栏未进入写信编辑器
+    // 时视为聚焦，驱动选中行 accent 纯色 / 中性灰两档与键盘游标轮廓。对齐
+    // Linux theme.rs：只有焦点进入写信编辑器或搜索输入框才移除 list-focused，
+    // 点击右侧阅读器查看邮件时列表仍保持聚焦高亮（WP-01）。
+    let list_focused = app.list_focused
+        && !app.is_text_input_focused(window, cx)
+        && app.right_mode != crate::app::RightPaneMode::Compose;
 
     let search_key = app.search_query.trim().to_lowercase();
     let matches_query = |subject: &str, body: &str| {

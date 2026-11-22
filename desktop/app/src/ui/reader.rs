@@ -20,7 +20,7 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
 use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display_with_options};
@@ -1059,17 +1059,8 @@ pub(crate) fn render(
         .min_w_0()
         .h_full()
         .bg(canvas)
-        // P3：焦点近似（gpui 没有列表级 focus-within）——阅读器任意按下视为
-        // 焦点离开列表，选中行药丸由 0.5 转暗为 0.3（dimming, never vanishing）。
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                if this.list_focused {
-                    this.list_focused = false;
-                    cx.notify();
-                }
-            }),
-        )
+        // WP-01：点击阅读器不再使列表失焦（对齐 Linux theme.rs：选中行保持
+        // accent 纯色高亮，仅写信编辑器 / 搜索输入持焦点时才转中性灰）。
         // 顶部操作栏 48px（空白区可拖拽窗口，最右侧为 Windows 原生窗口控制按钮）。
         .child(
             h_flex()
