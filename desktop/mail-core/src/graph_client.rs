@@ -147,7 +147,10 @@ fn fetch_headers_from_url(
     access_token: &str,
     url: &str,
 ) -> Result<(Vec<(CachedHeaderInput, String)>, Option<String>), String> {
+    // 任务四：历史批次跑在后台，请求必须有限超时（对齐 search_messages 的 15 秒），
+    // 避免一次卡住的响应占住单队列。
     let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(15))
         .set("Authorization", &format!("Bearer {access_token}"))
         .call()
         .map_err(format_graph_error)?;

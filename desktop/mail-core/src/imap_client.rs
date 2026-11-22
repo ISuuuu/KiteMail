@@ -300,8 +300,11 @@ async fn fetch_headers_for_uids(
         .collect::<Vec<_>>()
         .join(",");
 
+    // 任务四：改拉全文前缀而非纯邮件头——前 4KB 覆盖头 + 正文开头，
+    // mail_parser 提取出真实预览文本后历史邮件无需打开正文即可被搜索
+    //（PEEK 不改变服务器端 \Seen 标记）。
     let mut fetches = session
-        .uid_fetch(&uid_list, "(UID FLAGS RFC822.HEADER)")
+        .uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[]<0.4096>)")
         .await
         .map_err(|e| format!("拉取邮件头失败: {e}"))?;
 
@@ -324,10 +327,8 @@ async fn fetch_headers_for_uids(
                 _ => {}
             }
         }
-        let raw_header = fetch.header().unwrap_or_default();
-        headers.push(parse_header_bytes(
-            &parser, uid, unread, flagged, raw_header,
-        ));
+        let raw = fetch.body().unwrap_or_default();
+        headers.push(parse_header_bytes(&parser, uid, unread, flagged, raw));
     }
     drop(fetches);
     Ok(headers)
@@ -378,15 +379,17 @@ pub async fn fetch_older_folder_headers(
     limit: usize,
 ) -> Result<(u32, Vec<CachedHeaderInput>, Vec<u32>, bool), String> {
     let mut session = connect_imap(account, password).await?;
-    let mailbox = session
-        .select(folder_path)
+    // 任务四：历史批次跑在后台，每一步网络调用都必须有限超时，
+    // 避免一次卡住的服务器响应占住单队列。
+    let mailbox = tokio::time::timeout(IO_TIMEOUT, session.select(folder_path))
         .await
+        .map_err(|_| format!("打开文件夹 {folder_path} 超时"))?
         .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
 
     let uid_validity = mailbox.uid_validity.unwrap_or(1);
-    let uids_set = session
-        .uid_search("ALL")
+    let uids_set = tokio::time::timeout(IO_TIMEOUT, session.uid_search("ALL"))
         .await
+        .map_err(|_| "搜索邮件 UID 超时".to_string())?
         .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
 
     let mut live_uids: Vec<u32> = uids_set.into_iter().collect();
@@ -398,7 +401,7 @@ pub async fn fetch_older_folder_headers(
         .filter(|&u| u < before_uid)
         .collect();
     if older_uids.is_empty() {
-        let _ = session.logout().await;
+        let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
         return Ok((uid_validity, Vec::new(), live_uids, false));
     }
 
@@ -406,8 +409,13 @@ pub async fn fetch_older_folder_headers(
     let start_idx = older_uids.len().saturating_sub(batch);
     let target_uids = &older_uids[start_idx..];
     let has_more = start_idx > 0;
-    let headers = fetch_headers_for_uids(&mut session, target_uids).await?;
-    let _ = session.logout().await;
+    let headers = tokio::time::timeout(
+        IO_TIMEOUT,
+        fetch_headers_for_uids(&mut session, target_uids),
+    )
+    .await
+    .map_err(|_| format!("拉取历史邮件头超时 ({folder_path})"))??;
+    let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
 
     Ok((uid_validity, headers, live_uids, has_more))
 }
@@ -838,6 +846,9 @@ pub async fn search_folder_messages(
     Ok(headers)
 }
 
+/// 解析 FETCH 拉回的邮件前缀字节（含完整邮件头与正文开头）为缓存条目。
+/// 任务四：正文开头经 mail_parser 解码后截取为真实预览，历史邮件无需打开
+/// 正文即可按预览检索；解码失败或正文不可见时回退占位文案。
 fn parse_header_bytes(
     parser: &MessageParser,
     uid: u32,
@@ -909,6 +920,29 @@ fn parse_header_bytes(
         ct.ctype().eq_ignore_ascii_case("multipart") && ct.subtype() == Some("mixed")
     });
 
+    // 任务四：正文开头作为真实预览（preview 级即可，不引入大批正文下载）；
+    // 截断导致解码失败或纯 HTML 邮件转文本为空时回退占位文案。
+    const PREVIEW_MAX_CHARS: usize = 200;
+    let preview_from = |text: String| -> String {
+        let compact = text
+            .trim()
+            .chars()
+            .take(PREVIEW_MAX_CHARS)
+            .collect::<String>();
+        if compact.is_empty() {
+            "点击加载邮件正文...".to_string()
+        } else {
+            compact
+        }
+    };
+    let preview = if let Some(text) = msg.body_text(0) {
+        preview_from(text.into_owned())
+    } else if let Some(html) = msg.body_html(0) {
+        preview_from(html_to_readable_text(&html))
+    } else {
+        "点击加载邮件正文...".to_string()
+    };
+
     CachedHeaderInput {
         uid,
         message_id,
@@ -917,7 +951,7 @@ fn parse_header_bytes(
         sender,
         recipients,
         subject,
-        preview: "点击加载邮件正文...".to_string(),
+        preview,
         date_ts,
         date_display,
         unread,

@@ -598,6 +598,10 @@ pub enum MailRequest {
         folder_id: u32,
         limit: usize,
     },
+    /// 任务四后台历史索引：拉取一小批更早邮件入库（worker 自选下一个待索引的
+    /// 统一收件箱文件夹）。单队列事件驱动：批次完成后由 app 端决定是否续排，
+    /// 已入队的读信、搜索和发信请求自然插队，同一时刻最多一个在途批次。
+    BackfillHistoryBatch,
     /// Clear all cached message bodies (headers and accounts are kept).
     ClearBodyCaches,
     /// Batch-mark every message in `folder_path` as read on the server
@@ -794,6 +798,14 @@ pub enum WorkerEvent {
     },
     /// Result of fetching an older batch of messages from the remote server.
     OlderMessagesLoaded {
+        folder_id: u32,
+        fetched_count: usize,
+        has_more_remote: bool,
+    },
+    /// 任务四后台历史索引：单文件夹单批完成。`folder_id == 0` 表示已无待索引
+    /// 目标（全部拉完或全部放弃），app 端据此停止续排；`has_more_remote` 为
+    /// 处理后是否仍有待索引的收件箱（已过滤停用 / 退出统一视图 / 本会话放弃）。
+    BackfillHistoryBatchDone {
         folder_id: u32,
         fetched_count: usize,
         has_more_remote: bool,

@@ -380,6 +380,8 @@ pub(crate) struct HylkiApp {
     pub(crate) loading_more_local: bool,
     /// 正在从远端服务器（IMAP / Graph）预加载更早历史邮件（防止重复触发）。
     pub(crate) loading_more_remote: bool,
+    /// 任务四：后台历史索引驱动状态（最多一个在途批次，事件驱动排队）。
+    pub(crate) backfill: BackfillDriveState,
     pub(crate) current_page: MailPage,
     pub(crate) selected_message: Option<MessageDetail>,
     /// Ctrl+点击多选的邮件 ID 集合。
@@ -805,6 +807,7 @@ impl HylkiApp {
                 list_scroll_handle: ScrollHandle::new(),
                 loading_more_local: false,
                 loading_more_remote: false,
+                backfill: BackfillDriveState::default(),
                 current_page,
                 selected_message,
                 selected_message_ids: HashSet::new(),
@@ -966,6 +969,7 @@ impl HylkiApp {
             list_scroll_handle: ScrollHandle::new(),
             loading_more_local: false,
             loading_more_remote: false,
+            backfill: BackfillDriveState::default(),
             current_page: MailPage {
                 folder_id: UNIFIED_INBOX_FOLDER_ID,
                 offset: 0,
@@ -1179,6 +1183,9 @@ impl HylkiApp {
                     if self.current_view.is_unified() {
                         self.reload_current_page(cx);
                     }
+                    // 任务四：账号列表变化（保存 / 启停）后重新允许后台历史索引
+                    // 探测，续排由随后的页面事件驱动。
+                    self.backfill.on_scope_refresh();
                 }
                 WorkerEvent::FoldersLoaded {
                     account_id,
@@ -1202,6 +1209,9 @@ impl HylkiApp {
                     }
                     self.folders_by_account.insert(account_id, folders);
                     folders_updated = true;
+                    // 任务四：新文件夹可能出现（首次同步 / 新账号），重新允许
+                    // 后台历史索引探测；实际续排仍由下一个事件驱动点执行。
+                    self.backfill.on_scope_refresh();
                 }
                 WorkerEvent::MessagesPageLoaded(page) => {
                     self.loading_more_local = false;
@@ -1240,6 +1250,9 @@ impl HylkiApp {
                     ) {
                         self.reload_current_page(cx);
                     }
+                    // 任务四：首屏页面就绪后启动后台历史索引；此后每次列表页
+                    // 事件都会顺带检查是否需要续排（in-flight 保证最多一个批次）。
+                    self.maybe_drive_backfill(cx);
                 }
                 WorkerEvent::OlderMessagesLoaded {
                     folder_id: _,
@@ -1254,6 +1267,16 @@ impl HylkiApp {
                     } else {
                         self.status_line = SharedString::from("已加载全部历史邮件");
                     }
+                }
+                WorkerEvent::BackfillHistoryBatchDone {
+                    folder_id: _,
+                    fetched_count: _,
+                    has_more_remote,
+                } => {
+                    // 任务四：批次完成（单队列中已跑完），按剩余候选决定是否续排；
+                    // 侧栏计数由随批先行到达的 FoldersLoaded 刷新，不打扰界面。
+                    self.backfill.on_batch_done(has_more_remote);
+                    self.maybe_drive_backfill(cx);
                 }
                 WorkerEvent::MessageBodyLoaded(detail) => {
                     let pending = self.pending_row_action.take();
@@ -3846,12 +3869,12 @@ impl HylkiApp {
             return false;
         }
         match self.current_view {
-            CurrentView::UnifiedInbox => self.folders_by_account.values().flatten().any(|f| {
-                (f.path.eq_ignore_ascii_case("INBOX")
-                    || f.name.eq_ignore_ascii_case("INBOX")
-                    || f.name == "收件箱")
-                    && f.has_more_remote
-            }),
+            // 任务四：统一视图只统计 `enabled && in_unified` 账号（与列表、
+            // 未读数、分页拉取同范围）；退出统一视图的账号在独立文件夹视图
+            // 走 AccountFolder 分支，不受影响。
+            CurrentView::UnifiedInbox => {
+                unified_view_has_more_remote(&self.accounts, &self.folders_by_account)
+            }
             CurrentView::AccountFolder => self
                 .folders_by_account
                 .values()
@@ -3919,6 +3942,21 @@ impl HylkiApp {
             }
             cx.notify();
         }
+    }
+
+    /// 任务四：后台历史索引驱动。仅在无在途批次且本轮未结束时向单队列排下一个
+    /// 批次——已入队的读信、搜索和发信请求会先于下一批执行，当前批次跑完后
+    /// 下一批才排到队尾（事件驱动，无需定时器）。
+    fn maybe_drive_backfill(&mut self, cx: &mut Context<Self>) {
+        if self.demo_mode || !self.backfill.should_queue() {
+            return;
+        }
+        let Some(ref w) = self.worker else {
+            return;
+        };
+        self.backfill.on_batch_queued();
+        w.send(MailRequest::BackfillHistoryBatch);
+        cx.notify();
     }
 
     pub(crate) fn account_email_for(&self, account_id: u32) -> &str {
@@ -6864,6 +6902,68 @@ pub(crate) fn detect_new_unread(
     delta
 }
 
+/// 账号是否在统一视图范围内：已启用且加入统一收件箱（任务四）。
+/// 与 worker 端 `unified_account_ids` 语义一致；本地未知的账号按范围外处理。
+pub(crate) fn account_in_unified_scope(accounts: &[AccountConfig], account_id: u32) -> bool {
+    accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .is_some_and(|a| a.enabled && a.in_unified)
+}
+
+/// 统一收件箱视图是否仍有更早的远端历史邮件（任务四纯逻辑抽出便于单测）。
+/// 只统计 `enabled && in_unified` 账号的 INBOX，与列表、未读数、分页拉取同范围。
+pub(crate) fn unified_view_has_more_remote(
+    accounts: &[AccountConfig],
+    folders_by_account: &BTreeMap<u32, Vec<FolderSummary>>,
+) -> bool {
+    folders_by_account
+        .iter()
+        .filter(|(&account_id, _)| account_in_unified_scope(accounts, account_id))
+        .flat_map(|(_, folders)| folders.iter())
+        .any(|f| {
+            (f.path.eq_ignore_ascii_case("INBOX")
+                || f.name.eq_ignore_ascii_case("INBOX")
+                || f.name == "收件箱")
+                && f.has_more_remote
+        })
+}
+
+/// 任务四：后台历史索引驱动状态（纯逻辑抽出便于单测）。
+/// 事件驱动排队——最多保留一个待处理批次，防止批次在队列里堆积；
+/// worker 回「无待索引目标」后本轮停止，账号范围变化后重新允许探测。
+#[derive(Default)]
+pub(crate) struct BackfillDriveState {
+    /// 已向 worker 排队但完成事件未到的批次。
+    pub(crate) in_flight: bool,
+    /// worker 已回无待索引目标：本轮结束，不再续排。
+    pub(crate) exhausted: bool,
+}
+
+impl BackfillDriveState {
+    /// 当前是否应向队列排下一个后台索引批次。
+    pub(crate) fn should_queue(&self) -> bool {
+        !self.in_flight && !self.exhausted
+    }
+
+    fn on_batch_queued(&mut self) {
+        self.in_flight = true;
+    }
+
+    /// 批次完成事件到达：清除在途标志；无剩余候选时结束本轮。
+    fn on_batch_done(&mut self, has_more_remote: bool) {
+        self.in_flight = false;
+        if !has_more_remote {
+            self.exhausted = true;
+        }
+    }
+
+    /// 账号范围可能变化（账号保存 / 启停 / 新文件夹出现）：重新允许探测。
+    fn on_scope_refresh(&mut self) {
+        self.exhausted = false;
+    }
+}
+
 /// 将 GPUI `WindowBounds` 写入偏好中的窗口尺寸与最大化标记（忽略最小化时的退化尺寸）。
 pub(crate) fn capture_window_geometry(prefs: &mut AppPreferences, bounds: WindowBounds) -> bool {
     let (maximized, rect) = match bounds {
@@ -7214,6 +7314,98 @@ mod tests {
         assert_eq!(detect_new_unread(&mut baseline, 1, 8), 0);
         // 再次收到 1 封新邮件：基于最新基线 8 返回 1。
         assert_eq!(detect_new_unread(&mut baseline, 1, 9), 1);
+    }
+
+    /// 任务四：统一视图历史可用性只统计 `enabled && in_unified` 账号的 INBOX，
+    /// 与列表、未读数、分页拉取同范围（对齐 worker 端 unified_account_ids）。
+    #[test]
+    fn unified_view_has_more_remote_filters_account_scope() {
+        let acc_a = AccountConfig {
+            id: 1,
+            email: "a@qq.com".into(),
+            ..Default::default()
+        };
+        let mut acc_b = AccountConfig {
+            id: 2,
+            email: "b@qq.com".into(),
+            ..Default::default()
+        };
+        acc_b.in_unified = false;
+        let mut acc_c = AccountConfig {
+            id: 3,
+            email: "c@qq.com".into(),
+            ..Default::default()
+        };
+        acc_c.enabled = false;
+        let accounts = vec![acc_a.clone(), acc_b.clone(), acc_c];
+
+        let folder = |id: u32, account_id: u32, more: bool| FolderSummary {
+            id,
+            account_id,
+            name: "收件箱".into(),
+            path: "INBOX".into(),
+            unread_count: 0,
+            total_count: 10,
+            has_more_remote: more,
+        };
+        let mut folders_by_account = BTreeMap::new();
+        folders_by_account.insert(1u32, vec![folder(11, 1, false)]);
+        folders_by_account.insert(2u32, vec![folder(22, 2, true)]);
+        folders_by_account.insert(3u32, vec![folder(33, 3, true)]);
+
+        // 退出统一视图（B）与停用（C）账号的历史不计入统一视图可用性。
+        assert!(!unified_view_has_more_remote(
+            &accounts,
+            &folders_by_account
+        ));
+        assert!(!account_in_unified_scope(&accounts, 2));
+        assert!(!account_in_unified_scope(&accounts, 3));
+
+        folders_by_account.insert(1u32, vec![folder(11, 1, true)]);
+        assert!(unified_view_has_more_remote(&accounts, &folders_by_account));
+
+        // 未知账号（本地列表中不存在）按范围外处理。
+        assert!(!account_in_unified_scope(&accounts, 99));
+    }
+
+    /// 任务四：批次完成事件驱动的排队节制——同一索引任务最多一个在途批次，
+    /// 批次按完成事件逐个排队（事件驱动而非循环连发）。
+    #[test]
+    fn backfill_drive_state_queues_one_batch_at_a_time() {
+        let mut state = BackfillDriveState::default();
+        let mut queued = 0usize;
+        let drive = |state: &mut BackfillDriveState, queued: &mut usize| {
+            if state.should_queue() {
+                state.on_batch_queued();
+                *queued += 1;
+            }
+        };
+
+        // 首屏就绪：排第 1 批；在途期间任何再次驱动（FoldersLoaded / 页面刷新）都不排队。
+        drive(&mut state, &mut queued);
+        drive(&mut state, &mut queued);
+        assert_eq!(queued, 1);
+
+        // 批次完成（仍有候选）：清除在途并续排下一批——每个完成事件至多排队一次，
+        // 单队列顺序消费保证前台读写信、搜索请求可在批次之间插队。
+        state.on_batch_done(true);
+        drive(&mut state, &mut queued);
+        assert_eq!(queued, 2);
+        assert!(state.in_flight);
+        drive(&mut state, &mut queued);
+        assert_eq!(queued, 2);
+
+        // worker 回无待索引目标：本轮结束，空闲也不再排队。
+        state.on_batch_done(false);
+        assert!(!state.should_queue());
+        drive(&mut state, &mut queued);
+        assert_eq!(queued, 2);
+
+        // 账号范围变化（保存 / 启停 / 新文件夹）重新允许探测。
+        state.on_scope_refresh();
+        drive(&mut state, &mut queued);
+        assert_eq!(queued, 3);
+        assert!(state.in_flight);
     }
 
     #[test]
