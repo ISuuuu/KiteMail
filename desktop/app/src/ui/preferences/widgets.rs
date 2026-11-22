@@ -1,5 +1,6 @@
 //! 独立偏好设置窗口可复用控件（libadwaita 分组卡片、行高亮、下拉选择、3 列双态主题画廊）。
 
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -10,12 +11,45 @@ use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, AnyElement, App, Context, ElementId, Entity, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    IntoElement, ParentElement, ScrollAnchor, SharedString, StatefulInteractiveElement, Styled,
+    Window,
 };
 
 use crate::app::HylkiApp;
 use crate::theme::{self, HylkiPalette, THEME_LIST};
 use crate::ui::preferences::SettingsWindow;
+
+thread_local! {
+    /// `apply_search_hit_immediate` 置位：下一次设置页渲染需滚动到高亮行。
+    static SEARCH_SCROLL_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// 本帧渲染中待挂到高亮行上的滚动锚点（由 `render_tab` 装载、`setting_row` 消费）。
+    static SEARCH_SCROLL_ANCHOR: RefCell<Option<ScrollAnchor>> = const { RefCell::new(None) };
+}
+
+/// 搜索结果跳转后请求下一次渲染自动滚动到高亮行（对齐 Linux 版搜索定位行为）。
+pub(crate) fn request_search_scroll() {
+    SEARCH_SCROLL_PENDING.with(|f| f.set(true));
+}
+
+/// 渲染前领取「本帧需要滚动」标志；仅 `render_tab` 调用一次。
+pub(crate) fn take_search_scroll_pending() -> bool {
+    SEARCH_SCROLL_PENDING.with(|f| f.replace(false))
+}
+
+/// 把滚动锚点交给本帧渲染：`setting_row` 高亮时领取并挂到自身。
+pub(crate) fn arm_search_scroll_anchor(anchor: Option<ScrollAnchor>) {
+    SEARCH_SCROLL_ANCHOR.with(|c| *c.borrow_mut() = anchor);
+}
+
+/// `setting_row` 高亮时领取锚点挂到自身，供渲染帧记录行位置。
+fn take_search_scroll_anchor() -> Option<ScrollAnchor> {
+    SEARCH_SCROLL_ANCHOR.with(|c| c.borrow_mut().take())
+}
+
+/// 锚点是否已被高亮行消费（被消费才会真正执行滚动）。
+pub(crate) fn search_scroll_anchor_consumed() -> bool {
+    SEARCH_SCROLL_ANCHOR.with(|c| c.borrow().is_none())
+}
 
 /// 窄窗自动折叠为单栏导航的宽度阈值（对齐 Linux 版 640px）。
 pub(crate) const NARROW_BREAKPOINT: f32 = 640.0;
@@ -98,7 +132,12 @@ pub(crate) fn setting_row(
         .gap_3()
         .items_center()
         .justify_between()
-        .when(highlighted, |el| el.bg(highlight_bg))
+        .when(highlighted, |el| {
+            // 搜索跳转来的高亮行挂上滚动锚点：渲染帧记录行位置后由
+            // `render_tab` 调 `scroll_to` 把该行滚进视口（对齐 Linux 版 reveal）。
+            el.anchor_scroll(take_search_scroll_anchor())
+                .bg(highlight_bg)
+        })
         .when(!highlighted && !disabled, |el| {
             el.hover(move |s| s.bg(hover_bg))
         })

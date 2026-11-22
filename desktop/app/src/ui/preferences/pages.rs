@@ -9,14 +9,15 @@ use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    ParentElement, ScrollAnchor, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use hylki_mail_core::config::{self, DEFAULT_ATTACHMENT_KEYWORDS, UI_TEXT_SCALE_STEPS};
 
 use crate::app::HylkiApp;
 use crate::theme::HylkiPalette;
 use crate::ui::preferences::widgets::{
-    bool_switch, combo_button, combo_button_dynamic, info_row, setting_group, setting_row,
+    arm_search_scroll_anchor, bool_switch, combo_button, combo_button_dynamic, info_row,
+    search_scroll_anchor_consumed, setting_group, setting_row, take_search_scroll_pending,
     theme_gallery, CARDS_WIDE_MAX_WIDTH, CARD_MAX_WIDTH,
 };
 use crate::ui::preferences::{PrefTab, SettingsWindow};
@@ -132,6 +133,15 @@ pub(crate) fn render_tab(
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
+    // 搜索跳转来的本帧渲染：把滚动锚点交给高亮行（`setting_row` 领取挂载），
+    // 行位置在渲染帧中被记录，随后 `scroll_to` 在下一帧把该行滚进视口。
+    let mut scroll_anchor = None;
+    if take_search_scroll_pending() {
+        let anchor = ScrollAnchor::for_handle(win.content_scroll.clone());
+        arm_search_scroll_anchor(Some(anchor.clone()));
+        scroll_anchor = Some(anchor);
+    }
+
     let body = match win.active_tab {
         PrefTab::MailAccounts => div().into_any_element(),
         PrefTab::Senders => render_senders(win, app_entity, p, cx),
@@ -148,6 +158,15 @@ pub(crate) fn render_tab(
         PrefTab::System => render_system(win, app_entity, p, cx),
         PrefTab::Backup => render_backup(win, app_entity, p, window, cx),
     };
+
+    if let Some(anchor) = scroll_anchor {
+        if search_scroll_anchor_consumed() {
+            anchor.scroll_to(window, cx);
+        } else {
+            // 高亮行未出现（如账号编辑页），丢弃锚点避免悬挂到下一帧。
+            arm_search_scroll_anchor(None);
+        }
+    }
 
     v_flex()
         .id(SharedString::from(format!(
@@ -906,7 +925,7 @@ fn render_sidebar(
                         },
                     ),
                     false,
-                    false,
+                    is_hit(win, "pref-unified-starred"),
                     p,
                 ),
                 setting_row(
@@ -924,7 +943,7 @@ fn render_sidebar(
                         },
                     ),
                     false,
-                    false,
+                    is_hit(win, "pref-unified-sent"),
                     p,
                 ),
                 setting_row(
@@ -942,7 +961,7 @@ fn render_sidebar(
                         },
                     ),
                     false,
-                    false,
+                    is_hit(win, "pref-unified-drafts"),
                     p,
                 ),
                 setting_row(
@@ -960,7 +979,7 @@ fn render_sidebar(
                         },
                     ),
                     false,
-                    false,
+                    is_hit(win, "pref-unified-archive"),
                     p,
                 ),
             ],

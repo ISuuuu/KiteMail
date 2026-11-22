@@ -910,17 +910,34 @@ async fn handle_request(
             sort,
             offset,
             limit,
-        } => match cache.search_all_folders(&query, quick_filters, sort, offset, limit) {
-            Ok(page) => {
-                let _ = evt_tx.send(WorkerEvent::AllFoldersSearchLoaded(page));
+        } => {
+            // 跨文件夹搜索只覆盖已启用账号（对齐 Linux `folder_select`），
+            // 禁用账号的本地缓存邮件不参与全局搜索。
+            let enabled_account_ids: Vec<u32> = config::load_accounts_in(data_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|acc| acc.enabled)
+                .map(|acc| acc.id)
+                .collect();
+            match cache.search_all_folders(
+                &enabled_account_ids,
+                &query,
+                quick_filters,
+                sort,
+                offset,
+                limit,
+            ) {
+                Ok(page) => {
+                    let _ = evt_tx.send(WorkerEvent::AllFoldersSearchLoaded(page));
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
             }
-            Err(e) => {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: None,
-                    message: e,
-                });
-            }
-        },
+        }
 
         MailRequest::SearchServer { query, account_id } => {
             search_server_inner(data_dir, cache, tokens, &query, account_id, evt_tx).await;

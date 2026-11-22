@@ -959,8 +959,27 @@ fn format_year_month_day_part(dt: &chrono::DateTime<chrono::Local>, date_style: 
 }
 
 /// Detect whether subject or user-authored compose body mentions an attachment keyword
-/// without any attached files. Quoted reply/forward blocks and `>` quote lines are ignored.
+/// without any attached files. Quoted reply/forward blocks, `>` quote lines and the
+/// `-- ` signature block are ignored (ported from the Linux app's
+/// `mail::attachment_reminder`). Keywords starting with a letter must match at the
+/// start of a word, so "reattached" does not trigger "attach"; keywords starting
+/// with any other character (Chinese words such as "附件") match anywhere, since
+/// Chinese carries no whitespace word boundaries.
 pub fn detect_attachment_reminder(subject: &str, body: &str, keywords_csv: &str) -> Option<String> {
+    let hay = strip_quoted_and_signature(subject, body).to_lowercase();
+    keywords_csv
+        .split([',', '，'])
+        .map(str::trim)
+        .filter(|kw| !kw.is_empty())
+        .find(|kw| mentions_keyword(&hay, &kw.to_lowercase()))
+        .map(|kw| kw.to_string())
+}
+
+/// The subject plus the user-authored part of `body`: the lines after a quoted
+/// reply separator, the lines starting with `>` and everything from the `-- `
+/// signature marker on are left out — quoted originals and signature disclaimers
+/// are not the user saying that something is attached.
+fn strip_quoted_and_signature(subject: &str, body: &str) -> String {
     let mut authored = String::with_capacity(subject.len() + body.len() + 2);
     authored.push_str(subject);
     authored.push('\n');
@@ -974,16 +993,34 @@ pub fn detect_attachment_reminder(subject: &str, body: &str, keywords_csv: &str)
         if trimmed.starts_with('>') {
             continue;
         }
+        // 标准签名分隔行（`-- `，用户常丢尾部空格写成 `--`）：其后整块剥离。
+        if trimmed == "--" {
+            break;
+        }
         authored.push_str(line);
         authored.push('\n');
     }
-    let hay = authored.to_lowercase();
-    keywords_csv
-        .split([',', '，'])
-        .map(str::trim)
-        .filter(|kw| !kw.is_empty())
-        .find(|kw| hay.contains(&kw.to_lowercase()))
-        .map(|kw| kw.to_string())
+    authored
+}
+
+/// Whether the lowercased `kw` occurs in the lowercased `hay`: a keyword that
+/// starts with an ASCII letter must start a word (mirrors the Linux app's
+/// `starts_word`), any other keyword matches anywhere — CJK characters count
+/// as letters, but Chinese words carry no whitespace boundaries.
+fn mentions_keyword(hay: &str, kw: &str) -> bool {
+    if kw.is_empty() {
+        return false;
+    }
+    let first = kw.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() {
+        return hay.contains(kw);
+    }
+    hay.match_indices(kw).any(|(at, _)| {
+        hay[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric())
+    })
 }
 
 /// Format the attribution header placed above quoted messages in replies.
@@ -1147,6 +1184,74 @@ mod tests {
             detect_attachment_reminder("Re: 汇报", quoted_only, kw),
             None
         );
+    }
+
+    #[test]
+    fn attachment_reminder_ignores_quoted_lines() {
+        let kw = "attach, attached";
+        // 引用行（含缩进引用）里的 "attached" 不是用户本人所说。
+        let quoted = "Thanks, got it.\n\nOn Monday, Ada wrote:\n> The file is attached.\n  > > attachment below";
+        assert_eq!(detect_attachment_reminder("Re: Hi", quoted, kw), None);
+        // 自己正文里提到时仍命中（kw 首个命中词为 "attach"）。
+        assert_eq!(
+            detect_attachment_reminder("Re: Hi", "Thanks.\nHere it is attached.", kw).as_deref(),
+            Some("attach")
+        );
+    }
+
+    #[test]
+    fn attachment_reminder_ignores_signature_block() {
+        let kw = "attach, attached";
+        // `-- ` 签名块中的 "find attached" 不应误报（回复签名带 attached 的邮件）。
+        let with_sig = "好的，收到。\n-- \nFind attached my latest report.";
+        assert_eq!(detect_attachment_reminder("", with_sig, kw), None);
+        // 用户丢掉尾部空格写成 `--` 时同样剥离。
+        let dash_no_space = "好的，收到。\n--\nFind attached my latest report.";
+        assert_eq!(detect_attachment_reminder("", dash_no_space, kw), None);
+        // 签名之前的正文仍参与检测。
+        assert_eq!(
+            detect_attachment_reminder("", "The report is ready, see attached file.", kw)
+                .as_deref(),
+            Some("attach")
+        );
+    }
+
+    #[test]
+    fn attachment_reminder_word_boundary_vs_substring() {
+        // 词首命中：词边界匹配。
+        let kw = "attach";
+        assert_eq!(
+            detect_attachment_reminder("", "Please find the report attached.", kw).as_deref(),
+            Some("attach")
+        );
+        // 词中命中不算：reattached 内嵌 attach，不应误报。
+        assert_eq!(
+            detect_attachment_reminder("", "He reattached nothing.", kw),
+            None
+        );
+        assert_eq!(
+            detect_attachment_reminder("", "Nothing to see here.", kw),
+            None
+        );
+    }
+
+    #[test]
+    fn attachment_reminder_chinese_keywords_match_within_words() {
+        // 中文无空格词边界，任何位置的命中都算："见附" 出现在 "见附件" 中。
+        let kw = "附件, 附上, 见附";
+        assert_eq!(
+            detect_attachment_reminder("", "请查收附件。", kw).as_deref(),
+            Some("附件")
+        );
+        assert_eq!(
+            detect_attachment_reminder("", "合同已附上，请查收。", kw).as_deref(),
+            Some("附上")
+        );
+        assert_eq!(
+            detect_attachment_reminder("", "详见附页。", kw).as_deref(),
+            Some("见附")
+        );
+        assert_eq!(detect_attachment_reminder("", "今天天气不错。", kw), None);
     }
 
     #[test]
