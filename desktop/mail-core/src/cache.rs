@@ -179,6 +179,15 @@ fn is_trash_folder(name: &str, path: &str) -> bool {
     name == "已删除" || upper_path.contains("TRASH") || upper_path.contains("DELETED")
 }
 
+/// Check whether a folder's friendly name or raw path represents a Junk/Spam folder.
+fn is_junk_folder(name: &str, path: &str) -> bool {
+    let upper_path = path.to_ascii_uppercase();
+    name == "垃圾邮件"
+        || upper_path.contains("JUNK")
+        || upper_path.contains("SPAM")
+        || upper_path.contains("BULK")
+}
+
 /// Strip characters that Windows forbids in file names (same mapping as
 /// [`unique_attachment_path`]) and trim surrounding whitespace / dots;
 /// fall back to `attachment` when nothing usable remains.
@@ -984,6 +993,73 @@ impl CacheStore {
         tx.commit()
             .map_err(|e| format!("提交邮件同步事务失败: {e}"))?;
         Ok(())
+    }
+
+    /// Reconcile `unread` and `flagged` state for all cached messages in `folder_id`
+    /// against server-side `UID SEARCH FLAGGED` and `UID SEARCH UNSEEN` snapshots.
+    /// Returns the number of rows whose state changed.
+    pub fn reconcile_folder_flags(
+        &mut self,
+        folder_id: u32,
+        flagged_uids: &HashSet<u32>,
+        unseen_uids: &HashSet<u32>,
+    ) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("开启状态位对账事务失败: {e}"))?;
+
+        let rows: Vec<(u32, u32, bool, bool)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, uid, unread, flagged FROM messages WHERE folder_id = ?1")
+                .map_err(|e| format!("读取本地状态位失败: {e}"))?;
+            let collected = stmt
+                .query_map(params![folder_id], |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, i32>(2)? != 0,
+                        row.get::<_, i32>(3)? != 0,
+                    ))
+                })
+                .map_err(|e| format!("遍历本地状态位失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("收集本地状态位失败: {e}"))?;
+            collected
+        };
+
+        let mut updated = 0usize;
+        for (msg_id, uid, was_unread, was_flagged) in rows {
+            let now_unread = unseen_uids.contains(&uid);
+            let now_flagged = flagged_uids.contains(&uid);
+            if now_unread != was_unread || now_flagged != was_flagged {
+                tx.execute(
+                    "UPDATE messages SET unread = ?1, flagged = ?2 WHERE id = ?3",
+                    params![now_unread as i32, now_flagged as i32, msg_id],
+                )
+                .map_err(|e| format!("更新邮件状态位失败 (UID {uid}): {e}"))?;
+                updated += 1;
+            }
+        }
+
+        if updated > 0 {
+            let unread_count: u32 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND unread = 1",
+                    params![folder_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("统计未读数失败: {e}"))?;
+            tx.execute(
+                "UPDATE folders SET unread_count = ?1 WHERE id = ?2",
+                params![unread_count, folder_id],
+            )
+            .map_err(|e| format!("更新文件夹未读数失败: {e}"))?;
+        }
+
+        tx.commit()
+            .map_err(|e| format!("提交状态位对账事务失败: {e}"))?;
+        Ok(updated)
     }
 
     /// Build an FTS5 MATCH expression for pure ASCII alphanumeric/phrase terms.
@@ -2261,14 +2337,34 @@ impl CacheStore {
             }
         }
 
-        // 4. Deduplicate cross-folder copies with same (message_id, sender, date_ts),
-        //    preferring anchor message > anchor folder > non-Trash folder > Trash folder.
+        // 4. Exclude Trash/Junk rows unless the anchor message itself lives in Trash/Junk,
+        //    then deduplicate cross-folder copies with same (message_id, sender, date_ts),
+        //    preferring anchor message > anchor folder > non-Trash/Junk folder.
+        let anchor_in_trash_or_junk = anchor_folder_id
+            .and_then(|fid| {
+                raw_rows.iter().find(|r| r.folder_id == fid).map(|r| {
+                    is_trash_folder(&r.folder_name, &r.folder_path)
+                        || is_junk_folder(&r.folder_name, &r.folder_path)
+                })
+            })
+            .unwrap_or(false);
+
+        if !anchor_in_trash_or_junk {
+            raw_rows.retain(|r| {
+                (message_id != 0 && r.id == message_id)
+                    || (!is_trash_folder(&r.folder_name, &r.folder_path)
+                        && !is_junk_folder(&r.folder_name, &r.folder_path))
+            });
+        }
+
         let copy_priority = |r: &RawRow| -> u8 {
             if message_id != 0 && r.id == message_id {
                 3
             } else if anchor_folder_id == Some(r.folder_id) {
                 2
-            } else if !is_trash_folder(&r.folder_name, &r.folder_path) {
+            } else if !is_trash_folder(&r.folder_name, &r.folder_path)
+                && !is_junk_folder(&r.folder_name, &r.folder_path)
+            {
                 1
             } else {
                 0
@@ -5560,6 +5656,185 @@ mod tests {
         let (detail, _, _) = cache.get_message_detail(reply2_id).unwrap().unwrap();
         assert_eq!(detail.thread_messages.len(), 3);
         assert_eq!(detail.thread_messages[0].id, reply2_id);
+    }
+
+    #[test]
+    fn list_thread_messages_excludes_trash_and_junk_unless_anchor_is_there() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        cache
+            .sync_folders(
+                1,
+                &[
+                    RemoteFolder {
+                        name: "收件箱".to_string(),
+                        path: "INBOX".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "已删除".to_string(),
+                        path: "Trash".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                    RemoteFolder {
+                        name: "垃圾邮件".to_string(),
+                        path: "Junk".to_string(),
+                        unread_count: 0,
+                        total_count: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        let folders = cache.list_folders(1).unwrap();
+        let inbox = folders.iter().find(|f| f.path == "INBOX").unwrap().id;
+        let trash = folders.iter().find(|f| f.path == "Trash").unwrap().id;
+        let junk = folders.iter().find(|f| f.path == "Junk").unwrap().id;
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                1,
+                &[CachedHeaderInput {
+                    uid: 1,
+                    message_id: "<root@example.com>".to_string(),
+                    in_reply_to: String::new(),
+                    references_header: String::new(),
+                    sender: "Alice <alice@example.com>".to_string(),
+                    recipients: "me@example.com".to_string(),
+                    subject: "Thread Cleanup".to_string(),
+                    preview: "root".to_string(),
+                    date_ts: 1000,
+                    date_display: "09:00".to_string(),
+                    unread: false,
+                    flagged: false,
+                    has_attachment: false,
+                }],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                trash,
+                2,
+                &[CachedHeaderInput {
+                    uid: 2,
+                    message_id: "<deleted-reply@example.com>".to_string(),
+                    in_reply_to: "<root@example.com>".to_string(),
+                    references_header: "<root@example.com>".to_string(),
+                    sender: "Bob <bob@example.com>".to_string(),
+                    recipients: "me@example.com".to_string(),
+                    subject: "Re: Thread Cleanup".to_string(),
+                    preview: "in trash".to_string(),
+                    date_ts: 2000,
+                    date_display: "10:00".to_string(),
+                    unread: false,
+                    flagged: false,
+                    has_attachment: false,
+                }],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                junk,
+                3,
+                &[CachedHeaderInput {
+                    uid: 3,
+                    message_id: "<spam-reply@example.com>".to_string(),
+                    in_reply_to: "<root@example.com>".to_string(),
+                    references_header: "<root@example.com>".to_string(),
+                    sender: "Spammer <spam@example.com>".to_string(),
+                    recipients: "me@example.com".to_string(),
+                    subject: "Re: Thread Cleanup".to_string(),
+                    preview: "in junk".to_string(),
+                    date_ts: 3000,
+                    date_display: "11:00".to_string(),
+                    unread: false,
+                    flagged: false,
+                    has_attachment: false,
+                }],
+                None,
+            )
+            .unwrap();
+
+        let root_id = cache.list_messages_page(inbox, "", 0, 10).unwrap().items[0].id;
+        let from_inbox = cache
+            .list_thread_messages(1, root_id, "Thread Cleanup", true)
+            .unwrap();
+        assert_eq!(from_inbox.len(), 1);
+        assert_eq!(from_inbox[0].rfc_message_id, "<root@example.com>");
+
+        let trash_id = cache.list_messages_page(trash, "", 0, 10).unwrap().items[0].id;
+        let from_trash = cache
+            .list_thread_messages(1, trash_id, "Re: Thread Cleanup", true)
+            .unwrap();
+        assert!(from_trash
+            .iter()
+            .any(|m| m.rfc_message_id == "<deleted-reply@example.com>"));
+    }
+
+    #[test]
+    fn reconcile_folder_flags_updates_older_messages_and_unread_count() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        cache
+            .sync_folders(
+                1,
+                &[RemoteFolder {
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 0,
+                    total_count: 0,
+                }],
+            )
+            .unwrap();
+        let inbox = cache.list_folders(1).unwrap()[0].id;
+
+        let mk = |uid: u32, unread: bool, flagged: bool| CachedHeaderInput {
+            uid,
+            message_id: format!("<m-{uid}@example.com>"),
+            in_reply_to: String::new(),
+            references_header: String::new(),
+            sender: "Alice <alice@example.com>".to_string(),
+            recipients: "me@example.com".to_string(),
+            subject: format!("Mail {uid}"),
+            preview: "preview".to_string(),
+            date_ts: 1000 + uid as i64,
+            date_display: "10:00".to_string(),
+            unread,
+            flagged,
+            has_attachment: false,
+        };
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                1,
+                &[mk(1, true, false), mk(2, false, true), mk(3, true, true)],
+                None,
+            )
+            .unwrap();
+
+        let flagged: HashSet<u32> = [1, 3].into();
+        let unseen: HashSet<u32> = [2, 3].into();
+        let updated = cache
+            .reconcile_folder_flags(inbox, &flagged, &unseen)
+            .unwrap();
+        assert_eq!(updated, 2);
+
+        let page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let m1 = page.items.iter().find(|m| m.uid == 1).unwrap();
+        let m2 = page.items.iter().find(|m| m.uid == 2).unwrap();
+        let m3 = page.items.iter().find(|m| m.uid == 3).unwrap();
+        assert!(!m1.unread && m1.flagged);
+        assert!(m2.unread && !m2.flagged);
+        assert!(m3.unread && m3.flagged);
+
+        let folder = cache.list_folders(1).unwrap().into_iter().next().unwrap();
+        assert_eq!(folder.unread_count, 2);
     }
 
     #[test]
