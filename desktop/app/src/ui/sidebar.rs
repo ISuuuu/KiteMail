@@ -391,6 +391,9 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .outbox_by_account
         .values()
         .flat_map(|v| v.iter().cloned())
+        // 仍在撤回倒计时中的邮件在写信器里已有倒计时提示，不再列入发件箱
+        // 面板，避免每次发信时侧边栏底部面板弹出又消失（高度跳动）。
+        .filter(|item| app.pending_send.as_ref().and_then(|p| p.outbox_id) != Some(item.id))
         .collect();
     let outbox_pending = outbox_items
         .iter()

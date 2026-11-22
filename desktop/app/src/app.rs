@@ -1267,13 +1267,18 @@ impl HylkiApp {
                     }
                 }
                 WorkerEvent::BackfillHistoryBatchDone {
-                    folder_id: _,
+                    folder_id,
                     fetched_count,
                     body_only,
                     has_more_remote,
                 } => {
-                    // 每批落盘后刷新当前查询及总数，使新历史可滚动和搜索。
-                    if fetched_count > 0 && (!body_only || !self.search_query.trim().is_empty()) {
+                    // 仅当本批确有新邮件头落盘且展示范围覆盖该文件夹（统一视图
+                    // 或正选中该文件夹）时才刷新页面；后台其他文件夹或纯正文
+                    // 索引批次不重绘，避免索引期间列表高频抖动。
+                    let view_covers_folder =
+                        !matches!(self.current_view, CurrentView::AccountFolder)
+                            || folder_id == self.selected_folder_id;
+                    if fetched_count > 0 && !body_only && view_covers_folder {
                         self.reload_current_page(cx);
                     }
                     self.backfill.on_batch_done(has_more_remote);
@@ -1519,6 +1524,16 @@ impl HylkiApp {
                     );
                     self.cfg_feedback = Some((false, SharedString::from(message.clone())));
                     self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
+                    self.status_line = SharedString::from(message);
+                }
+                WorkerEvent::OAuthReauthorized {
+                    account_id: _,
+                    email,
+                } => {
+                    // 编辑已有账号重新授权成功：新令牌已写入 Keyring，账号配置与
+                    // 缓存未动；仅提示成功，保留当前编辑表单中未保存的修改。
+                    let message = format!("账号 {email} 重新授权成功");
+                    self.cfg_feedback = Some((true, SharedString::from(message.clone())));
                     self.status_line = SharedString::from(message);
                 }
                 WorkerEvent::MessageArchived {
@@ -1964,24 +1979,18 @@ impl HylkiApp {
             return;
         }
         if let Some(ref worker) = self.worker {
-            match worker.send_checked(MailRequest::PrepareQuit) {
-                Ok(()) => {
-                    self.quit_preparing = true;
-                    self.status_line = SharedString::from("正在保存发件队列…");
-                    cx.notify();
-                }
-                Err(message) => {
-                    self.quitting = false;
-                    if self.pending_send.is_some() {
-                        self.error_banner = Some(SharedString::from(message.clone()));
-                        self.status_line = SharedString::from(message);
-                        cx.notify();
-                    } else {
-                        self.shutdown_tray();
-                        cx.quit();
-                    }
-                }
+            // 主线程同步落盘：把仍排队的发件箱记录标记为到期后立即退出。
+            // 不再异步等待 worker 的 QuitPrepared——单线程 worker 可能正执行
+            // 耗时的同步或超时重连，异步请求会排在队尾导致关窗毫无反应。
+            if worker.prepare_quit_now().is_err() && self.pending_send.is_some() {
+                self.quitting = false;
+                self.error_banner = Some(SharedString::from("退出时保存发件队列失败，请重试"));
+                self.status_line = SharedString::from("退出时保存发件队列失败，请重试");
+                cx.notify();
+                return;
             }
+            self.shutdown_tray();
+            cx.quit();
         } else {
             self.shutdown_tray();
             cx.quit();
@@ -3956,6 +3965,7 @@ impl HylkiApp {
     pub(crate) fn start_outlook_oauth(
         &mut self,
         custom_client_id: String,
+        login_hint_email: String,
         editing_account_id: Option<u32>,
         cx: &mut Context<Self>,
     ) {
@@ -3966,9 +3976,18 @@ impl HylkiApp {
             true,
             SharedString::from("正在打开系统浏览器，请在微软页面完成 Outlook 授权..."),
         ));
+        let login_hint = {
+            let trimmed = login_hint_email.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
         if let Some(ref w) = self.worker {
             w.send(MailRequest::StartMicrosoftOAuth {
                 custom_client_id,
+                login_hint_email: login_hint,
                 editing_account_id,
             });
         }

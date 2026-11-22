@@ -440,6 +440,8 @@ pub enum MailRequest {
     },
     StartMicrosoftOAuth {
         custom_client_id: String,
+        /// 表单中已填写的邮箱，非空时作为 OAuth `login_hint` 预填登录页账号框。
+        login_hint_email: Option<String>,
         editing_account_id: Option<u32>,
     },
     DeleteAccount {
@@ -726,6 +728,12 @@ pub enum WorkerEvent {
     OAuthRebindRejected {
         account_id: Option<u32>,
         returned_email: String,
+    },
+    /// 编辑已有账号重新授权成功：仅新令牌已写入 Keyring，账号配置与缓存未动，
+    /// UI 提示后保留当前编辑表单（不清空未保存的修改）。
+    OAuthReauthorized {
+        account_id: u32,
+        email: String,
     },
     DraftSent {
         account_id: u32,

@@ -473,9 +473,9 @@ pub fn send_message(
     body_text: &str,
     attachment_paths: &[String],
 ) -> SendOutcome {
-    let address = extract_email_address(to_addr);
-    if address.is_empty() {
-        return SendOutcome::Failed("收件人邮箱地址不能为空".to_string());
+    let to_list = graph_recipient_array(to_addr);
+    if to_list.is_empty() {
+        return SendOutcome::Failed("Recipient address is empty".to_string());
     }
 
     let mut graph_attachments = Vec::new();
@@ -506,13 +506,7 @@ pub fn send_message(
             "contentType": "Text",
             "content": body_text
         },
-        "toRecipients": [
-            {
-                "emailAddress": {
-                    "address": address
-                }
-            }
-        ]
+        "toRecipients": serde_json::Value::Array(to_list)
     });
 
     if !graph_attachments.is_empty() {
@@ -594,4 +588,24 @@ fn graph_recipient_array(raw: &str) -> Vec<serde_json::Value> {
 
 fn urlencoding_segment(input: &str) -> String {
     url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_recipient_array_keeps_every_address_in_comma_list() {
+        // To 栏逗号分隔的多个收件人必须全部保留（修复多收件人漏发）。
+        let addrs = graph_recipient_array("Alice <alice@example.com>, bob@example.com ,  ");
+        let emails: Vec<&str> = addrs
+            .iter()
+            .map(|v| v["emailAddress"]["address"].as_str().unwrap())
+            .collect();
+        assert_eq!(emails, vec!["alice@example.com", "bob@example.com"]);
+
+        // 无 @ 的片段跳过；全无效时为空（send_message 据此报收件人为空）。
+        assert!(graph_recipient_array("notaaddress").is_empty());
+        assert!(graph_recipient_array("   ").is_empty());
+    }
 }
