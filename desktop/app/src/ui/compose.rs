@@ -16,7 +16,7 @@ use gpui_kit::{
     ParentElement, SharedString, Styled,
 };
 
-use crate::app::{filter_contact_suggestions, ComposeAddressField, HylkiApp};
+use crate::app::{filter_contact_suggestions, ComposeAddressField, HylkiApp, RecipientPill};
 use crate::theme;
 
 /// 信头行标签宽度。
@@ -43,6 +43,130 @@ fn header_row(
                 .child(label),
         )
         .child(div().flex_1().min_w_0().child(Input::new(input)))
+}
+
+/// 收件人胶囊（对齐 Linux `src/ui/recipient_row.rs` 的 `.recipient-pill`）：
+/// 点击主体把地址放回输入框继续编辑，`⇄` 移到下一个收件人字段，`×` 删除；
+/// 非法地址渲染红色 `.invalid` 边框。
+fn recipient_pill_view(
+    field: ComposeAddressField,
+    idx: usize,
+    pill: &RecipientPill,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let (bg, fg, border) = if pill.valid {
+        (p.accent_soft(), p.text, p.border)
+    } else {
+        (p.danger.opacity(0.12), p.danger, p.danger)
+    };
+    let pill_id = field.index() * 1000 + idx;
+    let label = pill.label.clone();
+    h_flex()
+        .id(("recipient-pill", pill_id))
+        .items_center()
+        .gap_1()
+        .pl_2()
+        .pr_1()
+        .py_0p5()
+        .rounded(px(9999.0))
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                this.edit_recipient_pill(field, idx, window, cx);
+            }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(fg)
+                .max_w(px(220.0))
+                .truncate()
+                .child(SharedString::from(label)),
+        )
+        .child(
+            div()
+                .id(("recipient-pill-move", pill_id))
+                .px_1()
+                .rounded(px(4.0))
+                .text_xs()
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(move |s| s.bg(bg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.move_recipient_pill(field, idx, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(SharedString::from("⇄")),
+        )
+        .child(
+            div()
+                .id(("recipient-pill-remove", pill_id))
+                .px_1()
+                .rounded(px(4.0))
+                .text_xs()
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(move |s| s.bg(bg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.remove_recipient_pill(field, idx, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(SharedString::from("×")),
+        )
+        .into_any_element()
+}
+
+/// 收件人信头行：左侧标签 + 胶囊流 + 输入框（输入框承载「正在输入的这一段」）。
+fn recipient_row(
+    field: ComposeAddressField,
+    app: &HylkiApp,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::Div {
+    let pills: Vec<gpui_kit::AnyElement> = app
+        .compose_pills(field)
+        .iter()
+        .enumerate()
+        .map(|(idx, pill)| recipient_pill_view(field, idx, pill, p, cx))
+        .collect();
+    let input = app.compose_field_input(field);
+    let border = p.border;
+    let muted_fg = p.text_muted;
+    h_flex()
+        .items_center()
+        .gap_2()
+        .border_b_1()
+        .border_color(border)
+        .py_1()
+        .child(
+            div()
+                .w(px(LABEL_WIDTH))
+                .flex_shrink_0()
+                .text_sm()
+                .text_color(muted_fg)
+                .child(field.label()),
+        )
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .children(pills)
+                .child(div().flex_1().min_w(px(120.0)).child(Input::new(&input))),
+        )
 }
 
 /// 附件芯片（圆角胶囊：📎 文件名 (大小) ×，点击移除）。
@@ -87,7 +211,17 @@ fn render_autocomplete_dropdown(
     if app.compose_autocomplete_field != Some(field) {
         return None;
     }
-    let suggestions = filter_contact_suggestions(input_value, &app.known_contacts, 5);
+    // 已收进胶囊的地址不再出现在建议里（输入框现在只承载「正在输入的这一段」）。
+    let taken: std::collections::HashSet<String> = app
+        .compose_pills(field)
+        .iter()
+        .map(|p| p.address.to_lowercase())
+        .collect();
+    let suggestions: Vec<_> = filter_contact_suggestions(input_value, &app.known_contacts, 8)
+        .into_iter()
+        .filter(|c| !taken.contains(&c.email.to_lowercase()))
+        .take(5)
+        .collect();
     if suggestions.is_empty() {
         return None;
     }
@@ -393,41 +527,26 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     )
                 })
                 .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(p.border)
-                        .py_1()
-                        .child(
-                            div()
-                                .w(px(LABEL_WIDTH))
-                                .flex_shrink_0()
-                                .text_sm()
-                                .text_color(muted_fg)
-                                .child("收件人"),
-                        )
-                        .child(div().flex_1().min_w_0().child(Input::new(&app.compose_to)))
-                        .child(
-                            Button::new("toggle-cc-bcc")
-                                .ghost()
-                                .compact()
-                                .text_size(px(12.0))
-                                .label(if app.compose_show_cc_bcc {
-                                    "收起抄送/密送"
-                                } else {
-                                    "抄送 / 密送"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_compose_cc_bcc(cx);
-                                })),
-                        ),
+                    recipient_row(ComposeAddressField::To, app, &p, cx).child(
+                        Button::new("toggle-cc-bcc")
+                            .ghost()
+                            .compact()
+                            .text_size(px(12.0))
+                            .label(if app.compose_show_cc_bcc {
+                                "收起抄送/密送"
+                            } else {
+                                "抄送 / 密送"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_compose_cc_bcc(cx);
+                            })),
+                    ),
                 )
                 .children(to_suggestions)
                 .when(app.compose_show_cc_bcc, |el| {
-                    el.child(header_row("抄送", &app.compose_cc, &p))
+                    el.child(recipient_row(ComposeAddressField::Cc, app, &p, cx))
                         .children(cc_suggestions)
-                        .child(header_row("密送", &app.compose_bcc, &p))
+                        .child(recipient_row(ComposeAddressField::Bcc, app, &p, cx))
                         .children(bcc_suggestions)
                 })
                 .child(header_row("主题", &app.compose_subject, &p)),

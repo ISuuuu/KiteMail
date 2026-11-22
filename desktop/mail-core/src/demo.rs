@@ -800,6 +800,7 @@ impl DemoStore {
                     id,
                     notes,
                     custom,
+                    ..KnownContact::default()
                 }
             })
             .filter(|c| {

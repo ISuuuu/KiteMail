@@ -91,6 +91,19 @@ pub struct KnownContact {
     /// 是否为用户自定义联系人（列表中标注来源徽标并开放编辑 / 删除）。
     #[serde(default)]
     pub custom: bool,
+    /// WP-10：电话、组织、职位、生日、分组标签与发信历史统计。
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub organization: String,
+    #[serde(default)]
+    pub job_title: String,
+    #[serde(default)]
+    pub birthday: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub sent_count: usize,
 }
 
 /// SQL predicate matching every account's Sent folder by friendly name or raw path.
@@ -474,6 +487,11 @@ impl CacheStore {
                     email TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL DEFAULT '',
                     notes TEXT NOT NULL DEFAULT '',
+                    phone TEXT NOT NULL DEFAULT '',
+                    organization TEXT NOT NULL DEFAULT '',
+                    job_title TEXT NOT NULL DEFAULT '',
+                    birthday TEXT NOT NULL DEFAULT '',
+                    groups_json TEXT NOT NULL DEFAULT '[]',
                     created_at INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL DEFAULT 0
                 );
@@ -486,6 +504,16 @@ impl CacheStore {
                 ",
             )
             .map_err(|e| format!("初始化用户联系人与标签表失败: {e}"))?;
+        // WP-10：兼容旧库迁移，按需补齐 user_contacts 扩展列。
+        for col_sql in [
+            "ALTER TABLE user_contacts ADD COLUMN phone TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE user_contacts ADD COLUMN organization TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE user_contacts ADD COLUMN job_title TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE user_contacts ADD COLUMN birthday TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE user_contacts ADD COLUMN groups_json TEXT NOT NULL DEFAULT '[]'",
+        ] {
+            let _ = self.conn.execute(col_sql, []);
+        }
         self.conn
             .execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_account_msgid ON messages(account_id, message_id)",
@@ -2560,21 +2588,33 @@ impl CacheStore {
     ) -> Result<Vec<KnownContact>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT sender, recipients FROM messages")
+            .prepare(&format!(
+                "
+                SELECT m.sender, m.recipients, CASE WHEN {SENT_FOLDER_MATCH} THEN 1 ELSE 0 END AS is_sent
+                FROM messages m
+                LEFT JOIN folders f ON f.id = m.folder_id
+                "
+            ))
             .map_err(|e| format!("查询联系人来源失败: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
             })
             .map_err(|e| format!("读取联系人来源失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析联系人来源失败: {e}"))?;
 
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut sent_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut emails: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        for (sender, recipients) in rows {
+        for (sender, recipients, is_sent) in rows {
             // Count each contact once per message, even if listed twice in it.
             let mut seen_in_message: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
@@ -2596,7 +2636,10 @@ impl CacheStore {
                 if name_slot.is_empty() && !name.is_empty() {
                     *name_slot = name;
                 }
-                *counts.entry(key).or_insert(0) += 1;
+                *counts.entry(key.clone()).or_insert(0) += 1;
+                if is_sent {
+                    *sent_counts.entry(key).or_insert(0) += 1;
+                }
             }
         }
 
@@ -2605,13 +2648,14 @@ impl CacheStore {
             .into_iter()
             .map(|(key, message_count)| KnownContact {
                 name: names.get(&key).cloned().unwrap_or_default(),
-                email: emails.get(&key).cloned().unwrap_or(key.clone()),
+                email: emails.get(&key).cloned().unwrap_or_else(|| key.clone()),
                 message_count,
+                sent_count: sent_counts.get(&key).copied().unwrap_or(0),
                 ..KnownContact::default()
             })
             .collect();
 
-        // F-5：叠加用户自定义联系人（邮箱冲突时覆盖聚合行的姓名 / 备注）。
+        // F-5：叠加用户自定义联系人（邮箱冲突时覆盖聚合行的姓名 / 备注 / 详情）。
         for user in self.list_user_contacts()? {
             let key = user.email.trim().to_lowercase();
             if key.is_empty() {
@@ -2620,6 +2664,11 @@ impl CacheStore {
             if let Some(existing) = contacts.iter_mut().find(|c| c.email.to_lowercase() == key) {
                 existing.id = user.id;
                 existing.notes = user.notes;
+                existing.phone = user.phone;
+                existing.organization = user.organization;
+                existing.job_title = user.job_title;
+                existing.birthday = user.birthday;
+                existing.groups = user.groups;
                 existing.custom = true;
                 if !user.display_name.trim().is_empty() {
                     existing.name = user.display_name;
@@ -2632,6 +2681,12 @@ impl CacheStore {
                     id: user.id,
                     notes: user.notes,
                     custom: true,
+                    phone: user.phone,
+                    organization: user.organization,
+                    job_title: user.job_title,
+                    birthday: user.birthday,
+                    groups: user.groups,
+                    sent_count: 0,
                 });
             }
         }
@@ -2661,7 +2716,7 @@ impl CacheStore {
             .conn
             .prepare(
                 "
-                SELECT id, email, display_name, notes
+                SELECT id, email, display_name, notes, phone, organization, job_title, birthday, groups_json
                 FROM user_contacts
                 ORDER BY id ASC
                 ",
@@ -2669,11 +2724,18 @@ impl CacheStore {
             .map_err(|e| format!("查询用户联系人失败: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
+                let groups_json: String = row.get(8)?;
+                let groups: Vec<String> = serde_json::from_str(&groups_json).unwrap_or_default();
                 Ok(UserContact {
                     id: row.get::<_, i64>(0)? as u32,
                     email: row.get(1)?,
                     display_name: row.get(2)?,
                     notes: row.get(3)?,
+                    phone: row.get(4)?,
+                    organization: row.get(5)?,
+                    job_title: row.get(6)?,
+                    birthday: row.get(7)?,
+                    groups,
                 })
             })
             .map_err(|e| format!("读取用户联系人失败: {e}"))?
@@ -2692,14 +2754,33 @@ impl CacheStore {
         let now = chrono::Utc::now().timestamp();
         let display_name = contact.display_name.trim().to_string();
         let notes = contact.notes.clone();
+        let phone = contact.phone.trim().to_string();
+        let organization = contact.organization.trim().to_string();
+        let job_title = contact.job_title.trim().to_string();
+        let birthday = contact.birthday.trim().to_string();
+        let groups_json =
+            serde_json::to_string(&contact.groups).unwrap_or_else(|_| "[]".to_string());
         if contact.id == 0 {
             self.conn
                 .execute(
                     "
-                    INSERT INTO user_contacts (email, display_name, notes, created_at, updated_at)
-                    VALUES (?1, ?2, ?3, ?4, ?4)
+                    INSERT INTO user_contacts (
+                        email, display_name, notes, phone, organization, job_title, birthday, groups_json,
+                        created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
                     ",
-                    params![email, display_name, notes, now],
+                    params![
+                        email,
+                        display_name,
+                        notes,
+                        phone,
+                        organization,
+                        job_title,
+                        birthday,
+                        groups_json,
+                        now
+                    ],
                 )
                 .map_err(|e| {
                     if format!("{e}").contains("UNIQUE") {
@@ -2714,10 +2795,23 @@ impl CacheStore {
                 .execute(
                     "
                     UPDATE user_contacts
-                    SET email = ?1, display_name = ?2, notes = ?3, updated_at = ?4
-                    WHERE id = ?5
+                    SET email = ?1, display_name = ?2, notes = ?3,
+                        phone = ?4, organization = ?5, job_title = ?6, birthday = ?7, groups_json = ?8,
+                        updated_at = ?9
+                    WHERE id = ?10
                     ",
-                    params![email, display_name, notes, now, contact.id],
+                    params![
+                        email,
+                        display_name,
+                        notes,
+                        phone,
+                        organization,
+                        job_title,
+                        birthday,
+                        groups_json,
+                        now,
+                        contact.id
+                    ],
                 )
                 .map_err(|e| {
                     if format!("{e}").contains("UNIQUE") {
@@ -3013,15 +3107,27 @@ impl CacheStore {
                 skipped += 1;
                 continue;
             }
+            let groups_json =
+                serde_json::to_string(&contact.groups).unwrap_or_else(|_| "[]".to_string());
             let affected = self
                 .conn
                 .execute(
                     "
                     INSERT OR IGNORE INTO user_contacts
-                        (email, display_name, notes, created_at, updated_at)
-                    VALUES (?1, ?2, ?3, ?4, ?4)
+                        (email, display_name, notes, phone, organization, job_title, birthday, groups_json, created_at, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
                     ",
-                    params![email, contact.display_name.trim(), contact.notes, now],
+                    params![
+                        email,
+                        contact.display_name.trim(),
+                        contact.notes,
+                        contact.phone.trim(),
+                        contact.organization.trim(),
+                        contact.job_title.trim(),
+                        contact.birthday.trim(),
+                        groups_json,
+                        now
+                    ],
                 )
                 .map_err(|e| format!("导入联系人失败: {e}"))?;
             if affected > 0 {
@@ -6332,6 +6438,7 @@ mod tests {
                 email: "custom@example.com".to_string(),
                 display_name: "自定义联系人".to_string(),
                 notes: "备注 A".to_string(),
+                ..Default::default()
             })
             .unwrap();
         assert!(id_new > 0);
@@ -6342,6 +6449,7 @@ mod tests {
                 email: alice_email.clone(),
                 display_name: "Alice 手工版".to_string(),
                 notes: String::new(),
+                ..Default::default()
             })
             .unwrap();
 
@@ -6352,6 +6460,7 @@ mod tests {
                 email: alice_email.clone(),
                 display_name: "重复".to_string(),
                 notes: String::new(),
+                ..Default::default()
             })
             .is_err());
 
@@ -6382,6 +6491,7 @@ mod tests {
                 email: "custom@example.com".to_string(),
                 display_name: "改名".to_string(),
                 notes: String::new(),
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(updated, id_new);
@@ -6406,18 +6516,21 @@ mod tests {
                     email: "alice@example.com".to_string(),
                     display_name: String::new(),
                     notes: String::new(),
+                    ..Default::default()
                 },
                 UserContact {
                     id: 0,
                     email: "batch1@example.com".to_string(),
                     display_name: "批量一".to_string(),
                     notes: String::new(),
+                    ..Default::default()
                 },
                 UserContact {
                     id: 0,
                     email: "not-an-email".to_string(),
                     display_name: String::new(),
                     notes: String::new(),
+                    ..Default::default()
                 },
             ])
             .unwrap();
@@ -6500,6 +6613,7 @@ mod tests {
                 email: "new@example.com".to_string(),
                 display_name: "新联系人".to_string(),
                 notes: String::new(),
+                ..UserContact::default()
             })
             .unwrap();
         assert!(id > 0);

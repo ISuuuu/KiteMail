@@ -284,6 +284,132 @@ pub(crate) enum ComposeAddressField {
     Bcc,
 }
 
+impl ComposeAddressField {
+    /// 胶囊「移动到下一个字段」的顺序：To -> Cc -> Bcc -> To
+    /// （对齐 Linux `recipient_row` 的胶囊菜单行为）。
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::To => Self::Cc,
+            Self::Cc => Self::Bcc,
+            Self::Bcc => Self::To,
+        }
+    }
+
+    /// 稳定的数字下标（用于生成唯一 `ElementId`）。
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::To => 0,
+            Self::Cc => 1,
+            Self::Bcc => 2,
+        }
+    }
+
+    /// 缺失标签文案（无胶囊时显示在输入框前的占位提示）。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::To => "收件人",
+            Self::Cc => "抄送",
+            Self::Bcc => "密送",
+        }
+    }
+}
+
+/// 写信收件人胶囊（对齐 Linux `src/ui/recipient_row.rs` 的 `.recipient-pill`）：
+/// 一个已确认的收件地址。输入框里按回车 / 逗号 / 空格 / 失焦后转成胶囊。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecipientPill {
+    /// 胶囊显示文本：有显示名时用显示名，否则用地址本身。
+    pub(crate) label: String,
+    /// 实际收件地址（发信与草稿落盘用它，`Name <addr>` 取尖括号内部分）。
+    pub(crate) address: String,
+    /// 地址格式是否合法；`false` 时渲染红色 `.invalid` 边框。
+    pub(crate) valid: bool,
+}
+
+impl RecipientPill {
+    /// 解析一段收件人文本；空白段返回 `None`。
+    ///
+    /// 支持 `addr`、`Name <addr>`、以及只写了显示名的半成品（后者
+    /// `valid = false`，渲染为红胶囊提示用户补全地址）。
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let (name, email) = split_sender(raw);
+        // `split_sender` 对不含尖括号的输入把整段当成显示名返回；
+        // 这类输入既可能是裸地址，也可能是纯显示名，统一当地址候选校验。
+        let address = if email.is_empty() {
+            name.clone()
+        } else {
+            email
+        };
+        let valid = looks_like_address(&address);
+        let label = if name.is_empty() {
+            address.clone()
+        } else {
+            name
+        };
+        Some(Self {
+            label,
+            address,
+            valid,
+        })
+    }
+
+    /// 送入发信 / 草稿的文本：有显示名时保留 `Name <addr>` 形式。
+    pub(crate) fn to_field_text(&self) -> String {
+        if self.label == self.address {
+            self.address.clone()
+        } else {
+            format!("{} <{}>", self.label, self.address)
+        }
+    }
+}
+
+/// 轻量邮箱格式校验（本地段 + `@` + 含点的域名），用于胶囊 `.invalid` 标红。
+pub(crate) fn looks_like_address(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+    let Some((local, domain)) = s.rsplit_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !local.contains('@')
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+}
+
+/// 按逗号 / 分号（含全角）切分收件人串，忽略 `<>` 内的分隔符
+/// （显示名里可能含逗号，如 `Doe, John <j@ex.com>`）。
+pub(crate) fn split_recipient_parts(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '<' => {
+                depth += 1;
+                buf.push(ch);
+            }
+            '>' => {
+                depth = depth.saturating_sub(1);
+                buf.push(ch);
+            }
+            ',' | ';' | '，' | '；' | '\n' if depth == 0 => {
+                parts.push(std::mem::take(&mut buf));
+            }
+            _ => buf.push(ch),
+        }
+    }
+    parts.push(buf);
+    parts
+}
+
 /// 撤销发送（Undo Send）缓冲中的待投递邮件。
 /// 记录先持久化到发件箱（Queued + 到期时间），撤销 = 删除该记录，到期 / 立即发送 = 触发投递。
 #[derive(Clone, Debug)]
@@ -412,6 +538,8 @@ pub(crate) struct HylkiApp {
     pub(crate) drafts: Vec<LocalDraft>,
     pub(crate) outbox_by_account: BTreeMap<u32, Vec<OutboxItem>>,
     pub(crate) right_mode: RightPaneMode,
+    /// WP-10：首次启动欢迎向导当前步骤（0..=4：Welcome -> Theme & Layout -> Add Account -> Sync & AI -> Ready）。
+    pub(crate) welcome_step: usize,
     pub(crate) search_input: Entity<InputState>,
     pub(crate) search_query: String,
 
@@ -433,6 +561,12 @@ pub(crate) struct HylkiApp {
     pub(crate) pending_forward_msg_id: Option<u32>,
     /// 当前触发联系人自动补全的地址框。
     pub(crate) compose_autocomplete_field: Option<ComposeAddressField>,
+    /// WP-10-1 收件人胶囊：To / Cc / Bcc 各自已确认的地址列表。
+    pub(crate) compose_to_pills: Vec<RecipientPill>,
+    pub(crate) compose_cc_pills: Vec<RecipientPill>,
+    pub(crate) compose_bcc_pills: Vec<RecipientPill>,
+    /// WP-10-1 最近一次点击编辑的胶囊下标（再次提交时尽量放回原位置）。
+    compose_pill_resume: Option<(ComposeAddressField, usize)>,
     /// F-4 草稿自动保存：防抖代际（每次输入变更 +1，旧定时器醒来后失效）。
     compose_autosave_generation: u64,
     /// F-4 自上次落库以来写信内容有变更（变更事件仅由真实编辑触发）。
@@ -727,27 +861,15 @@ impl HylkiApp {
         let compose_bcc =
             cx.new(|cx| InputState::new(window, cx).placeholder("密送：bcc@example.com"));
         cx.subscribe(&compose_to, |this, _input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.compose_autocomplete_field = Some(ComposeAddressField::To);
-                this.schedule_draft_autosave(cx);
-                cx.notify();
-            }
+            this.on_recipient_input_event(ComposeAddressField::To, event, cx);
         })
         .detach();
         cx.subscribe(&compose_cc, |this, _input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.compose_autocomplete_field = Some(ComposeAddressField::Cc);
-                this.schedule_draft_autosave(cx);
-                cx.notify();
-            }
+            this.on_recipient_input_event(ComposeAddressField::Cc, event, cx);
         })
         .detach();
         cx.subscribe(&compose_bcc, |this, _input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.compose_autocomplete_field = Some(ComposeAddressField::Bcc);
-                this.schedule_draft_autosave(cx);
-                cx.notify();
-            }
+            this.on_recipient_input_event(ComposeAddressField::Bcc, event, cx);
         })
         .detach();
         let compose_subject = cx.new(|cx| {
@@ -882,6 +1004,7 @@ impl HylkiApp {
                 drafts: Vec::new(),
                 outbox_by_account: BTreeMap::new(),
                 right_mode: RightPaneMode::Reader,
+                welcome_step: 0,
                 search_input,
                 search_query: String::new(),
                 compose_account_id: 1,
@@ -897,6 +1020,10 @@ impl HylkiApp {
                 compose_confirm_discard: false,
                 pending_forward_msg_id: None,
                 compose_autocomplete_field: None,
+                compose_to_pills: Vec::new(),
+                compose_cc_pills: Vec::new(),
+                compose_bcc_pills: Vec::new(),
+                compose_pill_resume: None,
                 compose_autosave_generation: 0,
                 compose_autosave_dirty: false,
                 compose_autosave_pending: false,
@@ -1047,6 +1174,7 @@ impl HylkiApp {
         };
 
         let mut app = Self {
+            welcome_step: 0,
             demo_mode: false,
             demo_store,
             worker,
@@ -1090,6 +1218,10 @@ impl HylkiApp {
             compose_confirm_discard: false,
             pending_forward_msg_id: None,
             compose_autocomplete_field: None,
+            compose_to_pills: Vec::new(),
+            compose_cc_pills: Vec::new(),
+            compose_bcc_pills: Vec::new(),
+            compose_pill_resume: None,
             compose_autosave_generation: 0,
             compose_autosave_dirty: false,
             compose_autosave_pending: false,
@@ -1838,6 +1970,14 @@ impl HylkiApp {
                                 *slot = Some(image);
                             }
                         }
+                    }
+                    if let Some(ref g) = self.gallery {
+                        let mime_c = mime_type.clone();
+                        let bytes_c = bytes.clone();
+                        g.update(cx, |state, cx| {
+                            state.set_thumbnail(attachment_id, &mime_c, bytes_c);
+                            cx.notify();
+                        });
                     }
                     if self.gallery_preview_pending == Some(attachment_id) {
                         self.gallery_preview_pending = None;
@@ -3303,6 +3443,289 @@ impl HylkiApp {
         cx.notify();
     }
 
+    // ---- WP-10-1 收件人胶囊（对齐 Linux `src/ui/recipient_row.rs`） ----
+
+    /// 取某个收件人字段对应的输入框实体（`Entity` 是引用计数，克隆开销极小）。
+    pub(crate) fn compose_field_input(&self, field: ComposeAddressField) -> Entity<InputState> {
+        match field {
+            ComposeAddressField::To => self.compose_to.clone(),
+            ComposeAddressField::Cc => self.compose_cc.clone(),
+            ComposeAddressField::Bcc => self.compose_bcc.clone(),
+        }
+    }
+
+    /// 只读访问某个字段的胶囊列表。
+    pub(crate) fn compose_pills(&self, field: ComposeAddressField) -> &[RecipientPill] {
+        match field {
+            ComposeAddressField::To => &self.compose_to_pills,
+            ComposeAddressField::Cc => &self.compose_cc_pills,
+            ComposeAddressField::Bcc => &self.compose_bcc_pills,
+        }
+    }
+
+    fn compose_pills_mut(&mut self, field: ComposeAddressField) -> &mut Vec<RecipientPill> {
+        match field {
+            ComposeAddressField::To => &mut self.compose_to_pills,
+            ComposeAddressField::Cc => &mut self.compose_cc_pills,
+            ComposeAddressField::Bcc => &mut self.compose_bcc_pills,
+        }
+    }
+
+    /// 某个字段的完整收件人串（胶囊 + 仍在输入的那一段），发信与草稿落盘用。
+    pub(crate) fn compose_field_text(
+        &self,
+        field: ComposeAddressField,
+        cx: &Context<Self>,
+    ) -> String {
+        let mut parts: Vec<String> = self
+            .compose_pills(field)
+            .iter()
+            .map(RecipientPill::to_field_text)
+            .collect();
+        let typed = self
+            .compose_field_input(field)
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if !typed.is_empty() {
+            parts.push(typed);
+        }
+        parts.join(", ")
+    }
+
+    /// 把一个已确认的地址加入胶囊（同地址去重）。返回是否真的新增。
+    fn push_recipient_pill(&mut self, field: ComposeAddressField, raw: &str) -> bool {
+        let Some(pill) = RecipientPill::parse(raw) else {
+            return false;
+        };
+        // 点击胶囊编辑后再次提交时，尽量放回原位置，避免顺序跳动。
+        let resume = self
+            .compose_pill_resume
+            .filter(|(f, _)| *f == field)
+            .map(|(_, idx)| idx);
+        let pills = self.compose_pills_mut(field);
+        if pills
+            .iter()
+            .any(|p| p.address.eq_ignore_ascii_case(&pill.address))
+        {
+            return false;
+        }
+        match resume {
+            Some(idx) if idx <= pills.len() => pills.insert(idx, pill),
+            _ => pills.push(pill),
+        }
+        true
+    }
+
+    /// 收件人输入框内容变更后：把已写完的分段吸收成胶囊，输入框只留最后一段。
+    ///
+    /// 触发点与 Linux 原版一致：逗号 / 分号切分；段末空格且该段已是合法地址
+    /// 时也立即成胶囊（`Zhang San` 这类带空格显示名不会被误切）。
+    pub(crate) fn absorb_recipient_typed(
+        &mut self,
+        field: ComposeAddressField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.compose_field_input(field);
+        let value = input.read(cx).value().to_string();
+        if value.is_empty() {
+            return;
+        }
+        let mut parts = split_recipient_parts(&value);
+        let tail = parts.pop().unwrap_or_default();
+        let mut changed = false;
+        for part in parts {
+            changed |= self.push_recipient_pill(field, &part);
+        }
+        // 段末空格表示「这一段写完了」，但只在该段已是合法地址时才切，
+        // 否则会把正在输入的显示名（如 `Zhang San`）提前切走。
+        let trimmed = tail.trim_end();
+        let mut remaining = tail.clone();
+        if trimmed.len() != tail.len() && RecipientPill::parse(trimmed).is_some_and(|p| p.valid) {
+            changed |= self.push_recipient_pill(field, trimmed);
+            remaining.clear();
+        }
+        if remaining != value {
+            input.update(cx, |state, cx| state.set_value(remaining, window, cx));
+            changed = true;
+        }
+        if changed {
+            self.schedule_draft_autosave(cx);
+            cx.notify();
+        }
+    }
+
+    /// 把输入框里剩下的内容整段提交成胶囊（回车 / 失焦触发）。
+    pub(crate) fn commit_recipient_typed(
+        &mut self,
+        field: ComposeAddressField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.compose_field_input(field);
+        let value = input.read(cx).value().trim().to_string();
+        self.compose_pill_resume = self.compose_pill_resume.filter(|(f, _)| *f != field);
+        if value.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for part in split_recipient_parts(&value) {
+            changed |= self.push_recipient_pill(field, &part);
+        }
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+        self.compose_pill_resume = None;
+        if changed {
+            self.schedule_draft_autosave(cx);
+        }
+        cx.notify();
+    }
+
+    /// 收件人输入框事件统一处理。
+    ///
+    /// 订阅回调没有 `&mut Window`，而改写输入框内容需要窗口，故经
+    /// `window_handle` 在 `cx.defer` 的下一 tick 执行，避免借用重入。
+    fn on_recipient_input_event(
+        &mut self,
+        field: ComposeAddressField,
+        event: &InputEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::Change => {
+                self.compose_autocomplete_field = Some(field);
+                self.schedule_draft_autosave(cx);
+                let handle = self.window_handle;
+                let entity = cx.entity();
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        entity.update(cx, |app, cx| app.absorb_recipient_typed(field, window, cx));
+                    });
+                });
+                cx.notify();
+            }
+            InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                if self.compose_autocomplete_field == Some(field) {
+                    self.compose_autocomplete_field = None;
+                }
+                let handle = self.window_handle;
+                let entity = cx.entity();
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        entity.update(cx, |app, cx| app.commit_recipient_typed(field, window, cx));
+                    });
+                });
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// 点击胶囊尾部 `×`：删除该地址。
+    pub(crate) fn remove_recipient_pill(
+        &mut self,
+        field: ComposeAddressField,
+        idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let pills = self.compose_pills_mut(field);
+        if idx >= pills.len() {
+            return;
+        }
+        pills.remove(idx);
+        self.schedule_draft_autosave(cx);
+        cx.notify();
+    }
+
+    /// 点击胶囊主体：把地址放回输入框继续编辑（对齐原版「点击胶囊可编辑」）。
+    pub(crate) fn edit_recipient_pill(
+        &mut self,
+        field: ComposeAddressField,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pill = {
+            let pills = self.compose_pills_mut(field);
+            if idx >= pills.len() {
+                return;
+            }
+            pills.remove(idx)
+        };
+        let input = self.compose_field_input(field);
+        let existing = input.read(cx).value().trim().to_string();
+        let next = if existing.is_empty() {
+            pill.to_field_text()
+        } else {
+            format!("{}, {}", existing, pill.to_field_text())
+        };
+        self.compose_pill_resume = Some((field, idx));
+        input.update(cx, |state, cx| {
+            state.set_value(next, window, cx);
+            state.focus(window, cx);
+        });
+        self.compose_autocomplete_field = Some(field);
+        cx.notify();
+    }
+
+    /// 点击胶囊上的 `⇄`：移到下一个收件人字段（To -> Cc -> Bcc -> To），
+    /// 目标字段为 Cc / Bcc 时自动展开抄送行。
+    pub(crate) fn move_recipient_pill(
+        &mut self,
+        field: ComposeAddressField,
+        idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let pill = {
+            let pills = self.compose_pills_mut(field);
+            if idx >= pills.len() {
+                return;
+            }
+            pills.remove(idx)
+        };
+        let target = field.next();
+        let pills = self.compose_pills_mut(target);
+        if !pills
+            .iter()
+            .any(|p| p.address.eq_ignore_ascii_case(&pill.address))
+        {
+            pills.push(pill);
+        }
+        if matches!(target, ComposeAddressField::Cc | ComposeAddressField::Bcc) {
+            self.compose_show_cc_bcc = true;
+        }
+        self.schedule_draft_autosave(cx);
+        cx.notify();
+    }
+
+    /// 整体设置某个收件人字段（逗号分隔文本解析为胶囊，输入框清空）。
+    fn set_recipient_field_text(
+        &mut self,
+        field: ComposeAddressField,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pills: Vec<RecipientPill> = split_recipient_parts(text)
+            .iter()
+            .filter_map(|part| RecipientPill::parse(part))
+            .collect();
+        *self.compose_pills_mut(field) = pills;
+        let input = self.compose_field_input(field);
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    /// 清空某个收件人字段（胶囊 + 输入框）。
+    fn clear_recipient_field(
+        &mut self,
+        field: ComposeAddressField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_recipient_field_text(field, "", window, cx);
+    }
+
     /// 查询指定账号配置的邮件签名。
     fn account_signature(&self, account_id: u32) -> String {
         self.accounts
@@ -3363,12 +3786,9 @@ impl HylkiApp {
             &self.account_signature(self.compose_account_id),
             self.prefs.signature_dashes,
         );
-        self.compose_to
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        self.compose_cc
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        self.compose_bcc
-            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.clear_recipient_field(ComposeAddressField::To, window, cx);
+        self.clear_recipient_field(ComposeAddressField::Cc, window, cx);
+        self.clear_recipient_field(ComposeAddressField::Bcc, window, cx);
         self.compose_show_cc_bcc = false;
         self.compose_subject
             .update(cx, |s, cx| s.set_value("", window, cx));
@@ -3427,9 +3847,9 @@ impl HylkiApp {
         let draft = LocalDraft {
             id: self.compose_draft_id.unwrap_or(0),
             account_id: self.compose_account_id,
-            to_addr: self.compose_to.read(cx).value().to_string(),
-            cc_addr: self.compose_cc.read(cx).value().to_string(),
-            bcc_addr: self.compose_bcc.read(cx).value().to_string(),
+            to_addr: self.compose_field_text(ComposeAddressField::To, cx),
+            cc_addr: self.compose_field_text(ComposeAddressField::Cc, cx),
+            bcc_addr: self.compose_field_text(ComposeAddressField::Bcc, cx),
             subject: self.compose_subject.read(cx).value().to_string(),
             body_text: self.compose_body.read(cx).value().to_string(),
             in_reply_to: self.compose_in_reply_to.clone(),
@@ -3498,8 +3918,7 @@ impl HylkiApp {
         self.pending_forward_msg_id = Some(detail.id);
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
-        self.compose_to
-            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.clear_recipient_field(ComposeAddressField::To, window, cx);
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(forward_subject, window, cx));
@@ -3547,9 +3966,7 @@ impl HylkiApp {
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
-        self.compose_to.update(cx, |s, cx| {
-            s.set_value(detail.recipients.clone(), window, cx)
-        });
+        self.set_recipient_field_text(ComposeAddressField::To, &detail.recipients, window, cx);
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(detail.subject.clone(), window, cx));
@@ -3602,8 +4019,7 @@ impl HylkiApp {
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
-        self.compose_to
-            .update(cx, |s, cx| s.set_value(to.to_string(), window, cx));
+        self.set_recipient_field_text(ComposeAddressField::To, to, window, cx);
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
@@ -3617,9 +4033,9 @@ impl HylkiApp {
     /// 判断当前写信表单是否存在未保存内容。
     pub(crate) fn compose_has_unsaved_content(&self, cx: &Context<Self>) -> bool {
         has_unsaved_compose_content(
-            self.compose_to.read(cx).value().as_ref(),
-            self.compose_cc.read(cx).value().as_ref(),
-            self.compose_bcc.read(cx).value().as_ref(),
+            &self.compose_field_text(ComposeAddressField::To, cx),
+            &self.compose_field_text(ComposeAddressField::Cc, cx),
+            &self.compose_field_text(ComposeAddressField::Bcc, cx),
             self.compose_subject.read(cx).value().as_ref(),
             self.compose_body.read(cx).value().as_ref(),
             self.compose_attachments.len(),
@@ -3675,7 +4091,7 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 点击收件人联系人补全建议项：替换最后一段并追加逗号。
+    /// 点击收件人联系人补全建议项：补全当前段并立即转成胶囊。
     pub(crate) fn apply_contact_suggestion(
         &mut self,
         field: ComposeAddressField,
@@ -3683,24 +4099,18 @@ impl HylkiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = match field {
-            ComposeAddressField::To => &self.compose_to,
-            ComposeAddressField::Cc => &self.compose_cc,
-            ComposeAddressField::Bcc => &self.compose_bcc,
-        };
+        let target = self.compose_field_input(field);
         let current = target.read(cx).value().to_string();
         let next = apply_contact_completion(&current, contact);
         target.update(cx, |s, cx| s.set_value(next, window, cx));
         self.compose_autocomplete_field = None;
-        cx.notify();
+        self.commit_recipient_typed(field, window, cx);
     }
 
     /// 清空 Cc / Bcc 输入（新写信 / 回复 / 转发入口共用）。
     fn clear_compose_cc_bcc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.compose_cc
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        self.compose_bcc
-            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.clear_recipient_field(ComposeAddressField::Cc, window, cx);
+        self.clear_recipient_field(ComposeAddressField::Bcc, window, cx);
         self.compose_show_cc_bcc = false;
     }
 
@@ -3715,12 +4125,9 @@ impl HylkiApp {
         self.compose_in_reply_to = draft.in_reply_to.clone();
         self.compose_attachments = draft.attachment_paths.clone();
         self.begin_compose_autosave_tracking();
-        self.compose_to
-            .update(cx, |s, cx| s.set_value(draft.to_addr.clone(), window, cx));
-        self.compose_cc
-            .update(cx, |s, cx| s.set_value(draft.cc_addr.clone(), window, cx));
-        self.compose_bcc
-            .update(cx, |s, cx| s.set_value(draft.bcc_addr.clone(), window, cx));
+        self.set_recipient_field_text(ComposeAddressField::To, &draft.to_addr, window, cx);
+        self.set_recipient_field_text(ComposeAddressField::Cc, &draft.cc_addr, window, cx);
+        self.set_recipient_field_text(ComposeAddressField::Bcc, &draft.bcc_addr, window, cx);
         self.compose_show_cc_bcc =
             !draft.cc_addr.trim().is_empty() || !draft.bcc_addr.trim().is_empty();
         self.compose_subject
@@ -3740,9 +4147,9 @@ impl HylkiApp {
         let draft = LocalDraft {
             id: self.compose_draft_id.unwrap_or(0),
             account_id: self.compose_account_id,
-            to_addr: self.compose_to.read(cx).value().to_string(),
-            cc_addr: self.compose_cc.read(cx).value().to_string(),
-            bcc_addr: self.compose_bcc.read(cx).value().to_string(),
+            to_addr: self.compose_field_text(ComposeAddressField::To, cx),
+            cc_addr: self.compose_field_text(ComposeAddressField::Cc, cx),
+            bcc_addr: self.compose_field_text(ComposeAddressField::Bcc, cx),
             subject: self.compose_subject.read(cx).value().to_string(),
             body_text: self.compose_body.read(cx).value().to_string(),
             in_reply_to: self.compose_in_reply_to.clone(),
@@ -4150,9 +4557,9 @@ impl HylkiApp {
             cx.notify();
             return;
         }
-        let to = self.compose_to.read(cx).value().to_string();
-        let cc = self.compose_cc.read(cx).value().to_string();
-        let bcc = self.compose_bcc.read(cx).value().to_string();
+        let to = self.compose_field_text(ComposeAddressField::To, cx);
+        let cc = self.compose_field_text(ComposeAddressField::Cc, cx);
+        let bcc = self.compose_field_text(ComposeAddressField::Bcc, cx);
         let subject = self.compose_subject.read(cx).value().to_string();
         let body = self.compose_body.read(cx).value().to_string();
 
@@ -4417,12 +4824,10 @@ impl HylkiApp {
         self.compose_show_cc_bcc =
             !pending.draft.cc.trim().is_empty() || !pending.draft.bcc.trim().is_empty();
         let draft = &pending.draft;
-        self.compose_to
-            .update(cx, |s, cx| s.set_value(draft.to.clone(), window, cx));
-        self.compose_cc
-            .update(cx, |s, cx| s.set_value(draft.cc.clone(), window, cx));
-        self.compose_bcc
-            .update(cx, |s, cx| s.set_value(draft.bcc.clone(), window, cx));
+        let (to_addr, cc_addr, bcc_addr) = (draft.to.clone(), draft.cc.clone(), draft.bcc.clone());
+        self.set_recipient_field_text(ComposeAddressField::To, &to_addr, window, cx);
+        self.set_recipient_field_text(ComposeAddressField::Cc, &cc_addr, window, cx);
+        self.set_recipient_field_text(ComposeAddressField::Bcc, &bcc_addr, window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
         self.compose_body
@@ -4944,6 +5349,31 @@ impl HylkiApp {
         cx.notify();
     }
 
+    /// WP-10：欢迎向导设置主题深浅模式（`None` 跟随系统，`Some(true/false)` 暗/亮）。
+    pub(crate) fn set_welcome_dark_mode(&mut self, mode: Option<bool>, cx: &mut Context<Self>) {
+        self.prefs.dark_mode = mode;
+        self.dark_mode = mode.unwrap_or(self.system_dark_mode);
+        let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
+        cx.notify();
+    }
+
+    /// WP-10：欢迎向导持久化偏好变更。
+    pub(crate) fn save_welcome_prefs(&mut self, cx: &mut Context<Self>) {
+        let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
+        cx.notify();
+    }
+
+    /// WP-10：完成欢迎向导，有账号则进入收件箱，无账号则进入演示模式。
+    pub(crate) fn finish_welcome_wizard(&mut self, cx: &mut Context<Self>) {
+        let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
+        if self.accounts.is_empty() {
+            self.enter_demo_mode(cx);
+        } else {
+            self.right_mode = RightPaneMode::Reader;
+            cx.notify();
+        }
+    }
+
     /// 切换专注模式（会话级）：按专注模式偏好控制侧栏、列表、简化阅读视图及工具栏。
     pub(crate) fn toggle_focus_mode(&mut self, cx: &mut Context<Self>) {
         self.focus_mode = !self.focus_mode;
@@ -5322,7 +5752,18 @@ impl HylkiApp {
         } else {
             name
         };
-        self.save_user_contact(None, target_email.clone(), display_name, String::new(), cx);
+        self.save_user_contact(
+            None,
+            target_email.clone(),
+            display_name,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            cx,
+        );
         self.status_line = SharedString::from(format!("已将 {target_email} 添加到通讯录"));
         cx.notify();
     }
@@ -5622,6 +6063,16 @@ impl HylkiApp {
                     GalleryEvent::PreviewImage(attachment_id) => {
                         this.fetch_gallery_preview(*attachment_id, cx);
                     }
+                    // WP-10：网格视图请求图片缩略图。
+                    GalleryEvent::RequestThumbnail(attachment_id) => {
+                        if !this.demo_mode {
+                            if let Some(ref w) = this.worker {
+                                w.send(MailRequest::FetchAttachmentBytes {
+                                    attachment_id: *attachment_id,
+                                });
+                            }
+                        }
+                    }
                 },
             );
             self.gallery = Some(entity);
@@ -5804,12 +6255,22 @@ impl HylkiApp {
                         email,
                         display_name,
                         notes,
+                        phone,
+                        organization,
+                        job_title,
+                        birthday,
+                        groups,
                     } => {
                         this.save_user_contact(
                             *id,
                             email.clone(),
                             display_name.clone(),
                             notes.clone(),
+                            phone.clone(),
+                            organization.clone(),
+                            job_title.clone(),
+                            birthday.clone(),
+                            groups.clone(),
                             cx,
                         );
                     }
@@ -5841,20 +6302,25 @@ impl HylkiApp {
     fn compose_to_contact(&mut self, email: String, window: &mut Window, cx: &mut Context<Self>) {
         self.main_view = MainContentView::Mail;
         self.start_new_compose(window, cx);
-        self.compose_to
-            .update(cx, |state, cx| state.set_value(email, window, cx));
+        self.set_recipient_field_text(ComposeAddressField::To, &email, window, cx);
         cx.notify();
     }
 
     // ---- F-5 用户联系人 CRUD 与导入 / 导出 ----
 
     /// 保存用户联系人（新建或编辑；去重校验已在联系人页完成）。
+    #[allow(clippy::too_many_arguments)]
     fn save_user_contact(
         &mut self,
         id: Option<u32>,
         email: String,
         display_name: String,
         notes: String,
+        phone: String,
+        organization: String,
+        job_title: String,
+        birthday: String,
+        groups: Vec<String>,
         cx: &mut Context<Self>,
     ) {
         if self.demo_mode {
@@ -5869,6 +6335,11 @@ impl HylkiApp {
                     email,
                     display_name,
                     notes,
+                    phone,
+                    organization,
+                    job_title,
+                    birthday,
+                    groups,
                 },
             });
         }
@@ -5949,6 +6420,11 @@ impl HylkiApp {
                             email: c.email.clone(),
                             display_name: c.name.clone(),
                             notes: c.notes.clone(),
+                            phone: c.phone.clone(),
+                            organization: c.organization.clone(),
+                            job_title: c.job_title.clone(),
+                            birthday: c.birthday.clone(),
+                            groups: c.groups.clone(),
                         })
                         .collect::<Vec<_>>(),
                 ),
@@ -5965,6 +6441,11 @@ impl HylkiApp {
                             email: c.email.clone(),
                             display_name: c.name.clone(),
                             notes: c.notes.clone(),
+                            phone: c.phone.clone(),
+                            organization: c.organization.clone(),
+                            job_title: c.job_title.clone(),
+                            birthday: c.birthday.clone(),
+                            groups: c.groups.clone(),
                         })
                         .collect::<Vec<_>>(),
                 ),
@@ -8432,6 +8913,84 @@ pub(crate) fn compose_demo_eml(detail: &MessageDetail) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- WP-10-1 收件人胶囊 ----
+
+    /// 裸地址、`Name <addr>` 与半成品显示名三种输入的解析结果。
+    #[test]
+    fn recipient_pill_parses_addresses_and_display_names() {
+        let bare = RecipientPill::parse("marcus@studio.dev").expect("裸地址应解析成功");
+        assert_eq!(bare.label, "marcus@studio.dev");
+        assert_eq!(bare.address, "marcus@studio.dev");
+        assert!(bare.valid);
+
+        let named =
+            RecipientPill::parse(" 张三 <zhang@exmail.qq.com> ").expect("带显示名应解析成功");
+        assert_eq!(named.label, "张三");
+        assert_eq!(named.address, "zhang@exmail.qq.com");
+        assert!(named.valid);
+        assert_eq!(named.to_field_text(), "张三 <zhang@exmail.qq.com>");
+
+        // 只写显示名：成胶囊但标红（valid = false），提示用户补全地址。
+        let half = RecipientPill::parse("李四").expect("显示名也应成胶囊");
+        assert!(!half.valid);
+        assert_eq!(half.label, "李四");
+        assert_eq!(half.address, "李四");
+
+        assert!(RecipientPill::parse("   ").is_none());
+    }
+
+    /// 邮箱格式校验的边界值。
+    #[test]
+    fn looks_like_address_rejects_malformed_input() {
+        assert!(looks_like_address("a@b.co"));
+        assert!(looks_like_address("first.last+tag@mail.example.com"));
+        assert!(!looks_like_address(""));
+        assert!(!looks_like_address("张三"));
+        assert!(!looks_like_address("no-at-sign.com"));
+        assert!(!looks_like_address("a@b")); // 域名无点
+        assert!(!looks_like_address("a@.com")); // 域名以点开头
+        assert!(!looks_like_address("a@b.")); // 域名以点结尾
+        assert!(!looks_like_address("@b.com")); // 本地段为空
+        assert!(!looks_like_address("a b@c.com")); // 含空格
+        assert!(!looks_like_address("a@b@c.com")); // 多个 @ 时域名段仍可解析，但本地段含 @
+    }
+
+    /// 逗号 / 分号切分：`<>` 内的分隔符不算分隔符，全角符号同样识别。
+    #[test]
+    fn split_recipient_parts_respects_angle_brackets() {
+        assert_eq!(
+            split_recipient_parts("a@x.com, b@y.com"),
+            vec!["a@x.com", " b@y.com"]
+        );
+        // `<>` 内的分隔符不切分（地址本身含逗号的极端情形）。
+        assert_eq!(
+            split_recipient_parts("Name <a,b@x.com>, k@y.com"),
+            vec!["Name <a,b@x.com>", " k@y.com"]
+        );
+        // 尖括号外的逗号一律视为分隔符：未加引号的显示名 `Doe, John` 无法与
+        // 分隔符区分（RFC 5322 要求用 `"Doe, John" <..>`），按分隔符处理。
+        assert_eq!(
+            split_recipient_parts("Doe, John <j@x.com>"),
+            vec!["Doe", " John <j@x.com>"]
+        );
+        assert_eq!(
+            split_recipient_parts("a@x.com；b@y.com，c@z.com"),
+            vec!["a@x.com", "b@y.com", "c@z.com"]
+        );
+        // 末尾分隔符切出一个空段，由调用方按空白丢弃。
+        assert_eq!(split_recipient_parts("a@x.com,"), vec!["a@x.com", ""]);
+    }
+
+    /// 胶囊「移到下一个字段」按 To -> Cc -> Bcc -> To 循环。
+    #[test]
+    fn compose_address_field_cycles_forward() {
+        assert_eq!(ComposeAddressField::To.next(), ComposeAddressField::Cc);
+        assert_eq!(ComposeAddressField::Cc.next(), ComposeAddressField::Bcc);
+        assert_eq!(ComposeAddressField::Bcc.next(), ComposeAddressField::To);
+        assert_eq!(ComposeAddressField::To.index(), 0);
+        assert_eq!(ComposeAddressField::Bcc.index(), 2);
+    }
 
     #[test]
     fn split_sender_parses_display_name_and_email() {

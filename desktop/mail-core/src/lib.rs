@@ -186,6 +186,16 @@ pub struct UserContact {
     pub email: String,
     pub display_name: String,
     pub notes: String,
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub organization: String,
+    #[serde(default)]
+    pub job_title: String,
+    #[serde(default)]
+    pub birthday: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 /// Persisted local compose draft recoverable across restarts.

@@ -23,6 +23,11 @@ pub fn parse_vcards(text: &str) -> Vec<UserContact> {
     let mut names: Vec<String> = Vec::new();
     let mut emails: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut phone = String::new();
+    let mut organization = String::new();
+    let mut job_title = String::new();
+    let mut birthday = String::new();
+    let mut groups: Vec<String> = Vec::new();
     let mut in_card = false;
     for line in unfolded {
         let upper = line.to_ascii_uppercase();
@@ -32,11 +37,26 @@ pub fn parse_vcards(text: &str) -> Vec<UserContact> {
             names.clear();
             emails.clear();
             notes.clear();
+            phone.clear();
+            organization.clear();
+            job_title.clear();
+            birthday.clear();
+            groups.clear();
             continue;
         }
         if upper.starts_with("END:VCARD") {
             if in_card {
-                contacts.push(build_contact(&display_name, &names, &emails, &notes));
+                contacts.push(build_contact(
+                    &display_name,
+                    &names,
+                    &emails,
+                    &notes,
+                    &phone,
+                    &organization,
+                    &job_title,
+                    &birthday,
+                    &groups,
+                ));
             }
             in_card = false;
             continue;
@@ -80,6 +100,35 @@ pub fn parse_vcards(text: &str) -> Vec<UserContact> {
             "NOTE" => {
                 if !value.trim().is_empty() {
                     notes.push(value.trim().to_string());
+                }
+            }
+            "TEL" => {
+                if phone.is_empty() && !value.trim().is_empty() {
+                    phone = value.trim().to_string();
+                }
+            }
+            "ORG" => {
+                let org = value.trim().trim_end_matches(';').replace(';', " / ");
+                if !org.trim().is_empty() {
+                    organization = org.trim().to_string();
+                }
+            }
+            "TITLE" => {
+                if !value.trim().is_empty() {
+                    job_title = value.trim().to_string();
+                }
+            }
+            "BDAY" => {
+                if !value.trim().is_empty() {
+                    birthday = value.trim().to_string();
+                }
+            }
+            "CATEGORIES" => {
+                for g in value.split(',') {
+                    let g = g.trim();
+                    if !g.is_empty() && !groups.iter().any(|existing| existing == g) {
+                        groups.push(g.to_string());
+                    }
                 }
             }
             _ => {}
@@ -173,6 +222,7 @@ pub fn parse_csv_contacts(text: &str) -> Vec<UserContact> {
             email,
             display_name: name,
             notes,
+            ..UserContact::default()
         });
     }
     contacts
@@ -199,6 +249,40 @@ pub fn export_vcards(contacts: &[UserContact]) -> String {
             out.push_str("EMAIL;TYPE=INTERNET:");
             out.push_str(&email);
             out.push_str("\r\n");
+        }
+        if !contact.phone.trim().is_empty() {
+            out.push_str("TEL;TYPE=WORK,VOICE:");
+            out.push_str(&sanitize_vcard_value(contact.phone.trim()));
+            out.push_str("\r\n");
+        }
+        if !contact.organization.trim().is_empty() {
+            out.push_str("ORG:");
+            out.push_str(&sanitize_vcard_value(contact.organization.trim()));
+            out.push_str("\r\n");
+        }
+        if !contact.job_title.trim().is_empty() {
+            out.push_str("TITLE:");
+            out.push_str(&sanitize_vcard_value(contact.job_title.trim()));
+            out.push_str("\r\n");
+        }
+        if !contact.birthday.trim().is_empty() {
+            out.push_str("BDAY:");
+            out.push_str(&sanitize_vcard_value(contact.birthday.trim()));
+            out.push_str("\r\n");
+        }
+        if !contact.groups.is_empty() {
+            let joined = contact
+                .groups
+                .iter()
+                .map(|g| sanitize_vcard_value(g.trim()))
+                .filter(|g| !g.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !joined.is_empty() {
+                out.push_str("CATEGORIES:");
+                out.push_str(&joined);
+                out.push_str("\r\n");
+            }
         }
         if !notes.is_empty() {
             out.push_str("NOTE:");
@@ -301,6 +385,11 @@ fn build_contact(
     names: &[String],
     emails: &[String],
     notes: &[String],
+    phone: &str,
+    organization: &str,
+    job_title: &str,
+    birthday: &str,
+    groups: &[String],
 ) -> UserContact {
     // FN 优先，其次 N 的「姓 名」拼接。
     let mut name = display_name.trim().to_string();
@@ -316,6 +405,11 @@ fn build_contact(
         email: emails.first().cloned().unwrap_or_default(),
         display_name: name,
         notes: notes.join("\n"),
+        phone: phone.to_string(),
+        organization: organization.to_string(),
+        job_title: job_title.to_string(),
+        birthday: birthday.to_string(),
+        groups: groups.to_vec(),
     }
 }
 
@@ -459,12 +553,29 @@ mod tests {
             email: "a@b.example".to_string(),
             display_name: "A; B".to_string(),
             notes: "line1\nline2".to_string(),
+            phone: "+86-13800000000".to_string(),
+            organization: "Hylki".to_string(),
+            job_title: "Engineer".to_string(),
+            birthday: "1995-01-02".to_string(),
+            groups: vec!["工作".to_string(), "研发".to_string()],
         }]);
         assert!(text.contains("BEGIN:VCARD\r\nVERSION:3.0\r\n"));
         assert!(text.contains("FN:A\\; B\r\n"));
         assert!(text.contains("EMAIL;TYPE=INTERNET:a@b.example\r\n"));
+        assert!(text.contains("TEL;TYPE=WORK,VOICE:+86-13800000000\r\n"));
+        assert!(text.contains("ORG:Hylki\r\n"));
+        assert!(text.contains("TITLE:Engineer\r\n"));
+        assert!(text.contains("BDAY:1995-01-02\r\n"));
+        assert!(text.contains("CATEGORIES:工作,研发\r\n"));
         assert!(text.contains("NOTE:line1\\nline2\r\n"));
         assert!(text.ends_with("END:VCARD\r\n"));
+        let parsed = parse_vcards(&text);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].phone, "+86-13800000000");
+        assert_eq!(parsed[0].organization, "Hylki");
+        assert_eq!(parsed[0].job_title, "Engineer");
+        assert_eq!(parsed[0].birthday, "1995-01-02");
+        assert_eq!(parsed[0].groups, vec!["工作", "研发"]);
     }
 
     #[test]
@@ -474,6 +585,7 @@ mod tests {
             email: "a@b.example".to_string(),
             display_name: "Doe, John".to_string(),
             notes: "said \"hi\"".to_string(),
+            ..UserContact::default()
         }]);
         assert!(text.starts_with("Name,Email,Notes\r\n"));
         assert!(text.contains("\"Doe, John\""));
