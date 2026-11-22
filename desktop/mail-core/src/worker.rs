@@ -143,6 +143,47 @@ fn unified_account_ids(data_dir: &std::path::Path) -> Vec<u32> {
         .collect()
 }
 
+/// Microsoft OAuth 返回身份的归属判定结果（任务二：先用邮箱核对账号身份再换绑）。
+#[derive(Debug, PartialEq, Eq)]
+enum OAuthAccountMatch {
+    /// 返回邮箱与账号身份一致：绑定到该账号 ID，更新令牌与配置。
+    Bind(u32),
+    /// 返回邮箱与正在编辑的原账号不一致：保留原账号、凭据与缓存完全不动。
+    Rejected,
+}
+
+/// 判定 OAuth 授权返回的邮箱应绑定到哪个账号：
+/// - 重新授权（`editing_account_id` 有值）：仅当返回邮箱与原账号一致（忽略大小写）
+///   时更新原账号，否则拒绝换绑（无论该邮箱是否命中其他已有账号）。
+/// - 添加账号流程（`editing_account_id` 为空）：返回邮箱命中已有账号时复用该账号，
+///   否则分配新账号 ID。
+fn resolve_oauth_account_match(
+    editing_account_id: Option<u32>,
+    existing: &[AccountConfig],
+    returned_email: &str,
+) -> OAuthAccountMatch {
+    match editing_account_id {
+        Some(edit_id) => {
+            let same_as_editing = existing
+                .iter()
+                .find(|a| a.id == edit_id)
+                .is_some_and(|a| a.email.eq_ignore_ascii_case(returned_email));
+            if same_as_editing {
+                OAuthAccountMatch::Bind(edit_id)
+            } else {
+                OAuthAccountMatch::Rejected
+            }
+        }
+        None => match existing
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(returned_email))
+        {
+            Some(acc) => OAuthAccountMatch::Bind(acc.id),
+            None => OAuthAccountMatch::Bind(config::next_account_id(existing)),
+        },
+    }
+}
+
 fn refresh_account_watcher(
     watchers: &mut IdleWatchers,
     data_dir: &std::path::Path,
@@ -539,14 +580,19 @@ async fn handle_request(
             };
 
             let existing = config::load_accounts_in(data_dir).unwrap_or_default();
-            let account_id = editing_account_id
-                .or_else(|| {
-                    existing
-                        .iter()
-                        .find(|a| a.email.eq_ignore_ascii_case(&result.email))
-                        .map(|a| a.id)
-                })
-                .unwrap_or_else(|| config::next_account_id(&existing));
+            // 先用返回的邮箱核对账号身份：与编辑中账号一致才更新；选择了另一个
+            // 邮箱时保留原账号、凭据与缓存完全不动，提示用户重新授权或走添加流程。
+            let account_id =
+                match resolve_oauth_account_match(editing_account_id, &existing, &result.email) {
+                    OAuthAccountMatch::Bind(id) => id,
+                    OAuthAccountMatch::Rejected => {
+                        let _ = evt_tx.send(WorkerEvent::OAuthRebindRejected {
+                            account_id: editing_account_id,
+                            returned_email: result.email.clone(),
+                        });
+                        return;
+                    }
+                };
 
             let prev = existing.iter().find(|a| a.id == account_id);
 
@@ -2856,4 +2902,55 @@ fn load_account_config(data_dir: &PathBuf, account_id: u32) -> Result<AccountCon
         .into_iter()
         .find(|a| a.id == account_id)
         .ok_or_else(|| format!("找不到账号 ID {account_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(id: u32, email: &str) -> AccountConfig {
+        AccountConfig {
+            id,
+            email: email.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn oauth_reauthorize_same_email_binds_editing_account() {
+        // 任务二：同邮箱重授权 -> 更新原账号（忽略大小写）。
+        let existing = vec![account(3, "User@Outlook.com")];
+        let resolved = resolve_oauth_account_match(Some(3), &existing, "user@outlook.com");
+        assert_eq!(resolved, OAuthAccountMatch::Bind(3));
+    }
+
+    #[test]
+    fn oauth_reauthorize_different_email_is_rejected() {
+        // 任务二：异邮箱重授权（无论是否命中其他账号）-> 保留原账号不动。
+        let existing = vec![account(3, "a@outlook.com"), account(7, "b@outlook.com")];
+        // 返回邮箱命中了另一个已有账号：仍拒绝换绑，避免把 A 的身份改成 B。
+        assert_eq!(
+            resolve_oauth_account_match(Some(3), &existing, "b@outlook.com"),
+            OAuthAccountMatch::Rejected
+        );
+        // 返回邮箱是本地没有的新邮箱：同样拒绝换绑。
+        assert_eq!(
+            resolve_oauth_account_match(Some(3), &existing, "new@gmail.com"),
+            OAuthAccountMatch::Rejected
+        );
+    }
+
+    #[test]
+    fn oauth_add_flow_reuses_matching_account_or_allocates_new_id() {
+        // 添加账号流程：返回邮箱命中已有账号时复用其 ID，否则分配新 ID。
+        let existing = vec![account(3, "a@outlook.com")];
+        assert_eq!(
+            resolve_oauth_account_match(None, &existing, "A@OUTLOOK.COM"),
+            OAuthAccountMatch::Bind(3)
+        );
+        assert_eq!(
+            resolve_oauth_account_match(None, &existing, "fresh@outlook.com"),
+            OAuthAccountMatch::Bind(4)
+        );
+    }
 }

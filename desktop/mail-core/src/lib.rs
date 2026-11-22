@@ -699,6 +699,12 @@ pub enum WorkerEvent {
         account_id: u32,
         outbox_id: u32,
     },
+    /// Microsoft OAuth 重授权返回了与编辑中账号不一致的邮箱：保留原账号、凭据与
+    /// 缓存完全不动，提示用户重新选择原邮箱授权或通过「添加账号」流程接入新邮箱。
+    OAuthRebindRejected {
+        account_id: Option<u32>,
+        returned_email: String,
+    },
     DraftSent {
         account_id: u32,
         subject: String,

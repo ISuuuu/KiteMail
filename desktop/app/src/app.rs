@@ -1367,6 +1367,19 @@ impl HylkiApp {
                     self.error_banner = Some(SharedString::from(message.clone()));
                     self.status_line = SharedString::from(message);
                 }
+                WorkerEvent::OAuthRebindRejected {
+                    account_id: _,
+                    returned_email,
+                } => {
+                    // 任务二：Microsoft 重授权选择了另一个邮箱，原账号、凭据与缓存
+                    // 保持不动；在设置窗口错误反馈条提示重新授权或走添加账号流程。
+                    let message = format!(
+                        "微软授权返回了不同的邮箱（{returned_email}），已保留原账号不变。请重新授权并选择原邮箱，或通过「添加账号」接入新邮箱。"
+                    );
+                    self.cfg_feedback = Some((false, SharedString::from(message.clone())));
+                    self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
+                    self.status_line = SharedString::from(message);
+                }
                 WorkerEvent::MessageArchived {
                     account_id,
                     message_id,
@@ -4881,10 +4894,10 @@ impl HylkiApp {
                             // 任务二：跳转到指定账号编辑 / 新建前先走未保存确认
                             //（保存 / 放弃 / 继续编辑），保存成功后再执行跳转。
                             SettingsOpenTarget::EditAccount(Some(ref cfg)) => {
-                                win.open_edit_account_editor(cfg, window, cx);
+                                win.request_edit_account_editor(cfg.id, window, cx);
                             }
                             SettingsOpenTarget::EditAccount(None) => {
-                                win.open_new_account_editor(window, cx);
+                                win.request_new_account_editor(window, cx);
                             }
                             SettingsOpenTarget::PresetAccount(idx) => {
                                 win.open_preset_account_editor(idx, window, cx);
