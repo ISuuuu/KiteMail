@@ -21,11 +21,20 @@ use hylki_mail_core::config::{
     self, AccountConfig, AppPreferences, SettingsBackupBundle, DEFAULT_ATTACHMENT_KEYWORDS,
 };
 
-use crate::app::{CloseOverlay, CloseSettingsWindow, FocusSearch, HylkiApp, ProviderPreset};
+use crate::app::{CloseOverlay, CloseSettingsWindow, FocusSearch, HylkiApp};
 use crate::theme::{self, HylkiPalette};
 use crate::ui::accounts::{self, AccountFormState};
 use crate::ui::preferences::search::{filter_search_items, PrefSearchItem};
 use crate::ui::preferences::widgets::{NARROW_BREAKPOINT, SEARCH_HIGHLIGHT_MS};
+
+/// 账号编辑页未保存时尝试离开的目标动作。
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EditorLeaveAction {
+    BackToAccountList,
+    SwitchTab(PrefTab),
+    ActivateSearchHit(&'static PrefSearchItem),
+    CloseWindow,
+}
 
 /// 侧栏分组（对齐 Linux 版 `账号` / `设置` 2 个分组）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +170,10 @@ pub(crate) struct SettingsWindow {
     pub(crate) highlighted_row_id: Option<&'static str>,
     pub(crate) highlight_token: u64,
     pub(crate) account_form: AccountFormState,
+    pub(crate) account_editor_open: bool,
+    pub(crate) confirm_remove_in_editor: bool,
+    pub(crate) pending_leave_action: Option<EditorLeaveAction>,
+    pub(crate) after_save_action: Option<EditorLeaveAction>,
     pub(crate) sender_input: Entity<InputState>,
     pub(crate) sender_feedback: Option<(bool, SharedString)>,
     pub(crate) reply_header_input: Entity<InputState>,
@@ -180,7 +193,8 @@ impl SettingsWindow {
         initial_prefs: AppPreferences,
         initial_tab: PrefTab,
         edit_account: Option<AccountConfig>,
-        preset: Option<ProviderPreset>,
+        preset_idx: Option<usize>,
+        open_account_editor: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -216,20 +230,28 @@ impl SettingsWindow {
         });
 
         let mut account_form = AccountFormState::new(edit_account.as_ref(), window, cx);
-        if let Some(p) = preset {
-            account_form.apply_preset(&p, window, cx);
+        if let Some(idx) = preset_idx {
+            account_form.apply_provider_for_new(idx, window, cx);
         }
+
+        let editor_open = initial_tab == PrefTab::MailAccounts && open_account_editor;
+        let narrow_show_content =
+            editor_open || edit_account.is_some() || preset_idx.is_some();
 
         Self {
             app,
             active_tab: initial_tab,
-            narrow_show_content: edit_account.is_some() || preset.is_some(),
+            narrow_show_content,
             search_open: false,
             search_query: String::new(),
             search_input,
             highlighted_row_id: None,
             highlight_token: 0,
             account_form,
+            account_editor_open: editor_open,
+            confirm_remove_in_editor: false,
+            pending_leave_action: None,
+            after_save_action: None,
             sender_input,
             sender_feedback: None,
             reply_header_input,
@@ -244,42 +266,201 @@ impl SettingsWindow {
         }
     }
 
+    fn is_account_editor_dirty(&self, cx: &Context<Self>) -> bool {
+        self.active_tab == PrefTab::MailAccounts
+            && self.account_editor_open
+            && self.account_form.is_dirty(cx)
+    }
+
+    pub(crate) fn open_new_account_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_tab = PrefTab::MailAccounts;
+        self.narrow_show_content = true;
+        self.account_editor_open = true;
+        self.confirm_remove_in_editor = false;
+        self.pending_leave_action = None;
+        self.after_save_action = None;
+        self.account_form.load_account(None, window, cx);
+        self.app.update(cx, |app, _| {
+            app.cfg_feedback = None;
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn open_edit_account_editor(
+        &mut self,
+        cfg: &AccountConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_tab = PrefTab::MailAccounts;
+        self.narrow_show_content = true;
+        self.account_editor_open = true;
+        self.confirm_remove_in_editor = false;
+        self.pending_leave_action = None;
+        self.after_save_action = None;
+        self.account_form.load_account(Some(cfg), window, cx);
+        self.app.update(cx, |app, _| {
+            app.cfg_feedback = None;
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn open_preset_account_editor(
+        &mut self,
+        provider_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_tab = PrefTab::MailAccounts;
+        self.narrow_show_content = true;
+        self.account_editor_open = true;
+        self.confirm_remove_in_editor = false;
+        self.pending_leave_action = None;
+        self.after_save_action = None;
+        self.account_form
+            .apply_provider_for_new(provider_idx, window, cx);
+        self.app.update(cx, |app, _| {
+            app.cfg_feedback = None;
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn request_leave_editor(
+        &mut self,
+        action: EditorLeaveAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_account_editor_dirty(cx) {
+            self.pending_leave_action = Some(action);
+            self.confirm_remove_in_editor = false;
+            cx.notify();
+        } else {
+            self.execute_leave_action(action, window, cx);
+        }
+    }
+
+    fn execute_leave_action(
+        &mut self,
+        action: EditorLeaveAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_leave_action = None;
+        self.confirm_remove_in_editor = false;
+        match action {
+            EditorLeaveAction::BackToAccountList => {
+                self.account_editor_open = false;
+                self.after_save_action = None;
+                self.account_form.load_account(None, window, cx);
+                self.app.update(cx, |app, _| {
+                    app.cfg_feedback = None;
+                });
+                cx.notify();
+            }
+            EditorLeaveAction::SwitchTab(tab) => {
+                self.account_editor_open = false;
+                self.after_save_action = None;
+                self.active_tab = tab;
+                self.narrow_show_content = true;
+                self.confirm_clear_cache = false;
+                self.sender_feedback = None;
+                self.compose_inputs_feedback = None;
+                cx.notify();
+            }
+            EditorLeaveAction::ActivateSearchHit(item) => {
+                self.account_editor_open = false;
+                self.after_save_action = None;
+                self.apply_search_hit_immediate(item, window, cx);
+            }
+            EditorLeaveAction::CloseWindow => {
+                self.account_editor_open = false;
+                self.after_save_action = None;
+                self.force_close_window(window, cx);
+            }
+        }
+    }
+
+    pub(crate) fn commit_account_editor_save(
+        &mut self,
+        after_action: Option<EditorLeaveAction>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.app.read(cx).demo_mode {
+            return;
+        }
+        if let Err(msg) = self.account_form.validate_before_save(cx) {
+            self.account_form.validation_error = Some(SharedString::from(msg));
+            self.pending_leave_action = None;
+            self.after_save_action = None;
+            cx.notify();
+            return;
+        }
+        self.account_form.validation_error = None;
+        self.pending_leave_action = None;
+        self.after_save_action = after_action;
+        let existing = self.app.read(cx).accounts.clone();
+        let (cfg, imap_pwd, smtp_pwd) = self.account_form.collect(&existing, cx);
+        self.app.update(cx, |app, cx| {
+            app.save_account_config(cfg, imap_pwd, smtp_pwd, cx);
+        });
+    }
+
+    pub(crate) fn on_account_saved(
+        &mut self,
+        account: &AccountConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_remove_in_editor = false;
+        self.pending_leave_action = None;
+        self.account_form.load_account(Some(account), window, cx);
+        if self.active_tab == PrefTab::MailAccounts && self.account_editor_open {
+            let next = self
+                .after_save_action
+                .take()
+                .unwrap_or(EditorLeaveAction::BackToAccountList);
+            self.execute_leave_action(next, window, cx);
+        } else {
+            self.after_save_action = None;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_account_deleted(
+        &mut self,
+        account_id: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.account_editor_open && self.account_form.editing_account_id == Some(account_id) {
+            self.after_save_action = None;
+            self.execute_leave_action(EditorLeaveAction::BackToAccountList, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_account_save_failed(&mut self, cx: &mut Context<Self>) {
+        self.after_save_action = None;
+        cx.notify();
+    }
+
     pub(crate) fn select_tab(
         &mut self,
         tab: PrefTab,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.active_tab = tab;
-        self.narrow_show_content = true;
-        self.confirm_clear_cache = false;
-        self.sender_feedback = None;
-        self.compose_inputs_feedback = None;
-        cx.notify();
-    }
-
-    pub(crate) fn edit_account_in_form(
-        &mut self,
-        cfg: Option<&AccountConfig>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active_tab = PrefTab::MailAccounts;
-        self.narrow_show_content = true;
-        self.account_form.load_account(cfg, window, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn apply_account_preset(
-        &mut self,
-        preset: &ProviderPreset,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.active_tab = PrefTab::MailAccounts;
-        self.narrow_show_content = true;
-        self.account_form.apply_preset(preset, window, cx);
-        cx.notify();
+        if self.is_account_editor_dirty(cx) {
+            self.request_leave_editor(EditorLeaveAction::SwitchTab(tab), window, cx);
+            return;
+        }
+        self.execute_leave_action(EditorLeaveAction::SwitchTab(tab), window, cx);
     }
 
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -298,6 +479,15 @@ impl SettingsWindow {
     }
 
     pub(crate) fn activate_search_hit(
+        &mut self,
+        item: &'static PrefSearchItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_leave_editor(EditorLeaveAction::ActivateSearchHit(item), window, cx);
+    }
+
+    fn apply_search_hit_immediate(
         &mut self,
         item: &PrefSearchItem,
         window: &mut Window,
@@ -522,11 +712,15 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn force_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.app.update(cx, |app, _| {
             app.clear_settings_window_ref();
         });
         window.remove_window();
+    }
+
+    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_leave_editor(EditorLeaveAction::CloseWindow, window, cx);
     }
 
     fn render_sidebar(
@@ -774,12 +968,99 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    fn render_unsaved_banner(&self, p: &HylkiPalette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(action) = self.pending_leave_action else {
+            return div().into_any_element();
+        };
+        let demo_mode = self.app.read(cx).demo_mode;
+        h_flex()
+            .w_full()
+            .px_6()
+            .py_2p5()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .bg(p.accent_soft())
+            .border_b_1()
+            .border_color(p.accent.opacity(0.4))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text)
+                            .child("当前账号有未保存的更改"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.text_muted)
+                            .child("是否保存更改后再离开编辑页面？"),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("acct-leave-cancel")
+                            .outline()
+                            .compact()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pending_leave_action = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("acct-leave-discard")
+                            .danger()
+                            .compact()
+                            .label("放弃更改")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.execute_leave_action(action, window, cx);
+                            })),
+                    )
+                    .when(!demo_mode, |el| {
+                        el.child(
+                            Button::new("acct-leave-save")
+                                .primary()
+                                .compact()
+                                .label("保存")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.commit_account_editor_save(Some(action), cx);
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_content_header(
         &mut self,
         narrow: bool,
         p: &HylkiPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let in_editor = self.active_tab == PrefTab::MailAccounts && self.account_editor_open;
+        let demo_mode = self.app.read(cx).demo_mode;
+        let can_remove =
+            in_editor && self.account_form.editing_account_id.is_some() && !demo_mode;
+        let can_save = in_editor && !demo_mode;
+        let header_title: SharedString = if in_editor {
+            if self.account_form.editing_account_id.is_some() {
+                "编辑账号".into()
+            } else {
+                "添加账号".into()
+            }
+        } else {
+            SharedString::from(self.active_tab.label())
+        };
+
         h_flex()
             .h(px(46.0))
             .w_full()
@@ -797,8 +1078,23 @@ impl SettingsWindow {
                     .h_full()
                     .items_center()
                     .gap_2()
-                    .window_control_area(WindowControlArea::Drag)
-                    .when(narrow && self.narrow_show_content, |el| {
+                    .when(in_editor, |el| {
+                        el.child(
+                            Button::new("acct-editor-back")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::ArrowLeft)
+                                .label("返回")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_leave_editor(
+                                        EditorLeaveAction::BackToAccountList,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
+                    .when(!in_editor && narrow && self.narrow_show_content, |el| {
                         el.child(
                             Button::new("pref-narrow-back")
                                 .ghost()
@@ -811,17 +1107,56 @@ impl SettingsWindow {
                         )
                     })
                     .child(
-                        v_flex().min_w_0().child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(p.text)
-                                .truncate()
-                                .child(SharedString::from(self.active_tab.label())),
-                        ),
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .items_center()
+                            .window_control_area(WindowControlArea::Drag)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.text)
+                                    .truncate()
+                                    .child(header_title),
+                            ),
                     ),
             )
-            .child(self.render_window_controls(cx))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .when(can_remove, |el| {
+                        el.child(
+                            Button::new("acct-editor-remove")
+                                .danger()
+                                .compact()
+                                .icon(IconName::Trash)
+                                .label("移除")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_remove_in_editor = !this.confirm_remove_in_editor;
+                                    this.pending_leave_action = None;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(can_save, |el| {
+                        el.child(
+                            Button::new("acct-editor-save")
+                                .primary()
+                                .compact()
+                                .label("保存")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.commit_account_editor_save(
+                                        Some(EditorLeaveAction::BackToAccountList),
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
+                    .child(self.render_window_controls(cx)),
+            )
             .into_any_element()
     }
 }
@@ -847,9 +1182,21 @@ impl Render for SettingsWindow {
         };
 
         let header = self.render_content_header(narrow, &p, cx);
+        let show_tab_subtitle = self.active_tab != PrefTab::MailAccounts;
+        let show_unsaved_banner =
+            self.active_tab == PrefTab::MailAccounts && self.account_editor_open && self.pending_leave_action.is_some();
+        let unsaved_banner = if show_unsaved_banner {
+            Some(self.render_unsaved_banner(&p, cx))
+        } else {
+            None
+        };
         let content_area: AnyElement = if self.active_tab == PrefTab::MailAccounts {
             let app_entity = self.app.clone();
-            accounts::render_content(&self.account_form, app_entity, cx)
+            if self.account_editor_open {
+                accounts::render_editor_page(self, app_entity, &p, cx)
+            } else {
+                accounts::render_list_page(self, app_entity, &p, cx)
+            }
         } else {
             let app_entity = self.app.clone();
             pages::render_tab(self, app_entity, &p, window, cx)
@@ -868,6 +1215,18 @@ impl Render for SettingsWindow {
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
                 if this.search_open {
                     this.close_search(window, cx);
+                } else if this.confirm_remove_in_editor {
+                    this.confirm_remove_in_editor = false;
+                    cx.notify();
+                } else if this.pending_leave_action.is_some() {
+                    this.pending_leave_action = None;
+                    cx.notify();
+                } else if this.active_tab == PrefTab::MailAccounts && this.account_editor_open {
+                    this.request_leave_editor(
+                        EditorLeaveAction::BackToAccountList,
+                        window,
+                        cx,
+                    );
                 } else if window.viewport_size().width.as_f32() <= NARROW_BREAKPOINT
                     && this.narrow_show_content
                 {
@@ -888,14 +1247,17 @@ impl Render for SettingsWindow {
                         .h_full()
                         .bg(p.canvas)
                         .child(header)
-                        .child(
-                            div()
-                                .px_6()
-                                .pt_3()
-                                .text_xs()
-                                .text_color(p.text_muted)
-                                .child(SharedString::from(self.active_tab.subtitle())),
-                        )
+                        .when_some(unsaved_banner, |el, banner| el.child(banner))
+                        .when(show_tab_subtitle, |el| {
+                            el.child(
+                                div()
+                                    .px_6()
+                                    .pt_3()
+                                    .text_xs()
+                                    .text_color(p.text_muted)
+                                    .child(SharedString::from(self.active_tab.subtitle())),
+                            )
+                        })
                         .child(content_area),
                 )
             })

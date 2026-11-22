@@ -342,10 +342,18 @@ fn message_row(
     } else {
         display_name.clone()
     };
-    let acc_email = if show_account_tag {
+    let acc_email = if show_account_tag || sender_email.is_empty() {
         app.account_email_for(account_id).to_string()
     } else {
         String::new()
+    };
+    let (acc_label, acc_color) = if show_account_tag {
+        (
+            app.account_label_for(account_id),
+            app.account_color_for(account_id).unwrap_or(p.accent),
+        )
+    } else {
+        (String::new(), p.accent)
     };
     // 头像取色键优先用发件人自身邮箱。
     let avatar_key = if sender_email.is_empty() {
@@ -543,7 +551,7 @@ fn message_row(
                                     .text_color(p.text.opacity(0.5))
                                     .child(SharedString::from(msg.preview.clone())),
                             )
-                            .when(!acc_email.is_empty(), |el| {
+                            .when(!acc_label.is_empty(), |el| {
                                 el.child(
                                     div()
                                         .flex_shrink_0()
@@ -553,9 +561,9 @@ fn message_row(
                                         .py_0p5()
                                         .rounded_full()
                                         .text_size(px(10.0))
-                                        .bg(p.accent_soft())
-                                        .text_color(p.accent)
-                                        .child(SharedString::from(acc_email)),
+                                        .bg(acc_color.opacity(0.14))
+                                        .text_color(acc_color)
+                                        .child(SharedString::from(acc_label)),
                                 )
                             }),
                     )
@@ -604,8 +612,8 @@ pub(crate) fn render(
     // 本地草稿视图（真实账号）：从 self.drafts 合成列表行（跨文件夹搜索时不拦截）。
     let drafts_view =
         app.current_view == CurrentView::Drafts && !app.demo_mode && !cross_folder_search;
-    let show_account_tag =
-        (app.current_view.is_unified() || cross_folder_search) && app.accounts.len() > 1;
+    let show_account_tag = (app.current_view.is_unified() || cross_folder_search)
+        && app.accounts.iter().filter(|a| a.enabled).count() > 1;
     let current_sort = app.list_sort;
     let quick_filters = app.quick_filters;
     let is_unified_list = !drafts_view;

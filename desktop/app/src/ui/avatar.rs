@@ -8,7 +8,16 @@
 //!   文字固定白色。
 //! - 圆形尺寸支持 36x36（列表）与 34x34（阅读卡片）等。
 
-use gpui_kit::{div, hsla, px, white, Div, FontWeight, Hsla, ParentElement, SharedString, Styled};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
+
+use gpui_kit::{
+    div, hsla, img, px, white, Div, FontWeight, Hsla, Image, ImageFormat, ObjectFit,
+    ParentElement, SharedString, Styled, StyledImage,
+};
+use hylki_mail_core::config::{self, AccountConfig};
 
 /// 头像文字高度与圆盘尺寸的比例（双字母时，与 Linux 版 0.42 对齐）。
 const AVATAR_TEXT_SCALE: f32 = 0.42;
@@ -30,11 +39,103 @@ const AVATAR_COLORS: [&str; 10] = [
     "#e33b6a", "#9945b5",
 ];
 
+/// 账号外观面板可选的 10 色强调色调色板（十六进制 + 中文名称，对齐 Linux 版）。
+pub const ACCOUNT_ACCENT_COLORS: [(&str, &str); 10] = [
+    ("#337fdc", "海洋蓝"),
+    ("#0f9ac8", "青碧"),
+    ("#29ae74", "翠绿"),
+    ("#6ab85b", "草绿"),
+    ("#d29d09", "琥珀"),
+    ("#d68400", "暖橙"),
+    ("#ed5b00", "橘红"),
+    ("#e62d42", "绯红"),
+    ("#e33b6a", "玫红"),
+    ("#9945b5", "紫罗兰"),
+];
+
+/// 解析 `#rrggbb` 十六进制颜色为 [`Hsla`]。
+pub fn parse_hex_color(hex: &str) -> Option<Hsla> {
+    let trimmed = hex.trim();
+    let body = trimmed.strip_prefix('#')?;
+    if body.len() != 6 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(body, 16).ok()?;
+    Some(rgb_to_hsla(value))
+}
+
+/// 返回账号最终强调色十六进制串：优先合法自定义色，否则按邮箱 FNV-1a 取默认色。
+pub fn account_accent_hex(email: &str, custom_color: Option<&str>) -> String {
+    if let Some(custom) = custom_color {
+        let trimmed = custom.trim();
+        if parse_hex_color(trimmed).is_some() {
+            return trimmed.to_ascii_lowercase();
+        }
+    }
+    AVATAR_COLORS[(fnv1a(email) % AVATAR_COLORS.len() as u32) as usize].to_string()
+}
+
+/// 返回账号最终强调色 [`Hsla`]。
+pub fn account_accent_color(email: &str, custom_color: Option<&str>) -> Hsla {
+    let hex = account_accent_hex(email, custom_color);
+    parse_hex_color(&hex).unwrap_or_else(|| avatar_bg_color(email))
+}
+
 /// 对邮箱地址（无邮箱时用显示名）做 FNV-1a 哈希，稳定取背景色。
 pub fn avatar_bg_color(key: &str) -> Hsla {
     let hex = AVATAR_COLORS[(fnv1a(key) % AVATAR_COLORS.len() as u32) as usize];
     let value = u32::from_str_radix(&hex[1..], 16).expect("avatar palette hex must be valid");
     rgb_to_hsla(value)
+}
+
+type AvatarImageCache = HashMap<PathBuf, (u64, Arc<Image>)>;
+
+fn avatar_image_cache() -> &'static Mutex<AvatarImageCache> {
+    static CACHE: OnceLock<Mutex<AvatarImageCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    match ext.as_str() {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "webp" => Some(ImageFormat::Webp),
+        "gif" => Some(ImageFormat::Gif),
+        _ => None,
+    }
+}
+
+/// 从本地 `avatars/` 目录安全加载用户自定义账号头像图片并做内存缓存。
+pub fn load_local_avatar_image(data_dir: &Path, filename: &str) -> Option<Arc<Image>> {
+    let path = config::avatar_path_in(data_dir, filename)?;
+    let format = image_format_for_path(&path)?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let stamp = modified_nanos ^ meta.len().rotate_left(17);
+
+    if let Ok(cache) = avatar_image_cache().lock() {
+        if let Some((cached_stamp, cached_img)) = cache.get(&path) {
+            if *cached_stamp == stamp {
+                return Some(Arc::clone(cached_img));
+            }
+        }
+    }
+
+    let bytes = std::fs::read(&path).ok()?;
+    let image = Arc::new(Image::from_bytes(format, bytes));
+    if let Ok(mut cache) = avatar_image_cache().lock() {
+        cache.insert(path, (stamp, Arc::clone(&image)));
+    }
+    Some(image)
 }
 
 /// 简化 sRGB → HSL 转换（预设色不透明、无色相丢失场景）。
@@ -155,47 +256,126 @@ pub fn avatar(name: &str, email: &str, size: f32) -> Div {
         .child(SharedString::from(initials))
 }
 
-/// 账号头像（左栏账号分组），圆盘 + 右上角未读小蓝圈。
-pub fn account_avatar(
-    display_name: &str,
+/// 账号外观圆盘：外层强调色圆环 + `ring_gap_px` 留白 + 内层圆盘（图片 → Emoji → 首字母）。
+#[allow(clippy::too_many_arguments)]
+pub fn account_circle_visual(
+    display_label: &str,
     email: &str,
+    color_hex: Option<&str>,
+    emoji: Option<&str>,
+    avatar_file: Option<&str>,
+    data_dir: &Path,
+    size: f32,
+    ring_px: f32,
+    ring_gap_px: f32,
+) -> Div {
+    let accent = account_accent_color(email, color_hex);
+    let mut inner = div()
+        .size(px(size))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(accent)
+        .flex()
+        .items_center()
+        .justify_center();
+
+    if let Some(image) = avatar_file.and_then(|f| load_local_avatar_image(data_dir, f)) {
+        inner = inner.child(img(image).size_full().object_fit(ObjectFit::Cover));
+    } else if let Some(em) = emoji.map(str::trim).filter(|s| !s.is_empty()) {
+        let glyph: String = em.chars().take(4).collect();
+        inner = inner
+            .text_color(white())
+            .text_size(px(size * 0.52))
+            .child(SharedString::from(glyph));
+    } else {
+        let label = if display_label.trim().is_empty() {
+            email
+        } else {
+            display_label
+        };
+        let initials = sender_initials(label);
+        inner = inner
+            .text_color(white())
+            .text_size(px(size * AVATAR_TEXT_SCALE))
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::from(initials));
+    }
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .rounded_full()
+        .size(px(size + 2.0 * (ring_px + ring_gap_px)))
+        .border(px(ring_px))
+        .border_color(accent)
+        .p(px(ring_gap_px))
+        .child(inner)
+}
+
+fn attach_unread_badge(
+    base: Div,
     size: f32,
     unread: u32,
     accent: Hsla,
     border: Hsla,
 ) -> Div {
-    let base = avatar(display_name, email, size);
     if unread == 0 {
         return base;
     }
     let badge = size * 0.5;
-    let mut wrapper = div().relative().flex_shrink_0();
-    wrapper = wrapper.child(base);
-    wrapper = wrapper.child(
-        div()
-            .absolute()
-            .top(px(-badge * 0.3))
-            .right(px(-badge * 0.3))
-            .rounded_full()
-            .min_w(px(badge))
-            .min_h(px(badge))
-            .bg(accent)
-            .border_1()
-            .border_color(border)
-            .flex()
-            .items_center()
-            .justify_center()
-            .px_0p5()
-            .text_size(px(badge * 0.55))
-            .text_color(white())
-            .font_weight(FontWeight::BOLD)
-            .child(SharedString::from(if unread > 99 {
-                "99+".to_string()
-            } else {
-                unread.to_string()
-            })),
+    div()
+        .relative()
+        .flex_shrink_0()
+        .child(base)
+        .child(
+            div()
+                .absolute()
+                .top(px(-badge * 0.3))
+                .right(px(-badge * 0.3))
+                .rounded_full()
+                .min_w(px(badge))
+                .min_h(px(badge))
+                .bg(accent)
+                .border_1()
+                .border_color(border)
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_0p5()
+                .text_size(px(badge * 0.55))
+                .text_color(white())
+                .font_weight(FontWeight::BOLD)
+                .child(SharedString::from(if unread > 99 {
+                    "99+".to_string()
+                } else {
+                    unread.to_string()
+                })),
+        )
+}
+
+/// 账号头像（左栏账号分组），复用自定义外观圆盘并叠加右上角未读角标。
+pub fn account_circle_with_badge(
+    acc: &AccountConfig,
+    data_dir: &Path,
+    size: f32,
+    unread: u32,
+    badge_accent: Hsla,
+    badge_border: Hsla,
+) -> Div {
+    let base = account_circle_visual(
+        &acc.display_label(),
+        &acc.email,
+        acc.color.as_deref(),
+        acc.emoji.as_deref(),
+        acc.avatar.as_deref(),
+        data_dir,
+        size,
+        2.0,
+        1.0,
     );
-    wrapper
+    attach_unread_badge(base, size, unread, badge_accent, badge_border)
 }
 
 #[cfg(test)]
@@ -234,5 +414,25 @@ mod tests {
 
     fn approx_hsla(a: Hsla, b: Hsla) -> bool {
         (a.h - b.h).abs() < 1e-4 && (a.s - b.s).abs() < 1e-4 && (a.l - b.l).abs() < 1e-4
+    }
+
+    #[test]
+    fn parse_hex_color_and_accent_hex_handle_custom_and_default() {
+        assert!(parse_hex_color("#337fdc").is_some());
+        assert!(parse_hex_color("  #E62D42 ").is_some());
+        assert!(parse_hex_color("337fdc").is_none());
+        assert!(parse_hex_color("#12345").is_none());
+        assert!(parse_hex_color("#zzzzzz").is_none());
+
+        assert_eq!(
+            account_accent_hex("alice@example.com", Some(" #E62D42 ")),
+            "#e62d42"
+        );
+        let fallback = account_accent_hex("alice@example.com", Some("invalid"));
+        assert!(AVATAR_COLORS.contains(&fallback.as_str()));
+        assert_eq!(account_accent_hex("alice@example.com", None), fallback);
+
+        let parsed = account_accent_color("alice@example.com", Some("#29ae74"));
+        assert!(approx_hsla(parsed, parse_hex_color("#29ae74").unwrap()));
     }
 }

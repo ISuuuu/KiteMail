@@ -21,7 +21,7 @@ use gpui_kit::{
     div, px, AppContext, Axis, Context, Div, InteractiveElement, IntoElement, ParentElement,
     SharedString, Stateful, StatefulInteractiveElement, Styled, WindowControlArea,
 };
-use hylki_mail_core::config::AuthBackend;
+use hylki_mail_core::config::{self, AccountConfig, AuthBackend};
 use hylki_mail_core::{MailRequest, OutboxItem, OutboxStatus};
 
 use crate::app::{CurrentView, HylkiApp, MainContentView, ReaderPosition, SidebarDrag};
@@ -141,13 +141,19 @@ fn nav_row(
 /// 账号折叠分组（头像 + 名称 + 邮箱 + 单账号刷新 + 折叠箭头 + 文件夹列表）。
 fn account_section(
     app: &HylkiApp,
-    acc_id: u32,
-    display_name: String,
-    email: String,
+    acc: &AccountConfig,
     folders: &[hylki_mail_core::FolderSummary],
+    data_dir: &std::path::Path,
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
+    let acc_id = acc.id;
+    let primary_label = acc.display_label();
+    let secondary_label = if primary_label == acc.email {
+        acc.display_name.trim().to_string()
+    } else {
+        acc.email.clone()
+    };
     let (sidebar_bg, text, muted_fg, accent) = (p.sidebar, p.text, p.text_muted, p.accent);
     let selected_folder_id = app.selected_folder_id;
     let expanded = app.account_expanded(acc_id);
@@ -173,9 +179,9 @@ fn account_section(
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_account_expanded(acc_id, cx);
                 }))
-                .child(avatar::account_avatar(
-                    &display_name,
-                    &email,
+                .child(avatar::account_circle_with_badge(
+                    acc,
+                    data_dir,
                     28.0,
                     // 展开时「收件箱」行已有未读胶囊，头像角标去重；窄轨模式始终显示角标。
                     if expanded { 0 } else { account_unread },
@@ -192,15 +198,17 @@ fn account_section(
                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .text_color(text)
                                 .truncate()
-                                .child(SharedString::from(display_name)),
+                                .child(SharedString::from(primary_label)),
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .truncate()
-                                .child(SharedString::from(email)),
-                        ),
+                        .when(!secondary_label.is_empty(), |col| {
+                            col.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .truncate()
+                                    .child(SharedString::from(secondary_label)),
+                            )
+                        }),
                 )
                 .when(!demo_mode, |row| {
                     row.child(
@@ -408,29 +416,18 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         app.drafts.len() as u32
     };
 
+    let data_dir = config::data_dir();
     let account_sections: Vec<gpui_kit::AnyElement> = app
         .accounts
         .iter()
+        .filter(|acc| acc.enabled)
         .map(|acc| {
-            let display_name = if acc.display_name.is_empty() {
-                acc.email.clone()
-            } else {
-                acc.display_name.clone()
-            };
             let folders = app
                 .folders_by_account
                 .get(&acc.id)
                 .cloned()
                 .unwrap_or_default();
-            account_section(
-                app,
-                acc.id,
-                display_name,
-                acc.email.clone(),
-                &folders,
-                &p,
-                cx,
-            )
+            account_section(app, acc, &folders, &data_dir, &p, cx)
         })
         .collect();
 
@@ -949,6 +946,7 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
     let p = theme::current(cx);
     let (sidebar_bg, border, accent, accent_fg) = (p.sidebar, p.border, p.accent, p.accent_fg);
     let demo_mode = app.demo_mode;
+    let data_dir = config::data_dir();
     let unified_unread = app.unified_unread_count();
     let is_unified_selected = app.current_view == CurrentView::UnifiedInbox;
 
@@ -1069,63 +1067,63 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
                     .items_center()
                     .py_1()
                     .gap_1()
-                    .children(app.accounts.iter().map(|acc| {
-                        let acc_id = acc.id;
-                        let display_name = if acc.display_name.is_empty() {
-                            acc.email.clone()
-                        } else {
-                            acc.display_name.clone()
-                        };
-                        let account_unread: u32 = app
-                            .folders_by_account
-                            .get(&acc.id)
-                            .map(|folders| {
-                                folders
-                                    .iter()
-                                    .filter(|f| {
-                                        f.path.eq_ignore_ascii_case("INBOX")
-                                            || f.name.contains("收件箱")
+                    .children(
+                        app.accounts
+                            .iter()
+                            .filter(|acc| acc.enabled)
+                            .map(|acc| {
+                                let acc_id = acc.id;
+                                let account_unread: u32 = app
+                                    .folders_by_account
+                                    .get(&acc.id)
+                                    .map(|folders| {
+                                        folders
+                                            .iter()
+                                            .filter(|f| {
+                                                f.path.eq_ignore_ascii_case("INBOX")
+                                                    || f.name.contains("收件箱")
+                                            })
+                                            .map(|f| f.unread_count)
+                                            .sum()
                                     })
-                                    .map(|f| f.unread_count)
-                                    .sum()
-                            })
-                            .unwrap_or(0);
-                        div()
-                            .id(("rail-acc", acc_id))
-                            .relative()
-                            .cursor_pointer()
-                            .p(px(2.0))
-                            .rounded(px(8.0))
-                            .hover(|s| s.bg(p.accent_soft()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // 点击头像恢复宽栏并展开该账号分组。
-                                this.sidebar_hidden = false;
-                                this.collapsed_accounts.remove(&acc_id);
-                                cx.notify();
-                            }))
-                            .child(avatar::account_avatar(
-                                &display_name,
-                                &acc.email,
-                                28.0,
-                                if rail_dots { 0 } else { account_unread },
-                                accent,
-                                sidebar_bg,
-                            ))
-                            .when(rail_dots && account_unread > 0, |el| {
-                                el.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(0.0))
-                                        .right(px(0.0))
-                                        .rounded_full()
-                                        .w(px(8.0))
-                                        .h(px(8.0))
-                                        .bg(accent)
-                                        .border_1()
-                                        .border_color(sidebar_bg),
-                                )
-                            })
-                    })),
+                                    .unwrap_or(0);
+                                div()
+                                    .id(("rail-acc", acc_id))
+                                    .relative()
+                                    .cursor_pointer()
+                                    .p(px(2.0))
+                                    .rounded(px(8.0))
+                                    .hover(|s| s.bg(p.accent_soft()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        // 点击头像恢复宽栏并展开该账号分组。
+                                        this.sidebar_hidden = false;
+                                        this.collapsed_accounts.remove(&acc_id);
+                                        cx.notify();
+                                    }))
+                                    .child(avatar::account_circle_with_badge(
+                                        acc,
+                                        &data_dir,
+                                        28.0,
+                                        if rail_dots { 0 } else { account_unread },
+                                        accent,
+                                        sidebar_bg,
+                                    ))
+                                    .when(rail_dots && account_unread > 0, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(0.0))
+                                                .right(px(0.0))
+                                                .rounded_full()
+                                                .w(px(8.0))
+                                                .h(px(8.0))
+                                                .bg(accent)
+                                                .border_1()
+                                                .border_color(sidebar_bg),
+                                        )
+                                    })
+                            }),
+                    ),
             )
         })
         // 底部固定：联系人 / 附件图标入口（现有入口的窄轨形态）。

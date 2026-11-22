@@ -32,6 +32,27 @@ pub struct AccountConfig {
     pub oauth_client_id: String,
     pub display_name: String,
     pub email: String,
+    /// Optional user-defined nickname shown in the sidebar and account list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Whether this account is enabled for syncing and shown in the sidebar.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional custom accent color (`#rrggbb`) for account badges and avatars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Optional emoji shown in the account circle instead of initials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    /// Optional avatar picture file name stored under `avatars/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    /// Whether this account's mail is included in unified views (All Inboxes, Starred, Sent, Archive).
+    #[serde(default = "default_true")]
+    pub in_unified: bool,
+    /// Per-account push override (`None` follows global setting, `Some(true/false)` forces on/off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_override: Option<bool>,
     pub imap_host: String,
     pub imap_port: u16,
     pub imap_security: SecurityMode,
@@ -46,6 +67,23 @@ pub struct AccountConfig {
     pub signature: String,
 }
 
+impl AccountConfig {
+    /// Return the custom nickname when non-empty, otherwise fall back to email.
+    pub fn display_label(&self) -> String {
+        self.label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.email)
+            .to_string()
+    }
+
+    /// Resolve effective push policy for this account given the global `push_enabled`.
+    pub fn effective_push(&self, global_push: bool) -> bool {
+        self.push_override.unwrap_or(global_push)
+    }
+}
+
 impl Default for AccountConfig {
     fn default() -> Self {
         Self {
@@ -54,6 +92,13 @@ impl Default for AccountConfig {
             oauth_client_id: String::new(),
             display_name: String::new(),
             email: String::new(),
+            label: None,
+            enabled: true,
+            color: None,
+            emoji: None,
+            avatar: None,
+            in_unified: true,
+            push_override: None,
             imap_host: String::new(),
             imap_port: 993,
             imap_security: SecurityMode::Tls,
@@ -549,6 +594,69 @@ pub fn data_dir() -> PathBuf {
         .join("Hylki")
 }
 
+/// Return the directory storing imported custom account avatars under `dir`.
+pub fn avatars_dir_in(dir: &Path) -> PathBuf {
+    dir.join("avatars")
+}
+
+/// Resolve a stored avatar file name inside `dir/avatars/`, rejecting path traversal.
+pub fn avatar_path_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('\0')
+    {
+        return None;
+    }
+    let mut comps = Path::new(trimmed).components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return None,
+    }
+    let p = avatars_dir_in(dir).join(trimmed);
+    p.is_file().then_some(p)
+}
+
+/// Validate and copy an image file into `dir/avatars/avatar-<unix_ms>.<ext>`.
+pub fn import_avatar_file_in(dir: &Path, src: &Path) -> Result<String, String> {
+    const MAX_AVATAR_BYTES: u64 = 8 * 1024 * 1024;
+    let meta = fs::metadata(src)
+        .map_err(|e| format!("无法读取所选图片文件 ({}): {e}", src.display()))?;
+    if !meta.is_file() {
+        return Err("请选择有效的图片文件".to_string());
+    }
+    if meta.len() > MAX_AVATAR_BYTES {
+        return Err("头像图片不能超过 8 MB".to_string());
+    }
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif") {
+        return Err("仅支持 PNG、JPG、WebP 或 GIF 格式的图片".to_string());
+    }
+    let avatars_dir = avatars_dir_in(dir);
+    fs::create_dir_all(&avatars_dir)
+        .map_err(|e| format!("创建头像目录失败 ({}): {e}", avatars_dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut name = format!("avatar-{stamp}.{ext}");
+    let mut dest = avatars_dir.join(&name);
+    let mut seq = 1u32;
+    while dest.exists() {
+        name = format!("avatar-{stamp}-{seq}.{ext}");
+        dest = avatars_dir.join(&name);
+        seq = seq.saturating_add(1);
+    }
+    fs::copy(src, &dest).map_err(|e| format!("复制头像文件失败 ({}): {e}", dest.display()))?;
+    Ok(name)
+}
+
 /// Return the path to `accounts.toml` inside `dir`.
 pub fn accounts_file_in(dir: &Path) -> PathBuf {
     dir.join("accounts.toml")
@@ -674,6 +782,37 @@ pub fn delete_account_in(dir: &Path, account_id: u32) -> Result<Vec<AccountConfi
     Ok(accounts)
 }
 
+/// Reorder saved accounts in `accounts.toml` according to `ordered_ids`.
+/// Any existing accounts not listed in `ordered_ids` are preserved in order at the end.
+pub fn reorder_accounts_in(dir: &Path, ordered_ids: &[u32]) -> Result<Vec<AccountConfig>, String> {
+    let mut remaining = load_accounts_in(dir)?;
+    let mut reordered = Vec::with_capacity(remaining.len());
+    for &id in ordered_ids {
+        if let Some(pos) = remaining.iter().position(|a| a.id == id) {
+            reordered.push(remaining.remove(pos));
+        }
+    }
+    reordered.extend(remaining);
+    save_accounts_in(dir, &reordered)?;
+    Ok(reordered)
+}
+
+/// Toggle `enabled` for `account_id` in `accounts.toml` inside `dir`.
+pub fn set_account_enabled_in(
+    dir: &Path,
+    account_id: u32,
+    enabled: bool,
+) -> Result<Option<AccountConfig>, String> {
+    let mut accounts = load_accounts_in(dir)?;
+    let Some(acc) = accounts.iter_mut().find(|a| a.id == account_id) else {
+        return Ok(None);
+    };
+    acc.enabled = enabled;
+    let updated = acc.clone();
+    save_accounts_in(dir, &accounts)?;
+    Ok(Some(updated))
+}
+
 /// Return the next unused account ID for `accounts`.
 pub fn next_account_id(accounts: &[AccountConfig]) -> u32 {
     accounts.iter().map(|a| a.id).max().unwrap_or(0) + 1
@@ -694,6 +833,13 @@ mod tests {
             oauth_client_id: String::new(),
             display_name: "测试账号".to_string(),
             email: "user@example.com".to_string(),
+            label: Some("工作邮箱".to_string()),
+            enabled: true,
+            color: Some("#3584e4".to_string()),
+            emoji: Some("🦊".to_string()),
+            avatar: None,
+            in_unified: true,
+            push_override: Some(false),
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_security: SecurityMode::Tls,
@@ -737,6 +883,73 @@ smtp_separate_credentials = false
         let loaded = load_accounts_in(&base).expect("load legacy account");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].signature, "");
+        assert!(loaded[0].enabled);
+        assert!(loaded[0].in_unified);
+        assert_eq!(loaded[0].label, None);
+        assert_eq!(loaded[0].color, None);
+        assert_eq!(loaded[0].emoji, None);
+        assert_eq!(loaded[0].avatar, None);
+        assert_eq!(loaded[0].push_override, None);
+        assert_eq!(loaded[0].display_label(), "legacy@example.com");
+        assert!(loaded[0].effective_push(true));
+        assert!(!loaded[0].effective_push(false));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn account_reorder_enable_and_avatar_import_work() {
+        let base = std::env::temp_dir().join("hylki test 账号排序与头像");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let a1 = AccountConfig {
+            id: 1,
+            email: "one@example.com".to_string(),
+            label: Some("  工作号  ".to_string()),
+            push_override: Some(false),
+            ..AccountConfig::default()
+        };
+        let a2 = AccountConfig {
+            id: 2,
+            email: "two@example.com".to_string(),
+            push_override: Some(true),
+            ..AccountConfig::default()
+        };
+        let a3 = AccountConfig {
+            id: 3,
+            email: "three@example.com".to_string(),
+            ..AccountConfig::default()
+        };
+        assert_eq!(a1.display_label(), "工作号");
+        assert!(!a1.effective_push(true));
+        assert!(a2.effective_push(false));
+
+        save_accounts_in(&base, &[a1, a2, a3]).unwrap();
+        let reordered = reorder_accounts_in(&base, &[3, 1]).unwrap();
+        let ids: Vec<u32> = reordered.iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![3, 1, 2]);
+
+        let toggled = set_account_enabled_in(&base, 1, false).unwrap().unwrap();
+        assert!(!toggled.enabled);
+        let reloaded = load_accounts_in(&base).unwrap();
+        assert!(!reloaded.iter().find(|a| a.id == 1).unwrap().enabled);
+
+        // 头像导入与路径穿越防护。
+        let src_png = base.join("sample.png");
+        fs::write(&src_png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let saved_name = import_avatar_file_in(&base, &src_png).unwrap();
+        assert!(saved_name.starts_with("avatar-"));
+        assert!(saved_name.ends_with(".png"));
+        assert!(avatar_path_in(&base, &saved_name).is_some());
+        assert!(avatar_path_in(&base, "../sample.png").is_none());
+        assert!(avatar_path_in(&base, "sub/file.png").is_none());
+        assert!(avatar_path_in(&base, "sub\\file.png").is_none());
+        assert!(avatar_path_in(&base, "").is_none());
+
+        let bad_ext = base.join("script.exe");
+        fs::write(&bad_ext, b"MZ").unwrap();
+        assert!(import_avatar_file_in(&base, &bad_ext).is_err());
+
         let _ = fs::remove_dir_all(&base);
     }
 

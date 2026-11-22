@@ -868,7 +868,8 @@ pub(crate) fn render(
             .into_any_element();
     };
 
-    let owner_email = app.account_email_for(detail.account_id).to_string();
+    let owner_label = app.account_label_for(detail.account_id);
+    let owner_color = app.account_color_for(detail.account_id).unwrap_or(accent);
     let flagged = detail.flagged;
     let is_unread = app.selected_message_unread();
     let prefer_plain = app.reader_prefer_plain;
@@ -1291,17 +1292,17 @@ pub(crate) fn render(
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .when(show_account_chip && !owner_email.is_empty(), |row| {
+                                .when(show_account_chip && !owner_label.is_empty(), |row| {
                                     row.child(
                                         div()
                                             .px_2()
                                             .py_0p5()
                                             .rounded_full()
-                                            .bg(p.accent_soft())
-                                            .text_color(accent)
+                                            .bg(owner_color.opacity(0.14))
+                                            .text_color(owner_color)
                                             .text_xs()
                                             .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                            .child(SharedString::from(owner_email)),
+                                            .child(SharedString::from(owner_label)),
                                     )
                                 })
                                 // 缩放胶囊（S-8）：非 100% 时显示，点击重置（Ctrl+0 同效）。

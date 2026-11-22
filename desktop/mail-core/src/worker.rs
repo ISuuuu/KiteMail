@@ -11,8 +11,8 @@ use crate::search_query::SearchQuery;
 use crate::secrets::{self, AccountSecrets};
 use crate::smtp_client::SendOutcome;
 use crate::{
-    graph_client, imap_client, oauth, smtp_client, MailRequest, MessageFilter, MessageSummary,
-    OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
+    graph_client, imap_client, oauth, smtp_client, MailRequest, MessageFilter, MessageSort,
+    MessageSummary, OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
 };
 
 type TokenCache = HashMap<u32, (String, Instant)>;
@@ -81,15 +81,10 @@ async fn worker_loop(
     };
     let mut tokens: TokenCache = HashMap::new();
     let mut watchers: IdleWatchers = HashMap::new();
-    let push_enabled = config::load_preferences_in(&data_dir)
-        .map(|p| p.push_enabled)
-        .unwrap_or(true);
 
-    if push_enabled {
-        if let Ok(accounts) = config::load_accounts_in(&data_dir) {
-            for acc in accounts {
-                spawn_account_idle_watcher(&mut watchers, acc, req_tx.clone());
-            }
+    if let Ok(accounts) = config::load_accounts_in(&data_dir) {
+        for acc in &accounts {
+            refresh_account_watcher(&mut watchers, &data_dir, acc, &req_tx);
         }
     }
 
@@ -135,6 +130,31 @@ fn spawn_account_idle_watcher(
 fn stop_account_idle_watcher(watchers: &mut IdleWatchers, account_id: u32) {
     if let Some(old) = watchers.remove(&account_id) {
         old.abort();
+    }
+}
+
+fn unified_account_ids(data_dir: &std::path::Path) -> Vec<u32> {
+    config::load_accounts_in(data_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|acc| acc.enabled && acc.in_unified)
+        .map(|acc| acc.id)
+        .collect()
+}
+
+fn refresh_account_watcher(
+    watchers: &mut IdleWatchers,
+    data_dir: &std::path::Path,
+    account: &AccountConfig,
+    req_tx: &mpsc::Sender<MailRequest>,
+) {
+    let global_push = config::load_preferences_in(data_dir)
+        .map(|p| p.push_enabled)
+        .unwrap_or(true);
+    if account.enabled && account.effective_push(global_push) {
+        spawn_account_idle_watcher(watchers, account.clone(), req_tx.clone());
+    } else {
+        stop_account_idle_watcher(watchers, account.id);
     }
 }
 
@@ -307,13 +327,60 @@ async fn handle_request(
             imap_password,
             smtp_password,
         } => {
-            let smtp_pwd = if config.smtp_separate_credentials {
-                smtp_password.as_deref().unwrap_or(&imap_password)
+            if config.auth_backend != AuthBackend::Password {
+                let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                    ok: true,
+                    message: "当前账号使用 OAuth2 浏览器授权，无需测试 IMAP/SMTP 密码".to_string(),
+                });
+                return;
+            }
+            let stored = if imap_password.is_empty()
+                || (config.smtp_separate_credentials
+                    && smtp_password.as_deref().is_none_or(str::is_empty))
+            {
+                secrets::load_account_secrets(config.id).ok()
             } else {
-                imap_password.as_str()
+                None
             };
-            let imap_res = imap_client::verify_login(&config, &imap_password).await;
-            let smtp_res = smtp_client::verify_login(&config, smtp_pwd).await;
+            let effective_imap = if imap_password.is_empty() {
+                stored
+                    .as_ref()
+                    .map(|s| s.imap_password.clone())
+                    .unwrap_or_default()
+            } else {
+                imap_password
+            };
+            if effective_imap.is_empty() {
+                let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                    ok: false,
+                    message: "请输入密码或客户端授权码".to_string(),
+                });
+                return;
+            }
+            let effective_smtp = if config.smtp_separate_credentials {
+                let raw = smtp_password
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        stored
+                            .as_ref()
+                            .and_then(|s| s.smtp_password.clone())
+                            .filter(|s| !s.is_empty())
+                    });
+                let Some(pwd) = raw else {
+                    let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                        ok: false,
+                        message: "启用独立 SMTP 凭据时请输入 SMTP 密码或授权码".to_string(),
+                    });
+                    return;
+                };
+                pwd
+            } else {
+                effective_imap.clone()
+            };
+            let imap_res = imap_client::verify_login(&config, &effective_imap).await;
+            let smtp_res = smtp_client::verify_login(&config, &effective_smtp).await;
             match (imap_res, smtp_res) {
                 (Ok(()), Ok(())) => {
                     let _ = evt_tx.send(WorkerEvent::AccountVerified {
@@ -335,18 +402,75 @@ async fn handle_request(
             imap_password,
             smtp_password,
         } => {
-            if let Err(e) = secrets::save_account_secrets(
-                config.id,
-                AccountSecrets {
-                    imap_password,
-                    smtp_password,
-                },
-            ) {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: Some(config.id),
-                    message: e,
-                });
-                return;
+            if config.auth_backend == AuthBackend::Password {
+                let stored = if imap_password.is_empty()
+                    || (config.smtp_separate_credentials
+                        && smtp_password.as_deref().is_none_or(str::is_empty))
+                {
+                    secrets::load_account_secrets(config.id).ok()
+                } else {
+                    None
+                };
+                let effective_imap = if imap_password.is_empty() {
+                    stored
+                        .as_ref()
+                        .map(|s| s.imap_password.clone())
+                        .unwrap_or_default()
+                } else {
+                    imap_password
+                };
+                if effective_imap.is_empty() {
+                    let msg = "请输入密码或客户端授权码".to_string();
+                    let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                        ok: false,
+                        message: msg.clone(),
+                    });
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(config.id),
+                        message: msg,
+                    });
+                    return;
+                }
+                let effective_smtp = if config.smtp_separate_credentials {
+                    let raw = smtp_password
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            stored
+                                .as_ref()
+                                .and_then(|s| s.smtp_password.clone())
+                                .filter(|s| !s.is_empty())
+                        });
+                    let Some(pwd) = raw else {
+                        let msg = "启用独立 SMTP 凭据时请输入 SMTP 密码或授权码".to_string();
+                        let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                            ok: false,
+                            message: msg.clone(),
+                        });
+                        let _ = evt_tx.send(WorkerEvent::Error {
+                            account_id: Some(config.id),
+                            message: msg,
+                        });
+                        return;
+                    };
+                    Some(pwd)
+                } else {
+                    None
+                };
+                if let Err(e) = secrets::save_account_secrets(
+                    config.id,
+                    AccountSecrets {
+                        imap_password: effective_imap,
+                        smtp_password: effective_smtp,
+                    },
+                ) {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(config.id),
+                        message: e,
+                    });
+                    return;
+                }
             }
             if let Err(e) = config::upsert_account_in(data_dir, config.clone()) {
                 let _ = evt_tx.send(WorkerEvent::Error {
@@ -356,14 +480,24 @@ async fn handle_request(
                 return;
             }
             let account_id = config.id;
-            let push_enabled = config::load_preferences_in(data_dir)
-                .map(|p| p.push_enabled)
-                .unwrap_or(true);
-            if push_enabled {
-                spawn_account_idle_watcher(watchers, config.clone(), req_tx.clone());
-            }
+            let account_enabled = config.enabled;
+            refresh_account_watcher(watchers, data_dir, &config, req_tx);
             let _ = evt_tx.send(WorkerEvent::AccountSaved { account: config });
-            sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
+            if account_enabled {
+                sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
+            }
+            let page_size = pref_page_size(data_dir);
+            let allowed = unified_account_ids(data_dir);
+            if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                &allowed,
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                page_size,
+            ) {
+                let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+            }
         }
 
         MailRequest::StartMicrosoftOAuth {
@@ -413,18 +547,24 @@ async fn handle_request(
                 })
                 .unwrap_or_else(|| config::next_account_id(&existing));
 
-            let existing_signature = existing
-                .iter()
-                .find(|a| a.id == account_id)
-                .map(|a| a.signature.clone())
-                .unwrap_or_default();
+            let prev = existing.iter().find(|a| a.id == account_id);
 
             let account = AccountConfig {
                 id: account_id,
                 auth_backend: AuthBackend::MicrosoftGraphOAuth2,
                 oauth_client_id: result.client_id,
-                display_name: result.display_name,
+                display_name: prev
+                    .map(|p| p.display_name.clone())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(result.display_name),
                 email: result.email.clone(),
+                label: prev.and_then(|p| p.label.clone()),
+                enabled: prev.map(|p| p.enabled).unwrap_or(true),
+                color: prev.and_then(|p| p.color.clone()),
+                emoji: prev.and_then(|p| p.emoji.clone()),
+                avatar: prev.and_then(|p| p.avatar.clone()),
+                in_unified: prev.map(|p| p.in_unified).unwrap_or(true),
+                push_override: prev.and_then(|p| p.push_override),
                 imap_host: "outlook.office365.com".to_string(),
                 imap_port: 993,
                 imap_security: config::SecurityMode::Tls,
@@ -434,7 +574,7 @@ async fn handle_request(
                 smtp_security: config::SecurityMode::StartTls,
                 smtp_username: result.email,
                 smtp_separate_credentials: false,
-                signature: existing_signature,
+                signature: prev.map(|p| p.signature.clone()).unwrap_or_default(),
             };
 
             if let Err(e) = secrets::save_oauth_refresh_token(account_id, result.refresh_token) {
@@ -460,14 +600,24 @@ async fn handle_request(
                 ok: true,
                 message: "Outlook OAuth2 授权成功，正在同步邮件...".to_string(),
             });
-            let push_enabled = config::load_preferences_in(data_dir)
-                .map(|p| p.push_enabled)
-                .unwrap_or(true);
-            if push_enabled {
-                spawn_account_idle_watcher(watchers, account.clone(), req_tx.clone());
-            }
+            let account_enabled = account.enabled;
+            refresh_account_watcher(watchers, data_dir, &account, req_tx);
             let _ = evt_tx.send(WorkerEvent::AccountSaved { account });
-            sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
+            if account_enabled {
+                sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
+            }
+            let page_size = pref_page_size(data_dir);
+            let allowed = unified_account_ids(data_dir);
+            if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                &allowed,
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                page_size,
+            ) {
+                let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+            }
         }
 
         MailRequest::DeleteAccount { account_id } => {
@@ -481,7 +631,15 @@ async fn handle_request(
                 let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
             }
             let page_size = pref_page_size(data_dir);
-            if let Ok(page) = cache.list_unified_inbox("", 0, page_size) {
+            let allowed = unified_account_ids(data_dir);
+            if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                &allowed,
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                page_size,
+            ) {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
         }
@@ -506,18 +664,34 @@ async fn handle_request(
                 let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
             }
             let page_size = pref_page_size(data_dir);
-            if let Ok(page) = cache.list_unified_inbox("", 0, page_size) {
+            let allowed = unified_account_ids(data_dir);
+            if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                &allowed,
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                page_size,
+            ) {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
         }
 
         MailRequest::SyncAllAccounts => {
             let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
-            for acc in accounts {
+            for acc in accounts.into_iter().filter(|a| a.enabled) {
                 sync_account_inner(data_dir, cache, tokens, acc.id, evt_tx).await;
             }
             let page_size = pref_page_size(data_dir);
-            if let Ok(page) = cache.list_unified_inbox("", 0, page_size) {
+            let allowed = unified_account_ids(data_dir);
+            if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                &allowed,
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                page_size,
+            ) {
                 let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
             }
         }
@@ -560,7 +734,10 @@ async fn handle_request(
             limit,
         } => {
             let effective = merge_filter_options(filter, quick_filters);
-            match cache.list_unified_inbox_with_options(&query, effective, sort, offset, limit) {
+            let allowed = unified_account_ids(data_dir);
+            match cache
+                .list_unified_inbox_for_accounts(&allowed, &query, effective, sort, offset, limit)
+            {
                 Ok(page) => {
                     let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
                 }
@@ -1453,15 +1630,17 @@ async fn handle_request(
             limit,
         } => {
             let effective = merge_filter_options(filter, quick_filters);
+            let allowed = unified_account_ids(data_dir);
             let result = match view {
-                UnifiedView::Starred => {
-                    cache.list_starred_messages_with_options(&query, effective, sort, offset, limit)
-                }
-                UnifiedView::Sent => {
-                    cache.list_sent_messages_with_options(&query, effective, sort, offset, limit)
-                }
-                UnifiedView::Archive => cache
-                    .list_archived_messages_with_options(&query, effective, sort, offset, limit),
+                UnifiedView::Starred => cache.list_starred_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Sent => cache.list_sent_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Archive => cache.list_archived_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
             };
             match result {
                 Ok(page) => {
@@ -1528,26 +1707,85 @@ async fn handle_request(
         },
 
         MailRequest::SetPushEnabled { enabled } => {
-            if enabled {
-                if let Ok(accounts) = config::load_accounts_in(data_dir) {
-                    for acc in accounts {
+            if let Ok(accounts) = config::load_accounts_in(data_dir) {
+                for acc in accounts {
+                    if acc.enabled && acc.effective_push(enabled) {
                         if !watchers.contains_key(&acc.id) {
                             spawn_account_idle_watcher(watchers, acc, req_tx.clone());
                         }
+                    } else {
+                        stop_account_idle_watcher(watchers, acc.id);
                     }
                 }
-                let _ = evt_tx.send(WorkerEvent::Status {
-                    account_id: None,
-                    text: "即时推送收信已开启".to_string(),
-                });
-            } else {
-                for (_, handle) in watchers.drain() {
-                    handle.abort();
+            }
+            let _ = evt_tx.send(WorkerEvent::Status {
+                account_id: None,
+                text: if enabled {
+                    "即时推送收信已开启".to_string()
+                } else {
+                    "即时推送收信已关闭（将按定时同步）".to_string()
+                },
+            });
+        }
+
+        MailRequest::ReorderAccounts { account_ids } => {
+            match config::reorder_accounts_in(data_dir, &account_ids) {
+                Ok(accounts) => {
+                    let _ = evt_tx.send(WorkerEvent::AccountsUpdated { accounts });
                 }
-                let _ = evt_tx.send(WorkerEvent::Status {
-                    account_id: None,
-                    text: "即时推送收信已关闭（将按定时同步）".to_string(),
-                });
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        MailRequest::SetAccountEnabled {
+            account_id,
+            enabled,
+        } => {
+            match config::set_account_enabled_in(data_dir, account_id, enabled) {
+                Ok(Some(updated)) => {
+                    refresh_account_watcher(watchers, data_dir, &updated, req_tx);
+                    if let Ok(accounts) = config::load_accounts_in(data_dir) {
+                        let _ = evt_tx.send(WorkerEvent::AccountsUpdated { accounts });
+                    }
+                    let page_size = pref_page_size(data_dir);
+                    let allowed = unified_account_ids(data_dir);
+                    if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                        &allowed,
+                        "",
+                        QuickFilterSet::default(),
+                        MessageSort::DateNewest,
+                        0,
+                        page_size,
+                    ) {
+                        let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+                    }
+                    if enabled {
+                        sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
+                        let allowed = unified_account_ids(data_dir);
+                        if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                            &allowed,
+                            "",
+                            QuickFilterSet::default(),
+                            MessageSort::DateNewest,
+                            0,
+                            page_size,
+                        ) {
+                            let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                }
             }
         }
     }
@@ -1804,6 +2042,9 @@ async fn sync_account_inner(
         });
         return;
     };
+    if !account.enabled {
+        return;
+    }
 
     let _ = evt_tx.send(WorkerEvent::Status {
         account_id: Some(account_id),
@@ -2061,6 +2302,9 @@ async fn load_older_messages_inner(
         let Ok(account) = load_account_config(data_dir, account_id) else {
             continue;
         };
+        if folder_id == 0 && !account.enabled {
+            continue;
+        }
 
         let res: Result<(usize, bool), String> = match account.auth_backend {
             AuthBackend::MicrosoftGraphOAuth2 => {
@@ -2368,7 +2612,7 @@ async fn search_server_inner(
     let accounts: Vec<AccountConfig> = config::load_accounts_in(data_dir)
         .unwrap_or_default()
         .into_iter()
-        .filter(|a| target_account_id.is_none_or(|id| a.id == id))
+        .filter(|a| a.enabled && target_account_id.is_none_or(|id| a.id == id))
         .collect();
 
     if accounts.is_empty() {

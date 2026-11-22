@@ -1132,6 +1132,29 @@ impl CacheStore {
         )
     }
 
+    /// Query a unified inbox page restricted to `allowed_account_ids`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_unified_inbox_for_accounts(
+        &self,
+        allowed_account_ids: &[u32],
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options_for_accounts(
+            "(UPPER(f.path) = 'INBOX' OR f.is_inbox = 1)",
+            "统一收件箱",
+            Some(allowed_account_ids),
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
     /// Query a page of starred (flagged) messages across all accounts and folders.
     pub fn list_starred_messages(
         &self,
@@ -1171,6 +1194,29 @@ impl CacheStore {
         self.list_role_messages_with_options(
             "m.flagged = 1",
             "星标邮件",
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
+    /// Query a page of starred messages restricted to `allowed_account_ids`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_starred_messages_for_accounts(
+        &self,
+        allowed_account_ids: &[u32],
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options_for_accounts(
+            "m.flagged = 1",
+            "星标邮件",
+            Some(allowed_account_ids),
             query,
             quick_filters,
             sort,
@@ -1227,6 +1273,29 @@ impl CacheStore {
         )
     }
 
+    /// Query a page of sent messages restricted to `allowed_account_ids`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_sent_messages_for_accounts(
+        &self,
+        allowed_account_ids: &[u32],
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options_for_accounts(
+            SENT_FOLDER_MATCH,
+            "已发送",
+            Some(allowed_account_ids),
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
     /// Query a page of messages aggregated across every account's Archive folder.
     pub fn list_archived_messages(
         &self,
@@ -1266,6 +1335,29 @@ impl CacheStore {
         self.list_role_messages_with_options(
             ARCHIVE_FOLDER_MATCH,
             "归档",
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
+    /// Query a page of archived messages restricted to `allowed_account_ids`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_archived_messages_for_accounts(
+        &self,
+        allowed_account_ids: &[u32],
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options_for_accounts(
+            ARCHIVE_FOLDER_MATCH,
+            "归档",
+            Some(allowed_account_ids),
             query,
             quick_filters,
             sort,
@@ -1492,9 +1584,50 @@ impl CacheStore {
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options_for_accounts(
+            predicate,
+            label,
+            None,
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn list_role_messages_with_options_for_accounts(
+        &self,
+        predicate: &str,
+        label: &str,
+        allowed_account_ids: Option<&[u32]>,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        if let Some(ids) = allowed_account_ids {
+            if ids.is_empty() {
+                return Ok(MailPage {
+                    folder_id: 0,
+                    offset,
+                    total: 0,
+                    items: Vec::new(),
+                });
+            }
+        }
         let parsed = SearchQuery::parse(query);
         let mut clauses = vec![predicate.to_string()];
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(ids) = allowed_account_ids {
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            clauses.push(format!("m.account_id IN ({placeholders})"));
+            for &id in ids {
+                args.push(i64::from(id).into());
+            }
+        }
         Self::append_search_and_filter_clauses(
             &parsed,
             quick_filters,
@@ -5105,6 +5238,63 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("cache.db-wal"));
         let _ = std::fs::remove_file(dir.join("cache.db-shm"));
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn unified_queries_filter_by_allowed_account_ids() {
+        let mut store = CacheStore::open_in_memory().unwrap();
+        store
+            .sync_folders(1, &[folder("收件箱", "INBOX"), folder("已发送", "Sent")])
+            .unwrap();
+        store
+            .sync_folders(2, &[folder("收件箱", "INBOX"), folder("已发送", "Sent")])
+            .unwrap();
+        let inbox_1 = store.find_inbox_folder(1).unwrap().unwrap().0;
+        let inbox_2 = store.find_inbox_folder(2).unwrap().unwrap().0;
+        store
+            .commit_folder_headers(1, inbox_1, 1, &[sample_header(1, "账号一邮件")], None)
+            .unwrap();
+        store
+            .commit_folder_headers(2, inbox_2, 1, &[sample_header(2, "账号二邮件")], None)
+            .unwrap();
+
+        let empty = store
+            .list_unified_inbox_for_accounts(
+                &[],
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                50,
+            )
+            .unwrap();
+        assert_eq!(empty.total, 0);
+        assert!(empty.items.is_empty());
+
+        let only_two = store
+            .list_unified_inbox_for_accounts(
+                &[2],
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                50,
+            )
+            .unwrap();
+        assert_eq!(only_two.total, 1);
+        assert_eq!(only_two.items[0].account_id, 2);
+
+        let both = store
+            .list_unified_inbox_for_accounts(
+                &[1, 2],
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                50,
+            )
+            .unwrap();
+        assert_eq!(both.total, 2);
     }
 }
 

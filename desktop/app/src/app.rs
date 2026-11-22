@@ -21,7 +21,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     actions, black, div, point, px, size, AnyWindowHandle, AppContext, Axis, Bounds, ClipboardItem,
-    Context, DragMoveEvent, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
+    Context, DragMoveEvent, Entity, Focusable, Hsla, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, TitlebarOptions,
     Window, WindowAppearance, WindowBounds, WindowOptions,
 };
@@ -83,110 +83,6 @@ fn list_wide_next(current_wide: bool, width: f32) -> bool {
     }
 }
 
-/// 邮箱服务商预设（原样迁自原型）。
-#[derive(Clone, Copy)]
-pub(crate) struct ProviderPreset {
-    pub(crate) id: &'static str,
-    pub(crate) label: &'static str,
-    pub(crate) imap_host: &'static str,
-    pub(crate) imap_port: &'static str,
-    pub(crate) imap_tls: bool,
-    pub(crate) smtp_host: &'static str,
-    pub(crate) smtp_port: &'static str,
-    pub(crate) smtp_tls: bool,
-    pub(crate) guide: &'static str,
-}
-
-pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
-    ProviderPreset {
-        id: "preset-qq",
-        label: "QQ 邮箱",
-        imap_host: "imap.qq.com",
-        imap_port: "993",
-        imap_tls: true,
-        smtp_host: "smtp.qq.com",
-        smtp_port: "465",
-        smtp_tls: true,
-        guide: "QQ 邮箱指引：登录网页版 QQ 邮箱 → 设置 → 账号 → 开启 IMAP/SMTP 服务，并生成 16 位授权码填在下方密码框（非 QQ 登录密码）。",
-    },
-    ProviderPreset {
-        id: "preset-163",
-        label: "网易 163",
-        imap_host: "imap.163.com",
-        imap_port: "993",
-        imap_tls: true,
-        smtp_host: "smtp.163.com",
-        smtp_port: "465",
-        smtp_tls: true,
-        guide: "网易 163 指引：登录网页版 163 邮箱 → 设置 → POP3/SMTP/IMAP → 开启 IMAP/SMTP 服务，并填写新增的客户端授权密码。",
-    },
-    ProviderPreset {
-        id: "preset-126",
-        label: "网易 126",
-        imap_host: "imap.126.com",
-        imap_port: "993",
-        imap_tls: true,
-        smtp_host: "smtp.126.com",
-        smtp_port: "465",
-        smtp_tls: true,
-        guide: "网易 126 指引：登录网页版 126 邮箱 → 设置 → POP3/SMTP/IMAP → 开启 IMAP/SMTP 服务，并填写客户端授权密码。",
-    },
-    ProviderPreset {
-        id: "preset-gmail",
-        label: "Gmail",
-        imap_host: "imap.gmail.com",
-        imap_port: "993",
-        imap_tls: true,
-        smtp_host: "smtp.gmail.com",
-        smtp_port: "465",
-        smtp_tls: true,
-        guide: "Gmail 指引：需在 Google 账号开启「两步验证」，并在安全性设置中生成 16 位「应用专用密码 (App Password)」填入下方密码框（普通账号密码会被拒绝）。",
-    },
-    ProviderPreset {
-        id: "preset-outlook",
-        label: "Outlook",
-        imap_host: "outlook.office365.com",
-        imap_port: "993",
-        imap_tls: true,
-        smtp_host: "smtp.office365.com",
-        smtp_port: "587",
-        smtp_tls: false,
-        guide: "Outlook / Hotmail 指引：IMAP 使用 TLS (993)，SMTP 使用 STARTTLS (587)。注意：微软目前已逐步停用个人/企业账号的传统密码登录，若验证失败通常需等待后续 OAuth2 登录支持。",
-    },
-    ProviderPreset {
-        id: "preset-icloud",
-        label: "iCloud",
-        imap_host: "imap.mail.me.com",
-        imap_port: "993",
-        imap_tls: true,
-        smtp_host: "smtp.mail.me.com",
-        smtp_port: "587",
-        smtp_tls: false,
-        guide: "iCloud 指引：请前往 account.apple.com → 登录和安全 →「App 专用密码」生成专用密码填入下方，SMTP 使用 STARTTLS (587)。",
-    },
-    ProviderPreset {
-        id: "preset-exmail",
-        label: "腾讯企业邮",
-        imap_host: "imap.exmail.qq.com",
-        imap_port: "993",
-        imap_tls: true,
-        smtp_host: "smtp.exmail.qq.com",
-        smtp_port: "465",
-        smtp_tls: true,
-        guide: "腾讯企业邮指引：若管理员开启了安全登录/微信绑定，请在企业邮箱设置 → 账号安全中生成客户端专用密码。",
-    },
-    ProviderPreset {
-        id: "preset-aliyun",
-        label: "阿里企业邮",
-        imap_host: "imap.qiye.aliyun.com",
-        imap_port: "993",
-        imap_tls: true,
-        smtp_host: "smtp.qiye.aliyun.com",
-        smtp_port: "465",
-        smtp_tls: true,
-        guide: "阿里企业邮指引：请使用完整企业邮箱地址作为用户名；如开启了三方客户端安全密码，请在网页端生成专用密码。",
-    },
-];
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RightPaneMode {
     Reader,
@@ -372,7 +268,7 @@ pub(crate) enum MainContentView {
 enum SettingsOpenTarget {
     Tab(PrefTab),
     EditAccount(Option<AccountConfig>),
-    PresetAccount(ProviderPreset),
+    PresetAccount(usize),
 }
 
 /// 当前全局浮层（命令面板、快捷键、关于）。
@@ -505,9 +401,7 @@ pub(crate) struct HylkiApp {
     /// 写信发送前检测到正文/主题提及附件关键词但未附带文件时触发的内联确认横幅（命中关键词）。
     pub(crate) compose_attachment_reminder: Option<String>,
 
-    // Account management banner/confirmation state
-    /// 账号管理页等待确认移除的账号 ID（内联二次确认）。
-    pub(crate) pending_delete_account_id: Option<u32>,
+    // Account management banner state
     pub(crate) cfg_feedback: Option<(bool, SharedString)>,
 
     pub(crate) status_line: SharedString,
@@ -896,7 +790,6 @@ impl HylkiApp {
                 pending_send: None,
                 next_send_token: 1,
                 compose_attachment_reminder: None,
-                pending_delete_account_id: None,
                 cfg_feedback: None,
                 status_line: SharedString::from("演示模式 (--demo)：已加载 10,000 封模拟邮件"),
                 error_banner: None,
@@ -1062,7 +955,6 @@ impl HylkiApp {
             pending_send: None,
             next_send_token: 1,
             compose_attachment_reminder: None,
-            pending_delete_account_id: None,
             cfg_feedback: None,
             status_line,
             error_banner: None,
@@ -1152,6 +1044,9 @@ impl HylkiApp {
                 WorkerEvent::AccountVerified { ok, message } => {
                     self.cfg_feedback = Some((ok, SharedString::from(message.clone())));
                     self.status_line = SharedString::from(message);
+                    if !ok {
+                        self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
+                    }
                 }
                 WorkerEvent::AccountSaved { account } => {
                     if let Some(existing) = self.accounts.iter_mut().find(|a| a.id == account.id) {
@@ -1159,30 +1054,20 @@ impl HylkiApp {
                     } else {
                         self.accounts.push(account.clone());
                     }
-                    self.compose_account_id = account.id;
-                    self.pending_delete_account_id = None;
+                    if account.enabled {
+                        self.compose_account_id = account.id;
+                    }
                     self.right_mode = RightPaneMode::Reader;
                     self.cfg_feedback = Some((
                         true,
                         SharedString::from(format!("账号 {} 已保存，正在同步...", account.email)),
                     ));
-                    if let Some((handle, entity)) = self.settings_window.clone() {
-                        let account_for_win = account.clone();
-                        cx.spawn(async move |_, cx| {
-                            cx.update(|cx| {
-                                let _ = handle.update(cx, |_, window, cx| {
-                                    let _ = entity.update(cx, |win, cx| {
-                                        win.account_form.load_account(
-                                            Some(&account_for_win),
-                                            window,
-                                            cx,
-                                        );
-                                        cx.notify();
-                                    });
-                                });
-                            });
-                        })
-                        .detach();
+                    let account_for_win = account.clone();
+                    self.with_settings_window(cx, move |win, window, cx| {
+                        win.on_account_saved(&account_for_win, window, cx);
+                    });
+                    if self.current_view.is_unified() {
+                        self.reload_current_page(cx);
                     }
                     self.error_banner = None;
                     self.status_line =
@@ -1197,26 +1082,18 @@ impl HylkiApp {
                     self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                     self.current_view = CurrentView::UnifiedInbox;
                     self.selected_message = None;
-                    self.pending_delete_account_id = None;
-                    if let Some((handle, entity)) = self.settings_window.clone() {
-                        let next_cfg = self.accounts.first().cloned();
-                        cx.spawn(async move |_, cx| {
-                            cx.update(|cx| {
-                                let _ = handle.update(cx, |_, window, cx| {
-                                    let _ = entity.update(cx, |win, cx| {
-                                        if win.account_form.editing_account_id == Some(account_id) {
-                                            win.account_form.load_account(
-                                                next_cfg.as_ref(),
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                        cx.notify();
-                                    });
-                                });
-                            });
-                        })
-                        .detach();
+                    self.with_settings_window(cx, move |win, window, cx| {
+                        win.on_account_deleted(account_id, window, cx);
+                    });
+                    if self.accounts.is_empty() {
+                        self.current_page = MailPage {
+                            folder_id: UNIFIED_INBOX_FOLDER_ID,
+                            offset: 0,
+                            total: 0,
+                            items: Vec::new(),
+                        };
+                    } else if self.current_view.is_unified() {
+                        self.reload_current_page(cx);
                     }
                     self.right_mode = if self.accounts.is_empty() {
                         RightPaneMode::Welcome
@@ -1224,6 +1101,39 @@ impl HylkiApp {
                         RightPaneMode::Reader
                     };
                     self.status_line = SharedString::from("账号及本地缓存已移除");
+                }
+                WorkerEvent::AccountsUpdated { accounts } => {
+                    self.accounts = accounts;
+                    if !self
+                        .accounts
+                        .iter()
+                        .any(|a| a.id == self.compose_account_id && a.enabled)
+                    {
+                        self.compose_account_id = self
+                            .accounts
+                            .iter()
+                            .find(|a| a.enabled)
+                            .or_else(|| self.accounts.first())
+                            .map(|a| a.id)
+                            .unwrap_or(1);
+                    }
+                    if self.current_view == CurrentView::AccountFolder {
+                        let current_disabled = self.folders_by_account.iter().any(
+                            |(&acc_id, folders)| {
+                                folders.iter().any(|f| f.id == self.selected_folder_id)
+                                    && self.accounts.iter().any(|a| a.id == acc_id && !a.enabled)
+                            },
+                        );
+                        if current_disabled {
+                            self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
+                            self.current_view = CurrentView::UnifiedInbox;
+                            self.selected_message = None;
+                        }
+                    }
+                    folders_updated = true;
+                    if self.current_view.is_unified() {
+                        self.reload_current_page(cx);
+                    }
                 }
                 WorkerEvent::FoldersLoaded {
                     account_id,
@@ -1379,6 +1289,7 @@ impl HylkiApp {
                 } => {
                     // B-2：抓取原文失败时退出「导出中…」状态。
                     self.pending_eml_export = None;
+                    self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
                     self.error_banner = Some(SharedString::from(message.clone()));
                     self.status_line = SharedString::from(message);
                 }
@@ -2928,15 +2839,22 @@ impl HylkiApp {
             self.accounts
                 .iter()
                 .find(|a| {
-                    a.email
-                        .eq_ignore_ascii_case(self.prefs.compose_default_from.trim())
+                    a.enabled
+                        && a.email
+                            .eq_ignore_ascii_case(self.prefs.compose_default_from.trim())
                 })
                 .map(|a| a.id)
         } else {
             None
         };
         self.compose_account_id = preferred_id
-            .or_else(|| self.accounts.first().map(|a| a.id))
+            .or_else(|| {
+                self.accounts
+                    .iter()
+                    .find(|a| a.enabled)
+                    .or_else(|| self.accounts.first())
+                    .map(|a| a.id)
+            })
             .unwrap_or(1);
         self.compose_draft_id = None;
         self.compose_in_reply_to.clear();
@@ -3558,20 +3476,18 @@ impl HylkiApp {
         cfg: Option<AccountConfig>,
         cx: &mut Context<Self>,
     ) {
-        self.pending_delete_account_id = None;
         self.cfg_feedback = None;
         self.open_settings_window(SettingsOpenTarget::EditAccount(cfg), cx);
     }
 
-    /// 欢迎页 / 账号页服务商预设入口：在设置窗口「邮箱账号」载入空白表单并套用主机 / 端口 / 加密与指引。
+    /// 欢迎页服务商预设入口：在设置窗口「邮箱账号」直接进入新建页并套用对应服务商。
     pub(crate) fn open_settings_preset_account(
         &mut self,
-        preset: ProviderPreset,
+        provider_idx: usize,
         cx: &mut Context<Self>,
     ) {
-        self.pending_delete_account_id = None;
         self.cfg_feedback = None;
-        self.open_settings_window(SettingsOpenTarget::PresetAccount(preset), cx);
+        self.open_settings_window(SettingsOpenTarget::PresetAccount(provider_idx), cx);
     }
 
     /// 运行时进入演示模式（欢迎页入口 3）：复用 `--demo` 启动路径的初始化。
@@ -3607,7 +3523,6 @@ impl HylkiApp {
         self.current_view = CurrentView::UnifiedInbox;
         self.reset_list_pagination();
         self.compose_account_id = 1;
-        self.pending_delete_account_id = None;
         self.right_mode = RightPaneMode::Reader;
         self.main_view = MainContentView::Mail;
         self.error_banner = None;
@@ -3617,26 +3532,11 @@ impl HylkiApp {
 
     /// 打开统一设置窗口并定位到「邮箱账号」页（菜单 / 欢迎页 / 命令面板入口），保留当前表单选择。
     pub(crate) fn open_account_manager(&mut self, cx: &mut Context<Self>) {
-        self.pending_delete_account_id = None;
         self.open_settings_on_tab(PrefTab::MailAccounts, cx);
     }
 
-    /// 账号卡片「移除账号」：先进入内联确认态（含确认）。
-    pub(crate) fn request_delete_account(&mut self, account_id: u32, cx: &mut Context<Self>) {
-        self.pending_delete_account_id = Some(account_id);
-        cx.notify();
-    }
-
-    pub(crate) fn cancel_delete_account(&mut self, cx: &mut Context<Self>) {
-        self.pending_delete_account_id = None;
-        cx.notify();
-    }
-
     /// 确认移除账号：发 `MailRequest::DeleteAccount`（清理配置、缓存与凭据）。
-    pub(crate) fn confirm_delete_account(&mut self, cx: &mut Context<Self>) {
-        let Some(account_id) = self.pending_delete_account_id.take() else {
-            return;
-        };
+    pub(crate) fn delete_account(&mut self, account_id: u32, cx: &mut Context<Self>) {
         if self.demo_mode {
             return;
         }
@@ -3793,11 +3693,85 @@ impl HylkiApp {
             .unwrap_or("")
     }
 
-    /// 统一收件箱未读总数（各账号 INBOX 未读之和）。
+    pub(crate) fn account_label_for(&self, account_id: u32) -> String {
+        self.accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .map(AccountConfig::display_label)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn account_color_for(&self, account_id: u32) -> Option<Hsla> {
+        self.accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .map(|a| crate::ui::avatar::account_accent_color(&a.email, a.color.as_deref()))
+    }
+
+    pub(crate) fn reorder_accounts(
+        &mut self,
+        from_idx: usize,
+        to_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode
+            || from_idx == to_idx
+            || from_idx >= self.accounts.len()
+            || to_idx >= self.accounts.len()
+        {
+            return;
+        }
+        let moved = self.accounts.remove(from_idx);
+        self.accounts.insert(to_idx, moved);
+        let account_ids: Vec<u32> = self.accounts.iter().map(|a| a.id).collect();
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::ReorderAccounts { account_ids });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_account_enabled(
+        &mut self,
+        account_id: u32,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        let Some(acc) = self.accounts.iter_mut().find(|a| a.id == account_id) else {
+            return;
+        };
+        if acc.enabled == enabled {
+            return;
+        }
+        acc.enabled = enabled;
+        if !enabled && self.compose_account_id == account_id {
+            if let Some(first_enabled) = self.accounts.iter().find(|a| a.enabled) {
+                self.compose_account_id = first_enabled.id;
+            }
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::SetAccountEnabled {
+                account_id,
+                enabled,
+            });
+        }
+        cx.notify();
+    }
+
+    /// 统一收件箱未读总数（仅统计已启用且加入统一收件箱的账号 INBOX 未读之和）。
     pub(crate) fn unified_unread_count(&self) -> u32 {
         self.folders_by_account
-            .values()
-            .flatten()
+            .iter()
+            .filter(|(&account_id, _)| {
+                self.accounts
+                    .iter()
+                    .find(|a| a.id == account_id)
+                    .map(|a| a.enabled && a.in_unified)
+                    .unwrap_or(true)
+            })
+            .flat_map(|(_, folders)| folders.iter())
             .filter(|f| {
                 f.path.eq_ignore_ascii_case("INBOX")
                     || f.name.eq_ignore_ascii_case("INBOX")
@@ -4311,14 +4285,8 @@ impl HylkiApp {
         let accounts = self
             .accounts
             .iter()
-            .map(|a| {
-                let name = if a.display_name.is_empty() {
-                    a.email.clone()
-                } else {
-                    a.display_name.clone()
-                };
-                (a.id, name)
-            })
+            .filter(|a| a.enabled)
+            .map(|a| (a.id, a.display_label()))
             .collect();
         if let Some(ref g) = self.gallery {
             g.update(cx, |state, _cx| state.set_accounts(accounts));
@@ -4693,6 +4661,24 @@ impl HylkiApp {
         self.open_settings_window(SettingsOpenTarget::Tab(tab), cx);
     }
 
+    fn with_settings_window(
+        &self,
+        cx: &Context<Self>,
+        f: impl FnOnce(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>) + 'static,
+    ) {
+        let Some((handle, entity)) = self.settings_window.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            cx.update(|cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = entity.update(cx, |win, cx| f(win, window, cx));
+                });
+            });
+        })
+        .detach();
+    }
+
     fn open_settings_window(&mut self, target: SettingsOpenTarget, cx: &mut Context<Self>) {
         if self.settings_window_opening {
             return;
@@ -4700,7 +4686,6 @@ impl HylkiApp {
         self.settings_window_opening = true;
         let existing = self.settings_window.clone();
         let initial_prefs = self.prefs.clone();
-        let fallback_account = self.accounts.first().cloned();
         let app_entity = cx.entity();
 
         cx.spawn(async move |this, cx| {
@@ -4711,12 +4696,14 @@ impl HylkiApp {
                         window.activate_window();
                         let _ = entity.update(cx, |win, cx| match target_copy {
                             SettingsOpenTarget::Tab(tab) => win.select_tab(tab, window, cx),
-                            SettingsOpenTarget::EditAccount(ref cfg) => {
-                                win.edit_account_in_form(cfg.as_ref(), window, cx);
+                            SettingsOpenTarget::EditAccount(Some(ref cfg)) => {
+                                win.open_edit_account_editor(cfg, window, cx);
                             }
-                            SettingsOpenTarget::PresetAccount(ref preset) => {
-                                win.edit_account_in_form(None, window, cx);
-                                win.apply_account_preset(preset, window, cx);
+                            SettingsOpenTarget::EditAccount(None) => {
+                                win.open_new_account_editor(window, cx);
+                            }
+                            SettingsOpenTarget::PresetAccount(idx) => {
+                                win.open_preset_account_editor(idx, window, cx);
                             }
                         });
                     });
@@ -4725,10 +4712,14 @@ impl HylkiApp {
                     }
                 }
 
-                let (initial_tab, edit_acc, preset) = match target {
-                    SettingsOpenTarget::Tab(tab) => (tab, fallback_account, None),
-                    SettingsOpenTarget::EditAccount(cfg) => (PrefTab::MailAccounts, cfg, None),
-                    SettingsOpenTarget::PresetAccount(p) => (PrefTab::MailAccounts, None, Some(p)),
+                let (initial_tab, edit_acc, preset_idx, open_account_editor) = match target {
+                    SettingsOpenTarget::Tab(tab) => (tab, None, None, false),
+                    SettingsOpenTarget::EditAccount(cfg) => {
+                        (PrefTab::MailAccounts, cfg, None, true)
+                    }
+                    SettingsOpenTarget::PresetAccount(idx) => {
+                        (PrefTab::MailAccounts, None, Some(idx), true)
+                    }
                 };
 
                 let centered = Bounds::centered(None, size(px(920.0), px(848.0)), cx);
@@ -4749,7 +4740,8 @@ impl HylkiApp {
                             initial_prefs,
                             initial_tab,
                             edit_acc,
-                            preset,
+                            preset_idx,
+                            open_account_editor,
                             window,
                             cx,
                         )
@@ -4901,6 +4893,20 @@ impl HylkiApp {
         self.prefs = bundle.preferences;
         if !self.demo_mode {
             self.accounts = bundle.accounts;
+            if !self
+                .accounts
+                .iter()
+                .any(|a| a.id == self.compose_account_id && a.enabled)
+            {
+                if let Some(first) = self
+                    .accounts
+                    .iter()
+                    .find(|a| a.enabled)
+                    .or_else(|| self.accounts.first())
+                {
+                    self.compose_account_id = first.id;
+                }
+            }
             if let Some(ref w) = self.worker {
                 w.send(MailRequest::SetPushEnabled {
                     enabled: self.prefs.push_enabled,
@@ -4995,22 +5001,18 @@ impl HylkiApp {
 
     /// GoFolder 命令的显示名（多账号时带账号前缀）。
     fn palette_folder_names(&self) -> Vec<(u32, u32, String)> {
-        let multi_account = self.accounts.len() > 1;
+        let multi_account = self.accounts.iter().filter(|a| a.enabled).count() > 1;
         self.folders_by_account
             .iter()
-            .flat_map(|(&account_id, folders)| {
-                let account_label = self
-                    .accounts
+            .filter(|(&account_id, _)| {
+                self.accounts
                     .iter()
                     .find(|a| a.id == account_id)
-                    .map(|a| {
-                        if a.display_name.is_empty() {
-                            a.email.clone()
-                        } else {
-                            a.display_name.clone()
-                        }
-                    })
-                    .unwrap_or_default();
+                    .map(|a| a.enabled)
+                    .unwrap_or(true)
+            })
+            .flat_map(|(&account_id, folders)| {
+                let account_label = self.account_label_for(account_id);
                 folders.iter().map(move |folder| {
                     let name = if multi_account {
                         format!("{account_label} / {}", folder.name)

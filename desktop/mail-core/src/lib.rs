@@ -636,6 +636,15 @@ pub enum MailRequest {
     SetPushEnabled {
         enabled: bool,
     },
+    /// Persist reordered account list in `accounts.toml`.
+    ReorderAccounts {
+        account_ids: Vec<u32>,
+    },
+    /// Enable or disable a single account in `accounts.toml` and update watchers/sync.
+    SetAccountEnabled {
+        account_id: u32,
+        enabled: bool,
+    },
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.
@@ -650,6 +659,10 @@ pub enum WorkerEvent {
     },
     AccountDeleted {
         account_id: u32,
+    },
+    /// Full reordered/updated account list emitted after reorder or enable toggle.
+    AccountsUpdated {
+        accounts: Vec<AccountConfig>,
     },
     FoldersLoaded {
         account_id: u32,

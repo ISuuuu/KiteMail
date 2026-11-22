@@ -34,6 +34,56 @@ use crate::app::{
 
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
 const WORDMARK_WHITE: &[u8] = include_bytes!("../../../data/welcome/wordmark-white.png");
+const BRAND_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "brands/outlook.png",
+        include_bytes!("../../../data/brands/outlook.png"),
+    ),
+    (
+        "brands/gmail.png",
+        include_bytes!("../../../data/brands/gmail.png"),
+    ),
+    (
+        "brands/icloud.png",
+        include_bytes!("../../../data/brands/icloud.png"),
+    ),
+    (
+        "brands/yahoo.png",
+        include_bytes!("../../../data/brands/yahoo.png"),
+    ),
+    (
+        "brands/proton.png",
+        include_bytes!("../../../data/brands/proton.png"),
+    ),
+    (
+        "brands/fastmail.png",
+        include_bytes!("../../../data/brands/fastmail.png"),
+    ),
+    (
+        "brands/aol.png",
+        include_bytes!("../../../data/brands/aol.png"),
+    ),
+    (
+        "brands/zoho.png",
+        include_bytes!("../../../data/brands/zoho.png"),
+    ),
+    (
+        "brands/gmx.png",
+        include_bytes!("../../../data/brands/gmx.png"),
+    ),
+    (
+        "brands/yandex.png",
+        include_bytes!("../../../data/brands/yandex.png"),
+    ),
+    (
+        "brands/mailcom.png",
+        include_bytes!("../../../data/brands/mailcom.png"),
+    ),
+    (
+        "brands/stalwart.png",
+        include_bytes!("../../../data/brands/stalwart.png"),
+    ),
+];
 #[cfg(target_os = "windows")]
 pub(crate) const APP_ICON_PNG: &[u8] =
     include_bytes!("../../../data/icons/hicolor/256x256/apps/co.hyprlab.Hylki.png");
@@ -66,13 +116,24 @@ impl AssetSource for HylkiAssets {
         match path {
             "welcome/wordmark-black.png" => Ok(Some(Cow::Borrowed(WORDMARK_BLACK))),
             "welcome/wordmark-white.png" => Ok(Some(Cow::Borrowed(WORDMARK_WHITE))),
-            _ => AllAssets.load(path),
+            _ => {
+                if let Some((_, bytes)) = BRAND_ASSETS
+                    .iter()
+                    .find(|(asset_path, _)| *asset_path == path)
+                {
+                    return Ok(Some(Cow::Borrowed(bytes)));
+                }
+                AllAssets.load(path)
+            }
         }
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut items = AllAssets.list(path)?;
-        for extra in ["welcome/wordmark-black.png", "welcome/wordmark-white.png"] {
+        for extra in ["welcome/wordmark-black.png", "welcome/wordmark-white.png"]
+            .into_iter()
+            .chain(BRAND_ASSETS.iter().map(|(asset_path, _)| *asset_path))
+        {
             if extra.starts_with(path) {
                 items.push(extra.into());
             }
@@ -326,6 +387,9 @@ mod tests {
             IconName::X,
             IconName::Ban,
             IconName::FolderClosed,
+            IconName::ArrowLeft,
+            IconName::GripVertical,
+            IconName::Image,
         ] {
             let bytes = HylkiAssets
                 .load(&icon.path())
@@ -335,6 +399,19 @@ mod tests {
                 "icon {:?} ({}) must be present in HylkiAssets",
                 icon,
                 icon.path()
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_brand_icons_exist() {
+        for (path, _) in super::BRAND_ASSETS {
+            let bytes = HylkiAssets
+                .load(path)
+                .expect("asset source load should not error");
+            assert!(
+                bytes.is_some_and(|b| !b.is_empty()),
+                "brand asset {path} must be present and non-empty in HylkiAssets"
             );
         }
     }

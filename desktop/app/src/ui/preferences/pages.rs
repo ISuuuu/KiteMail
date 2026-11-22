@@ -1581,11 +1581,16 @@ fn render_composing(
         SharedString::from("自动（使用当前查看账号）"),
         String::new(),
     )];
-    for acc in &app_ref.accounts {
-        let label = if acc.display_name.trim().is_empty() {
-            acc.email.clone()
+    for acc in app_ref.accounts.iter().filter(|a| a.enabled) {
+        let primary = acc.display_label();
+        let label = if primary == acc.email {
+            if acc.display_name.trim().is_empty() {
+                acc.email.clone()
+            } else {
+                format!("{} <{}>", acc.display_name.trim(), acc.email)
+            }
         } else {
-            format!("{} <{}>", acc.display_name.trim(), acc.email)
+            format!("{primary} <{}>", acc.email)
         };
         from_options.push((SharedString::from(label), acc.email.clone()));
     }

@@ -179,6 +179,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let account_pills: Vec<gpui_kit::AnyElement> = app
         .accounts
         .iter()
+        .filter(|acc| acc.enabled)
         .map(|acc| {
             let acc_id = acc.id;
             let active = acc_id == app.compose_account_id;
@@ -186,7 +187,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .ghost()
                 .compact()
                 .selected(active)
-                .label(acc.email.clone())
+                .label(acc.display_label())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.compose_account_id = acc_id;
                     cx.notify();

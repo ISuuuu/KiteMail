@@ -19,8 +19,8 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         tab: PrefTab::MailAccounts,
         row_id: "accounts-manage",
         title: "邮箱账号管理与添加",
-        subtitle: "Outlook OAuth2、IMAP/SMTP 服务商预设、连接测试与签名",
-        keywords: "account mail imap smtp oauth outlook gmail qq 163 邮箱 账号 登录 密码 签名",
+        subtitle: "QQ/163/126/企业邮/Gmail/Outlook 等服务商预设、账号昵称/强调色/头像、推送覆盖、统一收件箱与拖拽排序",
+        keywords: "account mail provider imap smtp oauth outlook qq 163 126 exmail aliyun gmail icloud yahoo proton fastmail aol zoho gmx yandex nickname label color emoji avatar unified push reorder 邮箱 账号 服务商 网易 腾讯企业邮 阿里企业邮 登录 密码 签名 昵称 颜色 强调色 头像 推送 排序 统一收件箱",
     },
     // ---- 账号：发件人 ----
     PrefSearchItem {

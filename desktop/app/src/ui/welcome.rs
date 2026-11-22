@@ -16,7 +16,8 @@ use gpui_kit::{
     Window,
 };
 
-use crate::app::{HylkiApp, PROVIDER_PRESETS};
+use crate::app::HylkiApp;
+use crate::ui::accounts::{ProviderKind, ACCOUNT_PROVIDERS};
 use crate::ui::window_controls;
 
 /// 欢迎卡片最大宽度。
@@ -44,17 +45,19 @@ pub(crate) fn render(
 ) -> gpui_kit::AnyElement {
     let win_controls = window_controls::render_window_controls("welcome-wc", window, cx);
 
-    // 服务商预设快捷行。
-    let preset_buttons: Vec<gpui_kit::AnyElement> = PROVIDER_PRESETS
+    // 服务商预设快捷行（欢迎页仅放高频国内 / 主流预设，其余可在设置页下拉选择）。
+    let preset_buttons: Vec<gpui_kit::AnyElement> = ACCOUNT_PROVIDERS
         .iter()
-        .map(|preset| {
+        .enumerate()
+        .filter(|(_, p)| p.kind == ProviderKind::Preset && p.featured_on_welcome)
+        .map(|(idx, preset)| {
             // ElementId 不支持 (&str, &str) 元组。
             let btn_id = SharedString::from(format!("welcome-preset-{}", preset.id));
             Button::new(btn_id)
                 .outline()
                 .label(preset.label)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_settings_preset_account(preset.clone(), cx);
+                    this.open_settings_preset_account(idx, cx);
                 }))
                 .into_any_element()
         })
