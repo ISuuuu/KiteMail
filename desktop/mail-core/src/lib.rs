@@ -222,6 +222,23 @@ pub struct LocalDraft {
     pub updated_at: i64,
 }
 
+/// WP-10-5 写信模板（`Save as Template`）：收件人 + 主题 + 正文的整套快照，
+/// 选中后直接填回写信器。与草稿不同，模板不绑定账号、不参与自动保存。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailTemplate {
+    pub id: u32,
+    pub name: String,
+    pub to_addr: String,
+    pub cc_addr: String,
+    pub bcc_addr: String,
+    pub subject: String,
+    pub body_text: String,
+    /// 正文格式（`ComposeFormat::as_str`）；空 / 未知按富文本处理。
+    pub body_format: String,
+    pub attachment_paths: Vec<String>,
+    pub created_at: i64,
+}
+
 /// One page of message summaries returned from the cache or demo store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailPage {
@@ -673,6 +690,16 @@ pub enum MailRequest {
     DeleteLocalDraft {
         draft_id: u32,
     },
+    /// WP-10-5 保存 / 覆盖一条写信模板（`template.id == 0` 为新建）。
+    SaveTemplate {
+        template: MailTemplate,
+    },
+    /// WP-10-5 删除一条写信模板。
+    DeleteTemplate {
+        template_id: u32,
+    },
+    /// WP-10-5 重新加载模板列表（启动与读写后刷新 UI）。
+    LoadTemplates,
     SendDraft {
         account_id: u32,
         draft: ComposeDraft,
@@ -845,6 +872,10 @@ pub enum WorkerEvent {
     OutboxUpdated {
         account_id: u32,
         items: Vec<OutboxItem>,
+    },
+    /// WP-10-5 写信模板列表（加载 / 保存 / 删除后推送）。
+    TemplatesUpdated {
+        templates: Vec<MailTemplate>,
     },
     /// 撤销发送缓冲：待发记录已持久化到发件箱（Queued + 到期时间），
     /// UI 据此绑定撤销 / 立即发送目标，并确认原草稿已交接落盘。

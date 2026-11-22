@@ -751,6 +751,99 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 })
                 .child(header_row("主题", &app.compose_subject, &p)),
         )
+        // WP-10-5 定时发送：自定义时间输入行（预设时间直接从顶栏时钟下拉里选）。
+        .when(app.compose_schedule_open, |el| {
+            el.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .w(px(LABEL_WIDTH))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .text_color(p.text_muted)
+                            .child("定时发送"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&app.compose_schedule_input)),
+                    )
+                    .child(
+                        Button::new("compose-schedule-confirm")
+                            .primary()
+                            .compact()
+                            .label("确定")
+                            .tooltip("按这个时间排入发件箱（YYYY-MM-DD HH:MM）")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_custom_compose_schedule(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("compose-schedule-cancel")
+                            .ghost()
+                            .compact()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_custom_compose_schedule(cx);
+                            })),
+                    ),
+            )
+        })
+        .when_some(app.compose_schedule_error.clone(), |el, message| {
+            el.child(
+                div()
+                    .pl(px(LABEL_WIDTH + 8.0))
+                    .pb_1()
+                    .text_xs()
+                    .text_color(p.danger)
+                    .child(message),
+            )
+        })
+        // WP-10-5 存为模板：名称输入行（保存后出现在顶栏书签下拉里）。
+        .when(app.compose_template_save_open, |el| {
+            el.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .w(px(LABEL_WIDTH))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .text_color(p.text_muted)
+                            .child("模板名称"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&app.compose_template_name)),
+                    )
+                    .child(
+                        Button::new("compose-template-save-confirm")
+                            .primary()
+                            .compact()
+                            .label("保存")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_save_compose_template(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("compose-template-save-cancel")
+                            .ghost()
+                            .compact()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_save_compose_template(cx);
+                            })),
+                    ),
+            )
+        })
         // F-4：草稿自动保存常驻小字提示（右对齐，自动保存成功后出现）。
         .when_some(app.compose_autosaved_at.clone(), |el, saved_at| {
             el.child(
@@ -776,6 +869,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
             el.child(h_flex().gap_2().flex_wrap().children(attachment_chips))
         })
         // 正文编辑区（flex-1 撑满剩余高度）+ WP-10-3 底部格式 / 格式化工具条。
+        // WP-10-5：整块正文区同时是外部文件拖放入口（DropZones）。
         .child(
             v_flex()
                 .flex_1()
@@ -784,6 +878,9 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .border_1()
                 .border_color(p.border)
                 .bg(p.surface)
+                .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                    this.attach_dropped_files(paths.0.iter().cloned().collect(), cx);
+                }))
                 .child(
                     div()
                         .flex_1()

@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::search_query::SearchQuery;
 use crate::{
-    start_of_today_ts, AttachmentMeta, FolderSummary, LocalDraft, MailPage, MessageDetail,
-    MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet,
-    ThreadMessage, UserContact,
+    start_of_today_ts, AttachmentMeta, FolderSummary, LocalDraft, MailPage, MailTemplate,
+    MessageDetail, MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus,
+    QuickFilterSet, ThreadMessage, UserContact,
 };
 
 /// Remote folder metadata returned by IMAP LIST/STATUS.
@@ -509,6 +509,18 @@ impl CacheStore {
                     name TEXT NOT NULL UNIQUE,
                     color TEXT NOT NULL DEFAULT '#3584e4',
                     shortcut INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    to_addr TEXT NOT NULL DEFAULT '',
+                    cc_addr TEXT NOT NULL DEFAULT '',
+                    bcc_addr TEXT NOT NULL DEFAULT '',
+                    subject TEXT NOT NULL DEFAULT '',
+                    body_text TEXT NOT NULL DEFAULT '',
+                    body_format TEXT NOT NULL DEFAULT '',
+                    attachment_paths_json TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL
                 );
                 ",
             )
@@ -3682,6 +3694,25 @@ impl CacheStore {
         Ok(rows)
     }
 
+    /// 仍排在未来（`send_at > now`）的最早一条 Queued 记录的到期时间。
+    ///
+    /// WP-10-5 定时发送：worker 主循环据此决定下一次巡检的等待时长——有更近的
+    /// 到期记录就等到那一刻，否则按固定间隔轮询。已过期却没发出去的记录
+    /// （例如账号被停用）**不参与**，否则会把「闹钟」永久压在过去的时刻。
+    pub fn next_queued_send_at(&self, now: i64) -> Result<Option<i64>, String> {
+        self.conn
+            .query_row(
+                "
+                SELECT MIN(send_at)
+                FROM outbox
+                WHERE status = 'queued' AND send_at IS NOT NULL AND send_at > ?1
+                ",
+                params![now],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| format!("查询下一个定时发送时间失败: {e}"))
+    }
+
     pub fn expire_queued_outbox(&mut self) -> Result<(), String> {
         self.conn
             .execute(
@@ -3882,6 +3913,107 @@ impl CacheStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析本地草稿失败: {e}"))?;
         Ok(rows)
+    }
+
+    /// 列出全部写信模板（WP-10-5 `Save as Template`），新建的在前。
+    pub fn list_templates(&self) -> Result<Vec<MailTemplate>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, name, to_addr, cc_addr, bcc_addr, subject, body_text,
+                       body_format, attachment_paths_json, created_at
+                FROM templates
+                ORDER BY created_at DESC, id DESC
+                ",
+            )
+            .map_err(|e| format!("查询写信模板失败: {e}"))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let paths_json: String = row.get(8)?;
+                let attachment_paths: Vec<String> =
+                    serde_json::from_str(&paths_json).unwrap_or_default();
+                Ok(MailTemplate {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    to_addr: row.get(2)?,
+                    cc_addr: row.get(3)?,
+                    bcc_addr: row.get(4)?,
+                    subject: row.get(5)?,
+                    body_text: row.get(6)?,
+                    body_format: row.get(7)?,
+                    attachment_paths,
+                    created_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| format!("读取写信模板失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析写信模板失败: {e}"))?;
+        Ok(rows)
+    }
+
+    /// 保存写信模板：`id == 0` 新建，否则按 ID 覆盖（返回最终 ID）。
+    pub fn upsert_template(&mut self, template: &MailTemplate) -> Result<u32, String> {
+        let paths_json =
+            serde_json::to_string(&template.attachment_paths).unwrap_or_else(|_| "[]".to_string());
+        if template.id == 0 {
+            self.conn
+                .execute(
+                    "
+                    INSERT INTO templates (
+                        name, to_addr, cc_addr, bcc_addr, subject, body_text,
+                        body_format, attachment_paths_json, created_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    ",
+                    params![
+                        template.name,
+                        template.to_addr,
+                        template.cc_addr,
+                        template.bcc_addr,
+                        template.subject,
+                        template.body_text,
+                        template.body_format,
+                        paths_json,
+                        template.created_at
+                    ],
+                )
+                .map_err(|e| format!("保存写信模板失败: {e}"))?;
+            return Ok(self.conn.last_insert_rowid() as u32);
+        }
+        self.conn
+            .execute(
+                "
+                UPDATE templates
+                SET name = ?2, to_addr = ?3, cc_addr = ?4, bcc_addr = ?5, subject = ?6,
+                    body_text = ?7, body_format = ?8, attachment_paths_json = ?9,
+                    created_at = ?10
+                WHERE id = ?1
+                ",
+                params![
+                    template.id,
+                    template.name,
+                    template.to_addr,
+                    template.cc_addr,
+                    template.bcc_addr,
+                    template.subject,
+                    template.body_text,
+                    template.body_format,
+                    paths_json,
+                    template.created_at
+                ],
+            )
+            .map_err(|e| format!("更新写信模板失败: {e}"))?;
+        Ok(template.id)
+    }
+
+    /// 删除一条写信模板。
+    pub fn delete_template(&mut self, template_id: u32) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM templates WHERE id = ?1", params![template_id])
+            .map_err(|e| format!("删除写信模板失败: {e}"))?;
+        Ok(())
     }
 
     /// Delete a local draft by ID.
@@ -4227,6 +4359,49 @@ mod tests {
     }
 
     #[test]
+    fn templates_round_trip_and_delete() {
+        // WP-10-5：模板保存 / 覆盖 / 列表 / 删除的完整往返。
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        assert!(cache.list_templates().unwrap().is_empty());
+
+        let id = cache
+            .upsert_template(&MailTemplate {
+                id: 0,
+                name: "客户回访".into(),
+                to_addr: "a@x.com".into(),
+                cc_addr: String::new(),
+                bcc_addr: String::new(),
+                subject: "回访".into(),
+                body_text: "您好".into(),
+                body_format: "markdown".into(),
+                attachment_paths: vec!["C:////tmp////a.pdf".into()],
+                created_at: 100,
+            })
+            .unwrap();
+        assert!(id > 0);
+
+        let list = cache.list_templates().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "客户回访");
+        assert_eq!(list[0].body_format, "markdown");
+        assert_eq!(
+            list[0].attachment_paths,
+            vec!["C:////tmp////a.pdf".to_string()]
+        );
+
+        // 同 ID 覆盖更新，不新增行。
+        let mut updated = list[0].clone();
+        updated.name = "新名字".into();
+        assert_eq!(cache.upsert_template(&updated).unwrap(), id);
+        let list = cache.list_templates().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "新名字");
+
+        cache.delete_template(id).unwrap();
+        assert!(cache.list_templates().unwrap().is_empty());
+    }
+
+    #[test]
     fn outbox_preserves_uncertain_state_without_auto_resend() {
         let mut cache = CacheStore::open_in_memory().expect("open memory db");
         let id = cache
@@ -4343,6 +4518,78 @@ mod tests {
         // 领取后到期扫描为空；未到期记录仍在排队但不出现在到期列表。
         assert!(cache.list_due_queued_ids(Some(1), now).unwrap().is_empty());
         assert!(cache.list_due_queued_ids(None, now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn next_queued_send_at_tracks_earliest_pending() {
+        // WP-10-5：worker 主循环按「最早的定时记录」决定巡检等待时长。
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let now = 1_700_000_000i64;
+        // 没有任何定时记录 -> None（主循环退回 30 秒固定轮询）。
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), None);
+
+        let later = cache
+            .enqueue_outbox(
+                1,
+                "late@x.com",
+                "",
+                "",
+                "晚上发",
+                "正文",
+                "",
+                &[],
+                now,
+                Some(now + 3600),
+            )
+            .unwrap();
+        let sooner = cache
+            .enqueue_outbox(
+                1,
+                "soon@x.com",
+                "",
+                "",
+                "一小时后发",
+                "正文",
+                "",
+                &[],
+                now,
+                Some(now + 600),
+            )
+            .unwrap();
+        // 取最早的一个，而不是最后写入的。
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), Some(now + 600));
+
+        // 到了到期时刻领取投递后，该记录不再算作待发（只剩较晚的一条）。
+        assert!(cache
+            .claim_outbox_for_delivery(sooner, now + 600)
+            .unwrap()
+            .is_some());
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), Some(now + 3600));
+
+        // 撤销（删除）后彻底没有定时记录。
+        cache.delete_outbox(later).unwrap();
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), None);
+
+        // 已过期却没发出去的记录（账号停用）不算「未来闹钟」，不会让主循环空转。
+        let stale = cache
+            .enqueue_outbox(
+                1,
+                "stale@x.com",
+                "",
+                "",
+                "过期未发",
+                "正文",
+                "",
+                &[],
+                now,
+                Some(now - 30),
+            )
+            .unwrap();
+        assert_eq!(cache.next_queued_send_at(now).unwrap(), None);
+        assert_eq!(
+            cache.list_due_queued_ids(None, now).unwrap(),
+            vec![(1, stale)]
+        );
     }
 
     #[test]

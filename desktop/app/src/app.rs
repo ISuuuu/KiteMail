@@ -15,10 +15,11 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{resize_handle, HandleEdge};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::{RangeHighlight, TextViewState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{h_flex, v_flex, Icon};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     actions, black, div, img, point, px, size, AnyWindowHandle, AppContext, Axis, Bounds,
@@ -36,10 +37,11 @@ use hylki_mail_core::markup::ComposeFormat;
 use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
     contacts_io, detect_attachment_reminder, format_reply_header, ComposeDraft, FolderSummary,
-    LocalDraft, MailPage, MailRequest, MessageDetail, MessageFilter, MessageSort, MessageSummary,
-    OutboxItem, QuickFilterSet, SearchScope, UnifiedView, UserContact, WorkerEvent,
+    LocalDraft, MailPage, MailRequest, MailTemplate, MessageDetail, MessageFilter, MessageSort,
+    MessageSummary, OutboxItem, QuickFilterSet, SearchScope, UnifiedView, UserContact, WorkerEvent,
 };
 
+use crate::compose_schedule::{self, LaterPreset};
 use crate::theme;
 use crate::tray::{self, TrayCommand, TrayHandle};
 use crate::ui::attachment_drawer::{
@@ -685,6 +687,8 @@ pub(crate) struct HylkiApp {
     /// Ctrl+点击多选的邮件 ID 集合。
     pub(crate) selected_message_ids: HashSet<u32>,
     pub(crate) drafts: Vec<LocalDraft>,
+    /// WP-10-5 写信模板（`Save as Template` 保存的整套草稿快照）。
+    pub(crate) templates: Vec<MailTemplate>,
     pub(crate) outbox_by_account: BTreeMap<u32, Vec<OutboxItem>>,
     pub(crate) right_mode: RightPaneMode,
     /// WP-10：首次启动欢迎向导当前步骤（0..=4：Welcome -> Theme & Layout -> Add Account -> Sync & AI -> Ready）。
@@ -725,6 +729,16 @@ pub(crate) struct HylkiApp {
     pub(crate) compose_detached: bool,
     /// 独立写信窗口的句柄（`None` = 未弹出或在别处已被关掉）。
     compose_window: Option<AnyWindowHandle>,
+    /// WP-10-5 定时发送：自定义时间输入行是否展开（预设时间直接从下拉里选）。
+    pub(crate) compose_schedule_open: bool,
+    /// WP-10-5 自定义定时时间手输框（`YYYY-MM-DD HH:MM`）。
+    pub(crate) compose_schedule_input: Entity<InputState>,
+    /// WP-10-5 自定义定时时间的校验提示。
+    pub(crate) compose_schedule_error: Option<SharedString>,
+    /// WP-10-5 保存模板时的名称输入行是否展开。
+    pub(crate) compose_template_save_open: bool,
+    /// WP-10-5 保存模板的名称输入框。
+    pub(crate) compose_template_name: Entity<InputState>,
     pub(crate) compose_in_reply_to: String,
     pub(crate) compose_attachments: Vec<String>,
     /// 写信退出前未保存确认条显示状态。
@@ -1054,6 +1068,32 @@ impl HylkiApp {
         // WP-10-2：自定义 From 手输框（对应原版 `custom_from_row`）。
         let compose_from =
             cx.new(|cx| InputState::new(window, cx).placeholder("发件人：自定义 Name <addr>"));
+        // WP-10-5：定时发送的自定义时间（默认收起，点「自定义时间…」才展开）。
+        let compose_schedule_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("定时发送时间：2026-11-23 08:00"));
+        // WP-10-5：保存模板时的名称输入框（默认取主题）。
+        let compose_template_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("模板名称（例如：客户回访）"));
+        // WP-10-5：模板名称回车即保存（与「保存」按钮同一条路径）。
+        cx.subscribe(
+            &compose_template_name,
+            |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.confirm_save_compose_template(cx);
+                }
+            },
+        )
+        .detach();
+        // WP-10-5：定时时间输入框回车即确认（与「确定」按钮同一条路径）。
+        cx.subscribe(
+            &compose_schedule_input,
+            |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.confirm_custom_compose_schedule(cx);
+                }
+            },
+        )
+        .detach();
         let compose_body = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(10, 24)
@@ -1198,6 +1238,7 @@ impl HylkiApp {
                 selected_message,
                 selected_message_ids: HashSet::new(),
                 drafts: Vec::new(),
+                templates: Vec::new(),
                 outbox_by_account: BTreeMap::new(),
                 right_mode: RightPaneMode::Reader,
                 welcome_step: 0,
@@ -1220,6 +1261,11 @@ impl HylkiApp {
                 compose_split_height: COMPOSE_SPLIT_DEFAULT_HEIGHT,
                 compose_detached: false,
                 compose_window: None,
+                compose_schedule_open: false,
+                compose_schedule_input: compose_schedule_input.clone(),
+                compose_schedule_error: None,
+                compose_template_save_open: false,
+                compose_template_name: compose_template_name.clone(),
                 compose_in_reply_to: String::new(),
                 compose_attachments: Vec::new(),
                 compose_confirm_discard: false,
@@ -1329,6 +1375,8 @@ impl HylkiApp {
         if let Some(ref w) = worker {
             if !existing_accounts.is_empty() {
                 w.send(MailRequest::LoadAllCached);
+                // WP-10-5：写信模板与缓存一起加载，首次打开写信就有模板可选。
+                w.send(MailRequest::LoadTemplates);
                 w.send(MailRequest::ListKnownContacts {
                     query: String::new(),
                     offset: 0,
@@ -1401,6 +1449,7 @@ impl HylkiApp {
             selected_message: None,
             selected_message_ids: HashSet::new(),
             drafts: Vec::new(),
+            templates: Vec::new(),
             outbox_by_account: BTreeMap::new(),
             // 方案文档页面 2：启动且无账号（非 demo）时进入欢迎向导。
             right_mode: if has_account {
@@ -1427,6 +1476,11 @@ impl HylkiApp {
             compose_split_height: COMPOSE_SPLIT_DEFAULT_HEIGHT,
             compose_detached: false,
             compose_window: None,
+            compose_schedule_open: false,
+            compose_schedule_input: compose_schedule_input.clone(),
+            compose_schedule_error: None,
+            compose_template_save_open: false,
+            compose_template_name: compose_template_name.clone(),
             compose_in_reply_to: String::new(),
             compose_attachments: Vec::new(),
             compose_confirm_discard: false,
@@ -1780,6 +1834,9 @@ impl HylkiApp {
                 }
                 WorkerEvent::DraftsUpdated { drafts } => {
                     self.drafts = drafts;
+                }
+                WorkerEvent::TemplatesUpdated { templates } => {
+                    self.templates = templates;
                 }
                 WorkerEvent::OutboxUpdated { account_id, items } => {
                     // 撤销缓冲对应的记录已被投递（如侧栏手动重发）或删除时清除缓冲横幅。
@@ -4169,6 +4226,202 @@ impl HylkiApp {
         }
     }
 
+    // ---- WP-10-5：定时发送（Send Later） ----
+
+    /// 定时发送下拉里的预设时间（今晚 / 明早 / 明天下午 / 周六 / 周一），
+    /// 与 Snooze 共用同一份时间表（对齐原版 `src/ui/later.rs`）。
+    pub(crate) fn compose_later_presets(&self) -> Vec<LaterPreset> {
+        compose_schedule::later_presets()
+    }
+
+    /// 展开「自定义时间…」输入行，预填下一个整点。
+    pub(crate) fn begin_custom_compose_schedule(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let at = (chrono::Local::now() + chrono::Duration::hours(1))
+            .format("%Y-%m-%d %H:00")
+            .to_string();
+        self.compose_schedule_open = true;
+        self.compose_schedule_error = None;
+        self.compose_schedule_input
+            .update(cx, |input, cx| input.set_value(at, window, cx));
+        self.compose_schedule_input
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
+    /// 确认手输的定时时间：解析成功后直接排入发件箱。
+    pub(crate) fn confirm_custom_compose_schedule(&mut self, cx: &mut Context<Self>) {
+        let text = self.compose_schedule_input.read(cx).value().to_string();
+        match compose_schedule::parse_schedule_input(&text, chrono::Local::now()) {
+            Ok(at) => {
+                self.compose_schedule_error = None;
+                self.send_compose_scheduled(at, cx);
+            }
+            Err(message) => {
+                self.compose_schedule_error = Some(SharedString::from(message));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 收起自定义时间输入行（不影响已排期的邮件）。
+    pub(crate) fn cancel_custom_compose_schedule(&mut self, cx: &mut Context<Self>) {
+        self.compose_schedule_open = false;
+        self.compose_schedule_error = None;
+        cx.notify();
+    }
+
+    /// WP-10-5 拖拽上传附件：把拖进写信区的文件追加到附件列表。
+    ///
+    /// 目录直接忽略（拖一整个文件夹进来没有意义），同名/同路径的跳过，
+    /// 避免重复拖入同一份文件把附件列表撑成一串重复项。
+    pub(crate) fn attach_dropped_files(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut added = 0usize;
+        for path in paths {
+            if path.is_dir() {
+                continue;
+            }
+            let display = path.to_string_lossy().to_string();
+            if display.is_empty() || self.compose_attachments.contains(&display) {
+                continue;
+            }
+            self.compose_attachments.push(display);
+            added += 1;
+        }
+        if added > 0 {
+            self.status_line = SharedString::from(format!("已添加 {added} 个附件"));
+            self.cancel_draft_autosave();
+            cx.notify();
+        }
+    }
+
+    // ---- WP-10-5：写信模板（Save as Template） ----
+
+    /// 把模板内容填回写信器：收件人、主题、正文、正文格式与附件一并恢复。
+    pub(crate) fn apply_compose_template(
+        &mut self,
+        template: &MailTemplate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_recipient_field_text(ComposeAddressField::To, &template.to_addr, window, cx);
+        self.set_recipient_field_text(ComposeAddressField::Cc, &template.cc_addr, window, cx);
+        self.set_recipient_field_text(ComposeAddressField::Bcc, &template.bcc_addr, window, cx);
+        if !template.cc_addr.is_empty() || !template.bcc_addr.is_empty() {
+            self.compose_show_cc_bcc = true;
+        }
+        self.compose_subject.update(cx, |s, cx| {
+            s.set_value(template.subject.clone(), window, cx)
+        });
+        // 正文按模板记录里的格式打开，避免把 Markdown 源当成纯文本发出去。
+        self.compose_format = ComposeFormat::from_str_lossy(&template.body_format);
+        self.compose_body.update(cx, |s, cx| {
+            s.set_value(template.body_text.clone(), window, cx)
+        });
+        // 附件按路径去重合并，已在信里的不重复添加。
+        for path in &template.attachment_paths {
+            if !self.compose_attachments.contains(path) {
+                self.compose_attachments.push(path.clone());
+            }
+        }
+        self.cancel_draft_autosave();
+        self.compose_template_save_open = false;
+        self.status_line = SharedString::from(format!("已套用模板「{}」", template.name));
+        cx.notify();
+    }
+
+    /// 展开「存为模板」的名称输入行，默认用当前主题当名称。
+    pub(crate) fn begin_save_compose_template(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subject = self.compose_subject.read(cx).value().trim().to_string();
+        let name = if subject.is_empty() {
+            "未命名模板".to_string()
+        } else {
+            subject
+        };
+        self.compose_template_save_open = true;
+        self.compose_template_name
+            .update(cx, |input, cx| input.set_value(name, window, cx));
+        self.compose_template_name
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
+    /// 把当前写信内容存成一条新模板。
+    pub(crate) fn confirm_save_compose_template(&mut self, cx: &mut Context<Self>) {
+        let name = self
+            .compose_template_name
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            self.status_line = SharedString::from("请填写模板名称");
+            cx.notify();
+            return;
+        }
+        let template = MailTemplate {
+            id: 0,
+            name,
+            to_addr: self.compose_field_text(ComposeAddressField::To, cx),
+            cc_addr: self.compose_field_text(ComposeAddressField::Cc, cx),
+            bcc_addr: self.compose_field_text(ComposeAddressField::Bcc, cx),
+            subject: self.compose_subject.read(cx).value().to_string(),
+            body_text: self.compose_body.read(cx).value().to_string(),
+            body_format: self.compose_format.as_str().to_string(),
+            attachment_paths: self.compose_attachments.clone(),
+            created_at: chrono::Local::now().timestamp(),
+        };
+        self.compose_template_save_open = false;
+        if self.demo_mode {
+            self.status_line =
+                SharedString::from(format!("演示模式：已生成模板「{}」", template.name));
+            cx.notify();
+            return;
+        }
+        let result = self
+            .worker
+            .as_ref()
+            .ok_or_else(|| "邮件后台线程不可用".to_string())
+            .and_then(|w| w.send_checked(MailRequest::SaveTemplate { template }));
+        self.status_line = SharedString::from(match result {
+            Ok(()) => "模板已保存".to_string(),
+            Err(message) => message,
+        });
+        cx.notify();
+    }
+
+    /// 收起「存为模板」的名称输入行。
+    pub(crate) fn cancel_save_compose_template(&mut self, cx: &mut Context<Self>) {
+        self.compose_template_save_open = false;
+        cx.notify();
+    }
+
+    /// 删除一条模板（下拉里每项的「删除」）。
+    pub(crate) fn delete_compose_template(&mut self, template_id: u32, cx: &mut Context<Self>) {
+        self.templates.retain(|t| t.id != template_id);
+        if self.demo_mode {
+            cx.notify();
+            return;
+        }
+        if let Some(worker) = self.worker.as_ref() {
+            let _ = worker.send_checked(MailRequest::DeleteTemplate { template_id });
+        }
+        cx.notify();
+    }
+
     // ---- WP-10-4：内联上下分屏回复与独立写信窗口 ----
 
     /// 进入写信会话时决定挂载方式。
@@ -4185,6 +4438,10 @@ impl HylkiApp {
             self.close_compose_window(cx);
         }
         self.compose_detached = false;
+        // 定时发送 / 存模板都是「这一次写信」的一次性动作，新会话重新收起。
+        self.compose_schedule_open = false;
+        self.compose_schedule_error = None;
+        self.compose_template_save_open = false;
         self.compose_split = split && self.prefs.compose_inline && self.selected_message.is_some();
         if self.compose_split_height < COMPOSE_SPLIT_MIN_HEIGHT {
             self.compose_split_height = COMPOSE_SPLIT_DEFAULT_HEIGHT;
@@ -5124,14 +5381,25 @@ impl HylkiApp {
     }
 
     pub(crate) fn send_compose(&mut self, cx: &mut Context<Self>) {
-        self.send_compose_inner(true, cx);
+        self.send_compose_inner(true, None, cx);
     }
 
     pub(crate) fn send_compose_forced(&mut self, cx: &mut Context<Self>) {
-        self.send_compose_inner(false, cx);
+        self.send_compose_inner(false, None, cx);
     }
 
-    fn send_compose_inner(&mut self, check_attachments: bool, cx: &mut Context<Self>) {
+    /// WP-10-5 定时发送：走与立即发送完全相同的校验，只是把到期时间换成用户
+    /// 挑的那一刻，并且不进入撤销发送倒计时。
+    pub(crate) fn send_compose_scheduled(&mut self, at: i64, cx: &mut Context<Self>) {
+        self.send_compose_inner(true, Some(at), cx);
+    }
+
+    fn send_compose_inner(
+        &mut self,
+        check_attachments: bool,
+        schedule_at: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
         if self.quitting
             || (!self.demo_mode
                 && self
@@ -5210,6 +5478,21 @@ impl HylkiApp {
             self.commit_pending_send(prev, cx);
         }
         let delay_secs = self.prefs.undo_send_secs.min(30) as u8;
+        // WP-10-5：定时发送把绝对时间折算成剩余秒数交给 worker（`SendDraft.send_at`
+        // 的既有语义就是「延迟秒数」），由 worker 定时巡检到点投递。
+        let scheduled_secs = match schedule_at {
+            Some(at) => {
+                let remaining = at - chrono::Local::now().timestamp();
+                if remaining <= 0 {
+                    self.compose_schedule_error =
+                        Some(SharedString::from("定时发送时间必须晚于当前时间"));
+                    cx.notify();
+                    return;
+                }
+                Some(remaining)
+            }
+            None => None,
+        };
         let token = self.next_send_token;
         self.next_send_token = self.next_send_token.wrapping_add(1).max(1);
         let pending = PendingSend {
@@ -5244,7 +5527,7 @@ impl HylkiApp {
                 draft: pending.draft.clone(),
                 local_draft_id: pending.local_draft_id,
                 undo_token: token,
-                send_at: Some(delay_secs as i64),
+                send_at: Some(scheduled_secs.unwrap_or(delay_secs as i64)),
             };
             let result = self
                 .worker
@@ -5257,7 +5540,10 @@ impl HylkiApp {
                 return;
             }
         }
-        self.pending_send = Some(pending);
+        // 定时发送不进撤销倒计时：记录已在发件箱排队，等 worker 到点投递即可。
+        if scheduled_secs.is_none() {
+            self.pending_send = Some(pending);
+        }
         self.compose_confirm_discard = false;
         self.compose_autocomplete_field = None;
         self.pending_forward_msg_id = None;
@@ -5270,6 +5556,19 @@ impl HylkiApp {
         self.finish_compose_session(cx);
         self.right_mode = RightPaneMode::Reader;
         self.error_banner = None;
+
+        if let Some(at) = schedule_at {
+            self.compose_schedule_open = false;
+            self.compose_schedule_error = None;
+            let when = compose_schedule::schedule_label(at);
+            self.status_line = SharedString::from(if self.demo_mode {
+                format!("演示定时发送：{when}")
+            } else {
+                format!("已排入定时发送：{when}，到点自动发出")
+            });
+            cx.notify();
+            return;
+        }
 
         if self.demo_mode {
             self.start_send_countdown(token, delay_secs, cx);
@@ -8006,6 +8305,102 @@ impl HylkiApp {
                                 this.pick_attachments(cx);
                             })),
                     )
+                    .child({
+                        // WP-10-5 写信模板：套用 / 存为模板 / 删除。
+                        let templates = self.templates.clone();
+                        let ent_tpl = cx.entity();
+                        Button::new("compose-bar-template")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Bookmark)
+                            .tooltip("写信模板")
+                            .dropdown_menu(move |mut menu, _, _| {
+                                if templates.is_empty() {
+                                    menu =
+                                        menu.item(PopupMenuItem::label("还没有模板，先写一封再存"));
+                                }
+                                for tpl in templates.iter() {
+                                    let tpl_item = tpl.clone();
+                                    let ent_item = ent_tpl.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(tpl.name.clone())
+                                            .icon(Icon::new(IconName::Bookmark))
+                                            .on_click(move |_, window, cx| {
+                                                ent_item.update(cx, |this, cx| {
+                                                    this.apply_compose_template(
+                                                        &tpl_item, window, cx,
+                                                    )
+                                                });
+                                            }),
+                                    );
+                                }
+                                let ent_save = ent_tpl.clone();
+                                menu = menu.item(PopupMenuItem::separator());
+                                menu = menu.item(
+                                    PopupMenuItem::new("存为模板…")
+                                        .icon(Icon::new(IconName::BookmarkPlus))
+                                        .on_click(move |_, window, cx| {
+                                            ent_save.update(cx, |this, cx| {
+                                                this.begin_save_compose_template(window, cx)
+                                            });
+                                        }),
+                                );
+                                if templates.is_empty() {
+                                    return menu;
+                                }
+                                menu = menu.item(PopupMenuItem::separator());
+                                for tpl in templates.iter() {
+                                    let id = tpl.id;
+                                    let name = tpl.name.clone();
+                                    let ent_item = ent_tpl.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(format!("删除「{name}」"))
+                                            .icon(Icon::new(IconName::Trash))
+                                            .on_click(move |_, _, cx| {
+                                                ent_item.update(cx, |this, cx| {
+                                                    this.delete_compose_template(id, cx)
+                                                });
+                                            }),
+                                    );
+                                }
+                                menu
+                            })
+                    })
+                    .child({
+                        // WP-10-5 定时发送：预设时间与「自定义时间…」。
+                        let presets = self.compose_later_presets();
+                        let ent_schedule = cx.entity();
+                        Button::new("compose-bar-schedule")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::AlarmClock)
+                            .tooltip("定时发送")
+                            .dropdown_menu(move |mut menu, _, _| {
+                                for preset in presets.iter() {
+                                    let at = preset.at;
+                                    let ent_item = ent_schedule.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(preset.label.clone()).on_click(
+                                            move |_, _, cx| {
+                                                ent_item.update(cx, |this, cx| {
+                                                    this.send_compose_scheduled(at, cx)
+                                                });
+                                            },
+                                        ),
+                                    );
+                                }
+                                let ent_custom = ent_schedule.clone();
+                                menu.item(
+                                    PopupMenuItem::new("自定义时间…")
+                                        .icon(Icon::new(IconName::Pencil))
+                                        .on_click(move |_, window, cx| {
+                                            ent_custom.update(cx, |this, cx| {
+                                                this.begin_custom_compose_schedule(window, cx)
+                                            });
+                                        }),
+                                )
+                            })
+                    })
                     .child(
                         Button::new("compose-bar-send")
                             .primary()
