@@ -558,8 +558,18 @@ pub enum MailRequest {
         account_id: u32,
         draft: ComposeDraft,
         local_draft_id: Option<u32>,
+        /// 撤销发送客户端令牌（`send_at` 为 `Some` 时用于 `OutboxEnqueued` 回执匹配）。
+        undo_token: u64,
+        /// `Some(到期时间戳)` = 仅入队不投递（撤销发送缓冲，到期后由启动恢复 /
+        /// 重新启用账号 / 显式重试投递）；`None` = 入队后立即投递。
+        send_at: Option<i64>,
     },
     RetryOutboxItem {
+        account_id: u32,
+        outbox_id: u32,
+    },
+    /// 撤销发送：删除仍在排队（Queued）的发件箱记录；已被领取投递的记录不可撤销。
+    DeleteOutboxItem {
         account_id: u32,
         outbox_id: u32,
     },
@@ -681,6 +691,19 @@ pub enum WorkerEvent {
     OutboxUpdated {
         account_id: u32,
         items: Vec<OutboxItem>,
+    },
+    /// 撤销发送缓冲：待发记录已持久化到发件箱（Queued + 到期时间），
+    /// UI 据此绑定撤销 / 立即发送目标，并确认原草稿已交接落盘。
+    OutboxEnqueued {
+        token: u64,
+        account_id: u32,
+        outbox_id: u32,
+    },
+    /// Microsoft OAuth 重授权返回了与编辑中账号不一致的邮箱：保留原账号、凭据与
+    /// 缓存完全不动，提示用户重新选择原邮箱授权或通过「添加账号」流程接入新邮箱。
+    OAuthRebindRejected {
+        account_id: Option<u32>,
+        returned_email: String,
     },
     DraftSent {
         account_id: u32,

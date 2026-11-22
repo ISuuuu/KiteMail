@@ -203,6 +203,11 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .map(|(idx, path)| attachment_chip(idx, path, cx).into_any_element())
         .collect();
 
+    // 任务一：当前所选发件账号已停用（或不存在）时的提示条；发送入口同时阻断，
+    // 要求用户明确选择可用账号后才能发送。
+    let sender_unavailable = app.compose_sender_unavailable();
+    let has_enabled_account = app.accounts.iter().any(|acc| acc.enabled);
+
     v_flex()
         .flex_1()
         .min_w_0()
@@ -210,6 +215,32 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .bg(p.canvas)
         .p_4()
         .gap_3()
+        // 发件账号停用提示条。
+        .when(sender_unavailable, |el| {
+            el.child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(p.danger.opacity(0.5))
+                    .bg(p.danger.opacity(0.10))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.danger)
+                            .child(SharedString::from(if has_enabled_account {
+                                "当前所选发件账号已停用，请点击上方发件人选择可用账号后再发送"
+                            } else {
+                                "所有邮箱账号均已停用，请先在偏好设置中启用一个账号后再发送"
+                            })),
+                    ),
+            )
+        })
         // 未保存退出确认条。
         .when(app.compose_confirm_discard, |el| {
             el.child(

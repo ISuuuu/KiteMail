@@ -34,6 +34,10 @@ pub(crate) enum EditorLeaveAction {
     SwitchTab(PrefTab),
     ActivateSearchHit(&'static PrefSearchItem),
     CloseWindow,
+    /// 主窗口 / 账号列表请求编辑指定账号（任务二：跳转前接入未保存确认）。
+    EditAccount(u32),
+    /// 主窗口 / 欢迎页请求新建账号（任务二：跳转前接入未保存确认）。
+    NewAccount,
 }
 
 /// 侧栏分组（对齐 Linux 版 `账号` / `设置` 2 个分组）。
@@ -201,6 +205,24 @@ impl SettingsWindow {
         let initial_scale = config::clamp_ui_text_scale(initial_prefs.ui_text_scale_percent);
         window.set_rem_size(px(16.0 * initial_scale as f32 / 100.0));
 
+        // 任务二：Alt+F4 / 系统关闭与窗口关闭按钮走同一套离开确认——账号编辑
+        // 页有未保存改动时先拦截并弹「保存 / 放弃 / 继续编辑」确认条。
+        let weak_self = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            weak_self
+                .update(cx, |this, cx| {
+                    if this.is_account_editor_dirty(cx) {
+                        this.pending_leave_action = Some(EditorLeaveAction::CloseWindow);
+                        this.confirm_remove_in_editor = false;
+                        cx.notify();
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .unwrap_or(true)
+        });
+
         // 只要主应用状态更新（如同步、账号保存回执、偏好变更），自动刷新本窗口。
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
 
@@ -339,6 +361,26 @@ impl SettingsWindow {
         }
     }
 
+    /// 主窗口 / 账号列表请求编辑指定账号（任务二）：表单有未保存改动时先弹
+    /// 「保存 / 放弃 / 继续编辑」确认，保存成功后再执行跳转。
+    pub(crate) fn request_edit_account_editor(
+        &mut self,
+        account_id: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_leave_editor(EditorLeaveAction::EditAccount(account_id), window, cx);
+    }
+
+    /// 主窗口 / 欢迎页请求新建账号（任务二）：同样接入未保存确认。
+    pub(crate) fn request_new_account_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_leave_editor(EditorLeaveAction::NewAccount, window, cx);
+    }
+
     fn execute_leave_action(
         &mut self,
         action: EditorLeaveAction,
@@ -376,6 +418,24 @@ impl SettingsWindow {
                 self.account_editor_open = false;
                 self.after_save_action = None;
                 self.force_close_window(window, cx);
+            }
+            EditorLeaveAction::EditAccount(account_id) => {
+                let cfg = self
+                    .app
+                    .read(cx)
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == account_id)
+                    .cloned();
+                if let Some(cfg) = cfg {
+                    self.open_edit_account_editor(&cfg, window, cx);
+                } else {
+                    // 账号已被移除等罕见竞态：保留当前界面。
+                    cx.notify();
+                }
+            }
+            EditorLeaveAction::NewAccount => {
+                self.open_new_account_editor(window, cx);
             }
         }
     }

@@ -12,7 +12,7 @@ use crate::secrets::{self, AccountSecrets};
 use crate::smtp_client::SendOutcome;
 use crate::{
     graph_client, imap_client, oauth, smtp_client, MailRequest, MessageFilter, MessageSort,
-    MessageSummary, OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
+    MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
 };
 
 type TokenCache = HashMap<u32, (String, Instant)>;
@@ -86,6 +86,7 @@ async fn worker_loop(
         for acc in &accounts {
             refresh_account_watcher(&mut watchers, &data_dir, acc, &req_tx);
         }
+        deliver_due_outbox(&data_dir, &mut cache, &mut tokens, &accounts, &evt_tx).await;
     }
 
     while let Ok(req) = req_rx.recv() {
@@ -140,6 +141,47 @@ fn unified_account_ids(data_dir: &std::path::Path) -> Vec<u32> {
         .filter(|acc| acc.enabled && acc.in_unified)
         .map(|acc| acc.id)
         .collect()
+}
+
+/// Microsoft OAuth 返回身份的归属判定结果（任务二：先用邮箱核对账号身份再换绑）。
+#[derive(Debug, PartialEq, Eq)]
+enum OAuthAccountMatch {
+    /// 返回邮箱与账号身份一致：绑定到该账号 ID，更新令牌与配置。
+    Bind(u32),
+    /// 返回邮箱与正在编辑的原账号不一致：保留原账号、凭据与缓存完全不动。
+    Rejected,
+}
+
+/// 判定 OAuth 授权返回的邮箱应绑定到哪个账号：
+/// - 重新授权（`editing_account_id` 有值）：仅当返回邮箱与原账号一致（忽略大小写）
+///   时更新原账号，否则拒绝换绑（无论该邮箱是否命中其他已有账号）。
+/// - 添加账号流程（`editing_account_id` 为空）：返回邮箱命中已有账号时复用该账号，
+///   否则分配新账号 ID。
+fn resolve_oauth_account_match(
+    editing_account_id: Option<u32>,
+    existing: &[AccountConfig],
+    returned_email: &str,
+) -> OAuthAccountMatch {
+    match editing_account_id {
+        Some(edit_id) => {
+            let same_as_editing = existing
+                .iter()
+                .find(|a| a.id == edit_id)
+                .is_some_and(|a| a.email.eq_ignore_ascii_case(returned_email));
+            if same_as_editing {
+                OAuthAccountMatch::Bind(edit_id)
+            } else {
+                OAuthAccountMatch::Rejected
+            }
+        }
+        None => match existing
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(returned_email))
+        {
+            Some(acc) => OAuthAccountMatch::Bind(acc.id),
+            None => OAuthAccountMatch::Bind(config::next_account_id(existing)),
+        },
+    }
 }
 
 fn refresh_account_watcher(
@@ -538,14 +580,19 @@ async fn handle_request(
             };
 
             let existing = config::load_accounts_in(data_dir).unwrap_or_default();
-            let account_id = editing_account_id
-                .or_else(|| {
-                    existing
-                        .iter()
-                        .find(|a| a.email.eq_ignore_ascii_case(&result.email))
-                        .map(|a| a.id)
-                })
-                .unwrap_or_else(|| config::next_account_id(&existing));
+            // 先用返回的邮箱核对账号身份：与编辑中账号一致才更新；选择了另一个
+            // 邮箱时保留原账号、凭据与缓存完全不动，提示用户重新授权或走添加流程。
+            let account_id =
+                match resolve_oauth_account_match(editing_account_id, &existing, &result.email) {
+                    OAuthAccountMatch::Bind(id) => id,
+                    OAuthAccountMatch::Rejected => {
+                        let _ = evt_tx.send(WorkerEvent::OAuthRebindRejected {
+                            account_id: editing_account_id,
+                            returned_email: result.email.clone(),
+                        });
+                        return;
+                    }
+                };
 
             let prev = existing.iter().find(|a| a.id == account_id);
 
@@ -1582,6 +1629,8 @@ async fn handle_request(
             account_id,
             draft,
             local_draft_id,
+            undo_token,
+            send_at,
         } => {
             let now = chrono::Utc::now().timestamp();
             let outbox_id = match cache.enqueue_outbox(
@@ -1594,6 +1643,7 @@ async fn handle_request(
                 &draft.in_reply_to,
                 &draft.attachment_paths,
                 now,
+                send_at,
             ) {
                 Ok(id) => id,
                 Err(e) => {
@@ -1604,20 +1654,60 @@ async fn handle_request(
                     return;
                 }
             };
+            // 原草稿交接给发件箱：记录落盘成功后立即删除，保证内容不丢也不重复。
             if let Some(draft_id) = local_draft_id {
                 let _ = cache.delete_draft(draft_id);
                 if let Ok(drafts) = cache.list_drafts() {
                     let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
                 }
             }
-            send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+            if send_at.is_some() {
+                // 撤销发送缓冲：仅入队不投递（Queued + 到期时间），等待撤销或到期触发。
+                let _ = evt_tx.send(WorkerEvent::OutboxEnqueued {
+                    token: undo_token,
+                    account_id,
+                    outbox_id,
+                });
+            } else {
+                send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+            }
+            if let Ok(outbox) = cache.list_outbox(account_id) {
+                let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                    account_id,
+                    items: outbox,
+                });
+            }
         }
 
         MailRequest::RetryOutboxItem {
             account_id,
             outbox_id,
         } => {
-            send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+            retry_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+        }
+
+        MailRequest::DeleteOutboxItem {
+            account_id,
+            outbox_id,
+        } => {
+            // 撤销发送：仅删除仍在排队（Queued）的记录；已被领取投递的不可撤销。
+            match cache.delete_queued_outbox(outbox_id) {
+                Ok(true) => {
+                    if let Ok(outbox) = cache.list_outbox(account_id) {
+                        let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                            account_id,
+                            items: outbox,
+                        });
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                }
+            }
         }
 
         MailRequest::LoadUnifiedView {
@@ -1764,6 +1854,17 @@ async fn handle_request(
                     let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
                 }
                 if enabled {
+                    // 自动续发（任务一）：重新启用账号后只触发该账号已到期的 Queued
+                    // 邮件；Failed / Uncertain 不参与。领取为原子转换，反复启停
+                    // 账号时同一条记录只会被领取一次。
+                    let now = chrono::Utc::now().timestamp();
+                    let due = cache
+                        .list_due_queued_ids(Some(account_id), now)
+                        .unwrap_or_default();
+                    for (_, outbox_id) in due {
+                        send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx)
+                            .await;
+                    }
                     sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
                     let allowed = unified_account_ids(data_dir);
                     if let Ok(page) = cache.list_unified_inbox_for_accounts(
@@ -2410,6 +2511,33 @@ async fn load_older_messages_inner(
     });
 }
 
+/// 启动恢复（对齐 Linux 退出落盘语义）：扫描发件箱中已到期的 Queued 记录直接进入
+/// 投递；Sending / Uncertain / Failed 保持不动，避免重复投递或让用户误以为已投递。
+/// 停用账号的记录保持 Queued 排队，等重新启用后由 `SetAccountEnabled` 触发续发。
+async fn deliver_due_outbox(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    accounts: &[AccountConfig],
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let enabled: std::collections::HashSet<u32> = accounts
+        .iter()
+        .filter(|a| a.enabled)
+        .map(|a| a.id)
+        .collect();
+    let due = cache.list_due_queued_ids(None, now).unwrap_or_default();
+    for (account_id, outbox_id) in due {
+        if !enabled.contains(&account_id) {
+            continue;
+        }
+        send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+    }
+}
+
+/// 自动投递路径（SendDraft 立即发送 / 启动恢复 / 重新启用账号续发）：
+/// 仅领取仍处于 Queued 且已到期的记录，已被领取或未到期则静默跳过。
 async fn send_outbox_item(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -2418,17 +2546,73 @@ async fn send_outbox_item(
     outbox_id: u32,
     evt_tx: &mpsc::Sender<WorkerEvent>,
 ) {
-    let items = cache.list_outbox(account_id).unwrap_or_default();
-    let Some(item) = items.into_iter().find(|i| i.id == outbox_id) else {
-        return;
+    let now = chrono::Utc::now().timestamp();
+    let item = match cache.claim_outbox_for_delivery(outbox_id, now) {
+        Ok(Some(item)) => item,
+        Ok(None) => return,
+        Err(e) => {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: e,
+            });
+            return;
+        }
     };
+    deliver_outbox_item(data_dir, cache, tokens, account_id, outbox_id, item, evt_tx).await;
+}
 
+/// 用户显式触发路径（手动重发 / 撤销倒计时到期的立即发送）：
+/// Queued / Failed 均可领取，绕过到期检查。
+async fn retry_outbox_item(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    account_id: u32,
+    outbox_id: u32,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let item = match cache.claim_outbox_for_retry(outbox_id) {
+        Ok(Some(item)) => item,
+        Ok(None) => return,
+        Err(e) => {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: e,
+            });
+            return;
+        }
+    };
+    deliver_outbox_item(data_dir, cache, tokens, account_id, outbox_id, item, evt_tx).await;
+}
+
+/// 投递一条已领取（Sending）的发件箱记录。
+async fn deliver_outbox_item(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    account_id: u32,
+    outbox_id: u32,
+    item: OutboxItem,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
     let Ok(account) = load_account_config(data_dir, account_id) else {
         let _ = cache.update_outbox_status(outbox_id, OutboxStatus::Failed, "缺少账号配置");
         return;
     };
 
-    let _ = cache.update_outbox_status(outbox_id, OutboxStatus::Sending, "");
+    // 停用账号：恢复 Queued 保持不动（不标 Failed），保留发件身份与正文，
+    // 等重新启用账号后自动续发。
+    if !account.enabled {
+        let _ = cache.update_outbox_status(outbox_id, OutboxStatus::Queued, "账号已停用，暂缓投递");
+        if let Ok(outbox) = cache.list_outbox(account_id) {
+            let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                account_id,
+                items: outbox,
+            });
+        }
+        return;
+    }
+
     if let Ok(outbox) = cache.list_outbox(account_id) {
         let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
             account_id,
@@ -2718,4 +2902,55 @@ fn load_account_config(data_dir: &PathBuf, account_id: u32) -> Result<AccountCon
         .into_iter()
         .find(|a| a.id == account_id)
         .ok_or_else(|| format!("找不到账号 ID {account_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(id: u32, email: &str) -> AccountConfig {
+        AccountConfig {
+            id,
+            email: email.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn oauth_reauthorize_same_email_binds_editing_account() {
+        // 任务二：同邮箱重授权 -> 更新原账号（忽略大小写）。
+        let existing = vec![account(3, "User@Outlook.com")];
+        let resolved = resolve_oauth_account_match(Some(3), &existing, "user@outlook.com");
+        assert_eq!(resolved, OAuthAccountMatch::Bind(3));
+    }
+
+    #[test]
+    fn oauth_reauthorize_different_email_is_rejected() {
+        // 任务二：异邮箱重授权（无论是否命中其他账号）-> 保留原账号不动。
+        let existing = vec![account(3, "a@outlook.com"), account(7, "b@outlook.com")];
+        // 返回邮箱命中了另一个已有账号：仍拒绝换绑，避免把 A 的身份改成 B。
+        assert_eq!(
+            resolve_oauth_account_match(Some(3), &existing, "b@outlook.com"),
+            OAuthAccountMatch::Rejected
+        );
+        // 返回邮箱是本地没有的新邮箱：同样拒绝换绑。
+        assert_eq!(
+            resolve_oauth_account_match(Some(3), &existing, "new@gmail.com"),
+            OAuthAccountMatch::Rejected
+        );
+    }
+
+    #[test]
+    fn oauth_add_flow_reuses_matching_account_or_allocates_new_id() {
+        // 添加账号流程：返回邮箱命中已有账号时复用其 ID，否则分配新 ID。
+        let existing = vec![account(3, "a@outlook.com")];
+        assert_eq!(
+            resolve_oauth_account_match(None, &existing, "A@OUTLOOK.COM"),
+            OAuthAccountMatch::Bind(3)
+        );
+        assert_eq!(
+            resolve_oauth_account_match(None, &existing, "fresh@outlook.com"),
+            OAuthAccountMatch::Bind(4)
+        );
+    }
 }

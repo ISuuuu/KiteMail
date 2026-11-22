@@ -1101,7 +1101,6 @@ pub(crate) fn render_list_page(
         let total = accounts_list.len();
         for (idx, acc) in accounts_list.iter().enumerate() {
             let acc_id = acc.id;
-            let acc_for_click = acc.clone();
             let display_label = acc.display_label();
             let secondary = if display_label == acc.email {
                 acc.display_name.trim().to_string()
@@ -1139,7 +1138,8 @@ pub(crate) fn render_list_page(
                 .cursor_pointer()
                 .hover(move |s| s.bg(surface.opacity(0.65)))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_edit_account_editor(&acc_for_click, window, cx);
+                    // 任务二：列表行跳转编辑同样接入未保存确认（保存 / 放弃 / 继续编辑）。
+                    this.request_edit_account_editor(acc_id, window, cx);
                 }));
 
             if !demo_mode {

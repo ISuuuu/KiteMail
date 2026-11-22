@@ -411,6 +411,9 @@ impl CacheStore {
         // Cc/Bcc（迭代 2）：旧库无列时补充，历史数据视为空字符串。
         self.ensure_column("outbox", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("outbox", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
+        // 撤销发送 / 停用账号排队（任务一）：到期时间戳；NULL = 立即到期。
+        // 历史数据视为已到期，启动恢复后可直接投递。
+        self.ensure_column("outbox", "send_at", "INTEGER")?;
         self.ensure_column("drafts", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
         // HTML 正文（迭代 3）：旧库无列时补充，历史数据视为 NULL。
@@ -2823,6 +2826,7 @@ impl CacheStore {
     }
 
     /// Persist a new outgoing message in the Outbox before SMTP transmission begins.
+    /// `send_at` 为到期时间戳（`None` = 立即到期）；撤销发送缓冲在倒计时结束前不投递。
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_outbox(
         &mut self,
@@ -2835,6 +2839,7 @@ impl CacheStore {
         in_reply_to: &str,
         attachment_paths: &[String],
         created_at: i64,
+        send_at: Option<i64>,
     ) -> Result<u32, String> {
         let paths_json = serde_json::to_string(attachment_paths)
             .map_err(|e| format!("序列化附件路径失败: {e}"))?;
@@ -2843,9 +2848,9 @@ impl CacheStore {
                 "
                 INSERT INTO outbox (
                     account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to,
-                    attachment_paths_json, status, last_error, created_at
+                    attachment_paths_json, status, last_error, created_at, send_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', '', ?9)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', '', ?9, ?10)
                 ",
                 params![
                     account_id,
@@ -2856,7 +2861,8 @@ impl CacheStore {
                     body_text,
                     in_reply_to,
                     paths_json,
-                    created_at
+                    created_at,
+                    send_at
                 ],
             )
             .map_err(|e| format!("写入发件箱持久化记录失败: {e}"))?;
@@ -2885,6 +2891,132 @@ impl CacheStore {
             .execute("DELETE FROM outbox WHERE id = ?1", params![outbox_id])
             .map_err(|e| format!("删除发件箱记录失败: {e}"))?;
         Ok(())
+    }
+
+    /// 原子领取一条自动投递记录：仅 Queued 且已到期（`send_at` 为空或不晚于 `now`）
+    /// 的记录会被置为 Sending 并返回，其余（未到期 / 已被其他路径领取 / 状态不符）
+    /// 返回 `None`。单条 UPDATE + 条件过滤保证同一记录不会被重复领取。
+    pub fn claim_outbox_for_delivery(
+        &mut self,
+        outbox_id: u32,
+        now: i64,
+    ) -> Result<Option<OutboxItem>, String> {
+        let claimed = self
+            .conn
+            .execute(
+                "
+                UPDATE outbox SET status = 'sending', last_error = ''
+                WHERE id = ?1 AND status = 'queued'
+                  AND (send_at IS NULL OR send_at <= ?2)
+                ",
+                params![outbox_id, now],
+            )
+            .map_err(|e| format!("领取发件箱记录失败: {e}"))?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+        self.load_outbox_row(outbox_id)
+    }
+
+    /// 原子领取一条用户显式重试记录：Queued / Failed 均可（绕过到期检查，
+    /// 对应「手动重发」与撤销倒计时到期的立即投递）。
+    pub fn claim_outbox_for_retry(&mut self, outbox_id: u32) -> Result<Option<OutboxItem>, String> {
+        let claimed = self
+            .conn
+            .execute(
+                "
+                UPDATE outbox SET status = 'sending', last_error = ''
+                WHERE id = ?1 AND status IN ('queued', 'failed')
+                ",
+                params![outbox_id],
+            )
+            .map_err(|e| format!("领取发件箱记录失败: {e}"))?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+        self.load_outbox_row(outbox_id)
+    }
+
+    /// Read back one Outbox row already marked `sending` by a claim above.
+    fn load_outbox_row(&self, outbox_id: u32) -> Result<Option<OutboxItem>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
+                       in_reply_to, attachment_paths_json, status, last_error
+                FROM outbox
+                WHERE id = ?1
+                ",
+            )
+            .map_err(|e| format!("查询发件箱失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![outbox_id], |row| {
+                let paths_json: String = row.get(8)?;
+                let attachment_paths: Vec<String> =
+                    serde_json::from_str(&paths_json).unwrap_or_default();
+                let status_str: String = row.get(9)?;
+                Ok(OutboxItem {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    to_addr: row.get(2)?,
+                    cc_addr: row.get(3)?,
+                    bcc_addr: row.get(4)?,
+                    subject: row.get(5)?,
+                    body_text: row.get(6)?,
+                    in_reply_to: row.get(7)?,
+                    attachment_paths,
+                    status: OutboxStatus::from_str(&status_str),
+                    last_error: row.get(10)?,
+                })
+            })
+            .map_err(|e| format!("读取发件箱失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析发件箱行失败: {e}"))?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// 列出到期（`send_at` 为空或不晚于 `now`）的 Queued 记录，供启动恢复与
+    /// 重新启用账号后的自动续发领取。`account_id` 为 `None` 时扫描全部账号。
+    /// Failed / Uncertain / Sending 记录不参与自动续发。
+    pub fn list_due_queued_ids(
+        &self,
+        account_id: Option<u32>,
+        now: i64,
+    ) -> Result<Vec<(u32, u32)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT account_id, id
+                FROM outbox
+                WHERE status = 'queued'
+                  AND (send_at IS NULL OR send_at <= ?1)
+                  AND (?2 IS NULL OR account_id = ?2)
+                ORDER BY id ASC
+                ",
+            )
+            .map_err(|e| format!("查询到期发件箱失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![now, account_id], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|e| format!("读取到期发件箱失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析到期发件箱行失败: {e}"))?;
+        Ok(rows)
+    }
+
+    /// 撤销发送：仅删除仍在排队（Queued）的记录；已被领取投递的记录返回 `false` 不可撤销。
+    pub fn delete_queued_outbox(&mut self, outbox_id: u32) -> Result<bool, String> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM outbox WHERE id = ?1 AND status = 'queued'",
+                params![outbox_id],
+            )
+            .map_err(|e| format!("删除发件箱记录失败: {e}"))?;
+        Ok(deleted > 0)
     }
 
     /// List all pending / uncertain / failed outbox items for `account_id`.
@@ -3251,6 +3383,7 @@ mod tests {
                 "<orig@example.com>",
                 &["C:\\temp\\test.txt".to_string()],
                 1_700_000_123,
+                None,
             )
             .unwrap();
 
@@ -3278,6 +3411,7 @@ mod tests {
                 "",
                 &[],
                 1_700_000_200,
+                None,
             )
             .unwrap();
 
@@ -3286,6 +3420,189 @@ mod tests {
         assert_eq!(items[0].to_addr, "to@example.com");
         assert_eq!(items[0].cc_addr, "c1@example.com, Carol <carol@c.com>");
         assert_eq!(items[0].bcc_addr, "secret@example.com");
+    }
+
+    #[test]
+    fn outbox_claim_requires_due_and_is_idempotent() {
+        // 任务一：启用续发 / 启动恢复只领取「已到期的 Queued」记录，且同一条
+        // 记录只能被领取一次（Queued -> Sending 原子转换，防重复投递）。
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let now = 1_700_000_000i64;
+        let due_id = cache
+            .enqueue_outbox(
+                1,
+                "a@x.com",
+                "",
+                "",
+                "已到期",
+                "正文",
+                "",
+                &[],
+                now - 60,
+                Some(now - 30),
+            )
+            .unwrap();
+        let not_due_id = cache
+            .enqueue_outbox(
+                1,
+                "b@x.com",
+                "",
+                "",
+                "未到期",
+                "正文",
+                "",
+                &[],
+                now - 10,
+                Some(now + 300),
+            )
+            .unwrap();
+
+        // 到期扫描只含已到期的 Queued 记录（撤销倒计时中的未到期记录不参与）。
+        assert_eq!(
+            cache.list_due_queued_ids(Some(1), now).unwrap(),
+            vec![(1, due_id)]
+        );
+
+        // 未到期的 Queued 不可自动领取（撤销倒计时期间不会被提前投递）。
+        assert!(cache
+            .claim_outbox_for_delivery(not_due_id, now)
+            .unwrap()
+            .is_none());
+        // 已到期的 Queued 可领取一次。
+        let claimed = cache
+            .claim_outbox_for_delivery(due_id, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, due_id);
+        assert_eq!(claimed.status, OutboxStatus::Sending);
+        // 再次领取同一条返回 None（幂等：反复启停账号不会重复投递）。
+        assert!(cache
+            .claim_outbox_for_delivery(due_id, now)
+            .unwrap()
+            .is_none());
+        // 已进入 Sending 的记录对显式重试也不再可领取。
+        assert!(cache.claim_outbox_for_retry(due_id).unwrap().is_none());
+
+        // 领取后到期扫描为空；未到期记录仍在排队但不出现在到期列表。
+        assert!(cache.list_due_queued_ids(Some(1), now).unwrap().is_empty());
+        assert!(cache.list_due_queued_ids(None, now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbox_disabled_account_stays_queued_and_resumes() {
+        // 任务一：停用账号的待发记录保持 Queued（不标 Failed），保留发件身份
+        // 与正文；恢复 Queued 后可再次领取（重新启用账号后续发）。
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let now = 1_700_000_000i64;
+        let id = cache
+            .enqueue_outbox(
+                1,
+                "a@x.com",
+                "c@x.com",
+                "",
+                "停用期间排队",
+                "正文",
+                "<r@x.com>",
+                &[],
+                now,
+                Some(now - 5),
+            )
+            .unwrap();
+
+        // 投递前发现账号停用：回滚为 Queued 并记录原因，正文与收件人保持不变。
+        let claimed = cache.claim_outbox_for_delivery(id, now).unwrap().unwrap();
+        cache
+            .update_outbox_status(id, OutboxStatus::Queued, "账号已停用，暂缓投递")
+            .unwrap();
+
+        let items = cache.list_outbox(1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, OutboxStatus::Queued);
+        assert_eq!(items[0].to_addr, claimed.to_addr);
+        assert_eq!(items[0].body_text, claimed.body_text);
+        assert_eq!(items[0].subject, claimed.subject);
+        assert_eq!(items[0].last_error, "账号已停用，暂缓投递");
+
+        // 恢复 Queued 后重新启用账号：可再次领取继续投递。
+        assert!(cache.claim_outbox_for_delivery(id, now).unwrap().is_some());
+        assert!(cache.list_due_queued_ids(Some(1), now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbox_auto_delivery_never_claims_failed_or_uncertain() {
+        // 任务一：Failed / Uncertain 不参与自动续发（Uncertain never auto-resend），
+        // 仅用户显式重试可领取 Failed 记录。
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let now = 1_700_000_000i64;
+        let failed_id = cache
+            .enqueue_outbox(1, "a@x.com", "", "", "失败", "正文", "", &[], now, None)
+            .unwrap();
+        let uncertain_id = cache
+            .enqueue_outbox(1, "b@x.com", "", "", "不确定", "正文", "", &[], now, None)
+            .unwrap();
+        cache
+            .update_outbox_status(failed_id, OutboxStatus::Failed, "SMTP 拒绝")
+            .unwrap();
+        cache
+            .update_outbox_status(uncertain_id, OutboxStatus::Uncertain, "连接中断")
+            .unwrap();
+
+        assert!(cache.list_due_queued_ids(Some(1), now).unwrap().is_empty());
+        assert!(cache
+            .claim_outbox_for_delivery(failed_id, now)
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .claim_outbox_for_delivery(uncertain_id, now)
+            .unwrap()
+            .is_none());
+        // 显式重试仍可领取 Failed（Queued / Uncertain 之外的用户触发路径）。
+        assert!(cache.claim_outbox_for_retry(failed_id).unwrap().is_some());
+        // Uncertain 连显式重试也不领取，只能人工确认后删除或重建。
+        assert!(cache
+            .claim_outbox_for_retry(uncertain_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn outbox_undo_deletes_only_queued_records() {
+        // 任务一：撤销发送 = 删除仍在排队的记录；已进入投递的不可撤销。
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let now = 1_700_000_000i64;
+        let queued_id = cache
+            .enqueue_outbox(
+                1,
+                "a@x.com",
+                "",
+                "",
+                "撤销目标",
+                "正文",
+                "",
+                &[],
+                now,
+                Some(now + 60),
+            )
+            .unwrap();
+        let sending_id = cache
+            .enqueue_outbox(1, "b@x.com", "", "", "投递中", "正文", "", &[], now, None)
+            .unwrap();
+        cache
+            .update_outbox_status(sending_id, OutboxStatus::Sending, "")
+            .unwrap();
+
+        assert!(cache.delete_queued_outbox(queued_id).unwrap());
+        assert!(cache
+            .list_outbox(1)
+            .unwrap()
+            .iter()
+            .all(|i| i.id != queued_id));
+        assert!(!cache.delete_queued_outbox(sending_id).unwrap());
+        assert!(cache
+            .list_outbox(1)
+            .unwrap()
+            .iter()
+            .any(|i| i.id == sending_id));
     }
 
     #[test]
@@ -3391,6 +3708,7 @@ mod tests {
                 "",
                 &[],
                 200,
+                None,
             )
             .unwrap();
         let outbox = cache.list_outbox(1).unwrap();
