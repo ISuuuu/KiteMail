@@ -246,6 +246,7 @@ pub(crate) enum ComposeAddressField {
 }
 
 /// 撤销发送（Undo Send）缓冲中的待投递邮件。
+/// 记录先持久化到发件箱（Queued + 到期时间），撤销 = 删除该记录，到期 / 立即发送 = 触发投递。
 #[derive(Clone, Debug)]
 pub(crate) struct PendingSend {
     pub(crate) token: u64,
@@ -253,6 +254,12 @@ pub(crate) struct PendingSend {
     pub(crate) draft: ComposeDraft,
     pub(crate) local_draft_id: Option<u32>,
     pub(crate) remaining_secs: u8,
+    /// 发件箱记录 ID（worker 落盘回执 `OutboxEnqueued` 到达后回填）。
+    pub(crate) outbox_id: Option<u32>,
+    /// 用户已点击撤销但落盘回执未到：回执到达后删除记录并清理缓冲。
+    pub(crate) undo_requested: bool,
+    /// 已触发投递但落盘回执未到：回执到达后立即投递。
+    pub(crate) commit_requested: bool,
 }
 
 /// 主内容区路由（方案文档五.1）：`Mail` 默认三栏，`Gallery` 附件总览，
@@ -397,6 +404,12 @@ pub(crate) struct HylkiApp {
     pub(crate) known_contacts: Vec<KnownContact>,
     /// 撤销发送（5 秒缓冲）状态。
     pub(crate) pending_send: Option<PendingSend>,
+    /// 已触发投递但落盘回执未到的请求（token, account_id）：回执到达后立即投递。
+    /// 独立缓冲避免连续发送时被新的撤销缓冲覆盖丢失。
+    pending_commit: Option<(u64, u32)>,
+    /// 已请求撤销但落盘回执未到的缓冲 token：回执到达后删除对应记录，
+    /// 保证撤销的邮件绝不会被投递。
+    pending_undo_delete: Vec<u64>,
     next_send_token: u64,
     /// 写信发送前检测到正文/主题提及附件关键词但未附带文件时触发的内联确认横幅（命中关键词）。
     pub(crate) compose_attachment_reminder: Option<String>,
@@ -788,6 +801,8 @@ impl HylkiApp {
                 compose_autosaved_at: None,
                 known_contacts: demo_contacts,
                 pending_send: None,
+                pending_commit: None,
+                pending_undo_delete: Vec::new(),
                 next_send_token: 1,
                 compose_attachment_reminder: None,
                 cfg_feedback: None,
@@ -953,6 +968,8 @@ impl HylkiApp {
             compose_autosaved_at: None,
             known_contacts: Vec::new(),
             pending_send: None,
+            pending_commit: None,
+            pending_undo_delete: Vec::new(),
             next_send_token: 1,
             compose_attachment_reminder: None,
             cfg_feedback: None,
@@ -1104,19 +1121,8 @@ impl HylkiApp {
                 }
                 WorkerEvent::AccountsUpdated { accounts } => {
                     self.accounts = accounts;
-                    if !self
-                        .accounts
-                        .iter()
-                        .any(|a| a.id == self.compose_account_id && a.enabled)
-                    {
-                        self.compose_account_id = self
-                            .accounts
-                            .iter()
-                            .find(|a| a.enabled)
-                            .or_else(|| self.accounts.first())
-                            .map(|a| a.id)
-                            .unwrap_or(1);
-                    }
+                    // 任务一：停用账号不再静默切换写信账号。写信界面检测到当前所选
+                    // 账号停用时显示提示，由用户明确选择可用账号后才能发送。
                     if self.current_view == CurrentView::AccountFolder {
                         let current_disabled =
                             self.folders_by_account.iter().any(|(&acc_id, folders)| {
@@ -1249,11 +1255,80 @@ impl HylkiApp {
                     self.drafts = drafts;
                 }
                 WorkerEvent::OutboxUpdated { account_id, items } => {
+                    // 撤销缓冲对应的记录已被投递（如侧栏手动重发）或删除时清除缓冲横幅。
+                    if let Some(outbox_id) = self.pending_send.as_ref().and_then(|p| {
+                        if p.account_id == account_id {
+                            p.outbox_id
+                        } else {
+                            None
+                        }
+                    }) {
+                        if !items.iter().any(|i| i.id == outbox_id) {
+                            self.pending_send = None;
+                        }
+                    }
                     if items.is_empty() {
                         self.outbox_by_account.remove(&account_id);
                     } else {
                         self.outbox_by_account.insert(account_id, items);
                     }
+                }
+                WorkerEvent::OutboxEnqueued {
+                    token,
+                    account_id,
+                    outbox_id,
+                } => {
+                    // 撤销发送：待发记录已落盘发件箱（原草稿同步交接删除），回填缓冲 ID。
+                    if self.pending_commit.as_ref().map(|(t, _)| *t) == Some(token) {
+                        // 已让位给后续发送的挂起投递：立即触发投递。
+                        if let Some(ref w) = self.worker {
+                            w.send(MailRequest::RetryOutboxItem {
+                                account_id,
+                                outbox_id,
+                            });
+                        }
+                        self.pending_commit = None;
+                        continue;
+                    }
+                    if let Some(pos) = self.pending_undo_delete.iter().position(|t| *t == token) {
+                        // 已让位给后续发送的撤销请求：删除刚落盘的记录。
+                        self.pending_undo_delete.remove(pos);
+                        if let Some(ref w) = self.worker {
+                            w.send(MailRequest::DeleteOutboxItem {
+                                account_id,
+                                outbox_id,
+                            });
+                        }
+                        continue;
+                    }
+                    let matched = self.pending_send.as_ref().is_some_and(|p| p.token == token);
+                    if !matched {
+                        // 已让位给后续发送或撤销流程已完成的旧回执，忽略。
+                        continue;
+                    }
+                    let undo_requested = {
+                        let pending = self.pending_send.as_mut().unwrap();
+                        pending.outbox_id = Some(outbox_id);
+                        pending.undo_requested
+                    };
+                    if undo_requested {
+                        // 撤销已在回执前生效（写信内容已恢复）：删除刚落盘的记录并清理缓冲。
+                        let pending = self.pending_send.take().unwrap();
+                        if let Some(ref w) = self.worker {
+                            w.send(MailRequest::DeleteOutboxItem {
+                                account_id: pending.account_id,
+                                outbox_id,
+                            });
+                        }
+                        self.status_line = SharedString::from("已撤销发送，返回编辑邮件");
+                    } else if self
+                        .pending_send
+                        .as_ref()
+                        .is_some_and(|p| p.commit_requested)
+                    {
+                        self.commit_pending_send(token, cx);
+                    }
+                    cx.notify();
                 }
                 WorkerEvent::DraftSent {
                     account_id: _,
@@ -3308,6 +3383,19 @@ impl HylkiApp {
             cx.notify();
             return;
         }
+        // 发送入口校验（任务一）：所选发件账号必须存在且已启用，停用账号阻断发送。
+        if !self.demo_mode
+            && !self
+                .accounts
+                .iter()
+                .any(|a| a.id == self.compose_account_id && a.enabled)
+        {
+            self.error_banner = Some(SharedString::from(
+                "当前所选发件账号已停用或不存在，请先选择可用账号再发送",
+            ));
+            cx.notify();
+            return;
+        }
         if !self.demo_mode && to.trim().is_empty() {
             self.error_banner = Some(SharedString::from("请填写收件人邮箱地址"));
             cx.notify();
@@ -3330,6 +3418,30 @@ impl HylkiApp {
         if let Some(prev) = self.pending_send.as_ref().map(|p| p.token) {
             self.commit_pending_send(prev, cx);
         }
+        // 投递因落盘回执未到而挂起时，转入独立等待槽，不随新缓冲覆盖丢失。
+        if self
+            .pending_send
+            .as_ref()
+            .is_some_and(|p| p.commit_requested)
+        {
+            let prev = self.pending_send.take().unwrap();
+            self.pending_commit = Some((prev.token, prev.account_id));
+        } else if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
+            // 撤销请求已登记但未完成时被新发送让位：已落盘的记录直接删除，
+            // 回执未到的登记待删 token，保证撤销的邮件绝不会被投递。
+            let prev = self.pending_send.take().unwrap();
+            match prev.outbox_id {
+                Some(outbox_id) => {
+                    if let Some(ref w) = self.worker {
+                        w.send(MailRequest::DeleteOutboxItem {
+                            account_id: prev.account_id,
+                            outbox_id,
+                        });
+                    }
+                }
+                None => self.pending_undo_delete.push(prev.token),
+            }
+        }
 
         let delay_secs = self.prefs.undo_send_secs.min(15) as u8;
         let token = self.next_send_token;
@@ -3348,7 +3460,25 @@ impl HylkiApp {
             },
             local_draft_id: self.compose_draft_id,
             remaining_secs: delay_secs,
+            outbox_id: None,
+            undo_requested: false,
+            commit_requested: false,
         };
+        // 任务一：撤销发送先把待发记录持久化到发件箱（Queued + 到期时间）再启动
+        // 倒计时；撤销 = 删除该记录，倒计时到期 / 立即发送 = 直接触发投递。原草稿
+        // 由 worker 在记录落盘成功后交接删除（保证内容已落盘且不重复）。
+        if !self.demo_mode {
+            if let Some(ref w) = self.worker {
+                let now = chrono::Utc::now().timestamp();
+                w.send(MailRequest::SendDraft {
+                    account_id: pending.account_id,
+                    draft: pending.draft.clone(),
+                    local_draft_id: pending.local_draft_id,
+                    undo_token: token,
+                    send_at: Some(now + delay_secs as i64),
+                });
+            }
+        }
         self.pending_send = Some(pending);
         self.compose_confirm_discard = false;
         self.compose_autocomplete_field = None;
@@ -3402,15 +3532,15 @@ impl HylkiApp {
     }
 
     /// 真正将 `pending_send` 投递给 Worker（倒计时到期或点击「立即发送」）。
+    /// 记录已在发送时落盘发件箱，此处仅触发投递；落盘回执未到时挂起等待。
     pub(crate) fn commit_pending_send(&mut self, token: u64, cx: &mut Context<Self>) {
         if self.pending_send.as_ref().map(|p| p.token) != Some(token) {
             return;
         }
-        let Some(pending) = self.pending_send.take() else {
-            return;
-        };
-
         if self.demo_mode {
+            let Some(pending) = self.pending_send.take() else {
+                return;
+            };
             self.status_line = SharedString::from(format!(
                 "演示发件成功：收件人=\"{}\"，主题=\"{}\"，附件={} 个",
                 if pending.draft.to.is_empty() {
@@ -3429,44 +3559,90 @@ impl HylkiApp {
             return;
         }
 
+        // 撤销请求优先：不投递、不让缓冲失效；记录由撤销流程在落盘回执到达后删除。
+        if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
+            cx.notify();
+            return;
+        }
+
+        let Some(pending) = self.pending_send.as_mut() else {
+            return;
+        };
+        if pending.outbox_id.is_none() {
+            // 记录落盘回执（OutboxEnqueued）尚未到达：挂起投递，回执到达后自动触发。
+            pending.commit_requested = true;
+            self.status_line = SharedString::from("正在发送...");
+            cx.notify();
+            return;
+        }
+        let pending = self.pending_send.take().unwrap();
         if let Some(ref w) = self.worker {
-            self.status_line = SharedString::from("正在持久化至发件箱并发送...");
-            w.send(MailRequest::SendDraft {
+            self.status_line = SharedString::from("正在发送...");
+            w.send(MailRequest::RetryOutboxItem {
                 account_id: pending.account_id,
-                draft: pending.draft,
-                local_draft_id: pending.local_draft_id,
+                outbox_id: pending.outbox_id.unwrap_or_default(),
             });
         }
         cx.notify();
     }
 
-    /// 撤销发送：取消 5 秒缓冲并恢复全部内容回到写信页。
+    /// 撤销发送：删除发件箱排队记录并把缓冲内容恢复到写信页。
     pub(crate) fn undo_pending_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_send.take() else {
+        let Some(pending) = self.pending_send.as_ref() else {
             return;
         };
+        if pending.outbox_id.is_some() {
+            let pending = self.pending_send.take().unwrap();
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::DeleteOutboxItem {
+                    account_id: pending.account_id,
+                    outbox_id: pending.outbox_id.unwrap_or_default(),
+                });
+            }
+            self.restore_pending_send_to_compose(&pending, window, cx);
+        } else {
+            // 落盘回执尚未到达（毫秒级窗口）：先恢复写信内容并登记撤销请求，
+            // 回执到达后（OutboxEnqueued 处理）删除刚落盘的记录。
+            if let Some(pending) = self.pending_send.as_mut() {
+                pending.undo_requested = true;
+            }
+            let snapshot = self.pending_send.clone();
+            if let Some(pending) = snapshot.as_ref() {
+                self.restore_pending_send_to_compose(pending, window, cx);
+            }
+        }
+        self.status_line = SharedString::from("已撤销发送，返回编辑邮件");
+        cx.notify();
+    }
+
+    /// 把撤销缓冲的内容恢复到写信页（原草稿已随落盘交接删除，恢复后由自动保存重建）。
+    fn restore_pending_send_to_compose(
+        &mut self,
+        pending: &PendingSend,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.main_view = MainContentView::Mail;
         self.compose_account_id = pending.account_id;
-        self.compose_draft_id = pending.local_draft_id;
-        self.compose_in_reply_to = pending.draft.in_reply_to;
-        self.compose_attachments = pending.draft.attachment_paths;
+        self.compose_draft_id = None;
+        self.compose_in_reply_to = pending.draft.in_reply_to.clone();
+        self.compose_attachments = pending.draft.attachment_paths.clone();
         self.begin_compose_autosave_tracking();
         self.compose_show_cc_bcc =
             !pending.draft.cc.trim().is_empty() || !pending.draft.bcc.trim().is_empty();
+        let draft = &pending.draft;
         self.compose_to
-            .update(cx, |s, cx| s.set_value(pending.draft.to, window, cx));
+            .update(cx, |s, cx| s.set_value(draft.to.clone(), window, cx));
         self.compose_cc
-            .update(cx, |s, cx| s.set_value(pending.draft.cc, window, cx));
+            .update(cx, |s, cx| s.set_value(draft.cc.clone(), window, cx));
         self.compose_bcc
-            .update(cx, |s, cx| s.set_value(pending.draft.bcc, window, cx));
+            .update(cx, |s, cx| s.set_value(draft.bcc.clone(), window, cx));
         self.compose_subject
-            .update(cx, |s, cx| s.set_value(pending.draft.subject, window, cx));
+            .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
         self.compose_body
-            .update(cx, |s, cx| s.set_value(pending.draft.body, window, cx));
+            .update(cx, |s, cx| s.set_value(draft.body.clone(), window, cx));
         self.compose_confirm_discard = false;
         self.right_mode = RightPaneMode::Compose;
-        self.status_line = SharedString::from("已撤销发送，返回编辑邮件");
-        cx.notify();
     }
 
     /// 在独立设置窗口编辑或新建指定账号。
@@ -3745,11 +3921,8 @@ impl HylkiApp {
             return;
         }
         acc.enabled = enabled;
-        if !enabled && self.compose_account_id == account_id {
-            if let Some(first_enabled) = self.accounts.iter().find(|a| a.enabled) {
-                self.compose_account_id = first_enabled.id;
-            }
-        }
+        // 任务一：停用写信所用账号时不静默切换写信账号；写信界面会提示用户
+        // 明确选择可用账号后才能发送。
         if let Some(ref w) = self.worker {
             w.send(MailRequest::SetAccountEnabled {
                 account_id,
@@ -3757,6 +3930,16 @@ impl HylkiApp {
             });
         }
         cx.notify();
+    }
+
+    /// 写信当前所选发件账号是否不可用（真实账号模式下已停用或不存在），
+    /// 写信界面据此提示用户明确选择可用账号。
+    pub(crate) fn compose_sender_unavailable(&self) -> bool {
+        !self.demo_mode
+            && !self
+                .accounts
+                .iter()
+                .any(|a| a.id == self.compose_account_id && a.enabled)
     }
 
     /// 统一收件箱未读总数（仅统计已启用且加入统一收件箱的账号 INBOX 未读之和）。
@@ -4695,6 +4878,8 @@ impl HylkiApp {
                         window.activate_window();
                         let _ = entity.update(cx, |win, cx| match target_copy {
                             SettingsOpenTarget::Tab(tab) => win.select_tab(tab, window, cx),
+                            // 任务二：跳转到指定账号编辑 / 新建前先走未保存确认
+                            //（保存 / 放弃 / 继续编辑），保存成功后再执行跳转。
                             SettingsOpenTarget::EditAccount(Some(ref cfg)) => {
                                 win.open_edit_account_editor(cfg, window, cx);
                             }

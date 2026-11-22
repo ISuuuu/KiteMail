@@ -12,7 +12,7 @@ use crate::secrets::{self, AccountSecrets};
 use crate::smtp_client::SendOutcome;
 use crate::{
     graph_client, imap_client, oauth, smtp_client, MailRequest, MessageFilter, MessageSort,
-    MessageSummary, OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
+    MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
 };
 
 type TokenCache = HashMap<u32, (String, Instant)>;
@@ -86,6 +86,7 @@ async fn worker_loop(
         for acc in &accounts {
             refresh_account_watcher(&mut watchers, &data_dir, acc, &req_tx);
         }
+        deliver_due_outbox(&data_dir, &mut cache, &mut tokens, &accounts, &evt_tx).await;
     }
 
     while let Ok(req) = req_rx.recv() {
@@ -1582,6 +1583,8 @@ async fn handle_request(
             account_id,
             draft,
             local_draft_id,
+            undo_token,
+            send_at,
         } => {
             let now = chrono::Utc::now().timestamp();
             let outbox_id = match cache.enqueue_outbox(
@@ -1594,6 +1597,7 @@ async fn handle_request(
                 &draft.in_reply_to,
                 &draft.attachment_paths,
                 now,
+                send_at,
             ) {
                 Ok(id) => id,
                 Err(e) => {
@@ -1604,20 +1608,60 @@ async fn handle_request(
                     return;
                 }
             };
+            // 原草稿交接给发件箱：记录落盘成功后立即删除，保证内容不丢也不重复。
             if let Some(draft_id) = local_draft_id {
                 let _ = cache.delete_draft(draft_id);
                 if let Ok(drafts) = cache.list_drafts() {
                     let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
                 }
             }
-            send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+            if send_at.is_some() {
+                // 撤销发送缓冲：仅入队不投递（Queued + 到期时间），等待撤销或到期触发。
+                let _ = evt_tx.send(WorkerEvent::OutboxEnqueued {
+                    token: undo_token,
+                    account_id,
+                    outbox_id,
+                });
+            } else {
+                send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+            }
+            if let Ok(outbox) = cache.list_outbox(account_id) {
+                let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                    account_id,
+                    items: outbox,
+                });
+            }
         }
 
         MailRequest::RetryOutboxItem {
             account_id,
             outbox_id,
         } => {
-            send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+            retry_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+        }
+
+        MailRequest::DeleteOutboxItem {
+            account_id,
+            outbox_id,
+        } => {
+            // 撤销发送：仅删除仍在排队（Queued）的记录；已被领取投递的不可撤销。
+            match cache.delete_queued_outbox(outbox_id) {
+                Ok(true) => {
+                    if let Ok(outbox) = cache.list_outbox(account_id) {
+                        let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                            account_id,
+                            items: outbox,
+                        });
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                }
+            }
         }
 
         MailRequest::LoadUnifiedView {
@@ -1764,6 +1808,17 @@ async fn handle_request(
                     let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
                 }
                 if enabled {
+                    // 自动续发（任务一）：重新启用账号后只触发该账号已到期的 Queued
+                    // 邮件；Failed / Uncertain 不参与。领取为原子转换，反复启停
+                    // 账号时同一条记录只会被领取一次。
+                    let now = chrono::Utc::now().timestamp();
+                    let due = cache
+                        .list_due_queued_ids(Some(account_id), now)
+                        .unwrap_or_default();
+                    for (_, outbox_id) in due {
+                        send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx)
+                            .await;
+                    }
                     sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
                     let allowed = unified_account_ids(data_dir);
                     if let Ok(page) = cache.list_unified_inbox_for_accounts(
@@ -2410,6 +2465,33 @@ async fn load_older_messages_inner(
     });
 }
 
+/// 启动恢复（对齐 Linux 退出落盘语义）：扫描发件箱中已到期的 Queued 记录直接进入
+/// 投递；Sending / Uncertain / Failed 保持不动，避免重复投递或让用户误以为已投递。
+/// 停用账号的记录保持 Queued 排队，等重新启用后由 `SetAccountEnabled` 触发续发。
+async fn deliver_due_outbox(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    accounts: &[AccountConfig],
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let enabled: std::collections::HashSet<u32> = accounts
+        .iter()
+        .filter(|a| a.enabled)
+        .map(|a| a.id)
+        .collect();
+    let due = cache.list_due_queued_ids(None, now).unwrap_or_default();
+    for (account_id, outbox_id) in due {
+        if !enabled.contains(&account_id) {
+            continue;
+        }
+        send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+    }
+}
+
+/// 自动投递路径（SendDraft 立即发送 / 启动恢复 / 重新启用账号续发）：
+/// 仅领取仍处于 Queued 且已到期的记录，已被领取或未到期则静默跳过。
 async fn send_outbox_item(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -2418,17 +2500,73 @@ async fn send_outbox_item(
     outbox_id: u32,
     evt_tx: &mpsc::Sender<WorkerEvent>,
 ) {
-    let items = cache.list_outbox(account_id).unwrap_or_default();
-    let Some(item) = items.into_iter().find(|i| i.id == outbox_id) else {
-        return;
+    let now = chrono::Utc::now().timestamp();
+    let item = match cache.claim_outbox_for_delivery(outbox_id, now) {
+        Ok(Some(item)) => item,
+        Ok(None) => return,
+        Err(e) => {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: e,
+            });
+            return;
+        }
     };
+    deliver_outbox_item(data_dir, cache, tokens, account_id, outbox_id, item, evt_tx).await;
+}
 
+/// 用户显式触发路径（手动重发 / 撤销倒计时到期的立即发送）：
+/// Queued / Failed 均可领取，绕过到期检查。
+async fn retry_outbox_item(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    account_id: u32,
+    outbox_id: u32,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let item = match cache.claim_outbox_for_retry(outbox_id) {
+        Ok(Some(item)) => item,
+        Ok(None) => return,
+        Err(e) => {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: e,
+            });
+            return;
+        }
+    };
+    deliver_outbox_item(data_dir, cache, tokens, account_id, outbox_id, item, evt_tx).await;
+}
+
+/// 投递一条已领取（Sending）的发件箱记录。
+async fn deliver_outbox_item(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    account_id: u32,
+    outbox_id: u32,
+    item: OutboxItem,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
     let Ok(account) = load_account_config(data_dir, account_id) else {
         let _ = cache.update_outbox_status(outbox_id, OutboxStatus::Failed, "缺少账号配置");
         return;
     };
 
-    let _ = cache.update_outbox_status(outbox_id, OutboxStatus::Sending, "");
+    // 停用账号：恢复 Queued 保持不动（不标 Failed），保留发件身份与正文，
+    // 等重新启用账号后自动续发。
+    if !account.enabled {
+        let _ = cache.update_outbox_status(outbox_id, OutboxStatus::Queued, "账号已停用，暂缓投递");
+        if let Ok(outbox) = cache.list_outbox(account_id) {
+            let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                account_id,
+                items: outbox,
+            });
+        }
+        return;
+    }
+
     if let Ok(outbox) = cache.list_outbox(account_id) {
         let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
             account_id,
