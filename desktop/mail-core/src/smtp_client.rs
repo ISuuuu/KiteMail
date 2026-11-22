@@ -98,6 +98,7 @@ pub async fn send_message(
     in_reply_to: &str,
     from_addr: &str,
     reply_to: &str,
+    body_html: Option<&str>,
     attachment_paths: &[String],
 ) -> SendOutcome {
     send_message_with_raw(
@@ -111,10 +112,57 @@ pub async fn send_message(
         in_reply_to,
         from_addr,
         reply_to,
+        body_html,
         attachment_paths,
     )
     .await
     .0
+}
+
+/// 组装信体：有 HTML 正文时按 `multipart/alternative` 发送（`text/plain` 兜底），
+/// 有附件时再套一层 `multipart/mixed`。
+///
+/// WP-10-3：写信器的富文本 / Markdown / HTML 三种格式都在应用层转成 HTML 后
+/// 传进来；纯文本模式传 `None`，保持「一个 `text/plain` 单段」的老行为。
+fn assemble_body(
+    builder: lettre::message::MessageBuilder,
+    body_text: &str,
+    body_html: Option<&str>,
+    attachment_paths: &[String],
+) -> Result<Message, String> {
+    let alternative = body_html.map(|html| {
+        MultiPart::alternative()
+            .singlepart(SinglePart::plain(body_text.to_string()))
+            .singlepart(SinglePart::html(html.to_string()))
+    });
+
+    let built = if attachment_paths.is_empty() {
+        match alternative {
+            Some(alt) => builder.multipart(alt),
+            None => builder.body(body_text.to_string()),
+        }
+    } else {
+        let mut multipart = match alternative {
+            Some(alt) => MultiPart::mixed().multipart(alt),
+            None => MultiPart::mixed().singlepart(SinglePart::plain(body_text.to_string())),
+        };
+        for path_str in attachment_paths {
+            let path = Path::new(path_str);
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("attachment.bin")
+                .to_string();
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("读取附件失败 ({}): {e}", path.display()))?;
+            let content_type = "application/octet-stream"
+                .parse()
+                .expect("valid fallback mime");
+            multipart = multipart.singlepart(Attachment::new(filename).body(bytes, content_type));
+        }
+        builder.multipart(multipart)
+    };
+    built.map_err(|e| format!("构建邮件 MIME 失败: {e}"))
 }
 
 /// 构造信封与信头（From / To / Cc / Bcc / In-Reply-To / Reply-To）。
@@ -193,6 +241,7 @@ pub async fn send_message_with_raw(
     in_reply_to: &str,
     from_addr: &str,
     reply_to: &str,
+    body_html: Option<&str>,
     attachment_paths: &[String],
 ) -> (SendOutcome, Option<Vec<u8>>) {
     let builder = match build_envelope(
@@ -209,42 +258,9 @@ pub async fn send_message_with_raw(
         Err(e) => return (SendOutcome::Failed(e), None),
     };
 
-    let message = if attachment_paths.is_empty() {
-        builder.body(body_text.to_string())
-    } else {
-        let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body_text.to_string()));
-        for path_str in attachment_paths {
-            let path = Path::new(path_str);
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("attachment.bin")
-                .to_string();
-            let bytes = match std::fs::read(path) {
-                Ok(b) => b,
-                Err(e) => {
-                    return (
-                        SendOutcome::Failed(format!("读取附件失败 ({}): {e}", path.display())),
-                        None,
-                    )
-                }
-            };
-            let content_type = "application/octet-stream"
-                .parse()
-                .expect("valid fallback mime");
-            multipart = multipart.singlepart(Attachment::new(filename).body(bytes, content_type));
-        }
-        builder.multipart(multipart)
-    };
-
-    let email = match message {
+    let email = match assemble_body(builder, body_text, body_html, attachment_paths) {
         Ok(m) => m,
-        Err(e) => {
-            return (
-                SendOutcome::Failed(format!("构建邮件 MIME 失败: {e}")),
-                None,
-            )
-        }
+        Err(e) => return (SendOutcome::Failed(e), None),
     };
     let raw_rfc822 = email.formatted();
 
@@ -321,6 +337,50 @@ mod tests {
             raw.contains("In-Reply-To: <prev@example.com>"),
             "缺 In-Reply-To: {raw}"
         );
+    }
+
+    /// WP-10-3：带 HTML 正文时发出 multipart/alternative（纯文本兜底 + HTML）。
+    #[test]
+    fn html_body_produces_multipart_alternative() {
+        let account = AccountConfig {
+            email: "me@example.com".to_string(),
+            display_name: "我".to_string(),
+            ..Default::default()
+        };
+        let builder = build_envelope(&account, "to@example.com", "", "", "主题", "", "", "")
+            .expect("envelope builds");
+        let message = assemble_body(
+            builder,
+            "纯文本兜底",
+            Some("<p>富文本<strong>正文</strong></p>"),
+            &[],
+        )
+        .expect("body assembles");
+        let raw = String::from_utf8(message.formatted()).expect("utf8 message");
+        assert!(raw.contains("multipart/alternative"), "未发多段正文: {raw}");
+        assert!(raw.contains("text/plain"), "缺纯文本兜底段: {raw}");
+        assert!(raw.contains("text/html"), "缺 HTML 段: {raw}");
+    }
+
+    /// 纯文本模式仍发单段 text/plain（不引入 multipart 开销）。
+    #[test]
+    fn plain_body_keeps_single_part() {
+        let account = AccountConfig {
+            email: "me@example.com".to_string(),
+            display_name: "我".to_string(),
+            ..Default::default()
+        };
+        let builder = build_envelope(&account, "to@example.com", "", "", "主题", "", "", "")
+            .expect("envelope builds");
+        let message = assemble_body(builder, "只有纯文本", None, &[]).expect("body assembles");
+        let raw = String::from_utf8(message.formatted()).expect("utf8 message");
+        // 单段纯文本不写 Content-Type（RFC 默认即 text/plain）。
+        assert!(
+            !raw.contains("multipart/alternative"),
+            "不该有多段正文: {raw}"
+        );
+        assert!(!raw.contains("text/html"), "不该有 HTML 段: {raw}");
+        assert!(!raw.contains("Content-Type:"), "不该写 Content-Type: {raw}");
     }
 
     /// 未指定自定义 From / Reply-To 时沿用账号身份，且不产生 Reply-To 头。

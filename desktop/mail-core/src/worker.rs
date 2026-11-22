@@ -1858,6 +1858,7 @@ async fn handle_request(
                 &draft.in_reply_to,
                 &draft.from_addr,
                 &draft.reply_to,
+                draft.body_html.as_deref(),
                 &draft.attachment_paths,
                 now,
                 send_at.map(|delay| now + delay),
@@ -1877,6 +1878,7 @@ async fn handle_request(
                             in_reply_to: draft.in_reply_to.clone(),
                             from_addr: draft.from_addr.clone(),
                             reply_to: draft.reply_to.clone(),
+                            body_format: draft.body_format.clone(),
                             attachment_paths: draft.attachment_paths.clone(),
                             updated_at: now,
                         })
@@ -3407,10 +3409,18 @@ async fn deliver_outbox_item(
                 let bcc_addrs = item.bcc_addr.clone();
                 let subject = item.subject.clone();
                 let body = item.body_text.clone();
+                let body_html = item.body_html.clone();
                 let atts = item.attachment_paths.clone();
                 let out = tokio::task::spawn_blocking(move || {
                     graph_client::send_message(
-                        &token, &to_addr, &cc_addrs, &bcc_addrs, &subject, &body, &atts,
+                        &token,
+                        &to_addr,
+                        &cc_addrs,
+                        &bcc_addrs,
+                        &subject,
+                        &body,
+                        body_html.as_deref(),
+                        &atts,
                     )
                 })
                 .await
@@ -3440,6 +3450,7 @@ async fn deliver_outbox_item(
                     &item.in_reply_to,
                     &item.from_addr,
                     &item.reply_to,
+                    item.body_html.as_deref(),
                     &item.attachment_paths,
                 )
                 .await;

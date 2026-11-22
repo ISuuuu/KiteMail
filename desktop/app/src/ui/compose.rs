@@ -17,8 +17,11 @@ use gpui_kit::{
     ParentElement, SharedString, Styled,
 };
 
-use crate::app::{filter_contact_suggestions, ComposeAddressField, HylkiApp, RecipientPill};
+use crate::app::{
+    filter_contact_suggestions, ComposeAddressField, ComposeMarkup, HylkiApp, RecipientPill,
+};
 use crate::theme;
+use hylki_mail_core::markup::ComposeFormat;
 
 /// 信头行标签宽度。
 const LABEL_WIDTH: f32 = 56.0;
@@ -376,6 +379,118 @@ fn compose_from_control(
         .into_any_element()
 }
 
+/// WP-10-3：工具条按钮对应的图标。
+fn markup_icon(kind: ComposeMarkup) -> IconName {
+    match kind {
+        ComposeMarkup::Bold => IconName::Bold,
+        ComposeMarkup::Italic => IconName::Italic,
+        ComposeMarkup::Strike => IconName::Strikethrough,
+        ComposeMarkup::InlineCode => IconName::Code,
+        ComposeMarkup::BulletList => IconName::List,
+        ComposeMarkup::NumberedList => IconName::ListOrdered,
+        ComposeMarkup::Quote => IconName::TextQuote,
+        ComposeMarkup::CodeBlock => IconName::SquareCode,
+        ComposeMarkup::Link => IconName::Link,
+    }
+}
+
+/// 格式在菜单里的图标（富文本 / Markdown 用书写类图标，HTML 用代码类）。
+fn format_icon(format: ComposeFormat) -> IconName {
+    match format {
+        ComposeFormat::Rich => IconName::Type,
+        ComposeFormat::Markdown => IconName::FileText,
+        ComposeFormat::Html => IconName::CodeXml,
+        ComposeFormat::Plain => IconName::Pilcrow,
+    }
+}
+
+/// WP-10-3：正文区底部「格式切换 + 格式化工具条」。
+///
+/// 左侧是四档格式菜单（当前格式 + 一行说明），右侧是加粗 / 斜体 / 列表 /
+/// 引用 / 代码块 / 链接等语法插入按钮；HTML 与纯文本模式不显示工具条，
+/// 因为这两种模式下插入 Markdown 标记只会污染正文。
+fn compose_format_bar(
+    app: &HylkiApp,
+    entity: Entity<HylkiApp>,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let current = app.compose_format;
+    let accent = p.accent;
+    let muted_fg = p.text_muted;
+
+    let ent_menu = entity.clone();
+    let menu_button = Button::new("compose-format-menu")
+        .ghost()
+        .compact()
+        .text_size(px(12.0))
+        .icon(format_icon(current))
+        .label(current.label())
+        .dropdown_menu(move |mut menu, _, _| {
+            for format in ComposeFormat::ALL {
+                let selected = format == current;
+                let ent_item = ent_menu.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format.label())
+                        .when(selected, |item| {
+                            item.icon(Icon::new(IconName::Check).text_color(accent))
+                        })
+                        .on_click(move |_, window, cx| {
+                            ent_item
+                                .update(cx, |this, cx| this.set_compose_format(format, window, cx));
+                        }),
+                );
+            }
+            menu
+        });
+
+    let toolbar: Vec<gpui_kit::AnyElement> = if current.has_format_toolbar() {
+        ComposeMarkup::ALL
+            .iter()
+            .map(|kind| {
+                let kind = *kind;
+                Button::new(("compose-markup", kind as usize))
+                    .ghost()
+                    .compact()
+                    .icon(markup_icon(kind))
+                    .tooltip(kind.hint())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.insert_compose_markup(kind, window, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    h_flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .border_t_1()
+        .border_color(p.border)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .child(menu_button)
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(SharedString::from(current.hint())),
+                ),
+        )
+        .child(h_flex().items_center().gap_0p5().children(toolbar))
+        .into_any_element()
+}
+
 pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 成局部变量。
     let p = theme::current(cx);
@@ -660,17 +775,23 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .when(!app.compose_attachments.is_empty(), |el| {
             el.child(h_flex().gap_2().flex_wrap().children(attachment_chips))
         })
-        // 正文编辑区（flex-1 撑满剩余高度）。
+        // 正文编辑区（flex-1 撑满剩余高度）+ WP-10-3 底部格式 / 格式化工具条。
         .child(
-            div()
+            v_flex()
                 .flex_1()
                 .min_h_0()
                 .rounded(px(8.0))
                 .border_1()
                 .border_color(p.border)
                 .bg(p.surface)
-                .p_2()
-                .child(Textarea::new(&app.compose_body)),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .p_2()
+                        .child(Textarea::new(&app.compose_body)),
+                )
+                .child(compose_format_bar(app, cx.entity(), &p, cx)),
         )
         .into_any_element()
 }

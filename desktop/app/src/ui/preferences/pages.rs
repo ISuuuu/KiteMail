@@ -2617,6 +2617,7 @@ fn render_composing(
         .unwrap_or_else(|| SharedString::from("自动（使用当前查看账号）"));
 
     let a_from = app_entity.clone();
+    let a_inline = app_entity.clone();
     let a_above = app_entity.clone();
     let a_dash = app_entity.clone();
     let a_undo = app_entity.clone();
@@ -2663,6 +2664,27 @@ fn render_composing(
                     ),
                     false,
                     is_hit(win, "pref-compose-default-from"),
+                    p,
+                ),
+                setting_row(
+                    "pref-compose-inline",
+                    "回复与转发在阅读器内联分屏",
+                    Some(
+                        "开启后原邮件留在上半部分可随时对照滚动，写信面板贴在下半部分；\
+                         也可随时点写信栏右上角的 ↗ 弹出为独立窗口",
+                    ),
+                    bool_switch(
+                        "sw-compose-inline",
+                        prefs.compose_inline,
+                        false,
+                        move |val, _, cx| {
+                            a_inline.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.compose_inline = val);
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-compose-inline"),
                     p,
                 ),
                 setting_row(

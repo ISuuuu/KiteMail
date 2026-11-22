@@ -471,6 +471,8 @@ pub fn send_message(
     bcc_addrs: &str,
     subject: &str,
     body_text: &str,
+    // WP-10-3：按正文格式预先算好的 HTML；`Some` 时以 `contentType: Html` 发送。
+    body_html: Option<&str>,
     attachment_paths: &[String],
 ) -> SendOutcome {
     let to_list = graph_recipient_array(to_addr);
@@ -500,11 +502,16 @@ pub fn send_message(
         }));
     }
 
+    // 有 HTML 正文时按 HTML 发送（Graph 的 body.contentType 只有 Text / Html 两种）。
+    let (content_type, content) = match body_html {
+        Some(html) => ("Html", html),
+        None => ("Text", body_text),
+    };
     let mut message_obj = serde_json::json!({
         "subject": subject,
         "body": {
-            "contentType": "Text",
-            "content": body_text
+            "contentType": content_type,
+            "content": content
         },
         "toRecipients": serde_json::Value::Array(to_list)
     });

@@ -32,6 +32,7 @@ use hylki_mail_core::config::{self, AccountConfig, AppPreferences, SettingsBacku
 use hylki_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_SENT_ID,
 };
+use hylki_mail_core::markup::ComposeFormat;
 use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
     contacts_io, detect_attachment_reminder, format_reply_header, ComposeDraft, FolderSummary,
@@ -45,6 +46,7 @@ use crate::ui::attachment_drawer::{
     self, AttachmentDrawerDrag, DRAWER_DEFAULT_HEIGHT, DRAWER_MAX_HEIGHT, DRAWER_MIN_HEIGHT,
 };
 use crate::ui::command_palette::{CommandPaletteEvent, CommandPaletteState, PaletteCommand};
+use crate::ui::compose_window::ComposeWindow;
 use crate::ui::contacts::{ContactExportKind, ContactsEvent, ContactsState};
 use crate::ui::gallery::{GalleryEvent, GalleryState};
 use crate::ui::message_window::{self, MessageWindow};
@@ -74,6 +76,11 @@ pub(crate) const BELOW_PANE_MIN_HEIGHT: f32 = 200.0;
 pub(crate) const BELOW_LIST_MIN_HEIGHT: f32 = 240.0;
 /// 下方模式列表默认高度（无持久化值时）。
 pub(crate) const BELOW_LIST_DEFAULT_HEIGHT: f32 = 360.0;
+/// WP-10-4：内联分屏写信面板的默认高度（贴底）与最小高度。
+pub(crate) const COMPOSE_SPLIT_DEFAULT_HEIGHT: f32 = 380.0;
+pub(crate) const COMPOSE_SPLIT_MIN_HEIGHT: f32 = 220.0;
+/// 内联分屏里上方阅读器的最小高度（再高就把写信面板压得只剩标题栏了）。
+pub(crate) const COMPOSE_SPLIT_READER_MIN_HEIGHT: f32 = 160.0;
 /// B-5：窗口宽度低于该值时阅读器顶栏低频动作收进「⋯」菜单（≈ 左栏最小 + 列表最小
 /// + 阅读器最小 441 的下限组合，此时右栏已被压至最小宽度附近，平铺按钮放不下）。
 pub(crate) const READER_OVERFLOW_BREAKPOINT: f32 = 880.0;
@@ -187,6 +194,9 @@ pub(crate) struct SidebarDrag;
 pub(crate) struct ListDrag;
 /// 列表与下方阅读器之间的水平分隔把手载荷（Below 模式）。
 pub(crate) struct BelowDrag;
+/// WP-10-4：内联分屏中「阅读器 | 写信器」之间的水平分隔把手载荷
+/// （对齐原版 `.split-grab-pill`）。
+pub(crate) struct ComposeSplitDrag;
 
 /// WP-08：宽表列头分隔线拖拽载荷。
 #[derive(Clone, Copy)]
@@ -215,6 +225,12 @@ impl Render for ListDrag {
 }
 
 impl Render for BelowDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl Render for ComposeSplitDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
     }
@@ -312,6 +328,114 @@ impl ComposeAddressField {
             Self::Bcc => "密送",
         }
     }
+}
+
+/// WP-10-3 正文格式化工具条上的按钮（只在富文本 / Markdown 模式下出现）。
+///
+/// Windows 版正文是一个多行文本框，没有原版 GTK 富文本编辑器的选区命令，
+/// 所以这些按钮做的是「往正文里插入对应语法」——写的是 Markdown 标记，
+/// 切换格式 / 发信时按语法转换成 HTML。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComposeMarkup {
+    Bold,
+    Italic,
+    Strike,
+    InlineCode,
+    BulletList,
+    NumberedList,
+    Quote,
+    CodeBlock,
+    Link,
+}
+
+impl ComposeMarkup {
+    /// 工具条从左到右的排列顺序。
+    pub(crate) const ALL: [ComposeMarkup; 9] = [
+        ComposeMarkup::Bold,
+        ComposeMarkup::Italic,
+        ComposeMarkup::Strike,
+        ComposeMarkup::InlineCode,
+        ComposeMarkup::BulletList,
+        ComposeMarkup::NumberedList,
+        ComposeMarkup::Quote,
+        ComposeMarkup::CodeBlock,
+        ComposeMarkup::Link,
+    ];
+
+    /// 按钮气泡提示。
+    pub(crate) fn hint(self) -> &'static str {
+        match self {
+            Self::Bold => "加粗 (**文字**)",
+            Self::Italic => "斜体 (*文字*)",
+            Self::Strike => "删除线 (~~文字~~)",
+            Self::InlineCode => "行内代码 (`代码`)",
+            Self::BulletList => "无序列表 (- 条目)",
+            Self::NumberedList => "有序列表 (1. 条目)",
+            Self::Quote => "引用 (> 引用)",
+            Self::CodeBlock => "代码块 (```)",
+            Self::Link => "插入链接 ([文字](https://))",
+        }
+    }
+
+    /// 生成要写进正文的片段：有选区时包裹选区，否则用占位文案。
+    pub(crate) fn wrap(self, selected: &str) -> String {
+        let text = if selected.is_empty() {
+            match self {
+                Self::Bold => "粗体",
+                Self::Italic => "斜体",
+                Self::Strike => "删除线",
+                Self::InlineCode => "代码",
+                Self::BulletList => "列表项",
+                Self::NumberedList => "列表项",
+                Self::Quote => "引用内容",
+                Self::CodeBlock => "",
+                Self::Link => "链接文字",
+            }
+        } else {
+            selected
+        };
+        match self {
+            Self::Bold => format!("**{text}**"),
+            Self::Italic => format!("*{text}*"),
+            Self::Strike => format!("~~{text}~~"),
+            Self::InlineCode => format!("`{text}`"),
+            Self::BulletList => prefix_lines(text, "- "),
+            Self::NumberedList => number_lines(text),
+            Self::Quote => prefix_lines(text, "> "),
+            Self::CodeBlock => format!("```\n{text}\n```"),
+            Self::Link => format!("[{text}](https://)"),
+        }
+    }
+}
+
+/// 给每一行加同样的前缀（空行不加），用于列表与引用。
+fn prefix_lines(text: &str, prefix: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            if line.trim().is_empty() {
+                line.to_string()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 给每一行加递增序号，用于有序列表。
+fn number_lines(text: &str) -> String {
+    let mut n = 0usize;
+    text.split('\n')
+        .map(|line| {
+            if line.trim().is_empty() {
+                line.to_string()
+            } else {
+                n += 1;
+                format!("{n}. {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// WP-10-2 写信 From 下拉的一个候选身份（账号默认身份或某个发信别名）。
@@ -586,6 +710,21 @@ pub(crate) struct HylkiApp {
     pub(crate) compose_reply_to: Entity<InputState>,
     pub(crate) compose_subject: Entity<InputState>,
     pub(crate) compose_body: Entity<TextareaState>,
+    /// WP-10-3 正文格式（富文本 / Markdown / HTML / 纯文本）。
+    ///
+    /// 与原版一致，切换格式会把正文转换成目标表示；当前格式随草稿一起
+    /// 落盘（`body_format`），重新打开草稿时按原格式恢复。
+    pub(crate) compose_format: ComposeFormat,
+    /// WP-10-4 写信是否以「阅读器在上、写信器在下」的内联分屏呈现
+    /// （对齐原版 `compose_inline` / `.reader-split`）。仅回复 / 转发且
+    /// 阅读器里有可对照的邮件时成立。
+    pub(crate) compose_split: bool,
+    /// 内联分屏中写信面板的高度（贴底，px）；拖拽中间手柄时更新。
+    pub(crate) compose_split_height: f32,
+    /// WP-10-4 写信任意弹出为独立窗口：主窗口回到阅读器，不再重复画写信页。
+    pub(crate) compose_detached: bool,
+    /// 独立写信窗口的句柄（`None` = 未弹出或在别处已被关掉）。
+    compose_window: Option<AnyWindowHandle>,
     pub(crate) compose_in_reply_to: String,
     pub(crate) compose_attachments: Vec<String>,
     /// 写信退出前未保存确认条显示状态。
@@ -1076,6 +1215,11 @@ impl HylkiApp {
                 compose_reply_to,
                 compose_subject,
                 compose_body,
+                compose_format: ComposeFormat::default(),
+                compose_split: false,
+                compose_split_height: COMPOSE_SPLIT_DEFAULT_HEIGHT,
+                compose_detached: false,
+                compose_window: None,
                 compose_in_reply_to: String::new(),
                 compose_attachments: Vec::new(),
                 compose_confirm_discard: false,
@@ -1278,6 +1422,11 @@ impl HylkiApp {
             compose_reply_to,
             compose_subject,
             compose_body,
+            compose_format: ComposeFormat::default(),
+            compose_split: false,
+            compose_split_height: COMPOSE_SPLIT_DEFAULT_HEIGHT,
+            compose_detached: false,
+            compose_window: None,
             compose_in_reply_to: String::new(),
             compose_attachments: Vec::new(),
             compose_confirm_discard: false,
@@ -3674,6 +3823,75 @@ impl HylkiApp {
         }
     }
 
+    /// 按当前正文格式算出投递用的 HTML。
+    ///
+    /// 纯文本模式返回 `None`（只发 `text/plain`）；其余三种格式把正文转换到
+    /// HTML，交给 SMTP 层组成 `multipart/alternative`，纯文本作为兜底。
+    fn compose_body_html(&self, cx: &Context<Self>) -> Option<String> {
+        if self.compose_format == ComposeFormat::Plain {
+            return None;
+        }
+        let body = self.compose_body.read(cx).value().to_string();
+        if body.trim().is_empty() {
+            return None;
+        }
+        Some(hylki_mail_core::markup::convert(
+            &body,
+            self.compose_format,
+            ComposeFormat::Html,
+        ))
+    }
+
+    /// WP-10-3：切换正文格式。
+    ///
+    /// 与原版 `on_load_as` 一致，切换不是「换一个空编辑器」，而是把当前正文
+    /// **转换**到目标表示后写回编辑区，因此切过去不会丢内容。用 `replace_all`
+    /// 而不是 `set_value`，保留撤销历史（一次误切换可以 Ctrl+Z 撤回）。
+    pub(crate) fn set_compose_format(
+        &mut self,
+        to: ComposeFormat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if to == self.compose_format {
+            return;
+        }
+        let from = self.compose_format;
+        let body = self.compose_body.read(cx).value().to_string();
+        let converted = hylki_mail_core::markup::convert(&body, from, to);
+        self.compose_format = to;
+        self.compose_body
+            .update(cx, |state, cx| state.replace_all(converted, window, cx));
+        // `replace_all` 是静默写入（不触发 Change 事件），自动保存要手动续上。
+        self.schedule_draft_autosave(cx);
+        self.compose_body.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// WP-10-3：向正文插入一段格式语法（加粗 / 斜体 / 列表 / 引用 / 代码块 / 链接）。
+    ///
+    /// 有选区时包裹选区，没有选区时插入带占位文案的完整片段。
+    /// 光标只能落在插入内容末尾（`gpui-base` 的 `set_cursor_to` 不对外），
+    /// 所以占位文案用的是「一看就知道要改哪个字」的词，而不是空标记。
+    pub(crate) fn insert_compose_markup(
+        &mut self,
+        kind: ComposeMarkup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.compose_format.has_format_toolbar() {
+            return;
+        }
+        self.compose_body.update(cx, |state, cx| {
+            let selected = state.selected_text().to_string();
+            let snippet = kind.wrap(&selected);
+            state.replace(snippet, window, cx);
+        });
+        self.schedule_draft_autosave(cx);
+        self.compose_body.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
     /// 某个字段的完整收件人串（胶囊 + 仍在输入的那一段），发信与草稿落盘用。
     pub(crate) fn compose_field_text(
         &self,
@@ -3951,6 +4169,124 @@ impl HylkiApp {
         }
     }
 
+    // ---- WP-10-4：内联上下分屏回复与独立写信窗口 ----
+
+    /// 进入写信会话时决定挂载方式。
+    ///
+    /// 对齐原版 "where composers live"（`src/app/compose_host.rs`）：
+    /// - `split = true`（回复 / 回复全部 / 转发 / 作为新邮件编辑）且偏好
+    ///   `compose_inline` 打开、阅读器里还留着一封可对照的邮件时，写信面板贴在
+    ///   阅读器下半部分，中间带可拖拽的 `.split-grab-pill`；
+    /// - `split = false`（新写信 / 打开草稿 / 撤销发送回填）时整栏呈现。
+    ///
+    /// 若此时写信正弹在独立窗口里，先把窗口收回，避免同一份表单在两处渲染。
+    fn begin_compose_session(&mut self, split: bool, cx: &mut Context<Self>) {
+        if self.compose_detached {
+            self.close_compose_window(cx);
+        }
+        self.compose_detached = false;
+        self.compose_split = split && self.prefs.compose_inline && self.selected_message.is_some();
+        if self.compose_split_height < COMPOSE_SPLIT_MIN_HEIGHT {
+            self.compose_split_height = COMPOSE_SPLIT_DEFAULT_HEIGHT;
+        }
+    }
+
+    /// 内联分屏把手移动：写信面板贴底，高度 = 分屏容器底 − 指针 y；
+    /// 上方阅读器保底 [`COMPOSE_SPLIT_READER_MIN_HEIGHT`]。
+    fn on_compose_split_drag_move(
+        &mut self,
+        event: &DragMoveEvent<ComposeSplitDrag>,
+        cx: &mut Context<Self>,
+    ) {
+        let pointer_y = event.event.position.y.as_f32();
+        let container_top = event.bounds.top().as_f32();
+        let container_height = event.bounds.size.height.as_f32();
+        let max =
+            (container_height - COMPOSE_SPLIT_READER_MIN_HEIGHT).max(COMPOSE_SPLIT_MIN_HEIGHT);
+        self.compose_split_height =
+            (container_top + container_height - pointer_y).clamp(COMPOSE_SPLIT_MIN_HEIGHT, max);
+        cx.notify();
+    }
+
+    /// 把当前写信会话弹出为独立窗口（写信栏右上角 `↗`）。
+    ///
+    /// 独立窗口直接渲染同一份 [`HylkiApp`] 写信状态（对齐设置窗口的做法），
+    /// 所以草稿自动保存、发送、附件等逻辑无需复制；主窗口同时回到阅读器。
+    pub(crate) fn pop_out_compose(&mut self, cx: &mut Context<Self>) {
+        if self.compose_detached {
+            return;
+        }
+        self.close_compose_window(cx);
+        let subject = self.compose_subject.read(cx).value().to_string();
+        let title = if subject.trim().is_empty() {
+            "写邮件".to_string()
+        } else {
+            subject
+        };
+        let app_entity = cx.entity();
+        let centered = Bounds::centered(None, size(px(780.0), px(700.0)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(centered)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.clone().into()),
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            ..Default::default()
+        };
+        let opened = gpui_kit::open_window(options, cx, move |window, cx| {
+            window.set_window_title(&title);
+            cx.new(|cx| ComposeWindow::new(app_entity, window, cx))
+        });
+        match opened {
+            Ok((handle, _entity)) => {
+                #[cfg(target_os = "windows")]
+                crate::apply_window_icon();
+                self.compose_window = Some(handle);
+                self.compose_detached = true;
+            }
+            Err(err) => {
+                self.status_line = SharedString::from(format!("无法打开独立写信窗口：{err}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 把独立窗口里的写信收回主窗口（`↙` 按钮；窗口关闭回调也走这里）。
+    pub(crate) fn attach_compose_back(&mut self, cx: &mut Context<Self>) {
+        self.compose_window = None;
+        self.set_compose_detached(false, cx);
+    }
+
+    /// 标记写信是否仍寄居在独立窗口（窗口被关掉时由关闭回调复位）。
+    pub(crate) fn set_compose_detached(&mut self, detached: bool, cx: &mut Context<Self>) {
+        if self.compose_detached == detached {
+            return;
+        }
+        self.compose_detached = detached;
+        if !detached {
+            self.compose_window = None;
+        }
+        cx.notify();
+    }
+
+    /// 结束写信会话：清掉分屏 / 独立窗口形态，回到阅读器。
+    /// 发送成功、放弃、保存草稿退出三条路径共用。
+    fn finish_compose_session(&mut self, cx: &mut Context<Self>) {
+        self.compose_split = false;
+        if self.compose_detached {
+            self.close_compose_window(cx);
+            self.compose_detached = false;
+        }
+    }
+
+    /// 关掉残留的独立写信窗口（新写信会话抢占 / 重复弹出前调用）。
+    fn close_compose_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.compose_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
     pub(crate) fn start_new_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.main_view = MainContentView::Mail;
         // P3：从浮层侧栏 / 窄轨发起写信时同步收起浮层。
@@ -3980,6 +4316,8 @@ impl HylkiApp {
         self.compose_in_reply_to.clear();
         self.compose_attachments.clear();
         self.compose_confirm_discard = false;
+        // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
+        self.compose_format = ComposeFormat::default();
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
@@ -3998,6 +4336,8 @@ impl HylkiApp {
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.compose_body
             .update(cx, |s, cx| s.set_value(initial_body, window, cx));
+        // WP-10-4：新写信没有可对照的原邮件，独占右栏。
+        self.begin_compose_session(false, cx);
         self.right_mode = RightPaneMode::Compose;
         self.ensure_contacts_loaded();
         cx.notify();
@@ -4059,6 +4399,7 @@ impl HylkiApp {
             in_reply_to: self.compose_in_reply_to.clone(),
             from_addr: self.compose_from_addr.clone(),
             reply_to: self.compose_reply_to.read(cx).value().to_string(),
+            body_format: self.compose_format.as_str().to_string(),
             attachment_paths: self.compose_attachments.clone(),
             updated_at: 0,
         };
@@ -4099,6 +4440,13 @@ impl HylkiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // WP-10-4：内联分屏时原邮件仍在眼前，回复 / 转发按钮随时可点；
+        // 当前写信已有内容时先拦下，避免一次误点把正在写的正文换掉。
+        if self.right_mode == RightPaneMode::Compose && self.compose_has_unsaved_content(cx) {
+            self.status_line = SharedString::from("当前写信尚未完成，请先发送、存草稿或取消");
+            cx.notify();
+            return;
+        }
         let forward_subject = if detail.subject.to_lowercase().starts_with("fwd:") {
             detail.subject.clone()
         } else {
@@ -4120,6 +4468,8 @@ impl HylkiApp {
         self.compose_in_reply_to.clear();
         self.compose_attachments.clear();
         self.compose_confirm_discard = false;
+        // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
+        self.compose_format = ComposeFormat::default();
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = Some(detail.id);
         self.compose_autocomplete_field = None;
@@ -4131,6 +4481,8 @@ impl HylkiApp {
             .update(cx, |s, cx| s.set_value(forward_subject, window, cx));
         self.compose_body
             .update(cx, |s, cx| s.set_value(body_with_sig, window, cx));
+        // WP-10-4：转发时原邮件留在阅读器上半部分对照（偏好可关）。
+        self.begin_compose_session(true, cx);
         self.right_mode = RightPaneMode::Compose;
         self.ensure_contacts_loaded();
 
@@ -4169,6 +4521,8 @@ impl HylkiApp {
         self.compose_in_reply_to.clear();
         self.compose_attachments.clear();
         self.compose_confirm_discard = false;
+        // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
+        self.compose_format = ComposeFormat::default();
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
@@ -4181,6 +4535,8 @@ impl HylkiApp {
         self.compose_body.update(cx, |s, cx| {
             s.set_value(detail.body_text.clone(), window, cx)
         });
+        // WP-10-4：作为新邮件编辑同样保留原邮件对照。
+        self.begin_compose_session(true, cx);
         self.right_mode = RightPaneMode::Compose;
         self.ensure_contacts_loaded();
         cx.notify();
@@ -4195,6 +4551,13 @@ impl HylkiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // WP-10-4：内联分屏时原邮件仍在眼前，回复 / 转发按钮随时可点；
+        // 当前写信已有内容时先拦下，避免一次误点把正在写的正文换掉。
+        if self.right_mode == RightPaneMode::Compose && self.compose_has_unsaved_content(cx) {
+            self.status_line = SharedString::from("当前写信尚未完成，请先发送、存草稿或取消");
+            cx.notify();
+            return;
+        }
         let reply_subject = if detail
             .subject
             .to_lowercase()
@@ -4223,6 +4586,8 @@ impl HylkiApp {
         self.compose_in_reply_to = detail.rfc_message_id.clone();
         self.compose_attachments.clear();
         self.compose_confirm_discard = false;
+        // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
+        self.compose_format = ComposeFormat::default();
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
@@ -4234,6 +4599,8 @@ impl HylkiApp {
             .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
         self.compose_body
             .update(cx, |s, cx| s.set_value(body_with_sig, window, cx));
+        // WP-10-4：回复 / 回复全部默认把原邮件留在上半部分（对齐原版 reader-split）。
+        self.begin_compose_session(true, cx);
         self.right_mode = RightPaneMode::Compose;
         self.ensure_contacts_loaded();
         cx.notify();
@@ -4281,9 +4648,12 @@ impl HylkiApp {
             self.compose_autosaved_at = None;
         }
         self.compose_confirm_discard = false;
+        // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
+        self.compose_format = ComposeFormat::default();
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
+        self.finish_compose_session(cx);
         self.right_mode = RightPaneMode::Reader;
         cx.notify();
     }
@@ -4293,9 +4663,12 @@ impl HylkiApp {
         self.cancel_draft_autosave();
         self.save_local_draft(cx);
         self.compose_confirm_discard = false;
+        // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
+        self.compose_format = ComposeFormat::default();
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
+        self.finish_compose_session(cx);
         self.right_mode = RightPaneMode::Reader;
         cx.notify();
     }
@@ -4343,8 +4716,12 @@ impl HylkiApp {
             || !draft.reply_to.trim().is_empty();
         self.compose_subject
             .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
+        // WP-10-3：草稿里记着正文格式，按原格式打开，避免把 Markdown 源当成纯文本。
+        self.compose_format = ComposeFormat::from_str_lossy(&draft.body_format);
         self.compose_body
             .update(cx, |s, cx| s.set_value(draft.body_text.clone(), window, cx));
+        // WP-10-4：草稿自带头与正文，整栏呈现。
+        self.begin_compose_session(false, cx);
         self.right_mode = RightPaneMode::Compose;
         cx.notify();
     }
@@ -4366,6 +4743,7 @@ impl HylkiApp {
             in_reply_to: self.compose_in_reply_to.clone(),
             from_addr: self.compose_from_addr.clone(),
             reply_to: self.compose_reply_to.read(cx).value().to_string(),
+            body_format: self.compose_format.as_str().to_string(),
             attachment_paths: self.compose_attachments.clone(),
             updated_at: 0,
         };
@@ -4846,6 +5224,8 @@ impl HylkiApp {
                 in_reply_to: self.compose_in_reply_to.clone(),
                 from_addr: self.compose_from_addr.clone(),
                 reply_to: self.compose_reply_to.read(cx).value().to_string(),
+                body_format: self.compose_format.as_str().to_string(),
+                body_html: self.compose_body_html(cx),
                 attachment_paths: self.compose_attachments.clone(),
             },
             local_draft_id: self.compose_draft_id,
@@ -4886,6 +5266,8 @@ impl HylkiApp {
         self.compose_autosaved_new = false;
         self.compose_autosaved_at = None;
         self.pending_unsubscribe = None;
+        // WP-10-4：发出后分屏 / 独立写信窗口一并收起，回到阅读器。
+        self.finish_compose_session(cx);
         self.right_mode = RightPaneMode::Reader;
         self.error_banner = None;
 
@@ -5062,9 +5444,12 @@ impl HylkiApp {
         self.restore_compose_identity(&draft.from_addr, &draft.reply_to, window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
+        self.compose_format = ComposeFormat::from_str_lossy(&draft.body_format);
         self.compose_body
             .update(cx, |s, cx| s.set_value(draft.body.clone(), window, cx));
         self.compose_confirm_discard = false;
+        // WP-10-4：撤销发送回填的邮件整栏呈现（没有原邮件可对照）。
+        self.begin_compose_session(false, cx);
         self.right_mode = RightPaneMode::Compose;
     }
 
@@ -7490,81 +7875,159 @@ impl HylkiApp {
     ) -> gpui_kit::AnyElement {
         match self.right_mode {
             RightPaneMode::Compose => {
-                let p = theme::current(cx);
-                // L-6：阅读器在下方 / 关闭时列表顶栏即窗口顶栏（对齐原版 controls_in_list），
-                // 写信页顶栏不再重复画窗口控制按钮。
+                // WP-10-4：写信已弹出为独立窗口时，主窗口回到阅读器。
+                if self.compose_detached {
+                    return reader::render(self, window, cx);
+                }
+                // WP-10-4：内联上下分屏——原邮件留在上半部分可随时对照滚动，
+                // 写信面板贴底，中间是 `.split-grab-pill` 拖拽手柄。
+                if self.compose_split && self.selected_message.is_some() {
+                    let p = theme::current(cx);
+                    // 窗口控制按钮画在上半部分阅读器的顶栏里。
+                    let reader_el = reader::render_with_pane_top(self, window, cx, true);
+                    let compose_el = self.render_compose_pane(window, cx, false, false);
+                    return v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .bg(p.canvas)
+                        .child(div().flex_1().min_h_0().child(reader_el))
+                        .child(
+                            resize_handle::<ComposeSplitDrag, ComposeSplitDrag>(
+                                "compose-split-handle",
+                                Axis::Vertical,
+                            )
+                            .inside(HandleEdge::Leading)
+                            .on_drag(ComposeSplitDrag, |_, _, _, cx| cx.new(|_| ComposeSplitDrag)),
+                        )
+                        .child(
+                            div()
+                                .h(px(self.compose_split_height))
+                                .min_h(px(COMPOSE_SPLIT_MIN_HEIGHT))
+                                .flex_shrink_0()
+                                .child(compose_el),
+                        )
+                        .on_drag_move(cx.listener(
+                            |this, event: &DragMoveEvent<ComposeSplitDrag>, _, cx| {
+                                this.on_compose_split_drag_move(event, cx);
+                            },
+                        ))
+                        .into_any_element();
+                }
                 let pane_top = self.pane_at_window_top();
-                // 写信页唯一标题栏（B-8：合并进 48px 顶栏，compose.rs 不再画第二层标题）：
-                // 左侧「取消 / 存草稿」，中间拖拽区，右侧「附件 / 发送」，复用现有动作。
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .bg(p.canvas)
-                    .child(
-                        h_flex()
-                            .h(px(window_controls::HEADER_HEIGHT))
-                            .flex_shrink_0()
-                            .px_2()
-                            .gap_1()
-                            .items_center()
-                            .border_b_1()
-                            .border_color(p.border)
-                            .child(
-                                Button::new("compose-bar-cancel")
-                                    .ghost()
-                                    .compact()
-                                    .label("取消")
-                                    .tooltip("放弃当前邮件（Esc）")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.request_close_compose(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("compose-bar-save-draft")
-                                    .ghost()
-                                    .compact()
-                                    .label("存草稿")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_local_draft(cx);
-                                    })),
-                            )
-                            .child(window_controls::drag_spacer())
-                            .child(
-                                Button::new("compose-bar-attach")
-                                    .ghost()
-                                    .compact()
-                                    .icon(IconName::Paperclip)
-                                    .label("附件")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.pick_attachments(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("compose-bar-send")
-                                    .primary()
-                                    .compact()
-                                    .label("发送")
-                                    .tooltip("发送（Ctrl+Enter）")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.send_compose(cx);
-                                    })),
-                            )
-                            .when(pane_top, |bar| {
-                                bar.child(window_controls::render_window_controls(
-                                    "compose-wc",
-                                    window,
-                                    cx,
-                                ))
-                            }),
-                    )
-                    .child(compose::render(self, cx))
-                    .into_any_element()
+                self.render_compose_pane(window, cx, pane_top, false)
             }
             RightPaneMode::Welcome => welcome::render(self, window, cx),
             RightPaneMode::Reader => reader::render(self, window, cx),
         }
     }
+    /// 写信页（标题栏 + 表单），供主窗口与独立写信窗口共用。
+    ///
+    /// - `pane_top`：是否在本页顶栏画窗口控制按钮（内联分屏时由上面阅读器承载）；
+    /// - `detached`：本页已在独立窗口里，标题栏换成「收回」按钮。
+    pub(crate) fn render_compose_pane(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+        pane_top: bool,
+        detached: bool,
+    ) -> gpui_kit::AnyElement {
+        let p = theme::current(cx);
+        // 写信页唯一标题栏（B-8：合并进 48px 顶栏，compose.rs 不再画第二层标题）：
+        // 左侧「取消 / 存草稿」，中间拖拽区，右侧「附件 / 发送」，复用现有动作。
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(p.canvas)
+            .child(
+                h_flex()
+                    .h(px(window_controls::HEADER_HEIGHT))
+                    .flex_shrink_0()
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(
+                        Button::new("compose-bar-cancel")
+                            .ghost()
+                            .compact()
+                            .label("取消")
+                            .tooltip("放弃当前邮件（Esc）")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request_close_compose(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("compose-bar-save-draft")
+                            .ghost()
+                            .compact()
+                            .label("存草稿")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_local_draft(cx);
+                            })),
+                    )
+                    .child(window_controls::drag_spacer())
+                    // WP-10-4：内联分屏 / 独立窗口互转。
+                    .when(detached, |bar| {
+                        bar.child(
+                            Button::new("compose-bar-attach-back")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::Minimize2)
+                                .label("收回")
+                                .tooltip("收回主窗口")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.attach_compose_back(cx);
+                                    window.remove_window();
+                                })),
+                        )
+                    })
+                    .when(!detached, |bar| {
+                        bar.child(
+                            Button::new("compose-bar-pop-out")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::ExternalLink)
+                                .tooltip("在独立窗口中撰写")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pop_out_compose(cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("compose-bar-attach")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Paperclip)
+                            .label("附件")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pick_attachments(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("compose-bar-send")
+                            .primary()
+                            .compact()
+                            .label("发送")
+                            .tooltip("发送（Ctrl+Enter）")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.send_compose(cx);
+                            })),
+                    )
+                    .when(pane_top, |bar| {
+                        bar.child(window_controls::render_window_controls(
+                            "compose-wc",
+                            window,
+                            cx,
+                        ))
+                    }),
+            )
+            .child(compose::render(self, cx))
+            .into_any_element()
+    }
+
     fn render_status_bar(
         &self,
         top: bool,
@@ -9145,6 +9608,50 @@ pub(crate) fn compose_demo_eml(detail: &MessageDetail) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- WP-10-3 正文格式与语法插入 ----
+
+    /// 有选区时包裹选区，无选区时用占位文案。
+    #[test]
+    fn compose_markup_wraps_selection_or_uses_placeholder() {
+        assert_eq!(ComposeMarkup::Bold.wrap("重点"), "**重点**");
+        assert_eq!(ComposeMarkup::Bold.wrap(""), "**粗体**");
+        assert_eq!(ComposeMarkup::Italic.wrap("斜"), "*斜*");
+        assert_eq!(ComposeMarkup::Strike.wrap("删"), "~~删~~");
+        assert_eq!(ComposeMarkup::InlineCode.wrap("a=1"), "`a=1`");
+        assert_eq!(ComposeMarkup::Link.wrap("官网"), "[官网](https://)");
+        assert_eq!(ComposeMarkup::CodeBlock.wrap("x=1"), "```\nx=1\n```");
+    }
+
+    /// 列表 / 引用按行加前缀，空行原样保留；有序列表逐行递增编号。
+    #[test]
+    fn compose_markup_prefixes_lines() {
+        assert_eq!(ComposeMarkup::BulletList.wrap("a\nb"), "- a\n- b");
+        assert_eq!(
+            ComposeMarkup::Quote.wrap("一句\n\n两句"),
+            "> 一句\n\n> 两句"
+        );
+        assert_eq!(ComposeMarkup::NumberedList.wrap("甲\n乙"), "1. 甲\n2. 乙");
+    }
+
+    /// HTML / 纯文本模式不提供语法工具条。
+    #[test]
+    fn only_rich_and_markdown_offer_the_toolbar() {
+        assert!(ComposeFormat::Rich.has_format_toolbar());
+        assert!(ComposeFormat::Markdown.has_format_toolbar());
+        assert!(!ComposeFormat::Html.has_format_toolbar());
+        assert!(!ComposeFormat::Plain.has_format_toolbar());
+    }
+
+    /// 格式标识的存入 / 读回是可逆的，未知值退回默认格式。
+    #[test]
+    fn compose_format_round_trips_through_storage_string() {
+        for format in ComposeFormat::ALL {
+            assert_eq!(ComposeFormat::from_str_lossy(format.as_str()), format);
+        }
+        assert_eq!(ComposeFormat::from_str_lossy(""), ComposeFormat::Rich);
+        assert_eq!(ComposeFormat::from_str_lossy("md"), ComposeFormat::Markdown);
+    }
 
     // ---- WP-10-1 收件人胶囊 ----
 

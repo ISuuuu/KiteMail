@@ -7,6 +7,7 @@ pub mod contacts_io;
 pub mod demo;
 pub mod graph_client;
 pub mod imap_client;
+pub mod markup;
 pub mod mime;
 pub mod oauth;
 pub mod search_query;
@@ -215,6 +216,8 @@ pub struct LocalDraft {
     pub from_addr: String,
     /// `Reply-To` 行（WP-10 第 2 项）；空表示不写该信头。
     pub reply_to: String,
+    /// 正文格式（`ComposeFormat::as_str`，WP-10 第 3 项）；空 / 未知按富文本处理。
+    pub body_format: String,
     pub attachment_paths: Vec<String>,
     pub updated_at: i64,
 }
@@ -243,6 +246,11 @@ pub struct ComposeDraft {
     pub from_addr: String,
     /// `Reply-To` 行；空表示不写该信头。
     pub reply_to: String,
+    /// 正文格式（`ComposeFormat::as_str`，WP-10 第 3 项）；空 / 未知按富文本处理。
+    pub body_format: String,
+    /// WP-10-3 按正文格式预先算好的 HTML（`Some` 时发 multipart/alternative，
+    /// 纯文本模式为 `None`）。草稿本身仍只存源文本 + 会话级格式。
+    pub body_html: Option<String>,
     pub attachment_paths: Vec<String>,
 }
 
@@ -293,6 +301,8 @@ pub struct OutboxItem {
     pub from_addr: String,
     /// `Reply-To` 行；空表示不写该信头。
     pub reply_to: String,
+    /// 投递用的 HTML 正文（`Some` 时发 multipart/alternative）。
+    pub body_html: Option<String>,
     pub attachment_paths: Vec<String>,
     pub status: OutboxStatus,
     pub last_error: String,
