@@ -181,10 +181,17 @@ pub(crate) struct SettingsWindow {
     pub(crate) after_save_action: Option<EditorLeaveAction>,
     pub(crate) sender_input: Entity<InputState>,
     pub(crate) sender_feedback: Option<(bool, SharedString)>,
+    /// WP-05：发件人页实时过滤关键词（同时作用于白名单与黑名单列表）。
+    pub(crate) senders_filter: String,
+    pub(crate) sender_search_input: Entity<InputState>,
+    /// WP-05：发件人页黑名单添加输入框。
+    pub(crate) blocked_input: Entity<InputState>,
     pub(crate) reply_header_input: Entity<InputState>,
     pub(crate) attachment_keywords_input: Entity<InputState>,
     pub(crate) compose_inputs_feedback: Option<SharedString>,
     pub(crate) confirm_clear_cache: bool,
+    /// WP-05：系统页本地缓存占用统计（进入系统页时计算一次，清除缓存后失效）。
+    pub(crate) storage_stats: Option<config::StorageStats>,
     pub(crate) pending_backup_import: Option<(std::path::PathBuf, SettingsBackupBundle)>,
     pub(crate) backup_feedback: Option<(bool, SharedString)>,
     pub(crate) sidebar_scroll: ScrollHandle,
@@ -241,6 +248,21 @@ impl SettingsWindow {
         let sender_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("输入邮箱地址添加，如 newsletter@example.com")
         });
+        let sender_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索发件人..."));
+        cx.subscribe(
+            &sender_search_input,
+            |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.senders_filter = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        let blocked_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("输入邮箱或域名，如 spam.example.com")
+        });
         let reply_header_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("留空用默认中文格式，支持 {name} {address} {date} {time} {subject}")
@@ -276,10 +298,14 @@ impl SettingsWindow {
             after_save_action: None,
             sender_input,
             sender_feedback: None,
+            senders_filter: String::new(),
+            sender_search_input,
+            blocked_input,
             reply_header_input,
             attachment_keywords_input,
             compose_inputs_feedback: None,
             confirm_clear_cache: false,
+            storage_stats: None,
             pending_backup_import: None,
             backup_feedback: None,
             sidebar_scroll: ScrollHandle::new(),
@@ -415,6 +441,8 @@ impl SettingsWindow {
                 self.active_tab = tab;
                 self.narrow_show_content = true;
                 self.confirm_clear_cache = false;
+                // 系统页存储占用统计在每次进入时重新计算。
+                self.storage_stats = None;
                 self.sender_feedback = None;
                 self.compose_inputs_feedback = None;
                 cx.notify();
@@ -623,6 +651,111 @@ impl SettingsWindow {
             self.sender_feedback = Some((false, SharedString::from("请输入包含 @ 的合法邮箱地址")));
         }
         cx.notify();
+    }
+
+    /// WP-05：把输入框中的邮箱或域名加入黑名单（非法输入给出行内反馈）。
+    pub(crate) fn add_blocked_sender(
+        &mut self,
+        app_entity: &Entity<HylkiApp>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let raw = self.blocked_input.read(cx).value().trim().to_string();
+        if raw.is_empty() {
+            self.sender_feedback = Some((
+                false,
+                SharedString::from("请输入邮箱地址或域名（如 example.com）"),
+            ));
+            cx.notify();
+            return;
+        }
+        let mut added = None;
+        app_entity.update(cx, |app, cx| {
+            app.mutate_preferences(cx, |prefs| {
+                added = prefs.block_sender(&raw);
+            });
+        });
+        if let Some(entry) = added {
+            self.blocked_input
+                .update(cx, |s, cx| s.set_value("", window, cx));
+            self.sender_feedback = Some((true, SharedString::from(format!("已屏蔽：{entry}"))));
+        } else {
+            self.sender_feedback = Some((
+                false,
+                SharedString::from("请输入合法的邮箱地址或域名（如 example.com）"),
+            ));
+        }
+        cx.notify();
+    }
+
+    /// WP-05：导出诊断信息文本（无日志文件，导出环境 / 配置摘要，邮箱地址
+    /// 只保留域名以免泄露隐私）。保存到用户选择的位置。
+    pub(crate) fn export_diagnostics_log(&mut self, cx: &mut Context<Self>) {
+        let app = self.app.read(cx);
+        let stats = config::storage_stats_in(&config::data_dir());
+        let mut domains = 0usize;
+        for acc in &app.accounts {
+            if let Some((_, domain)) = acc.email.rsplit_once('@') {
+                if !domain.is_empty() {
+                    domains += 1;
+                }
+            }
+        }
+        let report = format!(
+            "Hylki Windows 诊断信息\n=======================\n\
+             版本: v{}\n\
+             运行模式: {}\n\
+             操作系统: {} {}\n\
+             数据目录: {}\n\
+             本地数据占用: {}（{} 个文件）\n\
+             已配置账号: {} 个（{} 个含邮箱域名）\n\
+             偏好设置: 主题={} 明暗={:?} 列表布局={} 字号缩放={}%\n\
+             自动同步: {} 分钟 推送={} 计费省流={}\n\
+             黑名单发件人: {} 条 远程图像白名单: {} 条\n\
+             导出时间: {}\n",
+            env!("CARGO_PKG_VERSION"),
+            if app.demo_mode {
+                "演示模式（内存模拟）"
+            } else {
+                "标准模式（SQLite + TOML）"
+            },
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            config::data_dir().display(),
+            config::format_bytes(stats.total_bytes),
+            stats.file_count,
+            app.accounts.len(),
+            domains,
+            app.prefs.theme_id,
+            app.prefs.dark_mode,
+            app.prefs.list_layout,
+            app.prefs.ui_text_scale_percent,
+            app.prefs.auto_sync_minutes,
+            app.prefs.push_enabled,
+            app.prefs.metered_save_data,
+            app.prefs.blocked_senders.len(),
+            app.prefs.allowed_remote_senders.len(),
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        );
+        if let Some(dest) = rfd::FileDialog::new()
+            .set_file_name("hylki-diagnostics.txt")
+            .add_filter("诊断信息文本 (*.txt)", &["txt"])
+            .save_file()
+        {
+            match std::fs::write(&dest, report) {
+                Ok(()) => {
+                    self.backup_feedback = Some((
+                        true,
+                        SharedString::from(format!("诊断信息已导出至：{}", dest.display())),
+                    ));
+                }
+                Err(e) => {
+                    self.backup_feedback =
+                        Some((false, SharedString::from(format!("写出诊断信息失败: {e}"))));
+                }
+            }
+            cx.notify();
+        }
     }
 
     pub(crate) fn apply_reply_header_input(

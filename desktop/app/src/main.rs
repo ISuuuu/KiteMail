@@ -7,6 +7,7 @@
 //! message_list / reader / gallery / contacts / preferences / command_palette）。
 
 mod app;
+mod autostart;
 mod theme;
 mod tray;
 mod ui;

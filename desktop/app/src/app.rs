@@ -4417,6 +4417,60 @@ impl HylkiApp {
         cx.notify();
     }
 
+    /// WP-05：设置窗口的专注模式开关（与快捷键 / 主菜单切换同一行为路径，
+    /// 仅改运行时状态，不写偏好）。
+    pub(crate) fn set_focus_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.focus_mode != on {
+            self.toggle_focus_mode(cx);
+        }
+    }
+
+    /// WP-05：按「系统 → 链接打开方式」偏好打开邮件内链接。`system` 走
+    /// gpui 的系统 shell；指定浏览器时优先探测其安装路径并用其打开，
+    /// 未安装时回退系统默认。
+    pub(crate) fn open_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        let browser = match self.prefs.link_open_mode.as_str() {
+            "edge" => (
+                "msedge.exe",
+                [
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                ],
+            ),
+            "chrome" => (
+                "chrome.exe",
+                [
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                ],
+            ),
+            "firefox" => (
+                "firefox.exe",
+                [
+                    r"C:\Program Files\Mozilla Firefox\firefox.exe",
+                    r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+                ],
+            ),
+            _ => {
+                cx.open_url(url);
+                return;
+            }
+        };
+        let exe = browser
+            .1
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file());
+        match exe {
+            Some(path) => {
+                let _ = std::process::Command::new(path).arg(url).spawn();
+            }
+            None => {
+                // 指定浏览器未找到：回退系统默认。
+                cx.open_url(url);
+            }
+        }
+    }
+
     // ---- B-5：标题区视图切换 ----
 
     /// 切换单封邮件正文的亮 / 暗背景覆盖（会话级，键为邮件 ID；不持久化）。
@@ -4850,14 +4904,15 @@ impl HylkiApp {
     /// mailto 交给系统处理（gpui open_url 走系统 shell，可唤起默认邮件客户端）。
     pub(crate) fn confirm_unsubscribe(&mut self, _message_id: u32, cx: &mut Context<Self>) {
         self.pending_unsubscribe = None;
-        let Some(detail) = self.selected_message.as_ref() else {
-            return;
-        };
-        let Some(ref url) = detail.unsubscribe_url else {
+        let Some((url, one_click)) = self.selected_message.as_ref().and_then(|d| {
+            d.unsubscribe_url
+                .clone()
+                .map(|u| (u, d.unsubscribe_one_click))
+        }) else {
             return;
         };
         let lower = url.to_ascii_lowercase();
-        if detail.unsubscribe_one_click && lower.starts_with("https://") {
+        if one_click && lower.starts_with("https://") {
             if self.demo_mode {
                 self.status_line =
                     SharedString::from("演示模式：已模拟发送一键退订请求（不访问网络）");
@@ -4870,11 +4925,11 @@ impl HylkiApp {
             }
         } else if lower.starts_with("http://") || lower.starts_with("https://") {
             self.status_line = SharedString::from("已在浏览器打开退订页面");
-            cx.open_url(url);
+            self.open_link(&url, cx);
         } else if lower.starts_with("mailto:") {
             // gpui open_url 经系统 shell 打开，mailto 唤起默认邮件客户端。
             self.status_line = SharedString::from("已调用系统邮件客户端发送退订邮件");
-            cx.open_url(url);
+            cx.open_url(&url);
         } else {
             self.error_banner = Some(SharedString::from(
                 "该退订地址不受支持（仅支持 http/https/mailto）",
@@ -6979,8 +7034,8 @@ fn about_modal(
                         .outline()
                         .compact()
                         .label("打开")
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.open_url(url);
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_link(url, cx);
                         })),
                 )
         };

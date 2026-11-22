@@ -336,6 +336,180 @@ pub struct AppPreferences {
     /// L-6：阅读器在下方时列表的高度，逻辑像素；`None` 用默认 360。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list_below_height: Option<f32>,
+    // ---- WP-05：专注模式（对齐 Linux `src/config/focus.rs` FocusMode，
+    //      兼容映射保留既有 5 个 `focus_*` 旧字段，不迁移不丢数据） ----
+    /// 专注模式下折叠列表头部（搜索 / 筛选 / 计数 / 排序收进 ⋯ 菜单）。
+    #[serde(default = "default_true")]
+    pub focus_list_header: bool,
+    /// 专注模式下隐藏侧边栏账号分区。
+    #[serde(default = "default_true")]
+    pub focus_hide_accounts: bool,
+    /// 专注模式下折叠统一视图行。
+    #[serde(default = "default_true")]
+    pub focus_fold_unified: bool,
+    /// 专注模式下隐藏发件人头像。
+    #[serde(default = "default_true")]
+    pub focus_hide_avatars: bool,
+    /// 专注模式下隐藏主题（标签胶囊随之隐藏）。
+    #[serde(default)]
+    pub focus_hide_subject: bool,
+    /// 专注模式单行布局显示列标题。
+    #[serde(default)]
+    pub focus_column_headings: bool,
+    /// 专注模式下隐藏星标。
+    #[serde(default = "default_true")]
+    pub focus_hide_stars: bool,
+    /// 专注模式下隐藏附件图标。
+    #[serde(default = "default_true")]
+    pub focus_hide_attachment_icons: bool,
+    /// 专注模式下侧边栏折叠为图标栏。
+    #[serde(default = "default_true")]
+    pub focus_rail_sidebar: bool,
+    /// 专注模式图标栏以未读圆点代替计数。
+    #[serde(default = "default_true")]
+    pub focus_rail_dots: bool,
+    /// 专注模式下悬停图标栏滑出完整侧边栏。
+    #[serde(default)]
+    pub focus_hover_expand: bool,
+    /// 专注模式下折叠账号为头像。
+    #[serde(default = "default_true")]
+    pub focus_fold_accounts: bool,
+    /// 专注模式下单击账号即折叠。
+    #[serde(default)]
+    pub focus_click_folds: bool,
+    /// 专注模式统一视图行显示未读计数。
+    #[serde(default = "default_true")]
+    pub focus_unread_counts: bool,
+    /// 专注模式保留「收藏」分区。
+    #[serde(default = "default_true")]
+    pub focus_show_favorites: bool,
+    /// 专注模式保留「筛选文件夹」分区。
+    #[serde(default = "default_true")]
+    pub focus_show_filters: bool,
+    /// 专注模式保留「标签」分区。
+    #[serde(default = "default_true")]
+    pub focus_show_tags: bool,
+    /// 专注模式保留「联系人」分区。
+    #[serde(default = "default_true")]
+    pub focus_show_contacts: bool,
+    /// 专注模式保留「附件」分区。
+    #[serde(default = "default_true")]
+    pub focus_show_attachments: bool,
+    /// 专注模式保留「统一收件箱」行。
+    #[serde(default = "default_true")]
+    pub focus_show_inboxes: bool,
+    /// 专注模式下标签胶囊置于文本下方。
+    #[serde(default)]
+    pub focus_tags_below: bool,
+    /// 专注模式统一视图各行的显隐（星标 / 已发送 / 草稿 / 归档 / 垃圾邮件 / 废纸篓 / 稍后处理）。
+    #[serde(default = "default_true")]
+    pub focus_unified_starred: bool,
+    #[serde(default = "default_true")]
+    pub focus_unified_sent: bool,
+    #[serde(default = "default_true")]
+    pub focus_unified_drafts: bool,
+    #[serde(default = "default_true")]
+    pub focus_unified_archive: bool,
+    #[serde(default = "default_true")]
+    pub focus_unified_junk: bool,
+    #[serde(default = "default_true")]
+    pub focus_unified_trash: bool,
+    #[serde(default = "default_true")]
+    pub focus_unified_snoozed: bool,
+    /// 专注模式消息列表摘要行数（0..=3，对齐 Linux `preview_line_count`）。
+    #[serde(default = "default_focus_preview_lines")]
+    pub focus_preview_lines: u32,
+    /// 专注模式消息列表布局：`"cards"` / `"single_line"` / `"automatic"`（对齐 Linux `ListLayout`）。
+    #[serde(default = "default_focus_layout")]
+    pub focus_layout: String,
+    // ---- WP-05：侧边栏 ----
+    /// 统一视图导航项：显示「垃圾邮件」。
+    #[serde(default = "default_true")]
+    pub unified_show_junk: bool,
+    /// 统一视图导航项：显示「废纸篓」。
+    #[serde(default = "default_true")]
+    pub unified_show_trash: bool,
+    /// 统一视图导航项：显示「稍后处理」。
+    #[serde(default = "default_true")]
+    pub unified_show_snoozed: bool,
+    /// 侧边栏显示「筛选文件夹」分区。
+    #[serde(default = "default_true")]
+    pub sidebar_show_filtered: bool,
+    /// 侧边栏显示「智能文件夹」分区。
+    #[serde(default = "default_true")]
+    pub sidebar_show_smart: bool,
+    /// 侧边栏显示「标签」分区。
+    #[serde(default = "default_true")]
+    pub sidebar_show_tags: bool,
+    // ---- WP-05：消息列表 ----
+    /// 列表布局：`"cards"` 经典双行 / `"wide"` 宽表列视图（渲染接线随 WP-08 宽表落地）。
+    #[serde(default = "default_list_layout_key")]
+    pub list_layout: String,
+    /// 列表摘要行数（1 / 2 / 3 行；1 行为现状，多行渲染随 WP-08 接线）。
+    #[serde(default = "default_list_preview_lines")]
+    pub list_preview_lines: u32,
+    /// 单行宽表显示的列（`ListColumn` key 顺序表；主题列恒在）。
+    #[serde(default = "default_list_columns")]
+    pub list_columns: Vec<String>,
+    /// 宽表模式显示列标题栏。
+    #[serde(default)]
+    pub list_show_headings: bool,
+    // ---- WP-05：外观 ----
+    /// 阅读器工具栏左组按钮（`ToolbarItem` key 顺序表，最多 7 个）。
+    #[serde(default = "default_toolbar_left")]
+    pub reader_toolbar_left: Vec<String>,
+    /// 阅读器工具栏右组按钮（窄窗折叠进 ⋯ 菜单）。
+    #[serde(default = "default_toolbar_right")]
+    pub reader_toolbar_right: Vec<String>,
+    /// 应用图标变体 id（当前资源库仅内置默认图标，其余选择回退默认）。
+    #[serde(default = "default_app_icon")]
+    pub app_icon: String,
+    // ---- WP-05：常规 ----
+    /// 按流量计费的网络连接下省流：仅收取新邮件，不预取其余内容。
+    #[serde(default = "default_true")]
+    pub metered_save_data: bool,
+    /// 新邮件提示音开关（音频后端落地前仅存配置）。
+    #[serde(default)]
+    pub notification_sound_enabled: bool,
+    /// 新邮件提示音（`BUILTIN_SOUNDS` 之一）。
+    #[serde(default = "default_notification_sound")]
+    pub notification_sound: String,
+    /// 发送邮件提示音开关。
+    #[serde(default)]
+    pub send_sound_enabled: bool,
+    /// 通知操作按钮（`NotificationButton` key，最多 3 项）。
+    #[serde(default = "default_notification_buttons")]
+    pub notification_buttons: Vec<String>,
+    // ---- WP-05：发件人 ----
+    /// 屏蔽发件人黑名单（完整邮箱或域名如 `example.com`，命中邮件待过滤点接线）。
+    #[serde(default)]
+    pub blocked_senders: Vec<String>,
+    // ---- WP-05：隐私 ----
+    /// 发件人域名与地址显示不一致时警告（仿冒横幅）。
+    #[serde(default = "default_true")]
+    pub show_spoof_banner: bool,
+    /// 联系人无头像时向 Gravatar 查询（发送地址哈希到第三方）。
+    #[serde(default)]
+    pub use_gravatar: bool,
+    /// 允许抓取发件人站点图标填充头像圈。
+    #[serde(default)]
+    pub sender_logos: bool,
+    /// 已读回执策略：`"ask"` / `"always"` / `"never"`。
+    #[serde(default = "default_read_receipt_policy")]
+    pub read_receipt_policy: String,
+    /// 本地数据库加密（SQLCipher 后端暂缺，仅存配置，不伪造加密行为）。
+    #[serde(default)]
+    pub encrypt_stored_mail: bool,
+    // ---- WP-05：系统 ----
+    /// 已下载邮件保留天数（`0` = 永久；对齐 Linux `[0, 365, 90, 30]`）。
+    #[serde(default)]
+    pub keep_downloads_days: u32,
+    /// 登录时自启动（Windows 注册表 `HKCU\...\Run`，见 `autostart` 模块）。
+    #[serde(default)]
+    pub start_at_login: bool,
+    /// 邮件内链接打开方式：`"system"` / `"edge"` / `"chrome"` / `"firefox"`。
+    #[serde(default = "default_link_open_mode")]
+    pub link_open_mode: String,
 }
 
 fn default_true() -> bool {
@@ -375,6 +549,64 @@ fn default_attachment_keywords() -> String {
 }
 
 fn default_system_key() -> String {
+    "system".to_string()
+}
+
+// ---- WP-05 serde 默认值 ----
+
+fn default_focus_preview_lines() -> u32 {
+    0
+}
+
+fn default_focus_layout() -> String {
+    "automatic".to_string()
+}
+
+fn default_list_layout_key() -> String {
+    "cards".to_string()
+}
+
+fn default_list_preview_lines() -> u32 {
+    1
+}
+
+fn default_list_columns() -> Vec<String> {
+    ListColumn::to_keys(&ListColumn::DEFAULT)
+}
+
+fn default_toolbar_left() -> Vec<String> {
+    ReaderToolbarLayout::default()
+        .left
+        .iter()
+        .map(|i| i.key().to_string())
+        .collect()
+}
+
+fn default_toolbar_right() -> Vec<String> {
+    ReaderToolbarLayout::default()
+        .right
+        .iter()
+        .map(|i| i.key().to_string())
+        .collect()
+}
+
+fn default_app_icon() -> String {
+    "default".to_string()
+}
+
+fn default_notification_sound() -> String {
+    BUILTIN_SOUNDS[0].to_string()
+}
+
+fn default_notification_buttons() -> Vec<String> {
+    NotificationButtons::default().to_list()
+}
+
+fn default_read_receipt_policy() -> String {
+    "ask".to_string()
+}
+
+fn default_link_open_mode() -> String {
     "system".to_string()
 }
 
@@ -473,6 +705,86 @@ impl AppPreferences {
         self.fold_messages_mode = Some(normalized.to_string());
         self.fold_older_messages = normalized != "never";
     }
+
+    /// WP-05：解析阅读器工具栏布局（左右两组 + 未显示池）。
+    pub fn reader_toolbar(&self) -> ReaderToolbarLayout {
+        ReaderToolbarLayout::from_keys(&self.reader_toolbar_left, &self.reader_toolbar_right)
+    }
+
+    /// WP-05：解析单行宽表显示的列（去重、跳过未知名、主题列恒在）。
+    pub fn list_columns_shown(&self) -> Vec<ListColumn> {
+        ListColumn::from_keys(&self.list_columns)
+    }
+
+    /// WP-05：`sender` 是否被黑名单屏蔽。完整邮箱精确匹配；裸域名（如
+    /// `example.com`）匹配该域及其子域（对齐 Linux `app/filters.rs::is_blacklisted`）。
+    pub fn is_sender_blocked(&self, sender: &str) -> bool {
+        let addr = normalize_sender_email(sender);
+        if addr.is_empty() {
+            return false;
+        }
+        let domain = addr.rsplit('@').next().unwrap_or("");
+        self.blocked_senders.iter().any(|entry| {
+            let entry = entry.trim().to_ascii_lowercase();
+            if entry.is_empty() {
+                return false;
+            }
+            if entry.contains('@') {
+                addr == entry
+            } else {
+                domain == entry || domain.ends_with(&format!(".{entry}"))
+            }
+        })
+    }
+
+    /// WP-05：加入黑名单（接受完整邮箱、`Name <addr>` 形式或裸域名；大小写
+    /// 归一并去重）。返回归一化后的条目；空串或非法邮箱返回 `None`。
+    pub fn block_sender(&mut self, entry: &str) -> Option<String> {
+        let trimmed = entry.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // `Name <addr>` 形式：取尖括号内的地址。
+        let normalized = if let (Some(open), Some(close)) = (trimmed.rfind('<'), trimmed.rfind('>'))
+        {
+            if open < close {
+                trimmed[open + 1..close].trim().to_string()
+            } else {
+                trimmed
+            }
+        } else {
+            trimmed
+        };
+        if normalized.is_empty() {
+            return None;
+        }
+        // 完整邮箱需含 @ 且 @ 后非空；裸域名则不允许含 @。
+        if normalized.contains('@') {
+            let (_, domain) = normalized.rsplit_once('@')?;
+            if domain.is_empty() {
+                return None;
+            }
+        } else if normalized.contains('/') || normalized.contains('\\') {
+            return None;
+        }
+        if !self
+            .blocked_senders
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&normalized))
+        {
+            self.blocked_senders.push(normalized.clone());
+        }
+        Some(normalized)
+    }
+
+    /// WP-05：从黑名单移除（大小写不敏感）。返回是否确有移除。
+    pub fn unblock_sender(&mut self, entry: &str) -> bool {
+        let normalized = entry.trim().to_ascii_lowercase();
+        let before = self.blocked_senders.len();
+        self.blocked_senders
+            .retain(|existing| !existing.eq_ignore_ascii_case(&normalized));
+        self.blocked_senders.len() != before
+    }
 }
 
 impl Default for AppPreferences {
@@ -550,7 +862,584 @@ impl Default for AppPreferences {
             list_width: None,
             reader_position: "right".to_string(),
             list_below_height: None,
+            focus_list_header: true,
+            focus_hide_accounts: true,
+            focus_fold_unified: true,
+            focus_hide_avatars: true,
+            focus_hide_subject: false,
+            focus_column_headings: false,
+            focus_hide_stars: true,
+            focus_hide_attachment_icons: true,
+            focus_rail_sidebar: true,
+            focus_rail_dots: true,
+            focus_hover_expand: false,
+            focus_fold_accounts: true,
+            focus_click_folds: false,
+            focus_unread_counts: true,
+            focus_show_favorites: true,
+            focus_show_filters: true,
+            focus_show_tags: true,
+            focus_show_contacts: true,
+            focus_show_attachments: true,
+            focus_show_inboxes: true,
+            focus_tags_below: false,
+            focus_unified_starred: true,
+            focus_unified_sent: true,
+            focus_unified_drafts: true,
+            focus_unified_archive: true,
+            focus_unified_junk: true,
+            focus_unified_trash: true,
+            focus_unified_snoozed: true,
+            focus_preview_lines: default_focus_preview_lines(),
+            focus_layout: default_focus_layout(),
+            unified_show_junk: true,
+            unified_show_trash: true,
+            unified_show_snoozed: true,
+            sidebar_show_filtered: true,
+            sidebar_show_smart: true,
+            sidebar_show_tags: true,
+            list_layout: default_list_layout_key(),
+            list_preview_lines: default_list_preview_lines(),
+            list_columns: default_list_columns(),
+            list_show_headings: false,
+            reader_toolbar_left: default_toolbar_left(),
+            reader_toolbar_right: default_toolbar_right(),
+            app_icon: default_app_icon(),
+            metered_save_data: true,
+            notification_sound_enabled: false,
+            notification_sound: default_notification_sound(),
+            send_sound_enabled: false,
+            notification_buttons: default_notification_buttons(),
+            blocked_senders: Vec::new(),
+            show_spoof_banner: true,
+            use_gravatar: false,
+            sender_logos: false,
+            read_receipt_policy: default_read_receipt_policy(),
+            encrypt_stored_mail: false,
+            keep_downloads_days: 0,
+            start_at_login: false,
+            link_open_mode: default_link_open_mode(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP-05：移植 Linux 的可枚举配置（工具栏按钮 / 列表列 / 通知按钮）与辅助统计。
+// ---------------------------------------------------------------------------
+
+/// 内置新邮件提示音名（对齐 Linux `BUILTIN_SOUNDS`；无音频后端时仅存配置）。
+pub const BUILTIN_SOUNDS: [&str; 4] = ["click", "hum", "string", "swing"];
+
+/// 阅读器工具栏上的一个按钮（对齐 Linux `src/config/toolbar.rs::ToolbarItem`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ToolbarItem {
+    Reply,
+    ReplyAll,
+    Forward,
+    Star,
+    Archive,
+    Snooze,
+    Delete,
+    Spam,
+    ReadUnread,
+    Tags,
+    MoveTo,
+    Find,
+    Print,
+}
+
+impl ToolbarItem {
+    pub const ALL: [ToolbarItem; 13] = [
+        ToolbarItem::Reply,
+        ToolbarItem::ReplyAll,
+        ToolbarItem::Forward,
+        ToolbarItem::Star,
+        ToolbarItem::Archive,
+        ToolbarItem::Snooze,
+        ToolbarItem::Delete,
+        ToolbarItem::Spam,
+        ToolbarItem::ReadUnread,
+        ToolbarItem::Tags,
+        ToolbarItem::MoveTo,
+        ToolbarItem::Find,
+        ToolbarItem::Print,
+    ];
+
+    /// 写入配置的稳定名。
+    pub fn key(self) -> &'static str {
+        match self {
+            ToolbarItem::Reply => "reply",
+            ToolbarItem::ReplyAll => "reply_all",
+            ToolbarItem::Forward => "forward",
+            ToolbarItem::Star => "star",
+            ToolbarItem::Archive => "archive",
+            ToolbarItem::Snooze => "snooze",
+            ToolbarItem::Delete => "delete",
+            ToolbarItem::Spam => "spam",
+            ToolbarItem::ReadUnread => "read_unread",
+            ToolbarItem::Tags => "tags",
+            ToolbarItem::MoveTo => "move_to",
+            ToolbarItem::Find => "find",
+            ToolbarItem::Print => "print",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<ToolbarItem> {
+        ToolbarItem::ALL.iter().copied().find(|i| i.key() == key)
+    }
+
+    /// 设置页芯片的中文标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolbarItem::Reply => "回复",
+            ToolbarItem::ReplyAll => "全部回复",
+            ToolbarItem::Forward => "转发",
+            ToolbarItem::Star => "星标",
+            ToolbarItem::Archive => "归档",
+            ToolbarItem::Snooze => "稍后处理",
+            ToolbarItem::Delete => "删除",
+            ToolbarItem::Spam => "垃圾邮件",
+            ToolbarItem::ReadUnread => "已读 / 未读",
+            ToolbarItem::Tags => "标签",
+            ToolbarItem::MoveTo => "移动到",
+            ToolbarItem::Find => "查找",
+            ToolbarItem::Print => "打印",
+        }
+    }
+}
+
+/// 阅读器工具栏布局：左组（始终显示，最多 [`ReaderToolbarLayout::LEFT_MAX`] 个）、
+/// 右组（窄窗折叠进 ⋯）与未显示池（两个列表都不含即隐藏）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReaderToolbarLayout {
+    pub left: Vec<ToolbarItem>,
+    pub right: Vec<ToolbarItem>,
+}
+
+impl Default for ReaderToolbarLayout {
+    fn default() -> Self {
+        ReaderToolbarLayout {
+            left: vec![
+                ToolbarItem::Reply,
+                ToolbarItem::ReplyAll,
+                ToolbarItem::Forward,
+                ToolbarItem::Star,
+                ToolbarItem::Archive,
+                ToolbarItem::Spam,
+                ToolbarItem::Delete,
+            ],
+            right: vec![
+                ToolbarItem::Snooze,
+                ToolbarItem::Tags,
+                ToolbarItem::ReadUnread,
+                ToolbarItem::MoveTo,
+                ToolbarItem::Find,
+                ToolbarItem::Print,
+            ],
+        }
+    }
+}
+
+impl ReaderToolbarLayout {
+    /// 左组最多容纳的按钮数（对齐 Linux `TOOLBAR_LEFT_MAX`）。
+    pub const LEFT_MAX: usize = 7;
+
+    /// 从配置 key 列表重建（去重、跳过未知名、左组截断到上限）。
+    pub fn from_keys(left: &[String], right: &[String]) -> Self {
+        let parse = |keys: &[String]| -> Vec<ToolbarItem> {
+            keys.iter()
+                .filter_map(|k| ToolbarItem::from_key(k))
+                .collect()
+        };
+        let mut layout = ReaderToolbarLayout {
+            left: parse(left),
+            right: parse(right),
+        };
+        layout.sanitize();
+        layout
+    }
+
+    /// 按钮在哪一组（不在两组即隐藏）。
+    pub fn side(&self, item: ToolbarItem) -> Option<ToolbarSide> {
+        if self.left.contains(&item) {
+            Some(ToolbarSide::Left)
+        } else if self.right.contains(&item) {
+            Some(ToolbarSide::Right)
+        } else {
+            None
+        }
+    }
+
+    /// 未显示的按钮（规范顺序）。
+    pub fn hidden(&self) -> Vec<ToolbarItem> {
+        ToolbarItem::ALL
+            .iter()
+            .copied()
+            .filter(|i| self.side(*i).is_none())
+            .collect()
+    }
+
+    /// 把 `item` 放到 `side` 的 `index` 处（钳制）；`None` 隐藏。左组满员时不动。
+    pub fn place(&mut self, item: ToolbarItem, side: Option<ToolbarSide>, index: usize) {
+        if side == Some(ToolbarSide::Left)
+            && !self.left.contains(&item)
+            && self.left.len() >= Self::LEFT_MAX
+        {
+            return;
+        }
+        self.left.retain(|i| *i != item);
+        self.right.retain(|i| *i != item);
+        let list = match side {
+            Some(ToolbarSide::Left) => &mut self.left,
+            Some(ToolbarSide::Right) => &mut self.right,
+            None => return,
+        };
+        let index = index.min(list.len());
+        list.insert(index, item);
+    }
+
+    /// 在所属组内把 `item` 上移（`-1`）或下移（`1`）；越界即不动。
+    pub fn move_within(&mut self, item: ToolbarItem, delta: isize) {
+        let list = match self.side(item) {
+            Some(ToolbarSide::Left) => &mut self.left,
+            Some(ToolbarSide::Right) => &mut self.right,
+            None => return,
+        };
+        if let Some(pos) = list.iter().position(|i| *i == item) {
+            let next = pos as isize + delta;
+            if next >= 0 && (next as usize) < list.len() {
+                list.remove(pos);
+                list.insert(next as usize, item);
+            }
+        }
+    }
+
+    /// 去重并把左组截断到上限。
+    fn sanitize(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.left.retain(|i| seen.insert(*i));
+        self.right.retain(|i| seen.insert(*i));
+        self.left.truncate(Self::LEFT_MAX);
+    }
+}
+
+/// 工具栏按钮所在侧。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolbarSide {
+    Left,
+    Right,
+}
+
+/// 单行宽表消息列表的一列（对齐 Linux `src/config/look.rs::ListColumn` 12 列）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ListColumn {
+    Star,
+    Replied,
+    Sender,
+    Recipients,
+    Correspondents,
+    Subject,
+    Tags,
+    Attachment,
+    Importance,
+    Account,
+    Due,
+    Date,
+}
+
+impl ListColumn {
+    pub const ALL: [ListColumn; 12] = [
+        ListColumn::Star,
+        ListColumn::Replied,
+        ListColumn::Sender,
+        ListColumn::Recipients,
+        ListColumn::Correspondents,
+        ListColumn::Subject,
+        ListColumn::Tags,
+        ListColumn::Attachment,
+        ListColumn::Importance,
+        ListColumn::Account,
+        ListColumn::Due,
+        ListColumn::Date,
+    ];
+
+    /// 单行列表默认显示的列（对齐 Linux `ListColumn::DEFAULT`）。
+    pub const DEFAULT: [ListColumn; 7] = [
+        ListColumn::Star,
+        ListColumn::Replied,
+        ListColumn::Sender,
+        ListColumn::Subject,
+        ListColumn::Tags,
+        ListColumn::Attachment,
+        ListColumn::Date,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ListColumn::Star => "star",
+            ListColumn::Replied => "replied",
+            ListColumn::Sender => "sender",
+            ListColumn::Recipients => "recipients",
+            ListColumn::Correspondents => "correspondents",
+            ListColumn::Subject => "subject",
+            ListColumn::Tags => "tags",
+            ListColumn::Attachment => "attachment",
+            ListColumn::Importance => "importance",
+            ListColumn::Account => "account",
+            ListColumn::Due => "due",
+            ListColumn::Date => "date",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<ListColumn> {
+        ListColumn::ALL.iter().copied().find(|c| c.key() == key)
+    }
+
+    /// 设置页芯片的中文标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            ListColumn::Star => "星标",
+            ListColumn::Replied => "已回复",
+            ListColumn::Sender => "发件人",
+            ListColumn::Recipients => "收件人",
+            ListColumn::Correspondents => "往来联系人",
+            ListColumn::Subject => "主题",
+            ListColumn::Tags => "标签",
+            ListColumn::Attachment => "附件",
+            ListColumn::Importance => "重要性",
+            ListColumn::Account => "账号",
+            ListColumn::Due => "截止日期",
+            ListColumn::Date => "日期",
+        }
+    }
+
+    /// 从保存的 key 列表还原显示列：跳过未知名并去重；主题列是占满剩余
+    /// 宽度的弹性列，因此始终保留（缺省插到发件人之后）。
+    pub fn from_keys(keys: &[String]) -> Vec<ListColumn> {
+        let mut out: Vec<ListColumn> = Vec::new();
+        for c in keys.iter().filter_map(|k| ListColumn::from_key(k)) {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        if !out.contains(&ListColumn::Subject) {
+            let at = out
+                .iter()
+                .position(|c| *c == ListColumn::Sender)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            out.insert(at, ListColumn::Subject);
+        }
+        out
+    }
+
+    pub fn to_keys(columns: &[ListColumn]) -> Vec<String> {
+        columns.iter().map(|c| c.key().to_string()).collect()
+    }
+}
+
+/// 通知可携带的一个操作按钮（对齐 Linux `NotificationButton`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationButton {
+    MarkRead,
+    Archive,
+    Delete,
+    Reply,
+    Forward,
+    Spam,
+}
+
+impl NotificationButton {
+    pub const ALL: [NotificationButton; 6] = [
+        NotificationButton::MarkRead,
+        NotificationButton::Archive,
+        NotificationButton::Delete,
+        NotificationButton::Reply,
+        NotificationButton::Forward,
+        NotificationButton::Spam,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            NotificationButton::MarkRead => "mark_read",
+            NotificationButton::Archive => "archive",
+            NotificationButton::Delete => "delete",
+            NotificationButton::Reply => "reply",
+            NotificationButton::Forward => "forward",
+            NotificationButton::Spam => "spam",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<NotificationButton> {
+        NotificationButton::ALL
+            .iter()
+            .copied()
+            .find(|b| b.key() == key)
+    }
+
+    /// 设置页行的中文标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            NotificationButton::MarkRead => "标记为已读",
+            NotificationButton::Archive => "归档",
+            NotificationButton::Delete => "删除",
+            NotificationButton::Reply => "回复",
+            NotificationButton::Forward => "转发",
+            NotificationButton::Spam => "标记为垃圾邮件",
+        }
+    }
+}
+
+/// 新邮件通知携带的操作按钮集合：六个中最多三个（对齐 Linux 上限，
+/// Windows 通知 portal 同样只显示三条）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotificationButtons {
+    pub mark_read: bool,
+    pub archive: bool,
+    pub delete: bool,
+    pub reply: bool,
+    pub forward: bool,
+    pub spam: bool,
+}
+
+impl Default for NotificationButtons {
+    fn default() -> Self {
+        // 对齐 Linux：默认携带 标记已读 / 归档 / 删除。
+        NotificationButtons {
+            mark_read: true,
+            archive: true,
+            delete: true,
+            reply: false,
+            forward: false,
+            spam: false,
+        }
+    }
+}
+
+impl NotificationButtons {
+    pub const MAX: usize = 3;
+
+    /// 全关集合（[`Self::from_list`] 的解析起点）。
+    pub const NONE: Self = Self {
+        mark_read: false,
+        archive: false,
+        delete: false,
+        reply: false,
+        forward: false,
+        spam: false,
+    };
+
+    pub fn get(self, button: NotificationButton) -> bool {
+        match button {
+            NotificationButton::MarkRead => self.mark_read,
+            NotificationButton::Archive => self.archive,
+            NotificationButton::Delete => self.delete,
+            NotificationButton::Reply => self.reply,
+            NotificationButton::Forward => self.forward,
+            NotificationButton::Spam => self.spam,
+        }
+    }
+
+    pub fn set(&mut self, button: NotificationButton, on: bool) {
+        match button {
+            NotificationButton::MarkRead => self.mark_read = on,
+            NotificationButton::Archive => self.archive = on,
+            NotificationButton::Delete => self.delete = on,
+            NotificationButton::Reply => self.reply = on,
+            NotificationButton::Forward => self.forward = on,
+            NotificationButton::Spam => self.spam = on,
+        }
+    }
+
+    pub fn count(self) -> usize {
+        NotificationButton::ALL
+            .into_iter()
+            .filter(|b| self.get(*b))
+            .count()
+    }
+
+    /// 集已满，不能再开启下一个按钮。
+    pub fn full(self) -> bool {
+        self.count() >= Self::MAX
+    }
+
+    /// 某按钮的开关行当前是否可操作：已开启的随时可关；未开启的需未满员。
+    pub fn row_sensitive(self, button: NotificationButton) -> bool {
+        self.get(button) || !self.full()
+    }
+
+    /// 从保存的 key 列表还原（未知名跳过，超过 3 个按 ALL 顺序截断）。
+    pub fn from_list(names: &[String]) -> Self {
+        let mut b = Self::NONE;
+        for button in NotificationButton::ALL {
+            if !b.full() && names.iter().any(|n| n == button.key()) {
+                b.set(button, true);
+            }
+        }
+        b
+    }
+
+    pub fn to_list(self) -> Vec<String> {
+        NotificationButton::ALL
+            .into_iter()
+            .filter(|b| self.get(*b))
+            .map(|b| b.key().to_string())
+            .collect()
+    }
+}
+
+/// 本地数据目录占用统计：总字节数与文件数（纯 Rust 目录遍历，实时计算）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageStats {
+    pub total_bytes: u64,
+    pub file_count: u64,
+}
+
+/// 统计 `dir` 及其子目录的磁盘占用（跳过无法访问的条目）。`dir` 不存在时为零值。
+pub fn storage_stats_in(dir: &Path) -> StorageStats {
+    let mut stats = StorageStats {
+        total_bytes: 0,
+        file_count: 0,
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return stats;
+    };
+    let mut stack = vec![entries];
+    while let Some(entries) = stack.pop() {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    if let Ok(sub) = fs::read_dir(&path) {
+                        stack.push(sub);
+                    }
+                }
+                Ok(ft) if ft.is_file() => {
+                    if let Ok(meta) = entry.metadata() {
+                        stats.total_bytes += meta.len();
+                        stats.file_count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    stats
+}
+
+/// 把字节数格式化为人类可读的容量（`B` / `KB` / `MB` / `GB`，二进制换算）。
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -1287,5 +2176,275 @@ smtp_separate_credentials = false
 
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&restore);
+    }
+
+    // ---- WP-05 ----
+
+    /// WP-05：空偏好文件反序列化后应与 `AppPreferences::default()` 完全一致。
+    #[test]
+    fn wp05_empty_preferences_file_yields_defaults() {
+        let base = std::env::temp_dir().join("hylki test wp05 空偏好默认");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(preferences_file_in(&base), "").expect("write empty prefs");
+        let parsed = load_preferences_in(&base).expect("load empty file");
+        assert_eq!(parsed, AppPreferences::default());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// WP-05：专注模式全部布尔默认值对齐 Linux `FocusMode::default()`
+    ///（含 2 个 Windows 专属行为位），共 34 项。
+    #[test]
+    fn wp05_focus_mode_defaults_match_linux() {
+        let p = AppPreferences::default();
+        // 分组 1 专注模式（enabled 为运行时状态不持久化）。
+        assert!(!p.focus_start_enabled); // start_focused
+                                         // Windows 专属：隐藏侧边栏 / 隐藏列表窗格。
+        assert!(p.focus_hide_sidebar);
+        assert!(p.focus_hide_list);
+        // 分组 2 侧边栏。
+        assert!(p.focus_rail_sidebar);
+        assert!(p.focus_unread_counts);
+        assert!(p.focus_rail_dots);
+        assert!(!p.focus_hover_expand);
+        assert!(p.focus_hide_accounts);
+        assert!(p.focus_fold_accounts);
+        assert!(!p.focus_click_folds);
+        assert!(p.focus_fold_unified);
+        // 分组 3 统一视图。
+        assert!(p.focus_show_inboxes);
+        assert!(p.focus_unified_starred);
+        assert!(p.focus_unified_sent);
+        assert!(p.focus_unified_drafts);
+        assert!(p.focus_unified_archive);
+        assert!(p.focus_unified_junk);
+        assert!(p.focus_unified_trash);
+        assert!(p.focus_unified_snoozed);
+        // 分组 4 分区。
+        assert!(p.focus_show_favorites);
+        assert!(p.focus_show_filters);
+        assert!(p.focus_show_tags);
+        assert!(p.focus_show_contacts);
+        assert!(p.focus_show_attachments);
+        // 分组 5 消息列表。
+        assert_eq!(p.focus_layout, "automatic");
+        assert!(!p.focus_column_headings);
+        assert_eq!(p.focus_preview_lines, 0);
+        assert!(p.focus_list_header);
+        assert!(p.focus_hide_avatars);
+        assert!(!p.focus_hide_subject);
+        assert!(!p.focus_tags_below);
+        assert!(p.focus_hide_stars);
+        assert!(p.focus_hide_attachment_icons);
+        // 分组 6 阅读（旧字段复用：reader_toolbar / reader_view）。
+        assert!(p.focus_fold_toolbar); // reader_toolbar
+        assert!(p.focus_reader_view); // reader_view
+    }
+
+    /// WP-05：旧版 preferences.toml（仅有 5 个旧专注字段、无新字段）加载后
+    /// 新字段按默认值补齐，旧值保持不变（兼容映射不丢用户数据）。
+    #[test]
+    fn wp05_legacy_focus_fields_keep_values_and_fill_new_defaults() {
+        let base = std::env::temp_dir().join("hylki test wp05 旧专注字段");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            preferences_file_in(&base),
+            "focus_start_enabled = true\nfocus_reader_view = false\nfocus_hide_sidebar = false\n",
+        )
+        .expect("write legacy prefs");
+        let p = load_preferences_in(&base).expect("load legacy file");
+        assert!(p.focus_start_enabled);
+        assert!(!p.focus_reader_view);
+        assert!(!p.focus_hide_sidebar);
+        // 新字段回落默认值。
+        assert!(p.focus_list_header);
+        assert!(p.focus_unified_starred);
+        assert_eq!(p.focus_layout, "automatic");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// WP-05：黑名单添加 / 移除与邮箱、域名（含子域）匹配语义。
+    #[test]
+    fn wp05_blocked_senders_add_remove_and_matching() {
+        let mut p = AppPreferences::default();
+        assert!(p.blocked_senders.is_empty());
+        assert!(!p.is_sender_blocked("News <news@spam.example.com>"));
+
+        // 完整邮箱：大小写归一去重。
+        assert_eq!(
+            p.block_sender("Spam <News@SPAM.example.com>").as_deref(),
+            Some("news@spam.example.com")
+        );
+        assert_eq!(p.blocked_senders.len(), 1);
+        assert_eq!(
+            p.block_sender("news@spam.example.com").as_deref(),
+            Some("news@spam.example.com")
+        );
+        assert_eq!(p.blocked_senders.len(), 1, "重复添加不产生重复项");
+
+        // 完整邮箱只精确匹配该地址，不放宽到整个域。
+        assert!(p.is_sender_blocked("News@Spam.example.com"));
+        assert!(!p.is_sender_blocked("bob@spam.example.com"));
+
+        // 裸域名：匹配该域及子域，不匹配相似域。
+        assert_eq!(
+            p.block_sender("Spam <dan@SPAM.example.com>").as_deref(),
+            Some("dan@spam.example.com")
+        );
+        assert_eq!(
+            p.block_sender("spam.example.com").as_deref(),
+            Some("spam.example.com")
+        );
+        assert_eq!(
+            p.block_sender("Example.ORG").as_deref(),
+            Some("example.org")
+        );
+        assert!(p.is_sender_blocked("bob@spam.example.com"));
+        assert!(p.is_sender_blocked("alice@sub.spam.example.com"));
+        assert!(p.is_sender_blocked("dan@example.ORG"));
+        assert!(!p.is_sender_blocked("eve@notspam.example.com"));
+        assert!(!p.is_sender_blocked("bad@example.org.evil.com"));
+
+        // 无效条目拒绝。
+        assert_eq!(p.block_sender("   "), None);
+        assert_eq!(p.block_sender("user@"), None);
+        assert_eq!(p.block_sender("path/to"), None);
+        assert!(!p.is_sender_blocked(""));
+
+        // 移除。
+        assert!(p.unblock_sender("News@Spam.example.com"));
+        assert!(!p.unblock_sender("missing@example.com"));
+        assert_eq!(
+            p.blocked_senders,
+            vec!["dan@spam.example.com", "spam.example.com", "example.org"]
+        );
+        assert!(!p.is_sender_blocked("dan@other.org"));
+    }
+
+    /// WP-05：工具栏布局 place / move_within / sanitize 与配置往返。
+    #[test]
+    fn wp05_reader_toolbar_layout_place_and_roundtrip() {
+        let mut t = ReaderToolbarLayout::default();
+        // 默认左组已满：加入左组无效。
+        t.place(ToolbarItem::Print, Some(ToolbarSide::Left), 0);
+        assert_eq!(t.left.first(), Some(&ToolbarItem::Reply));
+        assert!(t.right.contains(&ToolbarItem::Print));
+        // 隐藏再放回左组首位。
+        t.place(ToolbarItem::Star, None, 0);
+        assert_eq!(t.side(ToolbarItem::Star), None);
+        assert_eq!(t.hidden(), vec![ToolbarItem::Star]);
+        t.place(ToolbarItem::Star, Some(ToolbarSide::Left), 0);
+        assert_eq!(t.left.first(), Some(&ToolbarItem::Star));
+        assert_eq!(t.left.len(), ReaderToolbarLayout::LEFT_MAX);
+        // 组内移动。
+        t.move_within(ToolbarItem::Star, 1);
+        assert_eq!(t.left[1], ToolbarItem::Star);
+        // 越界不动。
+        t.move_within(ToolbarItem::Star, -5);
+        assert_eq!(t.left[1], ToolbarItem::Star);
+        t.move_within(ToolbarItem::Star, -1);
+        assert_eq!(t.left.first(), Some(&ToolbarItem::Star));
+        // 未知名跳过 + 左组截断。
+        let mut keys: Vec<String> = ToolbarItem::ALL
+            .iter()
+            .map(|i| i.key().to_string())
+            .collect();
+        keys.insert(0, "bogus".to_string());
+        let layout = ReaderToolbarLayout::from_keys(&keys, &[]);
+        assert_eq!(layout.left.len(), ReaderToolbarLayout::LEFT_MAX);
+        assert!(layout.right.is_empty());
+        assert_eq!(layout.hidden().len(), 6);
+        // 往返：left/right keys 再解析保持不变。
+        let defaults = ReaderToolbarLayout::default();
+        let left_keys: Vec<String> = defaults.left.iter().map(|i| i.key().to_string()).collect();
+        let right_keys: Vec<String> = defaults.right.iter().map(|i| i.key().to_string()).collect();
+        assert_eq!(
+            ReaderToolbarLayout::from_keys(&left_keys, &right_keys),
+            defaults
+        );
+    }
+
+    /// WP-05：列表列 from_keys 始终保留主题列并去重。
+    #[test]
+    fn wp05_list_columns_from_keys_keeps_subject() {
+        let defaults = ListColumn::to_keys(&ListColumn::DEFAULT);
+        assert_eq!(ListColumn::from_keys(&defaults).len(), 7);
+        // 无主题列时插到发件人之后。
+        let keys = vec!["star".to_string(), "sender".to_string(), "date".to_string()];
+        let shown = ListColumn::from_keys(&keys);
+        assert_eq!(
+            shown,
+            vec![
+                ListColumn::Star,
+                ListColumn::Sender,
+                ListColumn::Subject,
+                ListColumn::Date,
+            ]
+        );
+        // 未知名跳过 + 去重。
+        let dup = vec!["star".to_string(), "star".to_string(), "bogus".to_string()];
+        let shown = ListColumn::from_keys(&dup);
+        assert_eq!(shown, vec![ListColumn::Subject, ListColumn::Star]);
+    }
+
+    /// WP-05：通知按钮最多 3 个，from_list 截断与往返。
+    #[test]
+    fn wp05_notification_buttons_max_three() {
+        let d = NotificationButtons::default();
+        assert_eq!(d.count(), 3);
+        assert!(d.full());
+        assert!(d.row_sensitive(NotificationButton::MarkRead));
+        assert!(!d.row_sensitive(NotificationButton::Reply));
+
+        // 超过 3 个按 ALL 顺序截断。
+        let names: Vec<String> = NotificationButton::ALL
+            .iter()
+            .map(|b| b.key().to_string())
+            .collect();
+        let parsed = NotificationButtons::from_list(&names);
+        assert_eq!(parsed.count(), 3);
+        assert!(parsed.get(NotificationButton::MarkRead));
+        assert!(parsed.get(NotificationButton::Archive));
+        assert!(parsed.get(NotificationButton::Delete));
+        assert!(!parsed.get(NotificationButton::Reply));
+
+        // to_list 往返。
+        let mut custom = NotificationButtons::default();
+        custom.set(NotificationButton::Archive, false);
+        custom.set(NotificationButton::Reply, true);
+        let back = NotificationButtons::from_list(&custom.to_list());
+        assert_eq!(back, custom);
+        // 未知名跳过。
+        let junk = vec!["bogus".to_string(), "reply".to_string()];
+        let parsed = NotificationButtons::from_list(&junk);
+        assert!(parsed.get(NotificationButton::Reply));
+        assert_eq!(parsed.count(), 1);
+    }
+
+    /// WP-05：本地数据目录占用统计与容量格式化。
+    #[test]
+    fn wp05_storage_stats_and_format_bytes() {
+        let base = std::env::temp_dir().join("hylki test wp05 存储统计");
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(
+            storage_stats_in(&base),
+            StorageStats {
+                total_bytes: 0,
+                file_count: 0
+            }
+        );
+        fs::create_dir_all(base.join("avatars")).unwrap();
+        fs::write(base.join("hylki-cache.db"), [0u8; 1024]).unwrap();
+        fs::write(base.join("avatars").join("a.png"), [0u8; 512]).unwrap();
+        let stats = storage_stats_in(&base);
+        assert_eq!(stats.file_count, 2);
+        assert_eq!(stats.total_bytes, 1536);
+        let _ = fs::remove_dir_all(&base);
+
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
     }
 }
