@@ -13,6 +13,9 @@ use crate::config::{AccountConfig, SecurityMode};
 use crate::FetchedMessageBody;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
+/// 单封正文拉取的超时：附件较大的邮件给更宽的窗口，但必须封顶，
+/// 否则卡住的连接会一直占住发信 / 读信请求的处理队列。
+const BODY_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_INITIAL_FETCH: usize = 100;
 
 type TlsStream = async_native_tls::TlsStream<TcpStream>;
@@ -100,14 +103,17 @@ async fn connect_imap(account: &AccountConfig, password: &str) -> Result<ImapSes
     let client = connect_imap_client(account).await?;
     let username = imap_username_for(account);
 
-    let mut session = client.login(username, password).await.map_err(|(e, _)| {
-        let msg = e.to_string();
-        if msg.contains("Basic authentication is disabled") {
-            "该邮箱服务商已禁用传统密码登录（Basic authentication is disabled），Outlook / Microsoft 365 需通过 OAuth2 授权登录；请先使用 QQ 邮箱、网易 163 或支持应用专用密码的邮箱测试。".to_string()
-        } else {
-            format!("IMAP 登录失败（请检查用户名或授权码）: {msg}")
-        }
-    })?;
+    let mut session = tokio::time::timeout(IO_TIMEOUT, client.login(username, password))
+        .await
+        .map_err(|_| "IMAP 登录超时".to_string())?
+        .map_err(|(e, _)| {
+            let msg = e.to_string();
+            if msg.contains("Basic authentication is disabled") {
+                "该邮箱服务商已禁用传统密码登录（Basic authentication is disabled），Outlook / Microsoft 365 需通过 OAuth2 授权登录；请先使用 QQ 邮箱、网易 163 或支持应用专用密码的邮箱测试。".to_string()
+            } else {
+                format!("IMAP 登录失败（请检查用户名或授权码）: {msg}")
+            }
+        })?;
 
     if is_netease_host(&account.imap_host) {
         send_netease_id_in_place(&mut session).await;
@@ -569,27 +575,32 @@ pub async fn fetch_message_body(
     uid: u32,
 ) -> Result<FetchedMessageBody, String> {
     let mut session = connect_imap(account, password).await?;
-    session
-        .select(folder_path)
+    tokio::time::timeout(BODY_FETCH_TIMEOUT, session.select(folder_path))
         .await
+        .map_err(|_| format!("打开文件夹 {folder_path} 超时"))?
         .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
 
-    let mut fetches = session
-        .uid_fetch(uid.to_string(), "RFC822")
-        .await
-        .map_err(|e| format!("拉取邮件正文失败 (UID {uid}): {e}"))?;
-
-    let mut raw_body: Option<Vec<u8>> = None;
-    while let Some(fetch_res) = fetches.next().await {
-        if let Ok(fetch) = fetch_res {
-            if let Some(body) = fetch.body() {
-                raw_body = Some(body.to_vec());
-                break;
+    // 正文 + 附件的整段拉取必须封顶：连接卡死时若无限等待，会一直占住
+    // worker 的串行队列，导致后续点击的邮件也迟迟没有反应。
+    let raw_body = tokio::time::timeout(BODY_FETCH_TIMEOUT, async {
+        let mut fetches = session
+            .uid_fetch(uid.to_string(), "RFC822")
+            .await
+            .map_err(|e| format!("拉取邮件正文失败 (UID {uid}): {e}"))?;
+        let mut raw_body: Option<Vec<u8>> = None;
+        while let Some(fetch_res) = fetches.next().await {
+            if let Ok(fetch) = fetch_res {
+                if let Some(body) = fetch.body() {
+                    raw_body = Some(body.to_vec());
+                    break;
+                }
             }
         }
-    }
-    drop(fetches);
-    let _ = session.logout().await;
+        Ok::<Option<Vec<u8>>, String>(raw_body)
+    })
+    .await
+    .map_err(|_| format!("拉取邮件正文超时 (UID {uid})"))??;
+    let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
 
     let bytes = raw_body.ok_or_else(|| format!("服务器未返回 UID {uid} 的邮件内容"))?;
     let parsed = MessageParser::default()

@@ -407,6 +407,8 @@ pub(crate) struct HylkiApp {
     pub(crate) backfill: BackfillDriveState,
     pub(crate) current_page: MailPage,
     pub(crate) selected_message: Option<MessageDetail>,
+    /// 正在等待远端正文的邮件 ID：用于立即占位显示并丢弃过期正文回包。
+    pub(crate) pending_body_message_id: Option<u32>,
     /// Ctrl+点击多选的邮件 ID 集合。
     pub(crate) selected_message_ids: HashSet<u32>,
     pub(crate) drafts: Vec<LocalDraft>,
@@ -878,6 +880,7 @@ impl HylkiApp {
                 backfill: BackfillDriveState::default(),
                 current_page,
                 selected_message,
+                pending_body_message_id: None,
                 selected_message_ids: HashSet::new(),
                 drafts: Vec::new(),
                 outbox_by_account: BTreeMap::new(),
@@ -1066,6 +1069,7 @@ impl HylkiApp {
                 items: Vec::new(),
             },
             selected_message: None,
+            pending_body_message_id: None,
             selected_message_ids: HashSet::new(),
             drafts: Vec::new(),
             outbox_by_account: BTreeMap::new(),
@@ -1397,6 +1401,13 @@ impl HylkiApp {
                     self.maybe_drive_backfill(cx);
                 }
                 WorkerEvent::MessageBodyLoaded(detail) => {
+                    if self
+                        .pending_body_message_id
+                        .is_some_and(|id| id != detail.id)
+                    {
+                        // 用户已切换到其他邮件：丢弃迟到的正文回包，避免阅读器回跳。
+                        continue;
+                    }
                     let pending = self.pending_row_action.take();
                     self.set_selected_message(detail.clone());
                     self.error_banner = None;
@@ -1621,6 +1632,8 @@ impl HylkiApp {
                 } => {
                     // B-2：抓取原文失败时退出「导出中…」状态。
                     self.pending_eml_export = None;
+                    // 正文拉取失败：解除占位态，让阅读器重新出现「加载完整正文」入口。
+                    self.pending_body_message_id = None;
                     self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
                     self.error_banner = Some(SharedString::from(message.clone()));
                     self.status_line = SharedString::from(message);
@@ -1934,6 +1947,7 @@ impl HylkiApp {
                 let mark_now = first.unread
                     && self.reader_position != ReaderPosition::Hidden
                     && self.prefs.read_mark_mode == "shown";
+                self.show_message_loading(first.id);
                 self.request_message_detail(
                     first.account_id,
                     first.id,
@@ -2317,6 +2331,7 @@ impl HylkiApp {
             cx.notify();
             return;
         }
+        self.show_message_loading(message_id);
         self.request_message_detail(account_id, message_id, uid, should_mark_now, folder_path);
         if should_mark_delay {
             self.schedule_delayed_read_mark(
@@ -2394,6 +2409,7 @@ impl HylkiApp {
         folder_path: &str,
     ) {
         if let Some(ref w) = self.worker {
+            self.pending_body_message_id = Some(message_id);
             w.send(MailRequest::LoadMessageBody {
                 account_id,
                 message_id,
@@ -2490,11 +2506,52 @@ impl HylkiApp {
         Some(detail)
     }
 
+    /// 立即用列表摘要构造占位详情，让列表高亮与阅读器在远端正文返回前先切换。
+    fn show_message_loading(&mut self, message_id: u32) {
+        if self
+            .selected_message
+            .as_ref()
+            .is_some_and(|d| d.id == message_id)
+        {
+            return;
+        }
+        let Some(msg) = self.current_page.items.iter().find(|m| m.id == message_id) else {
+            return;
+        };
+        self.selected_message = Some(MessageDetail {
+            id: msg.id,
+            account_id: msg.account_id,
+            folder_id: msg.folder_id,
+            folder_path: msg.folder_path.clone(),
+            uid: msg.uid,
+            rfc_message_id: String::new(),
+            sender: msg.sender.clone(),
+            recipients: msg.recipients.clone(),
+            subject: msg.subject.clone(),
+            date_ts: msg.date_ts,
+            date_display: msg.date_display.clone(),
+            body_text: String::new(),
+            body_html: None,
+            flagged: msg.flagged,
+            attachments: Vec::new(),
+            thread_messages: Vec::new(),
+            unsubscribe_url: None,
+            unsubscribe_one_click: false,
+        });
+    }
+
     /// 更新当前选中邮件详情并初始化会话卡片折叠态 / 原文态。
     fn set_selected_message(&mut self, detail: MessageDetail) {
-        let same_thread = self.selected_message.as_ref().is_some_and(|prev| {
-            prev.id == detail.id || prev.thread_messages.iter().any(|m| m.id == detail.id)
-        });
+        // 占位详情（空正文 / 空会话）切到真实详情时必须按新会话重新初始化折叠态；
+        // 已经是同一封完整邮件（重复点击 / 缓存命中）时保留现有折叠态。
+        let was_pending = self.pending_body_message_id == Some(detail.id)
+            && self.selected_message.as_ref().is_some_and(|prev| {
+                prev.id == detail.id && prev.body_text.is_empty() && prev.thread_messages.is_empty()
+            });
+        let same_thread = !was_pending
+            && self.selected_message.as_ref().is_some_and(|prev| {
+                prev.id == detail.id || prev.thread_messages.iter().any(|m| m.id == detail.id)
+            });
         if same_thread {
             // 同一会话内加载单张卡片正文：保留其他卡片状态，但确保刚加载的卡片处于展开态。
             self.collapsed_thread_cards.remove(&detail.id);
@@ -2517,6 +2574,7 @@ impl HylkiApp {
                 self.prefs.effective_fold_messages_mode(),
             );
         }
+        self.pending_body_message_id = None;
         self.selected_message = Some(detail);
     }
 
@@ -5678,7 +5736,9 @@ impl HylkiApp {
         let account_id = item.account_id;
         self.main_view = MainContentView::Mail;
         self.right_mode = RightPaneMode::Reader;
+        self.show_message_loading(message_id);
         if let Some(ref w) = self.worker {
+            self.pending_body_message_id = Some(message_id);
             w.send(MailRequest::LoadMessageBody {
                 account_id,
                 message_id,

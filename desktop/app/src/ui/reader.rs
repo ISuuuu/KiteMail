@@ -298,6 +298,7 @@ fn render_message_card(
     body_text: &str,
     body_html: Option<&str>,
     body_loaded: bool,
+    body_pending: bool,
     prefer_plain: bool,
     block_remote_images: bool,
     clean_links: bool,
@@ -1054,7 +1055,17 @@ fn render_message_card(
                     }),
             )
         })
-        .when(!body_loaded, |card| {
+        .when(body_pending, |card| {
+            card.child(
+                h_flex().py_2().child(
+                    div()
+                        .text_sm()
+                        .text_color(muted_fg)
+                        .child("正在加载邮件正文…"),
+                ),
+            )
+        })
+        .when(!body_loaded && !body_pending, |card| {
             card.child(
                 h_flex().child(
                     Button::new(("load-thread-body", msg_id))
@@ -1165,6 +1176,8 @@ pub(crate) fn render(
     let prefer_plain = app.reader_prefer_plain;
     let zoom_percent = app.prefs.reader_zoom_percent.clamp(50, 250);
     let thread_count = detail.thread_messages.len();
+    // 占位详情：正文仍在远端加载中，显示加载提示而不是“加载完整正文”按钮。
+    let body_pending = app.pending_body_message_id == Some(detail.id);
 
     // 汇总当前会话全部附件 ID（用于顶部「保存全部附件」入口）。
     let all_thread_attachment_ids: Vec<u32> = if thread_count > 1 {
@@ -1279,6 +1292,7 @@ pub(crate) fn render(
                     &tm.body_text,
                     tm.body_html.as_deref(),
                     tm.body_loaded,
+                    false,
                     prefer_plain,
                     block_remote,
                     clean_links,
@@ -1331,7 +1345,8 @@ pub(crate) fn render(
             &clock_style,
             &detail.body_text,
             detail.body_html.as_deref(),
-            true,
+            !body_pending,
+            body_pending,
             prefer_plain,
             block_remote,
             clean_links,

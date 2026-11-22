@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cache::CacheStore;
@@ -19,7 +20,7 @@ type TokenCache = HashMap<u32, (String, Instant)>;
 type IdleWatchers = HashMap<u32, tokio::task::JoinHandle<()>>;
 
 /// 任务四：后台历史索引每批拉取的邮件数上限。比前台滚动拉取的 100 小，
-/// 让已入队的读信、搜索和发信请求能尽快插队，当前批次仍会完整跑完。
+/// 批次在独立任务中执行，不占用交互请求（读信 / 搜索 / 发信）队列。
 const BACKFILL_HISTORY_BATCH: usize = 25;
 /// 任务四：后台索引连续失败达到该次数后放弃该文件夹本次会话（对齐 Linux
 /// `BACKFILL_TRIES`，避免对总是失败的文件夹紧循环；游标保留，重启后续跑）。
@@ -109,7 +110,7 @@ async fn worker_loop(
     };
     let mut tokens: TokenCache = HashMap::new();
     let mut watchers: IdleWatchers = HashMap::new();
-    let mut backfill = BackfillIndexState::default();
+    let background = BackgroundTasks::new(data_dir.clone(), db_path.clone(), evt_tx.clone());
 
     if let Ok(accounts) = config::load_accounts_in(&data_dir) {
         cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
@@ -138,12 +139,17 @@ async fn worker_loop(
             }
             continue;
         }
+        // 后台任务（历史索引 / 账号与文件夹同步）改派到独立任务执行，不占用
+        // 本条交互队列：否则点开一封未缓存正文的邮件时，正文请求要排在整批
+        // 索引或同步之后（表现为点击后很久才有反应）。
+        if background.dispatch_if_background(&req) {
+            continue;
+        }
         handle_request(
             &data_dir,
             &mut cache,
             &mut tokens,
             &mut watchers,
-            &mut backfill,
             &req_tx,
             req,
             &evt_tx,
@@ -153,6 +159,170 @@ async fn worker_loop(
 
     for (_, handle) in watchers.drain() {
         handle.abort();
+    }
+}
+
+/// 可改派到后台执行的任务：历史索引与账号 / 文件夹同步。
+enum BackgroundJob {
+    Backfill,
+    SyncAllAccounts,
+    SyncAccount(u32),
+    SyncFolder {
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+    },
+}
+
+impl BackgroundJob {
+    fn from_request(req: &MailRequest) -> Option<Self> {
+        match req {
+            MailRequest::BackfillHistoryBatch => Some(Self::Backfill),
+            MailRequest::SyncAllAccounts => Some(Self::SyncAllAccounts),
+            MailRequest::SyncAccount { account_id } => Some(Self::SyncAccount(*account_id)),
+            MailRequest::SyncFolder {
+                account_id,
+                folder_id,
+                folder_path,
+            } => Some(Self::SyncFolder {
+                account_id: *account_id,
+                folder_id: *folder_id,
+                folder_path: folder_path.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    async fn run(
+        self,
+        data_dir: &PathBuf,
+        tokens: &mut TokenCache,
+        backfill: Arc<tokio::sync::Mutex<BackfillIndexState>>,
+        db_path: &PathBuf,
+        evt_tx: &mpsc::Sender<WorkerEvent>,
+    ) {
+        let mut cache = match CacheStore::open(db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: e,
+                });
+                if matches!(&self, Self::Backfill) {
+                    // 同时回一个「无剩余候选」的批次完成事件，避免界面端的
+                    // in_flight 标志永远卡住导致索引不再续排。
+                    let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
+                        folder_id: 0,
+                        fetched_count: 0,
+                        body_only: false,
+                        has_more_remote: false,
+                    });
+                }
+                return;
+            }
+        };
+        // 独立连接也要设置本机账号邮箱，保证「发给我」类筛选与主连接口径一致。
+        let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
+        cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
+        match self {
+            Self::Backfill => {
+                let mut state = backfill.lock().await;
+                backfill_history_batch_inner(data_dir, &mut cache, tokens, &mut state, evt_tx)
+                    .await;
+            }
+            Self::SyncAllAccounts => {
+                for acc in accounts.into_iter().filter(|a| a.enabled) {
+                    sync_account_inner(data_dir, &mut cache, tokens, acc.id, evt_tx).await;
+                }
+                let page_size = pref_page_size(data_dir);
+                let allowed = unified_account_ids(data_dir);
+                if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                    &allowed,
+                    "",
+                    QuickFilterSet::default(),
+                    MessageSort::DateNewest,
+                    0,
+                    page_size,
+                ) {
+                    let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+                }
+            }
+            Self::SyncAccount(account_id) => {
+                sync_account_inner(data_dir, &mut cache, tokens, account_id, evt_tx).await;
+            }
+            Self::SyncFolder {
+                account_id,
+                folder_id,
+                folder_path,
+            } => {
+                let Ok(account) = load_account_config(data_dir, account_id) else {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: format!("账号 #{account_id} 未找到配置"),
+                    });
+                    return;
+                };
+                let page_size = pref_page_size(data_dir);
+                sync_folder_inner(
+                    &mut cache,
+                    tokens,
+                    &account,
+                    folder_id,
+                    &folder_path,
+                    page_size,
+                    evt_tx,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// 后台任务执行环境：每次改派都开一条独立的 SQLite 连接，并按信号量让后台
+/// 任务彼此串行（避免同一账号并发同步），但都不占用交互请求队列。
+struct BackgroundTasks {
+    gate: Arc<tokio::sync::Semaphore>,
+    backfill: Arc<tokio::sync::Mutex<BackfillIndexState>>,
+    /// 后台任务自己的 Graph 令牌缓存：跨批次复用，避免每批都刷新一次令牌。
+    tokens: Arc<tokio::sync::Mutex<TokenCache>>,
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    evt_tx: mpsc::Sender<WorkerEvent>,
+}
+
+impl BackgroundTasks {
+    fn new(data_dir: PathBuf, db_path: PathBuf, evt_tx: mpsc::Sender<WorkerEvent>) -> Self {
+        Self {
+            gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            backfill: Arc::new(tokio::sync::Mutex::new(BackfillIndexState::default())),
+            tokens: Arc::new(tokio::sync::Mutex::new(TokenCache::new())),
+            data_dir,
+            db_path,
+            evt_tx,
+        }
+    }
+
+    /// 后台请求在此改派到独立任务并返回 true（调用方跳过交互队列）。
+    fn dispatch_if_background(&self, req: &MailRequest) -> bool {
+        let Some(job) = BackgroundJob::from_request(req) else {
+            return false;
+        };
+        let gate = Arc::clone(&self.gate);
+        let backfill = Arc::clone(&self.backfill);
+        let tokens = Arc::clone(&self.tokens);
+        let data_dir = self.data_dir.clone();
+        let db_path = self.db_path.clone();
+        let evt_tx = self.evt_tx.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = gate.acquire_owned().await else {
+                return;
+            };
+            // 后台任务彼此串行（信号量 1），因此可以整段持有令牌缓存。
+            let mut tokens = tokens.lock().await;
+            job.run(&data_dir, &mut tokens, backfill, &db_path, &evt_tx)
+                .await;
+        });
+        true
     }
 }
 
@@ -429,7 +599,6 @@ async fn handle_request(
     cache: &mut CacheStore,
     tokens: &mut TokenCache,
     watchers: &mut IdleWatchers,
-    backfill: &mut BackfillIndexState,
     req_tx: &mpsc::Sender<MailRequest>,
     req: MailRequest,
     evt_tx: &mpsc::Sender<WorkerEvent>,
@@ -846,53 +1015,12 @@ async fn handle_request(
             }
         }
 
-        MailRequest::SyncAllAccounts => {
-            let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
-            for acc in accounts.into_iter().filter(|a| a.enabled) {
-                sync_account_inner(data_dir, cache, tokens, acc.id, evt_tx).await;
-            }
-            let page_size = pref_page_size(data_dir);
-            let allowed = unified_account_ids(data_dir);
-            if let Ok(page) = cache.list_unified_inbox_for_accounts(
-                &allowed,
-                "",
-                QuickFilterSet::default(),
-                MessageSort::DateNewest,
-                0,
-                page_size,
-            ) {
-                let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
-            }
-        }
-
-        MailRequest::SyncAccount { account_id } => {
-            sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
-        }
-
-        MailRequest::SyncFolder {
-            account_id,
-            folder_id,
-            folder_path,
-        } => {
-            let Ok(account) = load_account_config(data_dir, account_id) else {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: Some(account_id),
-                    message: format!("账号 #{account_id} 未找到配置"),
-                });
-                return;
-            };
-            let page_size = pref_page_size(data_dir);
-            sync_folder_inner(
-                cache,
-                tokens,
-                &account,
-                folder_id,
-                &folder_path,
-                page_size,
-                evt_tx,
-            )
-            .await;
-        }
+        // 后台任务（历史索引 / 账号与文件夹同步）在 worker_loop 中改派到独立
+        // 任务执行，不占用本队列；这里保留空分支以满足穷尽匹配。
+        MailRequest::BackfillHistoryBatch
+        | MailRequest::SyncAllAccounts
+        | MailRequest::SyncAccount { .. }
+        | MailRequest::SyncFolder { .. } => {}
 
         MailRequest::LoadUnifiedInbox {
             query,
@@ -2056,10 +2184,6 @@ async fn handle_request(
             load_older_messages_inner(data_dir, cache, tokens, folder_id, limit, evt_tx).await;
         }
 
-        MailRequest::BackfillHistoryBatch => {
-            backfill_history_batch_inner(data_dir, cache, tokens, backfill, evt_tx).await;
-        }
-
         MailRequest::ClearBodyCaches => match cache.clear_message_bodies() {
             Ok(_) => {
                 let _ = evt_tx.send(WorkerEvent::Status {
@@ -3017,10 +3141,11 @@ fn select_backfill_target(
     }
 }
 
-/// 任务四：后台历史索引批次。单队列事件驱动——每批只处理一个收件箱文件夹的
-/// [`BACKFILL_HISTORY_BATCH`] 条；完成后发 `BackfillHistoryBatchDone`，由 app 端
-/// 决定是否续排下一批（读写信、搜索、发信请求自然插队）。失败时游标保留，
-/// 连续失败 3 次放弃该文件夹本次会话并日志说明（不打扰界面）。
+/// 任务四：后台历史索引批次。每批只处理一个收件箱文件夹的
+/// [`BACKFILL_HISTORY_BATCH`] 条；由 worker_loop 放到独立任务里执行（自带
+/// SQLite 连接），不阻塞交互请求队列。完成后发 `BackfillHistoryBatchDone`，
+/// 由 app 端决定是否续排下一批。失败时游标保留，连续失败 3 次放弃该文件夹
+/// 本次会话并日志说明（不打扰界面）。
 async fn backfill_history_batch_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
