@@ -33,34 +33,6 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     // ---- 常规 ----
     PrefSearchItem {
         tab: PrefTab::General,
-        row_id: "pref-close-to-minimize",
-        title: "关闭主窗口时最小化到托盘",
-        subtitle: "点击关闭按钮时保持后台运行并常驻系统托盘",
-        keywords: "close tray minimize 托盘 关闭 最小化 后台",
-    },
-    PrefSearchItem {
-        tab: PrefTab::General,
-        row_id: "pref-minimize-to-tray",
-        title: "最小化时隐藏到托盘",
-        subtitle: "最小化窗口后仅保留系统托盘图标",
-        keywords: "minimize tray hide 托盘 最小化 隐藏",
-    },
-    PrefSearchItem {
-        tab: PrefTab::General,
-        row_id: "pref-default-view",
-        title: "启动时打开的默认视图",
-        subtitle: "选择打开「统一收件箱」或恢复上次关闭时的文件夹",
-        keywords: "startup default view last folder unified 启动 视图 默认 上次",
-    },
-    PrefSearchItem {
-        tab: PrefTab::General,
-        row_id: "pref-start-fullscreen",
-        title: "启动时全屏",
-        subtitle: "启动 Hylki 主窗口后自动进入全屏模式",
-        keywords: "fullscreen startup window 启动 全屏",
-    },
-    PrefSearchItem {
-        tab: PrefTab::General,
         row_id: "pref-page-size",
         title: "单页加载邮件数量",
         subtitle: "每次分页拉取与渲染的邮件条数",
@@ -94,20 +66,6 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         subtitle: "关闭后仅提示未读封数，隐藏邮件隐私摘要",
         keywords: "notification preview sender subject content 通知 内容 隐私 摘要",
     },
-    PrefSearchItem {
-        tab: PrefTab::General,
-        row_id: "pref-single-key-shortcuts",
-        title: "启用单键快捷键",
-        subtitle: "开启 Gmail 风格单键导航（j / k / r / a / d / s / m）",
-        keywords: "shortcut keybindings gmail single key 快捷键 单键",
-    },
-    PrefSearchItem {
-        tab: PrefTab::General,
-        row_id: "pref-settings-open-accounts",
-        title: "打开偏好设置时优先显示「邮箱账号」",
-        subtitle: "新建快捷入口时直接定位至账号管理页",
-        keywords: "settings default tab accounts 设置 启动页 邮箱账号",
-    },
     // ---- 外观 ----
     PrefSearchItem {
         tab: PrefTab::Appearance,
@@ -132,17 +90,17 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     },
     PrefSearchItem {
         tab: PrefTab::Appearance,
-        row_id: "pref-reader-zoom",
-        title: "阅读器正文字号",
-        subtitle: "调整邮件阅读正文的显示比例（70% ~ 160%）",
-        keywords: "reader zoom font body 阅读器 正文 缩放 字号",
+        row_id: "pref-settings-open-accounts",
+        title: "打开偏好设置时优先显示「邮箱账号」",
+        subtitle: "新建快捷入口时直接定位至账号管理页",
+        keywords: "settings default tab accounts 设置 启动页 邮箱账号",
     },
     PrefSearchItem {
         tab: PrefTab::Appearance,
-        row_id: "pref-status-bar-top",
-        title: "将状态栏置于窗口顶部",
-        subtitle: "把底部同步状态与快捷操作提示条移动至主内容顶部",
-        keywords: "status bar top bottom 状态栏 顶部 底部",
+        row_id: "pref-reader-fold-right",
+        title: "始终折叠阅读器右侧工具栏",
+        subtitle: "把标记未读、查看原文、另存 EML 等按钮收敛到菜单中",
+        keywords: "reader toolbar fold overflow 更多 工具栏 折叠",
     },
     // ---- 专注模式 ----
     PrefSearchItem {
@@ -181,6 +139,13 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         keywords: "focus fold toolbar overflow 专注 工具栏 折叠",
     },
     // ---- 侧边栏 ----
+    PrefSearchItem {
+        tab: PrefTab::Sidebar,
+        row_id: "pref-default-view",
+        title: "启动时打开的默认视图",
+        subtitle: "选择打开「统一收件箱」或恢复上次关闭时的文件夹",
+        keywords: "startup default view last folder unified 启动 视图 默认 上次",
+    },
     PrefSearchItem {
         tab: PrefTab::Sidebar,
         row_id: "pref-show-accounts",
@@ -319,6 +284,13 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     },
     PrefSearchItem {
         tab: PrefTab::Reading,
+        row_id: "pref-reader-zoom",
+        title: "阅读器正文字号",
+        subtitle: "调整邮件阅读正文的显示比例（50% ~ 250%）",
+        keywords: "reader zoom font body 阅读器 正文 缩放 字号",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Reading,
         row_id: "pref-always-show-recipients",
         title: "始终显示收件人行",
         subtitle: "在发件人卡片头部固定展开「收件人：...」信息行",
@@ -352,13 +324,6 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         subtitle: "保持上次选择、打开邮件时默认开启或始终显示完整富文本",
         keywords: "reader default mode remember on off 简化视图 默认 纯文本",
     },
-    PrefSearchItem {
-        tab: PrefTab::Reading,
-        row_id: "pref-reader-fold-right",
-        title: "始终折叠阅读器右侧工具栏",
-        subtitle: "把标记未读、查看原文、另存 EML 等按钮收敛到菜单中",
-        keywords: "reader toolbar fold overflow 更多 工具栏 折叠",
-    },
     // ---- 写信 ----
     PrefSearchItem {
         tab: PrefTab::Composing,
@@ -370,9 +335,9 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     PrefSearchItem {
         tab: PrefTab::Composing,
         row_id: "pref-signature-above-quote",
-        title: "回复与转发时签名置于引用正文上方",
-        subtitle: "将签名插在输入区之后、原始邮件引用块之前",
-        keywords: "signature above quote reply forward 签名 引用 上方 回复",
+        title: "回复与转发时的签名位置",
+        subtitle: "选择签名位于引用正文上方或下方（默认上方）",
+        keywords: "signature above below quote reply forward 签名 引用 上方 下方 位置 回复",
     },
     PrefSearchItem {
         tab: PrefTab::Composing,
@@ -440,6 +405,41 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         keywords: "clock time 12h 24h am pm 时间 小时制 格式",
     },
     // ---- 系统 ----
+    PrefSearchItem {
+        tab: PrefTab::System,
+        row_id: "pref-close-to-minimize",
+        title: "关闭主窗口时最小化到托盘",
+        subtitle: "点击关闭按钮时保持后台运行并常驻系统托盘",
+        keywords: "close tray minimize 托盘 关闭 最小化 后台",
+    },
+    PrefSearchItem {
+        tab: PrefTab::System,
+        row_id: "pref-minimize-to-tray",
+        title: "最小化时隐藏到托盘",
+        subtitle: "最小化窗口后仅保留系统托盘图标",
+        keywords: "minimize tray hide 托盘 最小化 隐藏",
+    },
+    PrefSearchItem {
+        tab: PrefTab::System,
+        row_id: "pref-start-fullscreen",
+        title: "启动时全屏",
+        subtitle: "启动 Hylki 主窗口后自动进入全屏模式",
+        keywords: "fullscreen startup window 启动 全屏",
+    },
+    PrefSearchItem {
+        tab: PrefTab::System,
+        row_id: "pref-single-key-shortcuts",
+        title: "启用单键快捷键",
+        subtitle: "开启 Gmail 风格单键导航（j / k / r / a / d / s / m）",
+        keywords: "shortcut keybindings gmail single key 快捷键 单键",
+    },
+    PrefSearchItem {
+        tab: PrefTab::System,
+        row_id: "pref-status-bar-top",
+        title: "将状态栏置于窗口顶部",
+        subtitle: "把底部同步状态与快捷操作提示条移动至主内容顶部",
+        keywords: "status bar top bottom 状态栏 顶部 底部",
+    },
     PrefSearchItem {
         tab: PrefTab::System,
         row_id: "pref-data-dir",

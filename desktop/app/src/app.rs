@@ -2366,13 +2366,13 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 调整阅读器正文字号缩放（步进 ±10%，范围 70..=160）并持久化。
+    /// 调整阅读器正文字号缩放（步进 ±10%，范围 50..=250）并持久化。
     pub(crate) fn adjust_reader_zoom(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let next = (self.prefs.reader_zoom_percent as i32 + delta).clamp(70, 160) as u32;
+        let next = (self.prefs.reader_zoom_percent as i32 + delta).clamp(50, 250) as u32;
         self.set_reader_zoom(next, cx);
     }
 
-    /// 设置阅读器正文字号缩放百分比（范围 70..=160）并持久化。
+    /// 设置阅读器正文字号缩放百分比（范围 50..=250）并持久化。
     pub(crate) fn set_reader_zoom(&mut self, percent: u32, cx: &mut Context<Self>) {
         let clamped = config::clamp_reader_zoom(percent);
         if self.prefs.reader_zoom_percent != clamped {
@@ -3651,7 +3651,7 @@ impl HylkiApp {
         if let Some(prev) = self.pending_send.as_ref().map(|p| p.token) {
             self.commit_pending_send(prev, cx);
         }
-        let delay_secs = self.prefs.undo_send_secs.min(15) as u8;
+        let delay_secs = self.prefs.undo_send_secs.min(30) as u8;
         let token = self.next_send_token;
         self.next_send_token = self.next_send_token.wrapping_add(1).max(1);
         let pending = PendingSend {
