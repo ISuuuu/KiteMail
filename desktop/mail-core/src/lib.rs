@@ -211,6 +211,10 @@ pub struct LocalDraft {
     pub subject: String,
     pub body_text: String,
     pub in_reply_to: String,
+    /// 自定义发件人（`Name <addr>` 或纯地址）；空表示使用账号默认身份。
+    pub from_addr: String,
+    /// `Reply-To` 行（WP-10 第 2 项）；空表示不写该信头。
+    pub reply_to: String,
     pub attachment_paths: Vec<String>,
     pub updated_at: i64,
 }
@@ -235,6 +239,10 @@ pub struct ComposeDraft {
     pub subject: String,
     pub body: String,
     pub in_reply_to: String,
+    /// 自定义发件人（`Name <addr>` 或纯地址）；空表示使用账号默认身份。
+    pub from_addr: String,
+    /// `Reply-To` 行；空表示不写该信头。
+    pub reply_to: String,
     pub attachment_paths: Vec<String>,
 }
 
@@ -281,6 +289,10 @@ pub struct OutboxItem {
     pub subject: String,
     pub body_text: String,
     pub in_reply_to: String,
+    /// 自定义发件人（`Name <addr>` 或纯地址）；空表示使用账号默认身份。
+    pub from_addr: String,
+    /// `Reply-To` 行；空表示不写该信头。
+    pub reply_to: String,
     pub attachment_paths: Vec<String>,
     pub status: OutboxStatus,
     pub last_error: String,

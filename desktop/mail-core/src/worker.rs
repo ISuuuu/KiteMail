@@ -1856,6 +1856,8 @@ async fn handle_request(
                 &draft.subject,
                 &draft.body,
                 &draft.in_reply_to,
+                &draft.from_addr,
+                &draft.reply_to,
                 &draft.attachment_paths,
                 now,
                 send_at.map(|delay| now + delay),
@@ -1873,6 +1875,8 @@ async fn handle_request(
                             subject: draft.subject.clone(),
                             body_text: draft.body.clone(),
                             in_reply_to: draft.in_reply_to.clone(),
+                            from_addr: draft.from_addr.clone(),
+                            reply_to: draft.reply_to.clone(),
                             attachment_paths: draft.attachment_paths.clone(),
                             updated_at: now,
                         })
@@ -3434,6 +3438,8 @@ async fn deliver_outbox_item(
                     &item.subject,
                     &item.body_text,
                     &item.in_reply_to,
+                    &item.from_addr,
+                    &item.reply_to,
                     &item.attachment_paths,
                 )
                 .await;

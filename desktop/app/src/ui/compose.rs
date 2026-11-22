@@ -9,6 +9,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{h_flex, v_flex, Icon, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -295,6 +296,86 @@ fn render_autocomplete_dropdown(
     )
 }
 
+/// WP-10-2 发件身份控件（对齐 Linux `adw::ComboRow` + `custom_from_row`）：
+/// 默认渲染「账号默认身份 + 别名」下拉，选中后写进 `compose_from_addr`；
+/// 点菜单里的「自定义发件人…」切换为手输框，手输框旁的按钮退回下拉。
+fn compose_from_control(
+    app: &HylkiApp,
+    entity: Entity<HylkiApp>,
+    p: &theme::HylkiPalette,
+    _cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    if app.compose_from_custom {
+        let ent_back = entity.clone();
+        return h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&app.compose_from)),
+            )
+            .child(
+                Button::new("compose-from-back")
+                    .ghost()
+                    .compact()
+                    .text_size(px(12.0))
+                    .label("用账号身份")
+                    .on_click(move |_, _, cx| {
+                        ent_back.update(cx, |this, cx| this.end_custom_compose_from(cx));
+                    }),
+            )
+            .into_any_element();
+    }
+
+    let choices = app.compose_from_choices();
+    let current_from = app.compose_from_addr.clone();
+    let accent = p.accent;
+    let ent_menu = entity.clone();
+    Button::new("compose-from-identity")
+        .ghost()
+        .compact()
+        .label(app.compose_from_display())
+        .icon(IconName::ChevronDown)
+        .dropdown_menu(move |mut menu, _, _| {
+            for choice in choices.iter() {
+                let selected = choice.from_addr == current_from;
+                let from_addr = choice.from_addr.clone();
+                let reply_to = choice.reply_to.clone();
+                let ent_item = ent_menu.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(choice.label.clone())
+                        .when(selected, |item| {
+                            item.icon(Icon::new(IconName::Check).text_color(accent))
+                        })
+                        .on_click(move |_, window, cx| {
+                            ent_item.update(cx, |this, cx| {
+                                this.select_compose_from(
+                                    from_addr.clone(),
+                                    reply_to.clone(),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }),
+                );
+            }
+            let ent_custom = ent_menu.clone();
+            menu.item(
+                PopupMenuItem::new("自定义发件人…")
+                    .icon(Icon::new(IconName::Pencil))
+                    .on_click(move |_, window, cx| {
+                        ent_custom
+                            .update(cx, |this, cx| this.begin_custom_compose_from(window, cx));
+                    }),
+            )
+        })
+        .into_any_element()
+}
+
 pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::AnyElement {
     // 避坑清单第 4 条：render 开头先把语义色 Copy 成局部变量。
     let p = theme::current(cx);
@@ -523,7 +604,9 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                     .flex_wrap()
                                     .gap_1()
                                     .children(account_pills),
-                            ),
+                            )
+                            // WP-10-2：发件身份下拉（账号默认身份 + 别名 + 自定义）。
+                            .child(compose_from_control(app, cx.entity(), &p, cx)),
                     )
                 })
                 .child(
@@ -533,9 +616,9 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             .compact()
                             .text_size(px(12.0))
                             .label(if app.compose_show_cc_bcc {
-                                "收起抄送/密送"
+                                "收起抄送/密送/Reply-To"
                             } else {
-                                "抄送 / 密送"
+                                "抄送 / 密送 / Reply-To"
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_compose_cc_bcc(cx);
@@ -548,6 +631,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .children(cc_suggestions)
                         .child(recipient_row(ComposeAddressField::Bcc, app, &p, cx))
                         .children(bcc_suggestions)
+                        // WP-10-2：Reply-To 行（对应原版 `reply_to_row`，默认折叠）。
+                        .child(header_row("Reply-To", &app.compose_reply_to, &p))
                 })
                 .child(header_row("主题", &app.compose_subject, &p)),
         )

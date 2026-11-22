@@ -314,6 +314,31 @@ impl ComposeAddressField {
     }
 }
 
+/// WP-10-2 写信 From 下拉的一个候选身份（账号默认身份或某个发信别名）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComposeFromChoice {
+    /// 下拉项与 From 行显示的文本（`Name <addr>` 或纯地址）。
+    pub(crate) label: String,
+    /// 写入 `ComposeDraft::from_addr` 的值；空 = 账号默认身份。
+    pub(crate) from_addr: String,
+    /// 别名自带的 Reply-To（选中且用户未填 Reply-To 时预填）。
+    pub(crate) reply_to: String,
+}
+
+/// 把显示名与地址拼成 `Name <addr>`；缺少显示名时只留地址。
+pub(crate) fn format_identity(name: &str, email: &str) -> String {
+    let name = name.trim();
+    let email = email.trim();
+    if email.is_empty() {
+        return name.to_string();
+    }
+    if name.is_empty() {
+        email.to_string()
+    } else {
+        format!("{name} <{email}>")
+    }
+}
+
 /// 写信收件人胶囊（对齐 Linux `src/ui/recipient_row.rs` 的 `.recipient-pill`）：
 /// 一个已确认的收件地址。输入框里按回车 / 逗号 / 空格 / 失焦后转成胶囊。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -551,6 +576,14 @@ pub(crate) struct HylkiApp {
     pub(crate) compose_bcc: Entity<InputState>,
     /// Cc / Bcc 输入行是否展开（默认折叠，方案文档页面 3）。
     pub(crate) compose_show_cc_bcc: bool,
+    /// WP-10-2 自定义发件人（`Name <addr>` 或纯地址）；空 = 沿用所选账号默认身份。
+    pub(crate) compose_from_addr: String,
+    /// WP-10-2 是否处于「自定义 From」手输态（对应原版 `custom_from_row`）。
+    pub(crate) compose_from_custom: bool,
+    /// WP-10-2 自定义 From 的手输框。
+    pub(crate) compose_from: Entity<InputState>,
+    /// WP-10-2 `Reply-To` 行（空 = 不写该信头）。
+    pub(crate) compose_reply_to: Entity<InputState>,
     pub(crate) compose_subject: Entity<InputState>,
     pub(crate) compose_body: Entity<TextareaState>,
     pub(crate) compose_in_reply_to: String,
@@ -875,6 +908,13 @@ impl HylkiApp {
         let compose_subject = cx.new(|cx| {
             InputState::new(window, cx).placeholder("主题：输入邮件主题（支持中文 IME）")
         });
+        // WP-10-2：Reply-To 行（默认折叠在「抄送 / 密送 / Reply-To」开关之后）。
+        let compose_reply_to = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Reply-To：回信转发到该地址（可留空）")
+        });
+        // WP-10-2：自定义 From 手输框（对应原版 `custom_from_row`）。
+        let compose_from =
+            cx.new(|cx| InputState::new(window, cx).placeholder("发件人：自定义 Name <addr>"));
         let compose_body = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(10, 24)
@@ -889,6 +929,23 @@ impl HylkiApp {
         })
         .detach();
         cx.subscribe(&compose_body, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.schedule_draft_autosave(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        // WP-10-2：自定义 From 与 Reply-To 变更同样参与自动保存；From 手输内容
+        // 同步回 `compose_from_addr`，避免切回下拉后丢失。
+        cx.subscribe(&compose_from, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.compose_from_addr = input.read(cx).value().to_string();
+                this.schedule_draft_autosave(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&compose_reply_to, |this, _input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.schedule_draft_autosave(cx);
                 cx.notify();
@@ -1013,6 +1070,10 @@ impl HylkiApp {
                 compose_cc,
                 compose_bcc,
                 compose_show_cc_bcc: false,
+                compose_from_addr: String::new(),
+                compose_from_custom: false,
+                compose_from,
+                compose_reply_to,
                 compose_subject,
                 compose_body,
                 compose_in_reply_to: String::new(),
@@ -1211,6 +1272,10 @@ impl HylkiApp {
             compose_cc,
             compose_bcc,
             compose_show_cc_bcc: false,
+            compose_from_addr: String::new(),
+            compose_from_custom: false,
+            compose_from,
+            compose_reply_to,
             compose_subject,
             compose_body,
             compose_in_reply_to: String::new(),
@@ -3437,10 +3502,148 @@ impl HylkiApp {
         }
     }
 
-    /// 展开 / 折叠 Cc / Bcc 输入行（方案文档页面 3）。
+    /// 展开 / 折叠 Cc / Bcc / Reply-To 输入行（方案文档页面 3 + WP-10-2）。
     pub(crate) fn toggle_compose_cc_bcc(&mut self, cx: &mut Context<Self>) {
         self.compose_show_cc_bcc = !self.compose_show_cc_bcc;
         cx.notify();
+    }
+
+    // ---- WP-10-2 发件人 From 下拉 + Reply-To 行 ----
+
+    /// 当前写信账号自身的默认身份文本（`Name <addr>`，无显示名时只有地址）。
+    pub(crate) fn compose_account_identity(&self) -> String {
+        self.accounts
+            .iter()
+            .find(|a| a.id == self.compose_account_id)
+            .map(|a| format_identity(&a.display_name, &a.email))
+            .unwrap_or_default()
+    }
+
+    /// From 行显示的文本：自定义地址优先，否则账号默认身份。
+    pub(crate) fn compose_from_display(&self) -> String {
+        if self.compose_from_addr.trim().is_empty() {
+            self.compose_account_identity()
+        } else {
+            self.compose_from_addr.clone()
+        }
+    }
+
+    /// From 下拉候选：账号默认身份 + 该账号已配置的别名（按邮箱去重）。
+    pub(crate) fn compose_from_choices(&self) -> Vec<ComposeFromChoice> {
+        let Some(account) = self
+            .accounts
+            .iter()
+            .find(|a| a.id == self.compose_account_id)
+        else {
+            return Vec::new();
+        };
+        let mut choices = vec![ComposeFromChoice {
+            label: format_identity(&account.display_name, &account.email),
+            from_addr: String::new(),
+            reply_to: String::new(),
+        }];
+        for alias in &account.aliases {
+            if alias.email.trim().is_empty() {
+                continue;
+            }
+            let label = format_identity(&alias.name, &alias.email);
+            if choices.iter().any(|c| c.label == label) {
+                continue;
+            }
+            choices.push(ComposeFromChoice {
+                from_addr: label.clone(),
+                label,
+                reply_to: alias.reply_to.clone(),
+            });
+        }
+        choices
+    }
+
+    /// 选择发件身份：`from_addr` 为空表示账号默认；别名自带的 Reply-To 仅在
+    /// 用户尚未填写时预填，避免覆盖手输内容。
+    pub(crate) fn select_compose_from(
+        &mut self,
+        from_addr: String,
+        alias_reply_to: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.compose_from_addr = from_addr;
+        self.compose_from_custom = false;
+        if !alias_reply_to.trim().is_empty()
+            && self.compose_reply_to.read(cx).value().trim().is_empty()
+        {
+            self.compose_reply_to
+                .update(cx, |s, cx| s.set_value(alias_reply_to, window, cx));
+        }
+        self.schedule_draft_autosave(cx);
+        cx.notify();
+    }
+
+    /// 切到「自定义 From」手输态（对应原版 `custom_from_row` 的铅笔按钮）。
+    pub(crate) fn begin_custom_compose_from(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.compose_from_addr.trim().is_empty() {
+            self.compose_from_addr = self.compose_account_identity();
+        }
+        self.compose_from_custom = true;
+        let current = self.compose_from_addr.clone();
+        self.compose_from
+            .update(cx, |s, cx| s.set_value(current, window, cx));
+        cx.notify();
+    }
+
+    /// 从自定义 From 退回下拉选择。
+    pub(crate) fn end_custom_compose_from(&mut self, cx: &mut Context<Self>) {
+        self.compose_from_custom = false;
+        self.compose_from_addr.clear();
+        self.schedule_draft_autosave(cx);
+        cx.notify();
+    }
+
+    /// 新写信 / 回复 / 转发入口复位发件身份与 Reply-To。
+    fn reset_compose_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.compose_from_addr.clear();
+        self.compose_from_custom = false;
+        self.compose_from
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.compose_reply_to
+            .update(cx, |s, cx| s.set_value("", window, cx));
+    }
+
+    /// 从草稿 / 撤销缓冲恢复发件身份与 Reply-To。
+    fn restore_compose_identity(
+        &mut self,
+        from_addr: &str,
+        reply_to: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.compose_from_addr = from_addr.to_string();
+        // 草稿里存的是自定义地址时，恢复后直接进入手输态，避免被下拉覆盖。
+        self.compose_from_custom = !from_addr.trim().is_empty();
+        self.compose_from
+            .update(cx, |s, cx| s.set_value(from_addr.to_string(), window, cx));
+        self.compose_reply_to
+            .update(cx, |s, cx| s.set_value(reply_to.to_string(), window, cx));
+    }
+
+    /// 发送前校验：Reply-To 非空时必须是合法邮箱（多个用逗号分隔）。
+    pub(crate) fn compose_reply_to_problem(&self, cx: &Context<Self>) -> Option<String> {
+        let raw = self.compose_reply_to.read(cx).value().to_string();
+        for part in split_recipient_parts(&raw) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if !RecipientPill::parse(part).is_some_and(|pill| pill.valid) {
+                return Some(format!("Reply-To「{part}」不是有效的邮箱地址"));
+            }
+        }
+        None
     }
 
     // ---- WP-10-1 收件人胶囊（对齐 Linux `src/ui/recipient_row.rs`） ----
@@ -3781,6 +3984,7 @@ impl HylkiApp {
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
+        self.reset_compose_identity(window, cx);
         let initial_body = append_signature_with_dashes(
             "",
             &self.account_signature(self.compose_account_id),
@@ -3853,6 +4057,8 @@ impl HylkiApp {
             subject: self.compose_subject.read(cx).value().to_string(),
             body_text: self.compose_body.read(cx).value().to_string(),
             in_reply_to: self.compose_in_reply_to.clone(),
+            from_addr: self.compose_from_addr.clone(),
+            reply_to: self.compose_reply_to.read(cx).value().to_string(),
             attachment_paths: self.compose_attachments.clone(),
             updated_at: 0,
         };
@@ -3918,6 +4124,7 @@ impl HylkiApp {
         self.pending_forward_msg_id = Some(detail.id);
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
+        self.reset_compose_identity(window, cx);
         self.clear_recipient_field(ComposeAddressField::To, window, cx);
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
@@ -3966,6 +4173,7 @@ impl HylkiApp {
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
+        self.reset_compose_identity(window, cx);
         self.set_recipient_field_text(ComposeAddressField::To, &detail.recipients, window, cx);
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
@@ -4019,6 +4227,7 @@ impl HylkiApp {
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
+        self.reset_compose_identity(window, cx);
         self.set_recipient_field_text(ComposeAddressField::To, to, window, cx);
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
@@ -4128,8 +4337,10 @@ impl HylkiApp {
         self.set_recipient_field_text(ComposeAddressField::To, &draft.to_addr, window, cx);
         self.set_recipient_field_text(ComposeAddressField::Cc, &draft.cc_addr, window, cx);
         self.set_recipient_field_text(ComposeAddressField::Bcc, &draft.bcc_addr, window, cx);
-        self.compose_show_cc_bcc =
-            !draft.cc_addr.trim().is_empty() || !draft.bcc_addr.trim().is_empty();
+        self.restore_compose_identity(&draft.from_addr, &draft.reply_to, window, cx);
+        self.compose_show_cc_bcc = !draft.cc_addr.trim().is_empty()
+            || !draft.bcc_addr.trim().is_empty()
+            || !draft.reply_to.trim().is_empty();
         self.compose_subject
             .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
         self.compose_body
@@ -4153,6 +4364,8 @@ impl HylkiApp {
             subject: self.compose_subject.read(cx).value().to_string(),
             body_text: self.compose_body.read(cx).value().to_string(),
             in_reply_to: self.compose_in_reply_to.clone(),
+            from_addr: self.compose_from_addr.clone(),
+            reply_to: self.compose_reply_to.read(cx).value().to_string(),
             attachment_paths: self.compose_attachments.clone(),
             updated_at: 0,
         };
@@ -4581,6 +4794,21 @@ impl HylkiApp {
             cx.notify();
             return;
         }
+        // WP-10-2：自定义 From 与 Reply-To 都必须是可解析的邮箱，否则不发信。
+        if !self.demo_mode && !self.compose_from_addr.trim().is_empty() {
+            if !RecipientPill::parse(&self.compose_from_addr).is_some_and(|pill| pill.valid) {
+                self.error_banner = Some(SharedString::from(
+                    "自定义发件人地址格式无效，请填写 `Name <addr>` 或纯邮箱地址",
+                ));
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(problem) = self.compose_reply_to_problem(cx) {
+            self.error_banner = Some(SharedString::from(problem));
+            cx.notify();
+            return;
+        }
         if !self.demo_mode && to.trim().is_empty() {
             self.error_banner = Some(SharedString::from("请填写收件人邮箱地址"));
             cx.notify();
@@ -4616,6 +4844,8 @@ impl HylkiApp {
                 subject,
                 body,
                 in_reply_to: self.compose_in_reply_to.clone(),
+                from_addr: self.compose_from_addr.clone(),
+                reply_to: self.compose_reply_to.read(cx).value().to_string(),
                 attachment_paths: self.compose_attachments.clone(),
             },
             local_draft_id: self.compose_draft_id,
@@ -4821,13 +5051,15 @@ impl HylkiApp {
         self.compose_in_reply_to = pending.draft.in_reply_to.clone();
         self.compose_attachments = pending.draft.attachment_paths.clone();
         self.begin_compose_autosave_tracking();
-        self.compose_show_cc_bcc =
-            !pending.draft.cc.trim().is_empty() || !pending.draft.bcc.trim().is_empty();
+        self.compose_show_cc_bcc = !pending.draft.cc.trim().is_empty()
+            || !pending.draft.bcc.trim().is_empty()
+            || !pending.draft.reply_to.trim().is_empty();
         let draft = &pending.draft;
         let (to_addr, cc_addr, bcc_addr) = (draft.to.clone(), draft.cc.clone(), draft.bcc.clone());
         self.set_recipient_field_text(ComposeAddressField::To, &to_addr, window, cx);
         self.set_recipient_field_text(ComposeAddressField::Cc, &cc_addr, window, cx);
         self.set_recipient_field_text(ComposeAddressField::Bcc, &bcc_addr, window, cx);
+        self.restore_compose_identity(&draft.from_addr, &draft.reply_to, window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
         self.compose_body
@@ -8954,6 +9186,40 @@ mod tests {
         assert!(!looks_like_address("@b.com")); // 本地段为空
         assert!(!looks_like_address("a b@c.com")); // 含空格
         assert!(!looks_like_address("a@b@c.com")); // 多个 @ 时域名段仍可解析，但本地段含 @
+    }
+
+    /// WP-10-2：From 身份文本的三种形态（有名字、只有地址、名字为空）。
+    #[test]
+    fn format_identity_covers_name_and_address_combinations() {
+        assert_eq!(
+            format_identity("Marcus Chen", "marcus@studio.dev"),
+            "Marcus Chen <marcus@studio.dev>"
+        );
+        assert_eq!(
+            format_identity("", "marcus@studio.dev"),
+            "marcus@studio.dev"
+        );
+        assert_eq!(
+            format_identity("  Marcus  ", "  marcus@studio.dev  "),
+            "Marcus <marcus@studio.dev>"
+        );
+        // 地址为空时退化为只显示名字（账号未配置完的中间态）。
+        assert_eq!(format_identity("Marcus", ""), "Marcus");
+    }
+
+    /// WP-10-2：Reply-To 允许逗号分隔多个地址，非法项必须被识别出来。
+    #[test]
+    fn reply_to_parts_validate_like_recipients() {
+        let valid = |raw: &str| -> bool {
+            split_recipient_parts(raw)
+                .into_iter()
+                .filter(|p| !p.trim().is_empty())
+                .all(|p| RecipientPill::parse(p.trim()).is_some_and(|pill| pill.valid))
+        };
+        assert!(valid("reply@example.com"));
+        assert!(valid("Support <support@example.com>, ops@example.com"));
+        assert!(!valid("not-an-address"));
+        assert!(!valid("ok@example.com, broken@"));
     }
 
     /// 逗号 / 分号切分：`<>` 内的分隔符不算分隔符，全角符号同样识别。

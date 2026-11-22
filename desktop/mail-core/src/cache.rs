@@ -454,6 +454,12 @@ impl CacheStore {
         self.ensure_column("outbox", "send_at", "INTEGER")?;
         self.ensure_column("drafts", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
+        // WP-10 第 2 项：自定义发件人（From）与 Reply-To 信头；旧库补列，
+        // 历史数据视为空（= 用账号默认身份、不写 Reply-To）。
+        self.ensure_column("drafts", "from_addr", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("drafts", "reply_to", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("outbox", "from_addr", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("outbox", "reply_to", "TEXT NOT NULL DEFAULT ''")?;
         // HTML 正文（迭代 3）：旧库无列时补充，历史数据视为 NULL。
         self.ensure_column("messages", "body_html", "TEXT")?;
         self.ensure_column("messages", "index_text", "TEXT")?;
@@ -3459,6 +3465,8 @@ impl CacheStore {
             subject,
             body_text,
             in_reply_to,
+            "",
+            "",
             attachment_paths,
             created_at,
             send_at,
@@ -3476,6 +3484,8 @@ impl CacheStore {
         subject: &str,
         body_text: &str,
         in_reply_to: &str,
+        from_addr: &str,
+        reply_to: &str,
         attachment_paths: &[String],
         created_at: i64,
         send_at: Option<i64>,
@@ -3491,9 +3501,10 @@ impl CacheStore {
             "
                 INSERT INTO outbox (
                     account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to,
-                    attachment_paths_json, status, last_error, created_at, send_at
+                    from_addr, reply_to, attachment_paths_json, status, last_error,
+                    created_at, send_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', '', ?9, ?10)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', '', ?11, ?12)
                 ",
             params![
                 account_id,
@@ -3503,6 +3514,8 @@ impl CacheStore {
                 subject,
                 body_text,
                 in_reply_to,
+                from_addr,
+                reply_to,
                 paths_json,
                 created_at,
                 send_at
@@ -3596,7 +3609,7 @@ impl CacheStore {
             .prepare(
                 "
                 SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
-                       in_reply_to, attachment_paths_json, status, last_error
+                       in_reply_to, from_addr, reply_to, attachment_paths_json, status, last_error
                 FROM outbox
                 WHERE id = ?1
                 ",
@@ -3604,10 +3617,10 @@ impl CacheStore {
             .map_err(|e| format!("查询发件箱失败: {e}"))?;
         let rows = stmt
             .query_map(params![outbox_id], |row| {
-                let paths_json: String = row.get(8)?;
+                let paths_json: String = row.get(10)?;
                 let attachment_paths: Vec<String> =
                     serde_json::from_str(&paths_json).unwrap_or_default();
-                let status_str: String = row.get(9)?;
+                let status_str: String = row.get(11)?;
                 Ok(OutboxItem {
                     id: row.get(0)?,
                     account_id: row.get(1)?,
@@ -3617,9 +3630,11 @@ impl CacheStore {
                     subject: row.get(5)?,
                     body_text: row.get(6)?,
                     in_reply_to: row.get(7)?,
+                    from_addr: row.get(8)?,
+                    reply_to: row.get(9)?,
                     attachment_paths,
                     status: OutboxStatus::from_str(&status_str),
-                    last_error: row.get(10)?,
+                    last_error: row.get(12)?,
                 })
             })
             .map_err(|e| format!("读取发件箱失败: {e}"))?
@@ -3680,8 +3695,8 @@ impl CacheStore {
             .transaction()
             .map_err(|e| format!("撤销发送事务失败: {e}"))?;
         let inserted = tx.execute(
-            "INSERT INTO drafts (account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, attachment_paths_json, updated_at)
-             SELECT account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, attachment_paths_json, ?3
+            "INSERT INTO drafts (account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, attachment_paths_json, updated_at)
+             SELECT account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, attachment_paths_json, ?3
              FROM outbox WHERE id = ?1 AND account_id = ?2 AND status = 'queued'",
             params![outbox_id, account_id, chrono::Utc::now().timestamp()],
         ).map_err(|e| format!("恢复草稿失败: {e}"))?;
@@ -3717,7 +3732,7 @@ impl CacheStore {
             .prepare(
                 "
                 SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
-                       in_reply_to, attachment_paths_json, status, last_error
+                       in_reply_to, from_addr, reply_to, attachment_paths_json, status, last_error
                 FROM outbox
                 WHERE account_id = ?1
                 ORDER BY id DESC
@@ -3727,10 +3742,10 @@ impl CacheStore {
 
         let rows = stmt
             .query_map(params![account_id], |row| {
-                let paths_json: String = row.get(8)?;
+                let paths_json: String = row.get(10)?;
                 let attachment_paths: Vec<String> =
                     serde_json::from_str(&paths_json).unwrap_or_default();
-                let status_str: String = row.get(9)?;
+                let status_str: String = row.get(11)?;
                 Ok(OutboxItem {
                     id: row.get(0)?,
                     account_id: row.get(1)?,
@@ -3740,9 +3755,11 @@ impl CacheStore {
                     subject: row.get(5)?,
                     body_text: row.get(6)?,
                     in_reply_to: row.get(7)?,
+                    from_addr: row.get(8)?,
+                    reply_to: row.get(9)?,
                     attachment_paths,
                     status: OutboxStatus::from_str(&status_str),
-                    last_error: row.get(10)?,
+                    last_error: row.get(12)?,
                 })
             })
             .map_err(|e| format!("读取发件箱失败: {e}"))?
@@ -3761,9 +3778,9 @@ impl CacheStore {
                     "
                     INSERT INTO drafts (
                         account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
-                        in_reply_to, attachment_paths_json, updated_at
+                        in_reply_to, from_addr, reply_to, attachment_paths_json, updated_at
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                     ",
                     params![
                         draft.account_id,
@@ -3773,6 +3790,8 @@ impl CacheStore {
                         draft.subject,
                         draft.body_text,
                         draft.in_reply_to,
+                        draft.from_addr,
+                        draft.reply_to,
                         paths_json,
                         draft.updated_at
                     ],
@@ -3786,8 +3805,9 @@ impl CacheStore {
                     UPDATE drafts
                     SET account_id = ?1, to_addr = ?2, cc_addr = ?3, bcc_addr = ?4,
                         subject = ?5, body_text = ?6, in_reply_to = ?7,
-                        attachment_paths_json = ?8, updated_at = ?9
-                    WHERE id = ?10
+                        from_addr = ?8, reply_to = ?9,
+                        attachment_paths_json = ?10, updated_at = ?11
+                    WHERE id = ?12
                     ",
                     params![
                         draft.account_id,
@@ -3797,6 +3817,8 @@ impl CacheStore {
                         draft.subject,
                         draft.body_text,
                         draft.in_reply_to,
+                        draft.from_addr,
+                        draft.reply_to,
                         paths_json,
                         draft.updated_at,
                         draft.id
@@ -3814,7 +3836,7 @@ impl CacheStore {
             .prepare(
                 "
                 SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
-                       in_reply_to, attachment_paths_json, updated_at
+                       in_reply_to, from_addr, reply_to, attachment_paths_json, updated_at
                 FROM drafts
                 ORDER BY updated_at DESC, id DESC
                 ",
@@ -3823,7 +3845,7 @@ impl CacheStore {
 
         let rows = stmt
             .query_map([], |row| {
-                let paths_json: String = row.get(8)?;
+                let paths_json: String = row.get(10)?;
                 let attachment_paths: Vec<String> =
                     serde_json::from_str(&paths_json).unwrap_or_default();
                 Ok(LocalDraft {
@@ -3835,8 +3857,10 @@ impl CacheStore {
                     subject: row.get(5)?,
                     body_text: row.get(6)?,
                     in_reply_to: row.get(7)?,
+                    from_addr: row.get(8)?,
+                    reply_to: row.get(9)?,
                     attachment_paths,
-                    updated_at: row.get(9)?,
+                    updated_at: row.get(11)?,
                 })
             })
             .map_err(|e| format!("读取本地草稿失败: {e}"))?
@@ -4395,6 +4419,8 @@ mod tests {
             subject: "subject".into(),
             body_text: "body".into(),
             in_reply_to: "ref".into(),
+            from_addr: "Me <me@example.com>".into(),
+            reply_to: "replies@example.com".into(),
             attachment_paths: vec!["file".into()],
             updated_at: 10,
         };
@@ -4409,6 +4435,8 @@ mod tests {
                 "subject",
                 "body",
                 "ref",
+                "Me <me@example.com>",
+                "replies@example.com",
                 &["file".into()],
                 10,
                 Some(20),
@@ -4430,6 +4458,8 @@ mod tests {
                 "subject",
                 "body",
                 "ref",
+                "Me <me@example.com>",
+                "replies@example.com",
                 &["file".into()],
                 10,
                 Some(20),
@@ -4437,7 +4467,11 @@ mod tests {
             )
             .unwrap();
         assert!(cache.list_drafts().unwrap().is_empty());
-        assert_eq!(cache.list_outbox(1).unwrap().len(), 1);
+        let outbox = cache.list_outbox(1).unwrap();
+        assert_eq!(outbox.len(), 1);
+        // 交接后发件箱记录仍保留自定义 From / Reply-To。
+        assert_eq!(outbox[0].from_addr, "Me <me@example.com>");
+        assert_eq!(outbox[0].reply_to, "replies@example.com");
     }
 
     #[test]
@@ -4753,6 +4787,8 @@ mod tests {
                 subject: "草稿主题".to_string(),
                 body_text: "第一版内容".to_string(),
                 in_reply_to: String::new(),
+                from_addr: "别名 <alias@example.com>".to_string(),
+                reply_to: "reply@example.com".to_string(),
                 attachment_paths: vec!["C:\\tmp\\report.pdf".to_string()],
                 updated_at: 100,
             })
@@ -4763,6 +4799,9 @@ mod tests {
         assert_eq!(drafts[0].id, id);
         assert_eq!(drafts[0].cc_addr, "bob@example.com");
         assert_eq!(drafts[0].bcc_addr, "");
+        // WP-10 第 2 项：自定义发件人与 Reply-To 随草稿持久化。
+        assert_eq!(drafts[0].from_addr, "别名 <alias@example.com>");
+        assert_eq!(drafts[0].reply_to, "reply@example.com");
         assert_eq!(drafts[0].attachment_paths, vec!["C:\\tmp\\report.pdf"]);
 
         // 更新 cc/bcc 也走同一 upsert 链路。
