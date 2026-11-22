@@ -396,7 +396,7 @@ fn render_message_card(
     }
 
     let (recipient_pill, recipient_list) = recipient_summary(recipients);
-    let zoom_scale = (zoom_percent.clamp(70, 160) as f32) / 100.0;
+    let zoom_scale = (zoom_percent.clamp(50, 250) as f32) / 100.0;
     let body_font_px = 14.0 * zoom_scale;
 
     // 决定原生富文本渲染内容：有 HTML 且未切纯文本模式时渲染净化后的 HTML，
@@ -873,7 +873,7 @@ pub(crate) fn render(
     let flagged = detail.flagged;
     let is_unread = app.selected_message_unread();
     let prefer_plain = app.reader_prefer_plain;
-    let zoom_percent = app.prefs.reader_zoom_percent.clamp(70, 160);
+    let zoom_percent = app.prefs.reader_zoom_percent.clamp(50, 250);
     let thread_count = detail.thread_messages.len();
 
     // 汇总当前会话全部附件 ID（用于顶部「保存全部附件」入口）。

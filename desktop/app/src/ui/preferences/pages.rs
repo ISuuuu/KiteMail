@@ -39,18 +39,24 @@ const DEFAULT_VIEW_OPTIONS: &[(&str, &str)] =
     &[("统一收件箱", "unified"), ("恢复上次位置", "last")];
 
 const READER_ZOOM_OPTIONS: &[(&str, u32)] = &[
+    ("50%", 50),
+    ("60%", 60),
+    ("70%", 70),
     ("80%", 80),
     ("90%", 90),
     ("100%（默认）", 100),
     ("110%", 110),
     ("125%", 125),
     ("150%", 150),
+    ("175%", 175),
+    ("200%", 200),
+    ("250%", 250),
 ];
 
 const FOLD_MODE_OPTIONS: &[(&str, &str)] = &[
-    ("折叠较早邮件", "all_but_newest"),
-    ("仅折叠已读邮件", "read"),
     ("全部展开（不折叠）", "never"),
+    ("仅折叠已读邮件", "read"),
+    ("折叠较早邮件", "all_but_newest"),
 ];
 
 const READ_MARK_OPTIONS: &[(&str, &str)] = &[
@@ -82,8 +88,12 @@ const UNDO_SEND_OPTIONS: &[(&str, u32)] = &[
     ("3 秒", 3),
     ("5 秒（推荐）", 5),
     ("10 秒", 10),
-    ("15 秒", 15),
+    ("20 秒", 20),
+    ("30 秒", 30),
 ];
+
+const SIGNATURE_POSITION_OPTIONS: &[(&str, bool)] =
+    &[("在引用内容上方", true), ("在引用内容下方", false)];
 
 const DATE_STYLE_OPTIONS: &[(&str, &str)] = &[
     ("跟随系统 (YYYY-MM-DD)", "system"),
@@ -318,133 +328,35 @@ fn render_general(
     let app3 = app_entity.clone();
     let app4 = app_entity.clone();
     let app5 = app_entity.clone();
-    let app6 = app_entity.clone();
-    let app7 = app_entity.clone();
-    let app8 = app_entity.clone();
-    let app9 = app_entity.clone();
-    let app10 = app_entity.clone();
-    let app11 = app_entity.clone();
 
     v_flex()
         .w_full()
         .max_w(px(CARD_MAX_WIDTH))
         .gap_5()
         .child(setting_group(
-            "窗口与系统托盘",
+            "分页加载",
             None,
             CARD_MAX_WIDTH,
-            vec![
-                setting_row(
-                    "pref-close-to-minimize",
-                    "关闭主窗口时最小化到托盘",
-                    Some("点击关闭按钮时不退出程序，保持系统托盘后台收取新邮件"),
-                    bool_switch(
-                        "sw-close-tray",
-                        prefs.close_to_minimize,
-                        false,
-                        move |val, _, cx| {
-                            app1.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.close_to_minimize = val);
-                            });
-                        },
-                    ),
+            vec![setting_row(
+                "pref-page-size",
+                "单页加载邮件数",
+                None,
+                combo_button(
+                    "cb-page-size",
+                    lookup_label(PAGE_SIZE_OPTIONS, &prefs.page_size, "100 封 / 页"),
+                    PAGE_SIZE_OPTIONS,
+                    prefs.page_size,
                     false,
-                    is_hit(win, "pref-close-to-minimize"),
-                    p,
+                    move |val: usize, _, cx| {
+                        app1.update(cx, |app, cx| {
+                            app.mutate_preferences(cx, |p| p.page_size = val);
+                        });
+                    },
                 ),
-                setting_row(
-                    "pref-minimize-to-tray",
-                    "最小化主窗口时隐藏到托盘",
-                    Some("最小化主窗口后从任务栏隐藏，可通过托盘图标单/双击恢复"),
-                    bool_switch(
-                        "sw-min-tray",
-                        prefs.minimize_to_tray,
-                        false,
-                        move |val, _, cx| {
-                            app2.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.minimize_to_tray = val);
-                            });
-                        },
-                    ),
-                    false,
-                    is_hit(win, "pref-minimize-to-tray"),
-                    p,
-                ),
-            ],
-            p,
-        ))
-        .child(setting_group(
-            "启动与分页",
-            None,
-            CARD_MAX_WIDTH,
-            vec![
-                setting_row(
-                    "pref-default-view",
-                    "启动时默认打开视图",
-                    Some("选择每次冷启动定位的视图或恢复上一次阅读的文件夹"),
-                    combo_button(
-                        "cb-default-view",
-                        lookup_label(
-                            DEFAULT_VIEW_OPTIONS,
-                            &prefs.default_view.as_str(),
-                            "统一收件箱",
-                        ),
-                        DEFAULT_VIEW_OPTIONS,
-                        if prefs.default_view == "last" {
-                            "last"
-                        } else {
-                            "unified"
-                        },
-                        false,
-                        move |val: &str, _, cx| {
-                            app3.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.default_view = val.to_string());
-                            });
-                        },
-                    ),
-                    false,
-                    is_hit(win, "pref-default-view"),
-                    p,
-                ),
-                setting_row(
-                    "pref-start-fullscreen",
-                    "启动时进入全屏模式",
-                    Some("冷启动创建主窗口后自动切换全屏（可随时按 F11 还原）"),
-                    bool_switch(
-                        "sw-start-fullscreen",
-                        prefs.start_fullscreen,
-                        false,
-                        move |val, _, cx| {
-                            app4.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.start_fullscreen = val);
-                            });
-                        },
-                    ),
-                    false,
-                    is_hit(win, "pref-start-fullscreen"),
-                    p,
-                ),
-                setting_row(
-                    "pref-page-size",
-                    "单页加载邮件数",
-                    None,
-                    combo_button(
-                        "cb-page-size",
-                        lookup_label(PAGE_SIZE_OPTIONS, &prefs.page_size, "100 封 / 页"),
-                        PAGE_SIZE_OPTIONS,
-                        prefs.page_size,
-                        false,
-                        move |val: usize, _, cx| {
-                            app5.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.page_size = val);
-                            });
-                        },
-                    ),
-                    false,
-                    is_hit(win, "pref-page-size"),
-                    p,
-                ),
-            ],
+                false,
+                is_hit(win, "pref-page-size"),
+                p,
+            )],
             p,
         ))
         .child(setting_group(
@@ -463,7 +375,7 @@ fn render_general(
                         prefs.auto_sync_minutes,
                         false,
                         move |val: u32, _, cx| {
-                            app6.update(cx, |app, cx| {
+                            app2.update(cx, |app, cx| {
                                 app.mutate_preferences(cx, |p| p.auto_sync_minutes = val);
                             });
                         },
@@ -481,7 +393,7 @@ fn render_general(
                         prefs.push_enabled,
                         false,
                         move |val, _, cx| {
-                            app7.update(cx, |app, cx| {
+                            app3.update(cx, |app, cx| {
                                 app.set_push_enabled(val, cx);
                             });
                         },
@@ -499,7 +411,7 @@ fn render_general(
                         prefs.desktop_notifications,
                         false,
                         move |val, _, cx| {
-                            app8.update(cx, |app, cx| {
+                            app4.update(cx, |app, cx| {
                                 app.mutate_preferences(cx, |p| p.desktop_notifications = val);
                             });
                         },
@@ -517,57 +429,13 @@ fn render_general(
                         prefs.notification_show_content,
                         !prefs.desktop_notifications,
                         move |val, _, cx| {
-                            app9.update(cx, |app, cx| {
+                            app5.update(cx, |app, cx| {
                                 app.mutate_preferences(cx, |p| p.notification_show_content = val);
                             });
                         },
                     ),
                     !prefs.desktop_notifications,
                     is_hit(win, "pref-notification-content"),
-                    p,
-                ),
-            ],
-            p,
-        ))
-        .child(setting_group(
-            "快捷操作",
-            None,
-            CARD_MAX_WIDTH,
-            vec![
-                setting_row(
-                    "pref-single-key-shortcuts",
-                    "启用单键快捷键",
-                    Some("在非输入焦点下响应 j/k/r/a/d/s/m（按 ? 查看速查）"),
-                    bool_switch(
-                        "sw-single-key",
-                        prefs.single_key_shortcuts,
-                        false,
-                        move |val, _, cx| {
-                            app10.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.single_key_shortcuts = val);
-                            });
-                        },
-                    ),
-                    false,
-                    is_hit(win, "pref-single-key-shortcuts"),
-                    p,
-                ),
-                setting_row(
-                    "pref-settings-open-accounts",
-                    "打开偏好设置时优先显示「邮箱账号」",
-                    None,
-                    bool_switch(
-                        "sw-open-acc",
-                        prefs.settings_open_accounts,
-                        false,
-                        move |val, _, cx| {
-                            app11.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.settings_open_accounts = val);
-                            });
-                        },
-                    ),
-                    false,
-                    is_hit(win, "pref-settings-open-accounts"),
                     p,
                 ),
             ],
@@ -585,8 +453,8 @@ fn render_appearance(
     let prefs = app_entity.read(cx).prefs.clone();
     let app_dark = app_entity.clone();
     let app_scale = app_entity.clone();
-    let app_zoom = app_entity.clone();
-    let app_status = app_entity.clone();
+    let app_open_acc = app_entity.clone();
+    let app_fold = app_entity.clone();
 
     let dark_mode_buttons = h_flex().gap_1p5().children(
         [
@@ -686,48 +554,48 @@ fn render_appearance(
                     p,
                 ),
                 setting_row(
-                    "pref-reader-zoom",
-                    "阅读器正文字号",
-                    Some("同时也可在阅读邮件时使用 Ctrl+= / Ctrl+- / Ctrl+0 快速调节"),
-                    combo_button(
-                        "cb-reader-zoom",
-                        lookup_label(
-                            READER_ZOOM_OPTIONS,
-                            &prefs.reader_zoom_percent,
-                            "100%（默认）",
-                        ),
-                        READER_ZOOM_OPTIONS,
-                        prefs.reader_zoom_percent,
-                        false,
-                        move |val: u32, _, cx| {
-                            app_zoom.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.reader_zoom_percent = val);
-                            });
-                        },
-                    ),
-                    false,
-                    is_hit(win, "pref-reader-zoom"),
-                    p,
-                ),
-                setting_row(
-                    "pref-status-bar-top",
-                    "将状态栏置于窗口顶部",
-                    Some("将同步状态及快速提示条从窗口底部移至顶栏下方"),
+                    "pref-settings-open-accounts",
+                    "打开偏好设置时优先显示「邮箱账号」",
+                    None,
                     bool_switch(
-                        "sw-status-top",
-                        prefs.status_bar_top,
+                        "sw-open-acc",
+                        prefs.settings_open_accounts,
                         false,
                         move |val, _, cx| {
-                            app_status.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.status_bar_top = val);
+                            app_open_acc.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.settings_open_accounts = val);
                             });
                         },
                     ),
                     false,
-                    is_hit(win, "pref-status-bar-top"),
+                    is_hit(win, "pref-settings-open-accounts"),
                     p,
                 ),
             ],
+            p,
+        ))
+        .child(setting_group(
+            "阅读器工具栏",
+            None,
+            CARD_MAX_WIDTH,
+            vec![setting_row(
+                "pref-reader-fold-right",
+                "始终折叠右侧工具栏辅助按钮",
+                Some("将已读切换、原文预览、导出 EML、一键退订等收敛至更多菜单"),
+                bool_switch(
+                    "sw-rd-fold",
+                    prefs.reader_toolbar_fold_right,
+                    false,
+                    move |val, _, cx| {
+                        app_fold.update(cx, |app, cx| {
+                            app.mutate_preferences(cx, |p| p.reader_toolbar_fold_right = val);
+                        });
+                    },
+                ),
+                false,
+                is_hit(win, "pref-reader-fold-right"),
+                p,
+            )],
             p,
         ))
         .into_any_element()
@@ -863,6 +731,7 @@ fn render_sidebar(
     let a3 = app_entity.clone();
     let a4 = app_entity.clone();
     let a5 = app_entity.clone();
+    let a6 = app_entity.clone();
     let u1 = app_entity.clone();
     let u2 = app_entity.clone();
     let u3 = app_entity.clone();
@@ -878,6 +747,34 @@ fn render_sidebar(
             None,
             CARD_MAX_WIDTH,
             vec![
+                setting_row(
+                    "pref-default-view",
+                    "启动时默认打开视图",
+                    Some("选择每次冷启动定位的视图或恢复上一次阅读的文件夹"),
+                    combo_button(
+                        "cb-default-view",
+                        lookup_label(
+                            DEFAULT_VIEW_OPTIONS,
+                            &prefs.default_view.as_str(),
+                            "统一收件箱",
+                        ),
+                        DEFAULT_VIEW_OPTIONS,
+                        if prefs.default_view == "last" {
+                            "last"
+                        } else {
+                            "unified"
+                        },
+                        false,
+                        move |val: &str, _, cx| {
+                            a6.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.default_view = val.to_string());
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-default-view"),
+                    p,
+                ),
                 setting_row(
                     "pref-show-accounts",
                     "显示账号与文件夹列表",
@@ -1316,7 +1213,7 @@ fn render_reading(
     let a_tsw = app_entity.clone();
     let a_vsw = app_entity.clone();
     let a_def = app_entity.clone();
-    let a_fold = app_entity.clone();
+    let a_zoom = app_entity.clone();
 
     v_flex()
         .w_full()
@@ -1436,6 +1333,30 @@ fn render_reading(
                     p,
                 ),
                 setting_row(
+                    "pref-reader-zoom",
+                    "阅读器正文字号",
+                    Some("同时也可在阅读邮件时使用 Ctrl+= / Ctrl+- / Ctrl+0 快速调节"),
+                    combo_button(
+                        "cb-reader-zoom",
+                        lookup_label(
+                            READER_ZOOM_OPTIONS,
+                            &prefs.reader_zoom_percent,
+                            "100%（默认）",
+                        ),
+                        READER_ZOOM_OPTIONS,
+                        prefs.reader_zoom_percent,
+                        false,
+                        move |val: u32, _, cx| {
+                            a_zoom.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.reader_zoom_percent = val);
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-reader-zoom"),
+                    p,
+                ),
+                setting_row(
                     "pref-always-show-recipients",
                     "始终显示收件人行",
                     None,
@@ -1545,24 +1466,6 @@ fn render_reading(
                     is_hit(win, "pref-reader-default-mode"),
                     p,
                 ),
-                setting_row(
-                    "pref-reader-fold-right",
-                    "始终折叠右侧工具栏辅助按钮",
-                    Some("将已读切换、原文预览、导出 EML、一键退订等收敛至更多菜单"),
-                    bool_switch(
-                        "sw-rd-fold",
-                        prefs.reader_toolbar_fold_right,
-                        false,
-                        move |val, _, cx| {
-                            a_fold.update(cx, |app, cx| {
-                                app.mutate_preferences(cx, |p| p.reader_toolbar_fold_right = val);
-                            });
-                        },
-                    ),
-                    false,
-                    is_hit(win, "pref-reader-fold-right"),
-                    p,
-                ),
             ],
             p,
         ))
@@ -1651,13 +1554,24 @@ fn render_composing(
                 ),
                 setting_row(
                     "pref-signature-above-quote",
-                    "回复与转发时签名放在引用正文上方",
-                    Some("推荐在长对话中让新写正文与签名紧靠在一起"),
-                    bool_switch("sw-sig-above", prefs.signature_above_quote, false, move |val, _, cx| {
-                        a_above.update(cx, |app, cx| {
-                            app.mutate_preferences(cx, |p| p.signature_above_quote = val);
-                        });
-                    }),
+                    "回复与转发时的签名位置",
+                    Some("默认在引用内容上方，使新写正文与签名紧靠在一起"),
+                    combo_button(
+                        "cb-sig-position",
+                        lookup_label(
+                            SIGNATURE_POSITION_OPTIONS,
+                            &prefs.signature_above_quote,
+                            "在引用内容上方",
+                        ),
+                        SIGNATURE_POSITION_OPTIONS,
+                        prefs.signature_above_quote,
+                        false,
+                        move |above, _, cx| {
+                            a_above.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.signature_above_quote = above);
+                            });
+                        },
+                    ),
                     false,
                     is_hit(win, "pref-signature-above-quote"),
                     p,
@@ -2007,8 +1921,14 @@ fn render_system(
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
     let demo_mode = app_entity.read(cx).demo_mode;
+    let prefs = app_entity.read(cx).prefs.clone();
     let data_dir_str = config::data_dir().display().to_string();
     let app_clear = app_entity.clone();
+    let app_close = app_entity.clone();
+    let app_min_tray = app_entity.clone();
+    let app_fullscreen = app_entity.clone();
+    let app_single_key = app_entity.clone();
+    let app_status = app_entity.clone();
 
     let cache_action: AnyElement = if win.confirm_clear_cache {
         h_flex()
@@ -2054,6 +1974,104 @@ fn render_system(
         .w_full()
         .max_w(px(CARD_MAX_WIDTH))
         .gap_5()
+        .child(setting_group(
+            "窗口、托盘与快捷键",
+            None,
+            CARD_MAX_WIDTH,
+            vec![
+                setting_row(
+                    "pref-close-to-minimize",
+                    "关闭主窗口时最小化到托盘",
+                    Some("点击关闭按钮时不退出程序，保持系统托盘后台收取新邮件"),
+                    bool_switch(
+                        "sw-close-tray",
+                        prefs.close_to_minimize,
+                        false,
+                        move |val, _, cx| {
+                            app_close.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.close_to_minimize = val);
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-close-to-minimize"),
+                    p,
+                ),
+                setting_row(
+                    "pref-minimize-to-tray",
+                    "最小化主窗口时隐藏到托盘",
+                    Some("最小化主窗口后从任务栏隐藏，可通过托盘图标单/双击恢复"),
+                    bool_switch(
+                        "sw-min-tray",
+                        prefs.minimize_to_tray,
+                        false,
+                        move |val, _, cx| {
+                            app_min_tray.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.minimize_to_tray = val);
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-minimize-to-tray"),
+                    p,
+                ),
+                setting_row(
+                    "pref-start-fullscreen",
+                    "启动时进入全屏模式",
+                    Some("冷启动创建主窗口后自动切换全屏（可随时按 F11 还原）"),
+                    bool_switch(
+                        "sw-start-fullscreen",
+                        prefs.start_fullscreen,
+                        false,
+                        move |val, _, cx| {
+                            app_fullscreen.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.start_fullscreen = val);
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-start-fullscreen"),
+                    p,
+                ),
+                setting_row(
+                    "pref-single-key-shortcuts",
+                    "启用单键快捷键",
+                    Some("在非输入焦点下响应 j/k/r/a/d/s/m（按 ? 查看速查）"),
+                    bool_switch(
+                        "sw-single-key",
+                        prefs.single_key_shortcuts,
+                        false,
+                        move |val, _, cx| {
+                            app_single_key.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.single_key_shortcuts = val);
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-single-key-shortcuts"),
+                    p,
+                ),
+                setting_row(
+                    "pref-status-bar-top",
+                    "将状态栏置于窗口顶部",
+                    Some("将同步状态及快速提示条从窗口底部移至顶栏下方"),
+                    bool_switch(
+                        "sw-status-top",
+                        prefs.status_bar_top,
+                        false,
+                        move |val, _, cx| {
+                            app_status.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.status_bar_top = val);
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-status-bar-top"),
+                    p,
+                ),
+            ],
+            p,
+        ))
         .child(setting_group(
             "本地数据与缓存维护",
             None,

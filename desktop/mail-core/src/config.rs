@@ -172,7 +172,7 @@ pub struct AppPreferences {
     #[serde(default = "default_true")]
     pub focus_hide_list: bool,
     /// In Focus Mode, open messages in simplified Reader View.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub focus_reader_view: bool,
     /// In Focus Mode, fold low-frequency reader toolbar buttons into overflow menu.
     #[serde(default = "default_true")]
@@ -187,7 +187,7 @@ pub struct AppPreferences {
     #[serde(default = "default_true")]
     pub sidebar_show_contacts: bool,
     /// Remember sidebar collapsed (icon rail) state across restarts.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub remember_sidebar_collapsed: bool,
     /// Persisted sidebar collapsed (icon rail) state.
     #[serde(default)]
@@ -204,7 +204,7 @@ pub struct AppPreferences {
     #[serde(default = "default_true")]
     pub unified_show_archive: bool,
     /// Show unread dots instead of numeric counts in icon rail mode.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub rail_unread_dots: bool,
     /// Show sender avatars in message list rows.
     #[serde(default = "default_true")]
@@ -242,10 +242,10 @@ pub struct AppPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_folder: Option<(u32, u32)>,
     /// Show newest replies first in conversation threads (`true` = descending).
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub thread_newest_first: bool,
     /// Automatically fold older messages when opening a multi-message thread.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub fold_older_messages: bool,
     /// Explicit thread fold mode: `"never"` / `"read"` / `"all_but_newest"`.
     /// When `None`, derived from legacy [`Self::fold_older_messages`].
@@ -270,7 +270,7 @@ pub struct AppPreferences {
     #[serde(default = "default_true")]
     pub single_message_card: bool,
     /// Always expand the recipients line in reader message cards.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub always_show_recipients: bool,
     /// Show simplified Reader View toggle button in the reader header.
     #[serde(default = "default_true")]
@@ -282,10 +282,10 @@ pub struct AppPreferences {
     #[serde(default)]
     pub compose_default_from: String,
     /// Place signature above quoted text when replying or forwarding.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub signature_above_quote: bool,
     /// Insert standard `"-- "` separator before signatures.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub signature_dashes: bool,
     /// Undo send delay in seconds (`0` disables undo send).
     #[serde(default = "default_undo_send_secs")]
@@ -317,7 +317,7 @@ pub struct AppPreferences {
     /// Lowercased sender email addresses always allowed to load remote images.
     #[serde(default)]
     pub allowed_remote_senders: Vec<String>,
-    /// Reader body zoom percentage (`70..=160`, default `100`).
+    /// Reader body zoom percentage (`50..=250`, default `100`).
     #[serde(default = "default_reader_zoom_percent")]
     pub reader_zoom_percent: u32,
     /// Enable the Gmail-style single-key shortcuts (`j` / `r` / `a` ...);
@@ -378,9 +378,9 @@ fn default_system_key() -> String {
     "system".to_string()
 }
 
-/// Clamp reader zoom percentage to the supported `70..=160` range.
+/// Clamp reader zoom percentage to the supported `50..=250` range.
 pub fn clamp_reader_zoom(percent: u32) -> u32 {
-    percent.clamp(70, 160)
+    percent.clamp(50, 250)
 }
 
 /// Supported interface text scale percentages.
@@ -495,19 +495,19 @@ impl Default for AppPreferences {
             focus_start_enabled: false,
             focus_hide_sidebar: true,
             focus_hide_list: true,
-            focus_reader_view: false,
+            focus_reader_view: true,
             focus_fold_toolbar: true,
             show_accounts: true,
             sidebar_show_attachments: true,
             sidebar_show_contacts: true,
-            remember_sidebar_collapsed: false,
+            remember_sidebar_collapsed: true,
             sidebar_collapsed: false,
             unified_show_inbox: true,
             unified_show_starred: true,
             unified_show_sent: true,
             unified_show_drafts: true,
             unified_show_archive: true,
-            rail_unread_dots: false,
+            rail_unread_dots: true,
             show_avatars: true,
             list_group_by_date: true,
             list_search_always_open: false,
@@ -519,8 +519,8 @@ impl Default for AppPreferences {
             default_view: "unified".to_string(),
             last_view: None,
             last_folder: None,
-            thread_newest_first: true,
-            fold_older_messages: true,
+            thread_newest_first: false,
+            fold_older_messages: false,
             fold_messages_mode: None,
             card_attachments: true,
             read_mark_mode: "shown".to_string(),
@@ -528,12 +528,12 @@ impl Default for AppPreferences {
             reader_show_theme_switch: true,
             reader_show_account_chip: true,
             single_message_card: true,
-            always_show_recipients: true,
+            always_show_recipients: false,
             reader_show_view_switch: true,
             reader_default_mode: "remember".to_string(),
             compose_default_from: String::new(),
-            signature_above_quote: false,
-            signature_dashes: true,
+            signature_above_quote: true,
+            signature_dashes: false,
             undo_send_secs: 5,
             reply_header_template: String::new(),
             attachment_reminder_keywords: DEFAULT_ATTACHMENT_KEYWORDS.to_string(),
@@ -1139,8 +1139,9 @@ smtp_separate_credentials = false
     #[test]
     fn remote_sender_whitelist_and_zoom_clamping_work() {
         let mut prefs = AppPreferences::default();
-        assert!(prefs.thread_newest_first);
-        assert!(prefs.fold_older_messages);
+        // WP-04：对齐 Linux 默认值——旧邮件在上、不折叠会话。
+        assert!(!prefs.thread_newest_first);
+        assert!(!prefs.fold_older_messages);
         assert_eq!(prefs.reader_zoom_percent, 100);
         // 阶段 3：单键快捷键默认开启。
         assert!(prefs.single_key_shortcuts);
@@ -1162,15 +1163,55 @@ smtp_separate_credentials = false
         // 无效发件人（不含 @）不写入白名单。
         assert_eq!(prefs.allow_remote_sender("(未知发件人)"), None);
 
-        // 字号范围钳制在 70..=160。
-        assert_eq!(clamp_reader_zoom(50), 70);
+        // 字号范围钳制在 50..=250（WP-04 对齐 Linux READER_ZOOM_STEPS）。
+        assert_eq!(clamp_reader_zoom(40), 50);
+        assert_eq!(clamp_reader_zoom(50), 50);
         assert_eq!(clamp_reader_zoom(100), 100);
-        assert_eq!(clamp_reader_zoom(220), 160);
+        assert_eq!(clamp_reader_zoom(220), 220);
+        assert_eq!(clamp_reader_zoom(260), 250);
 
         // 移除发件人白名单（大小写不敏感与格式化邮箱）。
         assert!(prefs.remove_remote_sender("Alice <ALICE@EXAMPLE.COM>"));
         assert!(prefs.allowed_remote_senders.is_empty());
         assert!(!prefs.remove_remote_sender("missing@example.com"));
+    }
+
+    #[test]
+    fn empty_preferences_file_yields_linux_aligned_defaults() {
+        let base = std::env::temp_dir().join("hylki test 空偏好默认值");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // 空文件走 serde 反序列化路径：全部字段按 serde/Default 回落，
+        // 应与 `AppPreferences::default()` 完全一致（WP-04 对齐 Linux）。
+        fs::write(preferences_file_in(&base), "").expect("write empty prefs");
+        let parsed = load_preferences_in(&base).expect("load empty file");
+        assert_eq!(parsed, AppPreferences::default());
+
+        // 1. 会话内旧邮件在上（最新不置顶）。
+        assert!(!parsed.thread_newest_first);
+        // 2. 打开会话时不折叠较早邮件（"never"）。
+        assert!(!parsed.fold_older_messages);
+        assert_eq!(parsed.effective_fold_messages_mode(), "never");
+        // 3. 收件人行默认不固定展开。
+        assert!(!parsed.always_show_recipients);
+        // 4. 签名默认位于引用内容上方。
+        assert!(parsed.signature_above_quote);
+        // 5. 签名前默认不插入 "-- " 分隔符。
+        assert!(!parsed.signature_dashes);
+        // 6. 专注模式默认开启简化阅读视图。
+        assert!(parsed.focus_reader_view);
+        // 7. 默认记住侧边栏折叠状态。
+        assert!(parsed.remember_sidebar_collapsed);
+        // 8. 窄栏模式默认以未读圆点代替计数。
+        assert!(parsed.rail_unread_dots);
+        // 9. 撤销发送默认 5 秒（档位 UI 提供 0/3/5/10/20/30）。
+        assert_eq!(parsed.undo_send_secs, 5);
+        // 10. 阅读器缩放默认 100%，档位范围扩展为 50..=250。
+        assert_eq!(parsed.reader_zoom_percent, 100);
+        assert_eq!(clamp_reader_zoom(250), 250);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
