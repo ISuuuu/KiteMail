@@ -333,6 +333,42 @@ fn render_message_card(
     };
     let sender_for_trust = sender.to_string();
     let can_trust_sender = sender.contains('@');
+    let sender_check = hylki_mail_core::verify::check_sender_summary(sender, None);
+    let (badge_label, badge_color) = match sender_check.trust {
+        hylki_mail_core::verify::SenderTrust::Pass => {
+            ("已验证", gpui_kit::hsla(0.38, 0.65, 0.36, 1.0))
+        }
+        hylki_mail_core::verify::SenderTrust::Unverified => ("未验证", muted_fg),
+        hylki_mail_core::verify::SenderTrust::Suspicious => {
+            ("疑似仿冒", gpui_kit::hsla(0.10, 0.85, 0.45, 1.0))
+        }
+        hylki_mail_core::verify::SenderTrust::Fail => ("校验失败", p.danger),
+    };
+    let spoof_banner = if matches!(
+        sender_check.trust,
+        hylki_mail_core::verify::SenderTrust::Suspicious
+            | hylki_mail_core::verify::SenderTrust::Fail
+    ) {
+        Some(
+            sender_check
+                .lookalike_warning
+                .clone()
+                .unwrap_or_else(|| sender_check.summary.clone()),
+        )
+    } else {
+        None
+    };
+    let detected_invite = if body_text.contains("BEGIN:VCALENDAR") {
+        hylki_mail_core::invite::parse(body_text)
+    } else {
+        None
+    };
+    let has_ics_attachment = attachments
+        .iter()
+        .any(|a| a.filename.to_ascii_lowercase().ends_with(".ics"));
+    let read_receipt_policy = app.prefs.read_receipt_policy.clone();
+    let has_mdn_header = read_receipt_policy != "never"
+        && hylki_mail_core::receipt::detect_raw(body_text.as_bytes()).is_some();
 
     // 折叠态：紧凑显示展开箭头 + 头像 + 发件人 + 单行摘要 + 时间 + 更多菜单。
     if is_collapsed {
@@ -569,6 +605,19 @@ fn render_message_card(
                                         .rounded_full()
                                         .bg(canvas)
                                         .border_1()
+                                        .border_color(badge_color.opacity(0.45))
+                                        .text_color(badge_color)
+                                        .text_xs()
+                                        .child(SharedString::from(badge_label)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(canvas)
+                                        .border_1()
                                         .border_color(border)
                                         .text_color(muted_fg)
                                         .text_xs()
@@ -623,6 +672,185 @@ fn render_message_card(
                                 this.toggle_raw_source(msg_id, cx);
                             })),
                     ),
+            )
+        })
+        .when_some(spoof_banner, |card, warning| {
+            card.child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(p.danger.opacity(0.45))
+                    .bg(p.danger.opacity(0.10))
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .with_size(px(14.0))
+                            .text_color(p.danger),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.danger)
+                            .child(SharedString::from(warning)),
+                    ),
+            )
+        })
+        .when(has_mdn_header, |card| {
+            card.child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.0))
+                    .bg(canvas)
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.text)
+                            .child("发件人请求已读回执（RFC 8098）"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(
+                                Button::new(("send-mdn", msg_id))
+                                    .outline()
+                                    .compact()
+                                    .label("发送回执")
+                                    .on_click(cx.listener(|_this, _, _, cx| {
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(("ignore-mdn", msg_id))
+                                    .ghost()
+                                    .compact()
+                                    .label("忽略")
+                                    .on_click(cx.listener(|_this, _, _, cx| {
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+        })
+        .when(detected_invite.is_some() || has_ics_attachment, |card| {
+            let title = detected_invite
+                .as_ref()
+                .map(|i| i.summary.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "日历会议邀请 (.ics)".to_string());
+            let loc = detected_invite
+                .as_ref()
+                .map(|i| i.location.clone())
+                .unwrap_or_default();
+            let org = detected_invite
+                .as_ref()
+                .and_then(|i| i.organizer.as_ref())
+                .map(|o| {
+                    if o.name.is_empty() {
+                        o.email.clone()
+                    } else {
+                        format!("{} <{}>", o.name, o.email)
+                    }
+                })
+                .unwrap_or_default();
+            let inv_for_accept = detected_invite.clone();
+            let inv_for_tentative = detected_invite.clone();
+            let inv_for_decline = detected_invite.clone();
+            card.child(
+                v_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_1p5()
+                    .rounded(px(8.0))
+                    .bg(canvas)
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(p.text)
+                                    .child(SharedString::from(title)),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Button::new(("ics-accept", msg_id))
+                                            .outline()
+                                            .compact()
+                                            .label("接受")
+                                            .on_click(cx.listener(move |_this, _, _, cx| {
+                                                if let Some(ref inv) = inv_for_accept {
+                                                    let _ = hylki_mail_core::invite::reply_ics(
+                                                        inv, "", "", "ACCEPTED",
+                                                    );
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("ics-tentative", msg_id))
+                                            .outline()
+                                            .compact()
+                                            .label("暂定")
+                                            .on_click(cx.listener(move |_this, _, _, cx| {
+                                                if let Some(ref inv) = inv_for_tentative {
+                                                    let _ = hylki_mail_core::invite::reply_ics(
+                                                        inv,
+                                                        "",
+                                                        "",
+                                                        "TENTATIVE",
+                                                    );
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("ics-decline", msg_id))
+                                            .outline()
+                                            .compact()
+                                            .label("拒绝")
+                                            .on_click(cx.listener(move |_this, _, _, cx| {
+                                                if let Some(ref inv) = inv_for_decline {
+                                                    let _ = hylki_mail_core::invite::reply_ics(
+                                                        inv, "", "", "DECLINED",
+                                                    );
+                                                }
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .when(!loc.is_empty() || !org.is_empty(), |el| {
+                        let meta = [
+                            (!org.is_empty()).then(|| format!("组织者：{org}")),
+                            (!loc.is_empty()).then(|| format!("地点：{loc}")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(SharedString::from(meta)),
+                        )
+                    }),
             )
         })
         .when(

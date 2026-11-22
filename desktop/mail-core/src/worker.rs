@@ -118,8 +118,17 @@ async fn worker_loop(
         }
         deliver_due_outbox(&data_dir, &mut cache, &mut tokens, &accounts, &evt_tx).await;
     }
+    wake_due_snoozed_messages(&mut cache, &evt_tx);
 
-    while let Ok(req) = req_rx.recv() {
+    loop {
+        let req = match req_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(req) => req,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                wake_due_snoozed_messages(&mut cache, &evt_tx);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if matches!(req, MailRequest::PrepareQuit) {
             let result = cache.expire_queued_outbox();
             let prepared = result.is_ok();
@@ -144,6 +153,19 @@ async fn worker_loop(
 
     for (_, handle) in watchers.drain() {
         handle.abort();
+    }
+}
+
+fn wake_due_snoozed_messages(cache: &mut CacheStore, evt_tx: &mpsc::Sender<WorkerEvent>) {
+    let now_ts = chrono::Utc::now().timestamp();
+    if let Ok(woken) = cache.wake_due_snoozed(now_ts) {
+        for (message_id, account_id, _subject) in woken {
+            let _ = evt_tx.send(WorkerEvent::MessageSnoozed {
+                account_id,
+                message_id,
+                until_ts: 0,
+            });
+        }
     }
 }
 

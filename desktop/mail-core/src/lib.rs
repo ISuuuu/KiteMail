@@ -1,18 +1,30 @@
 //! Core mail domain models, UI-worker command/event protocol, local SQLite cache,
 //! Windows Credential Manager secrets, and IMAP/SMTP worker runtime.
 
+pub mod at_rest;
+pub mod avatar;
 pub mod cache;
 pub mod config;
 pub mod contacts_io;
 pub mod demo;
 pub mod graph_client;
 pub mod imap_client;
+pub mod invite;
+pub mod jmap;
+pub mod link_clean;
+pub mod local;
+pub mod merge;
 pub mod mime;
 pub mod oauth;
+pub mod pop3;
+pub mod privacy;
+pub mod receipt;
 pub mod search_query;
 pub mod secrets;
 pub mod smtp_client;
+pub mod snooze;
 pub mod strip;
+pub mod verify;
 pub mod worker;
 
 pub use search_query::SearchQuery;

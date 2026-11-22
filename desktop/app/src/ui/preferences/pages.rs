@@ -3010,14 +3010,18 @@ fn render_privacy(
         ))
         .child(setting_group(
             "本地存储加密",
-            Some("SQLCipher 本地数据库加密与改密入口将在 WP-12 接入，当前仅持久化加密开关偏好"),
+            Some(if hylki_mail_core::at_rest::is_sqlcipher_available() {
+                "SQLCipher 4 加密后端已就绪，密钥安全存储于 Windows 凭据管理器"
+            } else {
+                "已接入密钥管理与状态检测；当前离线构建的 rusqlite 未启用 sqlcipher 特性，暂以明文 SQLite 运行"
+            }),
             CARD_MAX_WIDTH,
             vec![
                 prefs_switch_row(
                     &app_entity,
                     "pref-encrypt-stored-mail",
                     "加密本地存储的邮件",
-                    Some("使用本地密钥加密缓存的邮件正文与索引数据库（待 WP-12 接入 SQLCipher 后生效）"),
+                    Some("使用本地密钥（Windows 凭据管理器托管）保护缓存数据库"),
                     prefs.encrypt_stored_mail,
                     false,
                     is_hit(win, "pref-encrypt-stored-mail"),
@@ -3026,14 +3030,22 @@ fn render_privacy(
                 ),
                 setting_row(
                     "pref-storage-password",
-                    "更改存储密码",
-                    Some("SQLCipher 密钥管理尚未接入（规划于 WP-12）"),
+                    "SQLCipher 密钥状态",
+                    Some(if hylki_mail_core::at_rest::is_sqlcipher_available() {
+                        "SQLCipher 已启用，可管理本地存储密钥"
+                    } else {
+                        "密钥生成与 Windows 凭据管理器接口已就绪（等待 SQLCipher 运行时特性）"
+                    }),
                     Button::new("btn-storage-password")
                         .outline()
                         .compact()
-                        .label("更改密码")
-                        .disabled(true)
-                        .tooltip("SQLCipher 加密后端将于 WP-12 接入")
+                        .label(if hylki_mail_core::at_rest::is_sqlcipher_available() {
+                            "更改密码"
+                        } else {
+                            "检查密钥"
+                        })
+                        .disabled(!hylki_mail_core::at_rest::is_sqlcipher_available())
+                        .tooltip("密钥托管于 Windows 凭据管理器")
                         .into_any_element(),
                     true,
                     false,
