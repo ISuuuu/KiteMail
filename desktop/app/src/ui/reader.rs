@@ -933,6 +933,15 @@ pub(crate) fn render(
                 } else {
                     tm.subject.clone()
                 };
+                // 退订信息只在当前打开（锚点）邮件的 detail 中；会话其余卡片
+                // 无详情数据，维持 None（横幅仅出现在锚点卡片上）。
+                let is_anchor = tm.id == detail.id;
+                let card_unsubscribe_url = if is_anchor {
+                    detail.unsubscribe_url.as_deref()
+                } else {
+                    None
+                };
+                let card_unsubscribe_one_click = is_anchor && detail.unsubscribe_one_click;
                 let card_detail = MessageDetail {
                     id: tm.id,
                     account_id: detail.account_id,
@@ -955,8 +964,8 @@ pub(crate) fn render(
                     flagged: tm.flagged,
                     attachments: tm.attachments.clone(),
                     thread_messages: Vec::new(),
-                    unsubscribe_url: None,
-                    unsubscribe_one_click: false,
+                    unsubscribe_url: card_unsubscribe_url.map(str::to_string),
+                    unsubscribe_one_click: card_unsubscribe_one_click,
                 };
                 let eml_exporting = app.pending_eml_export == Some(tm.id);
                 let menu = build_card_more_menu(
@@ -994,8 +1003,8 @@ pub(crate) fn render(
                     card_attachments,
                     &tm.attachments,
                     is_current,
-                    None,
-                    false,
+                    card_unsubscribe_url,
+                    card_unsubscribe_one_click,
                     app.pending_unsubscribe == Some(tm.id),
                     menu,
                     &p,

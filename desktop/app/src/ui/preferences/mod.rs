@@ -559,6 +559,8 @@ impl SettingsWindow {
         self.active_tab = item.tab;
         self.narrow_show_content = true;
         self.highlighted_row_id = Some(item.row_id);
+        // 切换 Tab 后请求滚动：下一次渲染把锚点挂到高亮行，记录行位置后滚进视口。
+        widgets::request_search_scroll();
         self.highlight_token = self.highlight_token.wrapping_add(1);
         let token = self.highlight_token;
         let win_width = window.viewport_size().width.as_f32();
@@ -1254,6 +1256,8 @@ impl Render for SettingsWindow {
             None
         };
         let content_area: AnyElement = if self.active_tab == PrefTab::MailAccounts {
+            // 账号页不经 `render_tab`（行无统一高亮机制）：丢弃搜索滚动请求，避免悬挂到下次渲染。
+            let _ = widgets::take_search_scroll_pending();
             let app_entity = self.app.clone();
             if self.account_editor_open {
                 accounts::render_editor_page(self, app_entity, &p, cx)

@@ -1461,20 +1461,36 @@ impl CacheStore {
 
     /// Cross-account, cross-folder local search.
     ///
-    /// Excludes Trash and Junk folders by default (unless the query explicitly
-    /// specifies an `in:` / `folder:` operator), and deduplicates by non-empty
+    /// Only messages of `allowed_account_ids` are searched (the enabled
+    /// accounts, see `folder_select` in the Linux app). Excludes Trash and
+    /// Junk folders by default (unless the query explicitly specifies an
+    /// `in:` / `folder:` operator), and deduplicates by non-empty
     /// `message_id` preferring Inbox > regular folders > Archive > Trash/Junk.
     pub fn search_all_folders(
         &self,
+        allowed_account_ids: &[u32],
         query: &str,
         quick_filters: QuickFilterSet,
         sort: MessageSort,
         offset: usize,
         limit: usize,
     ) -> Result<MailPage, String> {
+        if allowed_account_ids.is_empty() {
+            return Ok(MailPage {
+                folder_id: 0,
+                offset,
+                total: 0,
+                items: Vec::new(),
+            });
+        }
         let parsed = SearchQuery::parse(query);
         let mut clauses: Vec<String> = Vec::new();
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let placeholders = vec!["?"; allowed_account_ids.len()].join(", ");
+        clauses.push(format!("m.account_id IN ({placeholders})"));
+        for &id in allowed_account_ids {
+            args.push(i64::from(id).into());
+        }
         if parsed.folder.is_empty() {
             clauses.push(format!("NOT ({TRASH_FOLDER_MATCH} OR {JUNK_FOLDER_MATCH})"));
         }
@@ -5173,6 +5189,7 @@ mod tests {
         for query in ["archivecode", "末尾合同", "archivecode 末尾合同"] {
             let page = cache
                 .search_all_folders(
+                    &[1],
                     query,
                     QuickFilterSet::default(),
                     MessageSort::DateNewest,
@@ -5293,6 +5310,7 @@ mod tests {
 
         let cn_contract = cache
             .search_all_folders(
+                &[1],
                 "合同",
                 QuickFilterSet::default(),
                 MessageSort::DateNewest,
@@ -5321,6 +5339,7 @@ mod tests {
         // 3. 结构化操作符：from / to / in / has:attachment / is:unread / is:read / is:starred
         let op_from_to = cache
             .search_all_folders(
+                &[1],
                 "from:mario to:finance has:attachment is:unread is:starred",
                 QuickFilterSet::default(),
                 MessageSort::DateNewest,
@@ -5333,6 +5352,7 @@ mod tests {
 
         let op_read_in = cache
             .search_all_folders(
+                &[1],
                 "is:read in:archive",
                 QuickFilterSet::default(),
                 MessageSort::DateNewest,
@@ -5484,6 +5504,7 @@ mod tests {
 
         let all = cache
             .search_all_folders(
+                &[1],
                 "合同",
                 QuickFilterSet::default(),
                 MessageSort::DateNewest,
@@ -5504,6 +5525,7 @@ mod tests {
         // 显式指定 in:trash 时可搜到已删除邮件。
         let in_trash = cache
             .search_all_folders(
+                &[1],
                 "in:trash 合同",
                 QuickFilterSet::default(),
                 MessageSort::DateNewest,
