@@ -20,7 +20,12 @@ use gpui_kit::{black, rgb, white, App, Global, Hsla};
 
 /// 内置主题列表（id, 显示名）；偏好设置页（preferences.rs）读取该列表
 /// 渲染色板选择器，持久化的 theme_id 经 [`static_theme_id`] 归一化。
+///
+/// WP-07：对齐 Linux 原版，首位是 `system`（GNOME/libadwaita 原生默认观感），
+/// 新用户默认落到该主题；旧 `default`（经典蓝）保留为可继续选择的色板，
+/// 已有配置中的 `theme_id = "default"` 渲染不变。
 pub const THEME_LIST: &[(&str, &str)] = &[
+    ("system", "系统"),
     ("default", "经典蓝"),
     ("midnight", "子夜"),
     ("tidal", "海潮"),
@@ -107,6 +112,39 @@ fn hx(hex: &str) -> Hsla {
         .expect("theme palette hex must be valid");
     Hsla::from(rgb(value))
 }
+
+/// 系统原生（WP-07，复刻自 Linux `src/ui/theme_picker.rs` 的 SYSTEM_LIGHT /
+/// SYSTEM_DARK，即 libadwaita 无主题时的 stock 观感：纯正灰白 / 深灰 + GNOME 蓝）。
+///
+/// 文档只给出 bg / surface / sidebar / card / text / accent / accent_fg 七个
+/// 语义值；`border` 取 Linux 同一常量的 `#d9d9d9`（暗色 `#454545`），
+/// `text_muted` 取 libadwaita dim-label 在对应底色上的扁平化近似值
+///（亮 rgba(0,0,6,.55) ≈ `#707074`，暗 rgba(255,255,255,.6) ≈ `#a7a7a9`），
+/// `danger` 沿用本文件经典蓝的 GNOME 错误红以保持全局一致。
+const SYSTEM_LIGHT: PaletteHex = PaletteHex {
+    canvas: "#fafafa",
+    sidebar: "#ebebed",
+    surface: "#ffffff",
+    surface_raised: "#ffffff",
+    accent: "#3584e4",
+    accent_fg: "#ffffff",
+    text: "#2e2e32",
+    text_muted: "#707074",
+    border: "#d9d9d9",
+    danger: "#e01b24",
+};
+const SYSTEM_DARK: PaletteHex = PaletteHex {
+    canvas: "#242424",
+    sidebar: "#303030",
+    surface: "#303030",
+    surface_raised: "#363636",
+    accent: "#3584e4",
+    accent_fg: "#ffffff",
+    text: "#ffffff",
+    text_muted: "#a7a7a9",
+    border: "#454545",
+    danger: "#f66151",
+};
 
 /// 经典蓝（方案文档第二节参考值）。
 const DEFAULT_LIGHT: PaletteHex = PaletteHex {
@@ -264,8 +302,9 @@ const MIDNIGHT_DARK: PaletteHex = PaletteHex {
     danger: "#fb414a",
 };
 
-/// 全部内置色板（id, 亮, 暗），顺序与 [`THEME_LIST`] 一致。
+/// 全部内置色板（id, 亮, 暗），顺序与 [`THEME_LIST`] 一致（首位 `system`）。
 const PALETTES: &[(&str, PaletteHex, PaletteHex)] = &[
+    ("system", SYSTEM_LIGHT, SYSTEM_DARK),
     ("default", DEFAULT_LIGHT, DEFAULT_DARK),
     ("midnight", MIDNIGHT_LIGHT, MIDNIGHT_DARK),
     ("tidal", TIDAL_LIGHT, TIDAL_DARK),
@@ -274,7 +313,7 @@ const PALETTES: &[(&str, PaletteHex, PaletteHex)] = &[
     ("forest", FOREST_LIGHT, FOREST_DARK),
 ];
 
-/// 按 id 与亮暗取语义色板；未知 id 回落到经典蓝。
+/// 按 id 与亮暗取语义色板；未知 id 回落到首位主题（`system`）。
 pub fn palette_for(theme_id: &str, dark: bool) -> HylkiPalette {
     let (_, light, dark_hex) = PALETTES
         .iter()
@@ -290,13 +329,13 @@ pub struct HylkiThemeState {
     pub palette: HylkiPalette,
 }
 
-/// 把持久化的 theme_id 归一化为内置列表里的 `&'static str`（未知回落经典蓝）。
+/// 把持久化的 theme_id 归一化为内置列表里的 `&'static str`（未知回落 `system`）。
 pub fn static_theme_id(id: &str) -> &'static str {
     THEME_LIST
         .iter()
         .find(|(known, _)| *known == id)
         .map(|(known, _)| *known)
-        .unwrap_or("default")
+        .unwrap_or("system")
 }
 
 impl Global for HylkiThemeState {}
@@ -305,7 +344,7 @@ impl Global for HylkiThemeState {}
 pub fn current(cx: &App) -> HylkiPalette {
     match cx.try_global::<HylkiThemeState>() {
         Some(state) => state.palette,
-        None => palette_for("default", false),
+        None => palette_for("system", false),
     }
 }
 
@@ -433,16 +472,40 @@ mod tests {
     }
 
     #[test]
-    fn unknown_theme_id_falls_back_to_default() {
-        let fallback = palette_for("default", false);
+    fn unknown_theme_id_falls_back_to_system() {
+        let fallback = palette_for("system", false);
         assert!(approx(
             palette_for("missing", false).accent,
             fallback.accent
         ));
         assert!(approx(
             palette_for("missing", true).canvas,
-            DEFAULT_DARK.to_palette().canvas
+            SYSTEM_DARK.to_palette().canvas
         ));
+        assert_eq!(static_theme_id("missing"), "system");
+        assert_eq!(static_theme_id("default"), "default");
+    }
+
+    #[test]
+    fn system_matches_adwaita_reference() {
+        // WP-07：对齐 Linux theme_picker SYSTEM_LIGHT / SYSTEM_DARK 参考值。
+        let light = palette_for("system", false);
+        assert!(approx(light.canvas, hx("#fafafa")));
+        assert!(approx(light.sidebar, hx("#ebebed")));
+        assert!(approx(light.surface, hx("#ffffff")));
+        assert!(approx(light.surface_raised, hx("#ffffff")));
+        assert!(approx(light.accent, hx("#3584e4")));
+        assert!(approx(light.accent_fg, hx("#ffffff")));
+        assert!(approx(light.text, hx("#2e2e32")));
+        let dark = palette_for("system", true);
+        assert!(approx(dark.canvas, hx("#242424")));
+        assert!(approx(dark.sidebar, hx("#303030")));
+        assert!(approx(dark.surface, hx("#303030")));
+        assert!(approx(dark.surface_raised, hx("#363636")));
+        assert!(approx(dark.accent, hx("#3584e4")));
+        assert!(approx(dark.text, hx("#ffffff")));
+        // `system` 是内置列表与色板表的首位（对齐 Linux catalog 顺序）。
+        assert_eq!(THEME_LIST.first().copied(), Some(("system", "系统")));
     }
 
     #[test]
