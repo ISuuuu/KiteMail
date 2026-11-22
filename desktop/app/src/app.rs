@@ -6259,9 +6259,27 @@ impl Render for HylkiApp {
             .child(body)
             // P3：窄窗口浮层侧栏（对齐 Linux sidebar_peek：完整侧栏从窄轨右缘
             // 滑出、盖在中栏列表 / 阅读器之上；导航选择后由各入口自动关闭）。
-            // 绝对定位 + 后挂子元素保证绘制在最上层。
+            // WP-01：浮层下方先铺全屏半透明遮罩（对齐 Linux OverlaySplitView 的
+            // scrim），点击遮罩任意区域收起抽屉；侧边栏浮层后挂、绘制在遮罩之上。
             .when(peek_open, |el| {
                 el.child(
+                    div()
+                        .id("sidebar-peek-scrim")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(sidebar::RAIL_WIDTH))
+                        .right_0()
+                        .bg(black().opacity(0.18))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.sidebar_peek_open = false;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
                     div()
                         .absolute()
                         .top_0()
@@ -6655,7 +6673,14 @@ impl Render for HylkiApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
-                // Esc 优先级：关闭浮层 > 清空文件夹确认 > 写信退出确认 > 撤销发送 > 取消多选。
+                // Esc 优先级：收起抽屉侧栏 > 关闭浮层 > 清空文件夹确认 > 写信退出确认
+                // > 撤销发送 > 取消多选。WP-01：半屏抽屉对齐 Linux OverlaySplitView，
+                // Esc 先收起抽屉。
+                if this.sidebar_peek_open {
+                    this.sidebar_peek_open = false;
+                    cx.notify();
+                    return;
+                }
                 if this.active_modal != ActiveModal::None {
                     this.close_modal(cx);
                 } else if this.pending_empty_folder.is_some() {

@@ -445,12 +445,19 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .border_r_1()
         .border_color(border)
         // L-2：右缘拖拽把手（180~280 调宽，移动监听与持久化在 app.rs 根节点）；
-        // 窄轨模式（render_collapsed）不挂把手。
-        .child(
-            resize_handle::<SidebarDrag, SidebarDrag>("sidebar-resize-handle", Axis::Horizontal)
+        // 窄轨模式（render_collapsed）不挂把手。WP-01：断点自动窄轨下完整侧栏
+        // 只会出现在半屏抽屉浮层里（对齐 Linux OverlaySplitView 抽屉模式宽度
+        // 固定不可拖拽），此时也不挂把手。
+        .when(!app.auto_rail_active, |sidebar| {
+            sidebar.child(
+                resize_handle::<SidebarDrag, SidebarDrag>(
+                    "sidebar-resize-handle",
+                    Axis::Horizontal,
+                )
                 .inside(HandleEdge::Trailing)
                 .on_drag(SidebarDrag, |_, _, _, cx| cx.new(|_| SidebarDrag)),
-        )
+            )
+        })
         // 顶部栏 48px：刷新 + Hylki + 菜单。
         .child(
             h_flex()
