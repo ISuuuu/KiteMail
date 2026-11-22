@@ -131,7 +131,7 @@ pub(crate) fn render(
                                 .hover(|s| s.bg(hx(OAUTH_BTN_HOVER)))
                                 .active(|s| s.bg(hx(OAUTH_BTN_ACTIVE)))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.start_outlook_oauth(String::new(), None, cx);
+                                    this.start_outlook_oauth(String::new(), String::new(), None, cx);
                                 }))
                                 .child("使用 Outlook / Microsoft 365 登录 (OAuth2)"),
                         )

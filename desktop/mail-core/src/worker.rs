@@ -29,6 +29,8 @@ const BACKFILL_HISTORY_TRIES: u32 = 3;
 pub struct MailWorkerHandle {
     req_tx: mpsc::Sender<MailRequest>,
     evt_rx: mpsc::Receiver<WorkerEvent>,
+    /// 数据目录：退出时主线程直接打开缓存库落盘，不排队等待单线程 worker。
+    data_dir: PathBuf,
 }
 
 impl MailWorkerHandle {
@@ -37,6 +39,7 @@ impl MailWorkerHandle {
         let (req_tx, req_rx) = mpsc::channel::<MailRequest>();
         let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
         let worker_req_tx = req_tx.clone();
+        let worker_data_dir = data_dir.clone();
 
         std::thread::Builder::new()
             .name("hylki-mail-worker".to_string())
@@ -47,11 +50,23 @@ impl MailWorkerHandle {
                     .build()
                     .expect("failed to start Tokio runtime");
 
-                rt.block_on(worker_loop(data_dir, worker_req_tx, req_rx, evt_tx));
+                rt.block_on(worker_loop(worker_data_dir, worker_req_tx, req_rx, evt_tx));
             })
             .map_err(|e| format!("启动邮件后台线程失败: {e}"))?;
 
-        Ok(Self { req_tx, evt_rx })
+        Ok(Self {
+            req_tx,
+            evt_rx,
+            data_dir,
+        })
+    }
+
+    /// 同步准备退出：不经 worker 队列，直接把仍排队的发件箱记录标记为到期，
+    /// 使下次启动立即续发（对齐 Linux 主线程直接落盘的退出语义）。即使 worker
+    /// 正在执行耗时的同步或超时重连也不会阻塞关窗。
+    pub fn prepare_quit_now(&self) -> Result<(), String> {
+        let mut cache = CacheStore::open(&config::cache_db_in(&self.data_dir))?;
+        cache.expire_queued_outbox()
     }
 
     /// Send a request to the background mail worker.
@@ -185,13 +200,13 @@ enum OAuthAccountMatch {
 /// 判定 OAuth 授权返回的邮箱应绑定到哪个账号：
 /// - 重新授权（`editing_account_id` 有值）：仅当返回邮箱与原账号一致（忽略大小写）
 ///   时更新原账号，否则拒绝换绑（无论该邮箱是否命中其他已有账号）。
-/// - 添加账号流程（`editing_account_id` 为空）：返回邮箱命中已有账号时复用该账号，
-///   否则分配新账号 ID。
+/// - 添加账号流程（`editing_account_id` 为空）：返回邮箱命中已有账号时视为重复
+///   添加并报错（不静默覆盖已有账号），否则分配新账号 ID。
 fn resolve_oauth_account_match(
     editing_account_id: Option<u32>,
     existing: &[AccountConfig],
     returned_email: &str,
-) -> OAuthAccountMatch {
+) -> Result<OAuthAccountMatch, String> {
     match editing_account_id {
         Some(edit_id) => {
             let same_as_editing = existing
@@ -199,18 +214,20 @@ fn resolve_oauth_account_match(
                 .find(|a| a.id == edit_id)
                 .is_some_and(|a| a.email.eq_ignore_ascii_case(returned_email));
             if same_as_editing {
-                OAuthAccountMatch::Bind(edit_id)
+                Ok(OAuthAccountMatch::Bind(edit_id))
             } else {
-                OAuthAccountMatch::Rejected
+                Ok(OAuthAccountMatch::Rejected)
             }
         }
-        None => match existing
-            .iter()
-            .find(|a| a.email.eq_ignore_ascii_case(returned_email))
-        {
-            Some(acc) => OAuthAccountMatch::Bind(acc.id),
-            None => OAuthAccountMatch::Bind(config::next_account_id(existing)),
-        },
+        None => {
+            if existing
+                .iter()
+                .any(|a| a.email.eq_ignore_ascii_case(returned_email))
+            {
+                return Err(format!("Account {returned_email} already exists"));
+            }
+            Ok(OAuthAccountMatch::Bind(config::next_account_id(existing)))
+        }
     }
 }
 
@@ -575,6 +592,7 @@ async fn handle_request(
 
         MailRequest::StartMicrosoftOAuth {
             custom_client_id,
+            login_hint_email,
             editing_account_id,
         } => {
             let _ = evt_tx.send(WorkerEvent::Status {
@@ -583,7 +601,7 @@ async fn handle_request(
             });
 
             let sign_in = tokio::task::spawn_blocking(move || {
-                oauth::run_microsoft_oauth_login(&custom_client_id)
+                oauth::run_microsoft_oauth_login(&custom_client_id, login_hint_email.as_deref())
             })
             .await;
 
@@ -613,17 +631,50 @@ async fn handle_request(
             let existing = config::load_accounts_in(data_dir).unwrap_or_default();
             // 先用返回的邮箱核对账号身份：与编辑中账号一致才更新；选择了另一个
             // 邮箱时保留原账号、凭据与缓存完全不动，提示用户重新授权或走添加流程。
+            // 新增流程授权到已存在的邮箱时直接报错，不静默覆盖已有账号。
             let account_id =
                 match resolve_oauth_account_match(editing_account_id, &existing, &result.email) {
-                    OAuthAccountMatch::Bind(id) => id,
-                    OAuthAccountMatch::Rejected => {
+                    Ok(OAuthAccountMatch::Bind(id)) => id,
+                    Ok(OAuthAccountMatch::Rejected) => {
                         let _ = evt_tx.send(WorkerEvent::OAuthRebindRejected {
                             account_id: editing_account_id,
                             returned_email: result.email.clone(),
                         });
                         return;
                     }
+                    Err(message) => {
+                        let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                            ok: false,
+                            message: message.clone(),
+                        });
+                        let _ = evt_tx.send(WorkerEvent::Error {
+                            account_id: None,
+                            message,
+                        });
+                        return;
+                    }
                 };
+
+            // 编辑已有账号重新授权：只把新令牌写入 Keyring 与内存令牌缓存，
+            // 账号配置、缓存与同步完全不动，由 UI 保留编辑表单并提示成功。
+            if editing_account_id.is_some() {
+                if let Err(e) = secrets::save_oauth_refresh_token(account_id, result.refresh_token)
+                {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                    return;
+                }
+                let expires_at = Instant::now()
+                    + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
+                tokens.insert(account_id, (result.access_token, expires_at));
+                let _ = evt_tx.send(WorkerEvent::OAuthReauthorized {
+                    account_id,
+                    email: result.email,
+                });
+                return;
+            }
 
             let prev = existing.iter().find(|a| a.id == account_id);
 
@@ -2796,7 +2847,7 @@ async fn backfill_history_batch_inner(
         return;
     }
 
-    // 一次请求只补一封正文，落盘成功后由界面续排下一批。
+    // 一次请求在同一 IMAP 会话内批量补一批正文（最多 10 封），落盘成功后由界面续排下一批。
     let has_older = cache
         .folder_remote_cursor(fid)
         .ok()
@@ -2805,67 +2856,117 @@ async fn backfill_history_batch_inner(
     let missing = if has_older {
         Vec::new()
     } else {
-        cache.list_unindexed_messages(fid, 1).unwrap_or_default()
+        cache.list_unindexed_messages(fid, 10).unwrap_or_default()
     };
-    if let Some((message_id, uid, remote_id)) = missing.into_iter().next() {
+    if !missing.is_empty() {
         let Some((_, account_id, path, _)) = folders.iter().find(|(id, _, _, _)| *id == fid) else {
             return;
         };
         let Some(account) = accounts.iter().find(|a| a.id == *account_id && a.enabled) else {
             return;
         };
-        let result = match account.auth_backend {
+        let validity = cache
+            .folder_meta(fid)
+            .ok()
+            .flatten()
+            .map(|(_, validity)| validity)
+            .unwrap_or(0);
+        let results: Vec<(u32, Result<String, String>)> = match account.auth_backend {
             AuthBackend::Password => match secrets::load_account_secrets(account.id) {
                 Ok(sec) => {
-                    let validity = cache
-                        .folder_meta(fid)
-                        .ok()
-                        .flatten()
-                        .map(|(_, validity)| validity)
-                        .unwrap_or(0);
-                    imap_client::fetch_index_text(account, &sec.imap_password, path, uid, validity)
-                        .await
+                    let uids: Vec<u32> = missing.iter().map(|(_, uid, _)| *uid).collect();
+                    match imap_client::fetch_index_texts_batch(
+                        account,
+                        &sec.imap_password,
+                        path,
+                        &uids,
+                        validity,
+                    )
+                    .await
+                    {
+                        Ok(batch) => {
+                            let by_uid: std::collections::HashMap<u32, String> = batch
+                                .into_iter()
+                                .map(|(uid, text, _, _)| (uid, text))
+                                .collect();
+                            missing
+                                .into_iter()
+                                .map(|(message_id, uid, _)| {
+                                    let result = match by_uid.get(&uid) {
+                                        Some(text) => Ok(text.clone()),
+                                        None => Err("服务器未返回索引正文".to_string()),
+                                    };
+                                    (message_id, result)
+                                })
+                                .collect()
+                        }
+                        Err(e) => missing
+                            .into_iter()
+                            .map(|(message_id, _, _)| (message_id, Err(e.clone())))
+                            .collect(),
+                    }
                 }
-                Err(e) => Err(e),
+                Err(e) => missing
+                    .into_iter()
+                    .map(|(message_id, _, _)| (message_id, Err(e.clone())))
+                    .collect(),
             },
-            AuthBackend::MicrosoftGraphOAuth2 => {
-                if remote_id.is_empty() {
-                    Err("缺少 Graph 邮件标识".to_string())
-                } else {
-                    match ensure_graph_token(tokens, account).await {
-                        Ok(token) => tokio::task::spawn_blocking(move || {
+            AuthBackend::MicrosoftGraphOAuth2 => match ensure_graph_token(tokens, account).await {
+                Ok(token) => {
+                    let mut out = Vec::new();
+                    for (message_id, _uid, remote_id) in missing {
+                        if remote_id.is_empty() {
+                            out.push((message_id, Err("缺少 Graph 邮件标识".to_string())));
+                            continue;
+                        }
+                        let token = token.clone();
+                        let result = tokio::task::spawn_blocking(move || {
                             graph_client::fetch_index_text(&token, &remote_id)
                         })
                         .await
-                        .unwrap_or_else(|e| Err(format!("Graph 索引任务异常: {e}"))),
-                        Err(e) => Err(e),
+                        .unwrap_or_else(|e| Err(format!("Graph 索引任务异常: {e}")));
+                        out.push((message_id, result));
+                    }
+                    out
+                }
+                Err(e) => missing
+                    .into_iter()
+                    .map(|(message_id, _, _)| (message_id, Err(e.clone())))
+                    .collect(),
+            },
+        };
+        let mut stored_count = 0usize;
+        let mut needs_resync = false;
+        for (message_id, result) in &results {
+            match result {
+                Ok(text) => {
+                    if cache.store_index_text(*message_id, text).is_ok() {
+                        stored_count += 1;
                     }
                 }
+                Err(e) if e == "UIDVALIDITY_CHANGED" || e == "服务器未返回索引正文" => {
+                    needs_resync = true;
+                }
+                Err(e) => {
+                    eprintln!("后台正文索引失败（文件夹 {fid}）: {e}");
+                }
             }
-        };
-        let stored = match result {
-            Ok(text) => cache.store_index_text(message_id, &text).is_ok(),
-            Err(e) if e == "UIDVALIDITY_CHANGED" || e == "服务器未返回索引正文" => {
-                state.uid_snapshots.remove(&fid);
-                let (background_events, _) = mpsc::channel();
-                sync_folder_inner(
-                    cache,
-                    tokens,
-                    account,
-                    fid,
-                    path,
-                    BACKFILL_HISTORY_BATCH,
-                    &background_events,
-                )
-                .await;
-                false
-            }
-            Err(e) => {
-                eprintln!("后台正文索引失败（文件夹 {fid}）: {e}");
-                false
-            }
-        };
-        if stored {
+        }
+        if needs_resync {
+            state.uid_snapshots.remove(&fid);
+            let (background_events, _) = mpsc::channel();
+            sync_folder_inner(
+                cache,
+                tokens,
+                account,
+                fid,
+                path,
+                BACKFILL_HISTORY_BATCH,
+                &background_events,
+            )
+            .await;
+        }
+        if stored_count > 0 {
             state.record_success(fid);
         } else {
             state.record_failure(fid);
@@ -2878,7 +2979,7 @@ async fn backfill_history_batch_inner(
             .collect();
         let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
             folder_id: fid,
-            fetched_count: usize::from(stored),
+            fetched_count: stored_count,
             body_only: true,
             has_more_remote: select_backfill_target(&remaining, &allowed, state).is_some(),
         });
@@ -3432,7 +3533,7 @@ mod tests {
         // 任务二：同邮箱重授权 -> 更新原账号（忽略大小写）。
         let existing = vec![account(3, "User@Outlook.com")];
         let resolved = resolve_oauth_account_match(Some(3), &existing, "user@outlook.com");
-        assert_eq!(resolved, OAuthAccountMatch::Bind(3));
+        assert_eq!(resolved, Ok(OAuthAccountMatch::Bind(3)));
     }
 
     #[test]
@@ -3442,26 +3543,27 @@ mod tests {
         // 返回邮箱命中了另一个已有账号：仍拒绝换绑，避免把 A 的身份改成 B。
         assert_eq!(
             resolve_oauth_account_match(Some(3), &existing, "b@outlook.com"),
-            OAuthAccountMatch::Rejected
+            Ok(OAuthAccountMatch::Rejected)
         );
         // 返回邮箱是本地没有的新邮箱：同样拒绝换绑。
         assert_eq!(
             resolve_oauth_account_match(Some(3), &existing, "new@gmail.com"),
-            OAuthAccountMatch::Rejected
+            Ok(OAuthAccountMatch::Rejected)
         );
     }
 
     #[test]
-    fn oauth_add_flow_reuses_matching_account_or_allocates_new_id() {
-        // 添加账号流程：返回邮箱命中已有账号时复用其 ID，否则分配新 ID。
+    fn oauth_add_flow_rejects_existing_email_or_allocates_new_id() {
+        // 添加账号流程：返回邮箱命中已有账号时报“已存在”（不静默覆盖），
+        // 全新邮箱则分配新账号 ID。
         let existing = vec![account(3, "a@outlook.com")];
         assert_eq!(
             resolve_oauth_account_match(None, &existing, "A@OUTLOOK.COM"),
-            OAuthAccountMatch::Bind(3)
+            Err("Account A@OUTLOOK.COM already exists".to_string())
         );
         assert_eq!(
             resolve_oauth_account_match(None, &existing, "fresh@outlook.com"),
-            OAuthAccountMatch::Bind(4)
+            Ok(OAuthAccountMatch::Bind(4))
         );
     }
 

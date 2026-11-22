@@ -1510,6 +1510,7 @@ pub(crate) fn render_editor_page(
 
         let app_for_oauth = app_entity.clone();
         let oauth_client_entity = form.oauth_client_id.clone();
+        let oauth_email_entity = form.email.clone();
         account_rows.push(
             h_flex()
                 .w_full()
@@ -1550,8 +1551,9 @@ pub(crate) fn render_editor_page(
                         })
                         .on_click(cx.listener(move |_, _, _, cx| {
                             let client_id = oauth_client_entity.read(cx).value().trim().to_string();
+                            let login_hint = oauth_email_entity.read(cx).value().trim().to_string();
                             app_for_oauth.update(cx, |app, cx| {
-                                app.start_outlook_oauth(client_id, editing_id, cx);
+                                app.start_outlook_oauth(client_id, login_hint, editing_id, cx);
                             });
                         })),
                 )

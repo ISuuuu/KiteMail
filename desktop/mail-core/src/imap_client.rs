@@ -437,16 +437,21 @@ pub async fn fetch_older_folder_headers(
     Ok((uid_validity, headers, has_more))
 }
 
-/// 读取有体积上限的 MIME 内容用于本地搜索，不下载或缓存附件。
-/// 超过上限的邮件返回空字符串，供服务器搜索覆盖。
-pub async fn fetch_index_text(
+/// 批量读取有体积上限的 MIME 内容用于本地搜索：在同一个 IMAP 会话内抓取
+/// `uids` 一批（最多 10 封）邮件正文并统一提取文本后登出，避免逐封重建
+/// TCP+TLS 连接触发服务器频控。返回 `(uid, 索引文本, 纯文本正文, HTML 正文)`，
+/// 超过体积上限的邮件文本为空，供服务器搜索覆盖。
+pub async fn fetch_index_texts_batch(
     account: &AccountConfig,
     password: &str,
     folder_path: &str,
-    uid: u32,
+    uids: &[u32],
     expected_validity: u32,
-) -> Result<String, String> {
+) -> Result<Vec<(u32, String, Option<String>, Option<String>)>, String> {
     const MAX_BYTES: usize = 262_144;
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut session = connect_imap(account, password).await?;
     let mailbox = tokio::time::timeout(IO_TIMEOUT, session.select(folder_path))
         .await
@@ -455,39 +460,58 @@ pub async fn fetch_index_text(
     if expected_validity != 0 && mailbox.uid_validity.unwrap_or(1) != expected_validity {
         return Err("UIDVALIDITY_CHANGED".to_string());
     }
-    let bytes = tokio::time::timeout(IO_TIMEOUT, async {
+    let uid_set = uids
+        .iter()
+        .map(|uid| uid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let fetched = tokio::time::timeout(IO_TIMEOUT, async {
         let mut stream = session
-            .uid_fetch(uid.to_string(), "(BODY.PEEK[]<0.262145>)")
+            .uid_fetch(uid_set, "(BODY.PEEK[]<0.262145>)")
             .await
             .map_err(|e| format!("拉取索引正文失败: {e}"))?;
+        let mut out = Vec::new();
         while let Some(item) = stream.next().await {
             let fetch = item.map_err(|e| format!("读取索引正文失败: {e}"))?;
-            if let Some(body) = fetch.body() {
-                return Ok(body.to_vec());
-            }
+            let Some(uid) = fetch.uid else { continue };
+            let Some(body) = fetch.body() else { continue };
+            out.push((uid, body.to_vec()));
         }
-        Err("服务器未返回索引正文".to_string())
+        Ok::<Vec<(u32, Vec<u8>)>, String>(out)
     })
     .await
     .map_err(|_| "拉取索引正文超时".to_string())??;
     let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
-    Ok(index_text_from_mime(&bytes, MAX_BYTES))
+
+    Ok(fetched
+        .into_iter()
+        .map(|(uid, bytes)| {
+            let (index_text, text, html) = index_parts_from_mime(&bytes, MAX_BYTES);
+            (uid, index_text, text, html)
+        })
+        .collect())
 }
 
-fn index_text_from_mime(bytes: &[u8], max_bytes: usize) -> String {
+/// 将单封邮件的 MIME 字节转换为 `(索引文本, 纯文本正文, HTML 正文)`。
+/// 超过 `max_bytes` 或无法解析时全部返回空，供服务器搜索覆盖。
+fn index_parts_from_mime(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> (String, Option<String>, Option<String>) {
     if bytes.len() > max_bytes {
-        return String::new();
+        return (String::new(), None, None);
     }
     let Some(parsed) = MessageParser::default().parse(bytes) else {
-        return String::new();
+        return (String::new(), None, None);
     };
-    if let Some(text) = parsed.body_text(0) {
-        text.into_owned()
-    } else if let Some(html) = parsed.body_html(0) {
-        html_to_readable_text(&html)
-    } else {
-        String::new()
-    }
+    let text = parsed.body_text(0).map(|t| t.into_owned());
+    let html = parsed.body_html(0).map(|h| h.into_owned());
+    let index_text = match (&text, &html) {
+        (Some(t), _) => t.clone(),
+        (None, Some(h)) => html_to_readable_text(h),
+        (None, None) => String::new(),
+    };
+    (index_text, text, html)
 }
 
 /// Fetch full RFC 822 message body and attachments for `uid` in `folder_path`.
@@ -1390,8 +1414,15 @@ mod tests {
     #[test]
     fn index_text_reads_mime_tail_and_limits_size() {
         let raw = b"Subject: hello\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nfirst line\r\nunique tail keyword";
-        assert!(super::index_text_from_mime(raw, 1024).contains("unique tail keyword"));
-        assert_eq!(super::index_text_from_mime(raw, raw.len() - 1), "");
+        let (index, text, _) = super::index_parts_from_mime(raw, 1024);
+        assert!(index.contains("unique tail keyword"));
+        assert!(text
+            .as_deref()
+            .is_some_and(|t| t.contains("unique tail keyword")));
+        let (empty, no_text, no_html) = super::index_parts_from_mime(raw, raw.len() - 1);
+        assert_eq!(empty, "");
+        assert_eq!(no_text, None);
+        assert_eq!(no_html, None);
     }
 
     use super::*;

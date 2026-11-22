@@ -94,7 +94,11 @@ fn open_system_browser(url: &str) -> Result<(), String> {
 }
 
 /// Run interactive Microsoft OAuth2 PKCE login in the user's system browser.
-pub fn run_microsoft_oauth_login(custom_client_id: &str) -> Result<OAuthSignInResult, String> {
+/// `login_hint`（可选）为表单中已填写的邮箱，非空时预填微软登录页的账号框。
+pub fn run_microsoft_oauth_login(
+    custom_client_id: &str,
+    login_hint: Option<&str>,
+) -> Result<OAuthSignInResult, String> {
     let client_id = if custom_client_id.trim().is_empty() {
         DEFAULT_MICROSOFT_CLIENT_ID.to_string()
     } else {
@@ -115,17 +119,22 @@ pub fn run_microsoft_oauth_login(custom_client_id: &str) -> Result<OAuthSignInRe
 
     let mut auth_url =
         url::Url::parse(MICROSOFT_AUTH_URL).map_err(|e| format!("构造授权地址失败: {e}"))?;
-    auth_url
-        .query_pairs_mut()
-        .append_pair("client_id", &client_id)
-        .append_pair("response_type", "code")
-        .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("response_mode", "query")
-        .append_pair("scope", MICROSOFT_AUTH_SCOPES)
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", &state)
-        .append_pair("prompt", "select_account");
+    {
+        let mut pairs = auth_url.query_pairs_mut();
+        pairs
+            .append_pair("client_id", &client_id)
+            .append_pair("response_type", "code")
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("response_mode", "query")
+            .append_pair("scope", MICROSOFT_AUTH_SCOPES)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &state)
+            .append_pair("prompt", "select_account");
+        if let Some(hint) = login_hint.map(str::trim).filter(|s| !s.is_empty()) {
+            pairs.append_pair("login_hint", hint);
+        }
+    }
 
     open_system_browser(auth_url.as_str())?;
 

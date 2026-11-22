@@ -695,18 +695,25 @@ impl CacheStore {
     }
 
     /// 后台索引候选：尚未同步、仍有远端历史或有待索引正文的文件夹。
+    /// 跳过 Trash / Junk / Drafts / Templates 等不值得索引的文件夹（对齐原版
+    /// `gallery_folder` 语义），INBOX 排在最前优先索引。
     pub fn list_backfill_folders(&self) -> Result<Vec<(u32, u32, String, bool)>, String> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT f.id, f.account_id, f.path, f.uid_validity = 0
                  FROM folders f
-                 WHERE f.has_more_remote = 1 OR f.uid_validity = 0 OR EXISTS (
-                     SELECT 1 FROM messages m
-                     WHERE m.folder_id = f.id AND m.body_text IS NULL AND m.index_text IS NULL
+                 WHERE (
+                     f.has_more_remote = 1 OR f.uid_validity = 0 OR EXISTS (
+                         SELECT 1 FROM messages m
+                         WHERE m.folder_id = f.id AND m.body_text IS NULL AND m.index_text IS NULL
+                     )
                  )
-                 ORDER BY f.id",
-            )
+                 AND NOT ({TRASH_FOLDER_MATCH} OR {JUNK_FOLDER_MATCH}
+                     OR f.name = '草稿' OR UPPER(f.path) LIKE '%DRAFT%'
+                     OR f.name = '模板' OR UPPER(f.path) LIKE '%TEMPLATE%')
+                 ORDER BY (f.is_inbox = 1 OR UPPER(f.path) = 'INBOX') DESC, f.id"
+            ))
             .map_err(|e| format!("查询后台索引文件夹失败: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
