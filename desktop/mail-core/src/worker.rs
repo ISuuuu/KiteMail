@@ -704,6 +704,23 @@ async fn handle_request(
                 smtp_username: result.email,
                 smtp_separate_credentials: false,
                 signature: prev.map(|p| p.signature.clone()).unwrap_or_default(),
+                quota_used_bytes: prev.and_then(|p| p.quota_used_bytes),
+                quota_total_bytes: prev.and_then(|p| p.quota_total_bytes),
+                aliases: prev.map(|p| p.aliases.clone()).unwrap_or_default(),
+                signatures: prev.map(|p| p.signatures.clone()).unwrap_or_default(),
+                default_new_signature: prev.and_then(|p| p.default_new_signature),
+                default_reply_signature: prev.and_then(|p| p.default_reply_signature),
+                special_folders: prev.map(|p| p.special_folders.clone()).unwrap_or_else(|| {
+                    config::SpecialFoldersConfig {
+                        server_saves_sent: true,
+                        ..Default::default()
+                    }
+                }),
+                sync_interval_minutes: prev.and_then(|p| p.sync_interval_minutes),
+                download_window_days: prev.map(|p| p.download_window_days).unwrap_or(0),
+                auto_empty_trash_days: prev.map(|p| p.auto_empty_trash_days).unwrap_or(0),
+                auto_empty_junk_days: prev.map(|p| p.auto_empty_junk_days).unwrap_or(0),
+                hidden_folders: prev.map(|p| p.hidden_folders.clone()).unwrap_or_default(),
             };
 
             if let Err(e) = secrets::save_oauth_refresh_token(account_id, result.refresh_token) {

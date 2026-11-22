@@ -65,6 +65,15 @@ pub struct CachedAttachment {
     pub date_ts: i64,
 }
 
+/// WP-06：持久化自定义标签（存入 SQLite `tags` 表，支持调色板颜色与 `1..9` 快捷键绑定）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagItem {
+    pub id: u32,
+    pub name: String,
+    pub color: String,
+    pub shortcut: Option<u8>,
+}
+
 /// Contact aggregated from cached senders/recipients for the contacts view.
 /// `custom == true` 的行来自 `user_contacts` 表（用户手动维护，可编辑 / 删除），
 /// 其余为已同步邮件自动聚合的结果（只读展示）。
@@ -446,9 +455,15 @@ impl CacheStore {
                     created_at INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    color TEXT NOT NULL DEFAULT '#3584e4',
+                    shortcut INTEGER
+                );
                 ",
             )
-            .map_err(|e| format!("初始化用户联系人表失败: {e}"))?;
+            .map_err(|e| format!("初始化用户联系人与标签表失败: {e}"))?;
         self.conn
             .execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_account_msgid ON messages(account_id, message_id)",
@@ -2650,6 +2665,262 @@ impl CacheStore {
             )
             .map_err(|e| format!("删除联系人失败: {e}"))?;
         Ok(affected > 0)
+    }
+
+    /// WP-06：读取所有自定义标签（按快捷键升序、名称升序）。
+    pub fn list_tags(&self) -> Result<Vec<TagItem>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, name, color, shortcut
+                FROM tags
+                ORDER BY CASE WHEN shortcut IS NULL THEN 1 ELSE 0 END, shortcut ASC, name COLLATE NOCASE ASC
+                ",
+            )
+            .map_err(|e| format!("查询标签失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let name: String = row.get(1)?;
+                let color: String = row.get(2)?;
+                let shortcut: Option<i64> = row.get(3)?;
+                Ok(TagItem {
+                    id: id.max(0) as u32,
+                    name,
+                    color,
+                    shortcut: shortcut
+                        .and_then(|s| u8::try_from(s).ok())
+                        .filter(|s| (1..=9).contains(s)),
+                })
+            })
+            .map_err(|e| format!("读取标签失败: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("解析标签行失败: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// WP-06：新增或更新自定义标签（快捷键 `1..=9` 若被其他标签占用会自动解绑）。
+    pub fn upsert_tag(
+        &mut self,
+        id: Option<u32>,
+        name: &str,
+        color: &str,
+        shortcut: Option<u8>,
+    ) -> Result<TagItem, String> {
+        let clean_name = name.trim();
+        if clean_name.is_empty() {
+            return Err("标签名称不能为空".to_string());
+        }
+        let clean_color = if color.trim().starts_with('#') && color.trim().len() == 7 {
+            color.trim().to_ascii_lowercase()
+        } else {
+            "#3584e4".to_string()
+        };
+        let clean_shortcut = shortcut.filter(|s| (1..=9).contains(s));
+        if let Some(sc) = clean_shortcut {
+            self.conn
+                .execute(
+                    "UPDATE tags SET shortcut = NULL WHERE shortcut = ?1 AND (?2 IS NULL OR id != ?2)",
+                    params![i64::from(sc), id.map(i64::from)],
+                )
+                .map_err(|e| format!("更新标签快捷键失败: {e}"))?;
+        }
+        let tag_id = match id {
+            Some(existing_id) => {
+                let affected = self
+                    .conn
+                    .execute(
+                        "UPDATE tags SET name = ?1, color = ?2, shortcut = ?3 WHERE id = ?4",
+                        params![
+                            clean_name,
+                            clean_color,
+                            clean_shortcut.map(i64::from),
+                            existing_id
+                        ],
+                    )
+                    .map_err(|e| {
+                        if format!("{e}").contains("UNIQUE") {
+                            format!("已存在名为「{clean_name}」的标签")
+                        } else {
+                            format!("更新标签失败: {e}")
+                        }
+                    })?;
+                if affected == 0 {
+                    return Err("未找到要更新的标签".to_string());
+                }
+                existing_id
+            }
+            None => {
+                self.conn
+                    .execute(
+                        "INSERT INTO tags (name, color, shortcut) VALUES (?1, ?2, ?3)",
+                        params![clean_name, clean_color, clean_shortcut.map(i64::from)],
+                    )
+                    .map_err(|e| {
+                        if format!("{e}").contains("UNIQUE") {
+                            format!("已存在名为「{clean_name}」的标签")
+                        } else {
+                            format!("创建标签失败: {e}")
+                        }
+                    })?;
+                self.conn.last_insert_rowid().max(0) as u32
+            }
+        };
+        Ok(TagItem {
+            id: tag_id,
+            name: clean_name.to_string(),
+            color: clean_color,
+            shortcut: clean_shortcut,
+        })
+    }
+
+    /// WP-06：按 ID 删除自定义标签。
+    pub fn delete_tag(&mut self, tag_id: u32) -> Result<bool, String> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM tags WHERE id = ?1", params![tag_id])
+            .map_err(|e| format!("删除标签失败: {e}"))?;
+        Ok(affected > 0)
+    }
+
+    /// WP-06：立即在本地缓存邮件上运行已启用的过滤器规则（支持标记已读、标星、移动/归档到本地已缓存文件夹），
+    /// 返回命中并更新的邮件数量。
+    pub fn apply_filter_rules(
+        &mut self,
+        rules: &[crate::config::FilterRule],
+        accounts: &[crate::config::AccountConfig],
+    ) -> Result<usize, String> {
+        use crate::config::{FilterField, FilterMatch};
+
+        let enabled_rules: Vec<&crate::config::FilterRule> = rules
+            .iter()
+            .filter(|r| r.enabled && !r.value.trim().is_empty())
+            .collect();
+        if enabled_rules.is_empty() {
+            return Ok(0);
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT m.id, m.account_id, m.folder_id, m.sender, m.recipients, m.subject,
+                       COALESCE(m.body_text, m.preview), m.unread, m.flagged
+                FROM messages m
+                ",
+            )
+            .map_err(|e| format!("读取缓存邮件失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)? != 0,
+                    row.get::<_, i64>(8)? != 0,
+                ))
+            })
+            .map_err(|e| format!("遍历缓存邮件失败: {e}"))?;
+
+        let mut messages = Vec::new();
+        for r in rows {
+            messages.push(r.map_err(|e| format!("解析邮件行失败: {e}"))?);
+        }
+        drop(stmt);
+
+        let mut updated = 0usize;
+        for (msg_id, account_id, folder_id, sender, recipients, subject, body, unread, flagged) in
+            messages
+        {
+            let acc_email = accounts
+                .iter()
+                .find(|a| a.id == account_id)
+                .map(|a| a.email.as_str())
+                .unwrap_or("");
+
+            for rule in &enabled_rules {
+                if !rule.account_email.trim().is_empty()
+                    && !rule.account_email.trim().eq_ignore_ascii_case(acc_email)
+                {
+                    continue;
+                }
+                let haystack = match rule.field {
+                    FilterField::From => sender.as_str(),
+                    FilterField::To => recipients.as_str(),
+                    FilterField::Subject => subject.as_str(),
+                    FilterField::Body => body.as_str(),
+                }
+                .to_lowercase();
+                let needle = rule.value.trim().to_lowercase();
+                let matched = match rule.matcher {
+                    FilterMatch::Contains => haystack.contains(&needle),
+                    FilterMatch::Equals => haystack.trim() == needle,
+                    FilterMatch::StartsWith => haystack.trim_start().starts_with(&needle),
+                    FilterMatch::EndsWith => haystack.trim_end().ends_with(&needle),
+                };
+                if !matched {
+                    continue;
+                }
+
+                let mut changed = false;
+                if rule.mark_read && unread {
+                    self.conn
+                        .execute(
+                            "UPDATE messages SET unread = 0 WHERE id = ?1",
+                            params![msg_id],
+                        )
+                        .map_err(|e| format!("过滤器标记已读失败: {e}"))?;
+                    changed = true;
+                }
+                if rule.star && !flagged {
+                    self.conn
+                        .execute(
+                            "UPDATE messages SET flagged = 1 WHERE id = ?1",
+                            params![msg_id],
+                        )
+                        .map_err(|e| format!("过滤器标星失败: {e}"))?;
+                    changed = true;
+                }
+                let target_folder = if !rule.move_to_folder.trim().is_empty() {
+                    Some(rule.move_to_folder.trim())
+                } else if rule.archive {
+                    Some("Archive")
+                } else {
+                    None
+                };
+                if let Some(target) = target_folder {
+                    if let Some(dest_id) = self
+                        .conn
+                        .query_row(
+                            "SELECT id FROM folders WHERE account_id = ?1 AND (LOWER(path) = LOWER(?2) OR LOWER(name) = LOWER(?2)) LIMIT 1",
+                            params![account_id, target],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(|e| format!("查询目标文件夹失败: {e}"))?
+                    {
+                        if dest_id != folder_id {
+                            let _ = self.conn.execute(
+                                "UPDATE messages SET folder_id = ?1 WHERE id = ?2",
+                                params![dest_id, msg_id],
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    updated += 1;
+                }
+            }
+        }
+        Ok(updated)
     }
 
     /// Bulk-import user contacts (F-5)：按邮箱去重（`INSERT OR IGNORE`），
@@ -6021,6 +6292,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(both.total, 2);
+    }
+
+    #[test]
+    fn wp06_tags_crud_and_apply_filter_rules() {
+        let mut store = CacheStore::open_in_memory().unwrap();
+        let t1 = store.upsert_tag(None, "重要", "#e01b24", Some(1)).unwrap();
+        let t2 = store.upsert_tag(None, "账单", "#3584e4", Some(1)).unwrap();
+        let list = store.list_tags().unwrap();
+        assert_eq!(list.len(), 2);
+        // 快捷键 1 被 t2 抢占后，t1 自动解绑。
+        let reloaded_t1 = list.iter().find(|t| t.id == t1.id).unwrap();
+        let reloaded_t2 = list.iter().find(|t| t.id == t2.id).unwrap();
+        assert_eq!(reloaded_t1.shortcut, None);
+        assert_eq!(reloaded_t2.shortcut, Some(1));
+
+        assert!(store.delete_tag(t1.id).unwrap());
+        assert_eq!(store.list_tags().unwrap().len(), 1);
+
+        // 插入一封测试邮件并运行过滤规则
+        store
+            .conn
+            .execute(
+                "INSERT INTO folders (account_id, name, path) VALUES (1, '收件箱', 'INBOX')",
+                [],
+            )
+            .unwrap();
+        let inbox_id: i64 = store.conn.last_insert_rowid();
+        store
+            .conn
+            .execute(
+                "INSERT INTO folders (account_id, name, path) VALUES (1, '归档', 'Archive')",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (account_id, folder_id, uid, sender, subject, unread, flagged) VALUES (1, ?1, 101, 'billing@example.com', 'Monthly Invoice', 1, 0)",
+                params![inbox_id],
+            )
+            .unwrap();
+
+        let rules = vec![crate::config::FilterRule {
+            id: 1,
+            name: "账单自动处理".to_string(),
+            account_email: String::new(),
+            enabled: true,
+            match_all: true,
+            field: crate::config::FilterField::From,
+            matcher: crate::config::FilterMatch::Contains,
+            value: "billing@".to_string(),
+            move_to_folder: String::new(),
+            archive: true,
+            star: true,
+            mark_read: true,
+            apply_tag: String::new(),
+            forward_to: String::new(),
+        }];
+        let updated = store.apply_filter_rules(&rules, &[]).unwrap();
+        assert_eq!(updated, 1);
+
+        let (unread, flagged): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT unread, flagged FROM messages WHERE uid = 101",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unread, 0);
+        assert_eq!(flagged, 1);
     }
 }
 

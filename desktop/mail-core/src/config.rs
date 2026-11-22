@@ -21,6 +21,59 @@ pub enum AuthBackend {
     MicrosoftGraphOAuth2,
 }
 
+/// WP-06：发信别名配置（对齐 Linux `src/config/account.rs` AliasConfig）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SendAsAlias {
+    pub name: String,
+    pub email: String,
+    pub reply_to: String,
+    pub is_default: bool,
+}
+
+/// WP-06：多命名 HTML/文本签名配置（对齐 Linux `NamedSignature`）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamedSignature {
+    pub name: String,
+    pub body: String,
+    pub is_html: bool,
+}
+
+/// WP-06：账号级特殊文件夹映射与 `server_saves_sent` 策略。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpecialFoldersConfig {
+    pub sent: String,
+    pub drafts: String,
+    pub trash: String,
+    pub junk: String,
+    pub archive: String,
+    pub server_saves_sent: bool,
+}
+
+/// 根据邮箱域名判断 `server_saves_sent` 默认值（Gmail/Outlook/iCloud 默认 true，自建 IMAP 默认 false）。
+pub fn default_server_saves_sent_for_email(email: &str) -> bool {
+    let domain = email
+        .trim()
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        domain.as_str(),
+        "gmail.com"
+            | "googlemail.com"
+            | "outlook.com"
+            | "hotmail.com"
+            | "live.com"
+            | "msn.com"
+            | "icloud.com"
+            | "me.com"
+            | "mac.com"
+    )
+}
+
 /// Non-sensitive configuration for one mail account.
 /// Passwords and OAuth refresh tokens live in Windows Credential Manager.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +118,42 @@ pub struct AccountConfig {
     /// Optional plain-text email signature appended to newly composed / replied / forwarded mails.
     #[serde(default)]
     pub signature: String,
+    /// WP-06：缓存的 IMAP `GETQUOTAROOT` 已用字节数（`None` 表示服务端未返回配额）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_used_bytes: Option<u64>,
+    /// WP-06：缓存的 IMAP `GETQUOTAROOT` 总配额字节数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_total_bytes: Option<u64>,
+    /// WP-06：发信别名列表。
+    #[serde(default)]
+    pub aliases: Vec<SendAsAlias>,
+    /// WP-06：多命名 HTML/文本签名列表。
+    #[serde(default)]
+    pub signatures: Vec<NamedSignature>,
+    /// WP-06：新邮件默认签名索引。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_new_signature: Option<usize>,
+    /// WP-06：回复/转发默认签名索引。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reply_signature: Option<usize>,
+    /// WP-06：特殊文件夹映射与服务器自动保存已发送邮件开关。
+    #[serde(default)]
+    pub special_folders: SpecialFoldersConfig,
+    /// WP-06：账号级轮询周期覆盖（`None` 跟随全局，`Some(0)` 仅手动，`Some(n)` 每 n 分钟）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_interval_minutes: Option<u32>,
+    /// WP-06：`Download messages from` 天数窗口（`0` = 全部，`30` / `90` / `365`）。
+    #[serde(default)]
+    pub download_window_days: u32,
+    /// WP-06：自动清空废纸篓天数（`0` = 从不，`7` / `14` / `30`）。
+    #[serde(default)]
+    pub auto_empty_trash_days: u32,
+    /// WP-06：自动清空垃圾邮件天数（`0` = 从不，`7` / `14` / `30`）。
+    #[serde(default)]
+    pub auto_empty_junk_days: u32,
+    /// WP-06：账号级隐藏文件夹路径列表。
+    #[serde(default)]
+    pub hidden_folders: Vec<String>,
 }
 
 impl AccountConfig {
@@ -109,6 +198,18 @@ impl Default for AccountConfig {
             smtp_username: String::new(),
             smtp_separate_credentials: false,
             signature: String::new(),
+            quota_used_bytes: None,
+            quota_total_bytes: None,
+            aliases: Vec::new(),
+            signatures: Vec::new(),
+            default_new_signature: None,
+            default_reply_signature: None,
+            special_folders: SpecialFoldersConfig::default(),
+            sync_interval_minutes: None,
+            download_window_days: 0,
+            auto_empty_trash_days: 0,
+            auto_empty_junk_days: 0,
+            hidden_folders: Vec::new(),
         }
     }
 }
@@ -136,6 +237,97 @@ pub struct SidebarFolderRole {
     pub account_id: u32,
     pub path: String,
     pub role: String,
+}
+
+/// WP-06：OpenPGP 密钥元数据条目（Windows 端持久化密钥元信息与签名/加密策略）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PgpKeyEntry {
+    pub id: u32,
+    pub name: String,
+    pub email: String,
+    pub fingerprint: String,
+    pub has_secret: bool,
+    pub trusted: bool,
+    pub sign_by_default: bool,
+    pub encrypt_by_default: bool,
+    pub created_at: String,
+}
+
+/// WP-06：云存储账号配置（Nextcloud / WebDAV / S3 / Dropbox）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudStorageAccount {
+    pub id: u32,
+    pub provider: String,
+    pub name: String,
+    pub server_url: String,
+    pub username: String,
+    pub bucket_or_path: String,
+    pub enabled: bool,
+}
+
+/// WP-06：通讯录同步源配置（CardDAV / iCloud / Nextcloud / Fastmail）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContactSourceEntry {
+    pub id: u32,
+    pub provider: String,
+    pub name: String,
+    pub server_url: String,
+    pub username: String,
+    pub enabled: bool,
+}
+
+/// WP-06：邮件过滤器匹配字段。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterField {
+    #[default]
+    From,
+    To,
+    Subject,
+    Body,
+}
+
+/// WP-06：邮件过滤器匹配方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterMatch {
+    #[default]
+    Contains,
+    Equals,
+    StartsWith,
+    EndsWith,
+}
+
+/// WP-06：自动化过滤器规则。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FilterRule {
+    pub id: u32,
+    pub name: String,
+    pub account_email: String,
+    pub enabled: bool,
+    pub match_all: bool,
+    pub field: FilterField,
+    pub matcher: FilterMatch,
+    pub value: String,
+    pub move_to_folder: String,
+    pub archive: bool,
+    pub star: bool,
+    pub mark_read: bool,
+    pub apply_tag: String,
+    pub forward_to: String,
+}
+
+/// WP-06：智能文件夹配置。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmartFolderConfig {
+    pub id: u32,
+    pub name: String,
+    pub icon: String,
+    pub query: String,
+    pub account_email: String,
 }
 
 /// User interface & sync preferences persisted in `preferences.toml`.
@@ -535,6 +727,67 @@ pub struct AppPreferences {
     /// WP-07：自定义文件夹的特殊角色指定（覆盖按路径推断的角色分类）。
     #[serde(default)]
     pub sidebar_special_roles: Vec<SidebarFolderRole>,
+    // ---- WP-06：8 个新增设置一级分类持久化字段 ----
+    /// WP-06 OpenPGP：是否通过 WKD 查询收件人公钥。
+    #[serde(default)]
+    pub openpgp_wkd_lookup: bool,
+    /// WP-06 OpenPGP：是否查询 keys.openpgp.org。
+    #[serde(default)]
+    pub openpgp_keyserver_lookup: bool,
+    /// WP-06 OpenPGP：本地登记的 PGP 密钥列表与邮箱绑定策略。
+    #[serde(default)]
+    pub pgp_keys: Vec<PgpKeyEntry>,
+    /// WP-06 云存储：超大附件自动转存云盘阈值（MB，默认 25）。
+    #[serde(default = "default_cloud_threshold_mb")]
+    pub cloud_auto_upload_threshold_mb: u32,
+    /// WP-06 云存储：云盘账号列表。
+    #[serde(default)]
+    pub cloud_accounts: Vec<CloudStorageAccount>,
+    /// WP-06 通讯录源：自动收集已发送/回复邮件联系人。
+    #[serde(default = "default_true")]
+    pub contacts_auto_collect_senders: bool,
+    /// WP-06 通讯录源：CardDAV 远程通讯录同步源列表。
+    #[serde(default)]
+    pub contact_sources: Vec<ContactSourceEntry>,
+    /// WP-06 过滤器：自动化邮件过滤规则列表。
+    #[serde(default)]
+    pub filter_rules: Vec<FilterRule>,
+    /// WP-06 智能文件夹：基于搜索表达式的动态虚拟文件夹列表。
+    #[serde(default)]
+    pub smart_folders: Vec<SmartFolderConfig>,
+    /// WP-06 翻译：翻译引擎（`"off"` / `"libretranslate"` / `"deepl"` / `"google"` / `"local_llm"`）。
+    #[serde(default = "default_translation_engine")]
+    pub translation_engine: String,
+    /// WP-06 翻译：服务端 URL（LibreTranslate / 本地 LLM）。
+    #[serde(default)]
+    pub translation_api_url: String,
+    /// WP-06 翻译：目标语言代码（`"system"` / `"zh-CN"` / `"en"` / `"ja"` / `"ko"` / `"fr"` / `"de"` / `"es"`）。
+    #[serde(default = "default_system_key")]
+    pub translation_target_language: String,
+    /// WP-06 翻译：阅读器内提供一键翻译按钮。
+    #[serde(default = "default_true")]
+    pub translation_offer_reader: bool,
+    /// WP-06 翻译：写信器内提供一键翻译按钮。
+    #[serde(default)]
+    pub translation_offer_composer: bool,
+    /// WP-06 MCP 服务：是否启用本地 MCP Server。
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// WP-06 MCP 服务：Windows 命名管道 / Socket 路径。
+    #[serde(default = "default_mcp_socket_path")]
+    pub mcp_socket_path: String,
+    /// WP-06 MCP 服务：允许 AI 助手读取邮件内容。
+    #[serde(default = "default_true")]
+    pub mcp_allow_read: bool,
+    /// WP-06 MCP 服务：允许 AI 助手搜索邮件。
+    #[serde(default = "default_true")]
+    pub mcp_allow_search: bool,
+    /// WP-06 MCP 服务：允许 AI 助手创建草稿。
+    #[serde(default)]
+    pub mcp_allow_draft: bool,
+    /// WP-06 MCP 服务：允许 AI 助手标记已读/星标/标签。
+    #[serde(default)]
+    pub mcp_allow_modify_flags: bool,
 }
 
 fn default_true() -> bool {
@@ -633,6 +886,18 @@ fn default_read_receipt_policy() -> String {
 
 fn default_link_open_mode() -> String {
     "system".to_string()
+}
+
+fn default_cloud_threshold_mb() -> u32 {
+    25
+}
+
+fn default_translation_engine() -> String {
+    "off".to_string()
+}
+
+fn default_mcp_socket_path() -> String {
+    r"\\.\pipe\hylki-mcp".to_string()
 }
 
 /// Clamp reader zoom percentage to the supported `50..=250` range.
@@ -947,6 +1212,26 @@ impl Default for AppPreferences {
             sidebar_favorite_folders: Vec::new(),
             sidebar_hidden_folders: Vec::new(),
             sidebar_special_roles: Vec::new(),
+            openpgp_wkd_lookup: false,
+            openpgp_keyserver_lookup: false,
+            pgp_keys: Vec::new(),
+            cloud_auto_upload_threshold_mb: default_cloud_threshold_mb(),
+            cloud_accounts: Vec::new(),
+            contacts_auto_collect_senders: true,
+            contact_sources: Vec::new(),
+            filter_rules: Vec::new(),
+            smart_folders: Vec::new(),
+            translation_engine: default_translation_engine(),
+            translation_api_url: String::new(),
+            translation_target_language: default_system_key(),
+            translation_offer_reader: true,
+            translation_offer_composer: false,
+            mcp_enabled: false,
+            mcp_socket_path: default_mcp_socket_path(),
+            mcp_allow_read: true,
+            mcp_allow_search: true,
+            mcp_allow_draft: false,
+            mcp_allow_modify_flags: false,
         }
     }
 }
@@ -1767,6 +2052,7 @@ mod tests {
             smtp_username: "user@example.com".to_string(),
             smtp_separate_credentials: false,
             signature: "Best regards,\nTester".to_string(),
+            ..Default::default()
         };
 
         upsert_account_in(&base, account.clone()).expect("upsert should succeed");
@@ -2519,5 +2805,69 @@ smtp_separate_credentials = false
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+    }
+
+    /// WP-06：账号高阶配置与 8 个新增设置分类配置序列化往返及旧配置向后兼容。
+    #[test]
+    fn wp06_account_advanced_and_new_prefs_roundtrip_and_compat() {
+        assert!(default_server_saves_sent_for_email("user@gmail.com"));
+        assert!(default_server_saves_sent_for_email("user@outlook.com"));
+        assert!(!default_server_saves_sent_for_email("user@company.example"));
+
+        let mut acc = AccountConfig::default();
+        acc.quota_used_bytes = Some(1_200_000_000);
+        acc.quota_total_bytes = Some(15_000_000_000);
+        acc.aliases.push(SendAsAlias {
+            name: "Sales".to_string(),
+            email: "sales@example.com".to_string(),
+            reply_to: "support@example.com".to_string(),
+            is_default: true,
+        });
+        acc.signatures = vec![
+            NamedSignature {
+                name: "商务".to_string(),
+                body: "<b>Best</b>".to_string(),
+                is_html: true,
+            },
+            NamedSignature {
+                name: "简短".to_string(),
+                body: "Thx".to_string(),
+                is_html: false,
+            },
+        ];
+        acc.default_new_signature = Some(0);
+        acc.default_reply_signature = Some(1);
+        acc.special_folders = SpecialFoldersConfig {
+            sent: "Sent".to_string(),
+            drafts: "Drafts".to_string(),
+            trash: "Trash".to_string(),
+            junk: "Junk".to_string(),
+            archive: "Archive".to_string(),
+            server_saves_sent: true,
+        };
+        acc.sync_interval_minutes = Some(5);
+        acc.download_window_days = 90;
+        acc.auto_empty_trash_days = 14;
+        acc.auto_empty_junk_days = 7;
+        acc.hidden_folders = vec!["[Gmail]/Important".to_string()];
+
+        let toml_str = toml::to_string(&acc).unwrap();
+        let back: AccountConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(back, acc);
+
+        let mut prefs = AppPreferences::default();
+        prefs.openpgp_wkd_lookup = true;
+        prefs.cloud_auto_upload_threshold_mb = 50;
+        prefs.translation_engine = "deepl".to_string();
+        prefs.mcp_enabled = true;
+        prefs.mcp_allow_draft = true;
+        let prefs_toml = toml::to_string(&prefs).unwrap();
+        let prefs_back: AppPreferences = toml::from_str(&prefs_toml).unwrap();
+        assert_eq!(prefs_back, prefs);
+
+        // 空 TOML 应能以默认值反序列化，不破坏旧版配置。
+        let legacy: AppPreferences = toml::from_str("").unwrap();
+        assert_eq!(legacy.cloud_auto_upload_threshold_mb, 25);
+        assert_eq!(legacy.mcp_socket_path, r"\\.\pipe\hylki-mcp");
     }
 }

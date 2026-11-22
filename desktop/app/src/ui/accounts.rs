@@ -20,13 +20,18 @@ use gpui_kit::{
     InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, StyledImage, Window,
 };
-use hylki_mail_core::config::{self, AccountConfig, AuthBackend, SecurityMode};
+use hylki_mail_core::config::{
+    self, AccountConfig, AuthBackend, NamedSignature, SecurityMode, SendAsAlias,
+    SpecialFoldersConfig,
+};
 use hylki_mail_core::MailRequest;
 
 use crate::app::HylkiApp;
 use crate::theme::{self, HylkiPalette};
 use crate::ui::avatar::{self, ACCOUNT_ACCENT_COLORS};
-use crate::ui::preferences::widgets::{combo_button, setting_group, CARD_MAX_WIDTH};
+use crate::ui::preferences::widgets::{
+    combo_button, combo_button_dynamic, setting_group, CARD_MAX_WIDTH,
+};
 use crate::ui::preferences::SettingsWindow;
 
 /// 常用快捷 Emoji 预设列表。
@@ -40,6 +45,32 @@ const PUSH_OVERRIDE_OPTIONS: &[(&str, Option<bool>)] = &[
     ("跟随全局设置", None),
     ("为此账号开启", Some(true)),
     ("为此账号关闭", Some(false)),
+];
+
+/// WP-06：账号级轮询周期覆盖下拉选项。
+const ACCOUNT_SYNC_INTERVAL_OPTIONS: &[(&str, Option<u32>)] = &[
+    ("跟随全局设置", None),
+    ("仅手动同步", Some(0)),
+    ("每 1 分钟", Some(1)),
+    ("每 5 分钟", Some(5)),
+    ("每 15 分钟", Some(15)),
+    ("每 30 分钟", Some(30)),
+];
+
+/// WP-06：下载历史邮件时间窗口。
+const DOWNLOAD_WINDOW_OPTIONS: &[(&str, u32)] = &[
+    ("全部历史", 0),
+    ("最近 30 天", 30),
+    ("最近 90 天", 90),
+    ("最近 1 年", 365),
+];
+
+/// WP-06：自动清空废纸篓 / 垃圾邮件天数。
+const AUTO_EMPTY_DAYS_OPTIONS: &[(&str, u32)] = &[
+    ("从不自动清空", 0),
+    ("超过 7 天", 7),
+    ("超过 14 天", 14),
+    ("超过 30 天", 30),
 ];
 
 /// 服务商接入类型。
@@ -485,6 +516,24 @@ pub(crate) struct AccountFormState {
     pub(crate) emoji_input: Entity<InputState>,
     pub(crate) avatar: Option<String>,
     pub(crate) signature: Entity<TextareaState>,
+    // WP-06：高阶账号配置字段
+    pub(crate) quota_used_bytes: Option<u64>,
+    pub(crate) quota_total_bytes: Option<u64>,
+    pub(crate) aliases: Vec<SendAsAlias>,
+    pub(crate) alias_name_input: Entity<InputState>,
+    pub(crate) alias_email_input: Entity<InputState>,
+    pub(crate) alias_reply_to_input: Entity<InputState>,
+    pub(crate) signatures: Vec<NamedSignature>,
+    pub(crate) active_sig_idx: usize,
+    pub(crate) sig_name_input: Entity<InputState>,
+    pub(crate) default_new_signature: Option<usize>,
+    pub(crate) default_reply_signature: Option<usize>,
+    pub(crate) special_folders: SpecialFoldersConfig,
+    pub(crate) sync_interval_minutes: Option<u32>,
+    pub(crate) download_window_days: u32,
+    pub(crate) auto_empty_trash_days: u32,
+    pub(crate) auto_empty_junk_days: u32,
+    pub(crate) hidden_folders: Vec<String>,
     pub(crate) validation_error: Option<SharedString>,
     initial_fingerprint: String,
 }
@@ -586,12 +635,41 @@ impl AccountFormState {
                 .placeholder("输入或选择单个 Emoji，如 💼")
                 .default_value(normalized_emoji.clone().unwrap_or_default())
         });
+        let initial_signatures = if !cfg.signatures.is_empty() {
+            cfg.signatures.clone()
+        } else {
+            vec![NamedSignature {
+                name: "默认签名".to_string(),
+                body: cfg.signature.clone(),
+                is_html: false,
+            }]
+        };
+        let initial_sig_body = initial_signatures
+            .first()
+            .map(|s| s.body.clone())
+            .unwrap_or_default();
+        let initial_sig_name = initial_signatures
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "默认签名".to_string());
         let signature = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(3, 6)
                 .placeholder("可选：邮件签名（写信 / 回复 / 转发时自动以 -- 分隔插入正文末尾）")
-                .default_value(cfg.signature.clone())
+                .default_value(initial_sig_body)
         });
+        let sig_name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("签名名称（如：商务签名 / 简短回复）")
+                .default_value(initial_sig_name)
+        });
+        let alias_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("发件人显示名称（可选）"));
+        let alias_email_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("别名邮箱地址（如：sales@example.com）")
+        });
+        let alias_reply_to_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Reply-To 回复地址（可选）"));
 
         // 实时同步邮箱 -> 默认昵称，并随用户输入刷新 72px 外观预览与清除过期错误。
         cx.subscribe_in(
@@ -657,6 +735,14 @@ impl AccountFormState {
             .detach();
         }
 
+        let special_folders = if editing_account_id.is_none() && !cfg.email.is_empty() {
+            SpecialFoldersConfig {
+                server_saves_sent: config::default_server_saves_sent_for_email(&cfg.email),
+                ..cfg.special_folders.clone()
+            }
+        } else {
+            cfg.special_folders.clone()
+        };
         let picture_mode = cfg.avatar.is_some();
         let mut form = Self {
             editing_account_id,
@@ -688,6 +774,23 @@ impl AccountFormState {
             emoji_input,
             avatar: cfg.avatar,
             signature,
+            quota_used_bytes: cfg.quota_used_bytes,
+            quota_total_bytes: cfg.quota_total_bytes,
+            aliases: cfg.aliases,
+            alias_name_input,
+            alias_email_input,
+            alias_reply_to_input,
+            signatures: initial_signatures,
+            active_sig_idx: 0,
+            sig_name_input,
+            default_new_signature: cfg.default_new_signature,
+            default_reply_signature: cfg.default_reply_signature,
+            special_folders,
+            sync_interval_minutes: cfg.sync_interval_minutes,
+            download_window_days: cfg.download_window_days,
+            auto_empty_trash_days: cfg.auto_empty_trash_days,
+            auto_empty_junk_days: cfg.auto_empty_junk_days,
+            hidden_folders: cfg.hidden_folders,
             validation_error: None,
             initial_fingerprint: String::new(),
         };
@@ -747,8 +850,46 @@ impl AccountFormState {
             s.set_value(normalized_emoji.unwrap_or_default(), window, cx)
         });
         self.avatar = c.avatar;
+        let loaded_sigs = if !c.signatures.is_empty() {
+            c.signatures
+        } else {
+            vec![NamedSignature {
+                name: "默认签名".to_string(),
+                body: c.signature.clone(),
+                is_html: false,
+            }]
+        };
+        let first_body = loaded_sigs
+            .first()
+            .map(|s| s.body.clone())
+            .unwrap_or_default();
+        let first_name = loaded_sigs
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "默认签名".to_string());
+        self.signatures = loaded_sigs;
+        self.active_sig_idx = 0;
         self.signature
-            .update(cx, |s, cx| s.set_value(c.signature, window, cx));
+            .update(cx, |s, cx| s.set_value(first_body, window, cx));
+        self.sig_name_input
+            .update(cx, |s, cx| s.set_value(first_name, window, cx));
+        self.quota_used_bytes = c.quota_used_bytes;
+        self.quota_total_bytes = c.quota_total_bytes;
+        self.aliases = c.aliases;
+        self.alias_name_input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.alias_email_input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.alias_reply_to_input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.default_new_signature = c.default_new_signature;
+        self.default_reply_signature = c.default_reply_signature;
+        self.special_folders = c.special_folders;
+        self.sync_interval_minutes = c.sync_interval_minutes;
+        self.download_window_days = c.download_window_days;
+        self.auto_empty_trash_days = c.auto_empty_trash_days;
+        self.auto_empty_junk_days = c.auto_empty_junk_days;
+        self.hidden_folders = c.hidden_folders;
         self.validation_error = None;
         self.snapshot_clean(cx);
     }
@@ -793,9 +934,41 @@ impl AccountFormState {
         }
     }
 
+    /// 将当前激活签名的名称与正文从输入框写回 `self.signatures` 列表。
+    pub(crate) fn sync_active_signature_from_inputs(&mut self, cx: &Context<SettingsWindow>) {
+        if let Some(sig) = self.signatures.get_mut(self.active_sig_idx) {
+            let name = self.sig_name_input.read(cx).value().trim().to_string();
+            sig.name = if name.is_empty() {
+                format!("签名 {}", self.active_sig_idx + 1)
+            } else {
+                name
+            };
+            sig.body = self.signature.read(cx).value().to_string();
+        }
+    }
+
+    /// 切换到指定索引的命名签名。
+    pub(crate) fn select_signature(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<SettingsWindow>,
+    ) {
+        if idx >= self.signatures.len() {
+            return;
+        }
+        self.sync_active_signature_from_inputs(cx);
+        self.active_sig_idx = idx;
+        let sig = self.signatures[idx].clone();
+        self.sig_name_input
+            .update(cx, |s, cx| s.set_value(sig.name, window, cx));
+        self.signature
+            .update(cx, |s, cx| s.set_value(sig.body, window, cx));
+    }
+
     fn fingerprint(&self, cx: &Context<SettingsWindow>) -> String {
         format!(
-            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{}",
+            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}",
             self.editing_account_id,
             self.provider_idx,
             self.original_enabled,
@@ -822,6 +995,17 @@ impl AccountFormState {
             self.avatar,
             self.signature.read(cx).value(),
             self.emoji_input.read(cx).value().trim(),
+            self.aliases,
+            self.signatures,
+            self.sig_name_input.read(cx).value().trim(),
+            self.default_new_signature,
+            self.default_reply_signature,
+            self.special_folders,
+            self.sync_interval_minutes,
+            self.download_window_days,
+            self.auto_empty_trash_days,
+            self.auto_empty_junk_days,
+            self.hidden_folders,
         )
     }
 
@@ -921,6 +1105,22 @@ impl AccountFormState {
             && self.original_auth_backend == AuthBackend::MicrosoftGraphOAuth2
             && self.current_provider().kind == ProviderKind::Microsoft;
 
+        let mut collected_signatures = self.signatures.clone();
+        if let Some(active) = collected_signatures.get_mut(self.active_sig_idx) {
+            let name = self.sig_name_input.read(cx).value().trim().to_string();
+            active.name = if name.is_empty() {
+                format!("签名 {}", self.active_sig_idx + 1)
+            } else {
+                name
+            };
+            active.body = self.signature.read(cx).value().to_string();
+        }
+        let primary_sig = collected_signatures
+            .get(self.default_new_signature.unwrap_or(0))
+            .or_else(|| collected_signatures.first())
+            .map(|s| s.body.clone())
+            .unwrap_or_default();
+
         if is_oauth {
             let base = existing_acc.cloned().unwrap_or_default();
             let cfg = AccountConfig {
@@ -940,12 +1140,24 @@ impl AccountFormState {
                 smtp_security: base.smtp_security,
                 smtp_username: base.smtp_username,
                 smtp_separate_credentials: base.smtp_separate_credentials,
-                signature: self.signature.read(cx).value().to_string(),
+                signature: primary_sig,
                 color,
                 emoji,
                 avatar: avatar_file,
                 in_unified: self.in_unified,
                 push_override: self.push_override,
+                quota_used_bytes: self.quota_used_bytes,
+                quota_total_bytes: self.quota_total_bytes,
+                aliases: self.aliases.clone(),
+                signatures: collected_signatures,
+                default_new_signature: self.default_new_signature,
+                default_reply_signature: self.default_reply_signature,
+                special_folders: self.special_folders.clone(),
+                sync_interval_minutes: self.sync_interval_minutes,
+                download_window_days: self.download_window_days,
+                auto_empty_trash_days: self.auto_empty_trash_days,
+                auto_empty_junk_days: self.auto_empty_junk_days,
+                hidden_folders: self.hidden_folders.clone(),
             };
             return (cfg, String::new(), None);
         }
@@ -996,12 +1208,24 @@ impl AccountFormState {
             },
             smtp_username: smtp_user,
             smtp_separate_credentials: self.smtp_separate,
-            signature: self.signature.read(cx).value().to_string(),
+            signature: primary_sig,
             color,
             emoji,
             avatar: avatar_file,
             in_unified: self.in_unified,
             push_override: self.push_override,
+            quota_used_bytes: self.quota_used_bytes,
+            quota_total_bytes: self.quota_total_bytes,
+            aliases: self.aliases.clone(),
+            signatures: collected_signatures,
+            default_new_signature: self.default_new_signature,
+            default_reply_signature: self.default_reply_signature,
+            special_folders: self.special_folders.clone(),
+            sync_interval_minutes: self.sync_interval_minutes,
+            download_window_days: self.download_window_days,
+            auto_empty_trash_days: self.auto_empty_trash_days,
+            auto_empty_junk_days: self.auto_empty_junk_days,
+            hidden_folders: self.hidden_folders.clone(),
         };
         let imap_pwd = self.imap_pass.read(cx).value().to_string();
         let smtp_pwd = if self.smtp_separate {
@@ -2149,76 +2373,962 @@ pub(crate) fn render_editor_page(
         );
     }
 
-    // ---- 分组 3：签名 ----
-    let signature_group = setting_group(
-        "签名",
-        Some("新建、回复或转发时自动附加在正文末尾"),
-        CARD_MAX_WIDTH,
-        vec![div()
+    // ---- WP-06 分组 0：存储配额（Storage） ----
+    let storage_group: Option<AnyElement> = if editing_id.is_some() {
+        let (quota_subtitle, quota_ratio) = match (form.quota_used_bytes, form.quota_total_bytes) {
+            (Some(used), Some(total)) if total > 0 => {
+                let pct = ((used as f64 / total as f64) * 100.0).clamp(0.0, 100.0);
+                (
+                    format!(
+                        "{} / {} ({:.0}%)",
+                        config::format_bytes(used),
+                        config::format_bytes(total),
+                        pct
+                    ),
+                    Some((used as f32 / total as f32).clamp(0.0, 1.0)),
+                )
+            }
+            _ => (
+                "服务器未上报配额（IMAP GETQUOTAROOT 同步后自动更新）".to_string(),
+                None,
+            ),
+        };
+        let quota_bar: AnyElement = if let Some(ratio) = quota_ratio {
+            div()
+                .w(px(160.0))
+                .h(px(8.0))
+                .rounded(px(4.0))
+                .bg(border)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .w(px(160.0 * ratio))
+                        .rounded(px(4.0))
+                        .bg(if ratio > 0.9 { danger } else { accent }),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .text_xs()
+                .text_color(muted_fg)
+                .child("无配额上限")
+                .into_any_element()
+        };
+        Some(setting_group(
+            "存储空间",
+            None,
+            CARD_MAX_WIDTH,
+            vec![h_flex()
+                .w_full()
+                .min_h(px(54.0))
+                .px_4()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(text)
+                                .child("邮箱配额"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(SharedString::from(quota_subtitle)),
+                        ),
+                )
+                .child(quota_bar)
+                .into_any_element()],
+            p,
+        ))
+    } else {
+        None
+    };
+
+    // ---- WP-06 分组 3：发信别名（Send-as Aliases） ----
+    let mut alias_rows: Vec<AnyElement> = Vec::new();
+    for (idx, alias) in form.aliases.iter().enumerate() {
+        let title = if alias.name.trim().is_empty() {
+            alias.email.clone()
+        } else {
+            format!("{} <{}>", alias.name.trim(), alias.email.trim())
+        };
+        let subtitle = if alias.reply_to.trim().is_empty() {
+            if alias.is_default {
+                "默认发信身份".to_string()
+            } else {
+                "使用主账号 SMTP 发送".to_string()
+            }
+        } else {
+            format!("Reply-To: {}", alias.reply_to.trim())
+        };
+        let is_def = alias.is_default;
+        alias_rows.push(
+            h_flex()
+                .w_full()
+                .min_h(px(52.0))
+                .px_4()
+                .py_2()
+                .gap_2()
+                .items_center()
+                .justify_between()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(text)
+                                .truncate()
+                                .child(SharedString::from(title)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .truncate()
+                                .child(SharedString::from(subtitle)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .flex_shrink_0()
+                        .child(
+                            Button::new(("acct-alias-default", idx))
+                                .outline()
+                                .compact()
+                                .disabled(demo_mode)
+                                .label(if is_def { "默认" } else { "设为默认" })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    for (i, item) in
+                                        this.account_form.aliases.iter_mut().enumerate()
+                                    {
+                                        item.is_default = i == idx;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new(("acct-alias-del", idx))
+                                .ghost()
+                                .compact()
+                                .disabled(demo_mode)
+                                .icon(IconName::Trash)
+                                .tooltip("移除此别名")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if idx < this.account_form.aliases.len() {
+                                        this.account_form.aliases.remove(idx);
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        );
+    }
+    alias_rows.push(
+        v_flex()
             .w_full()
-            .p_3()
+            .px_4()
+            .py_3()
+            .gap_2()
             .child(
-                div()
+                h_flex()
                     .w_full()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(border)
-                    .bg(surface)
-                    .p_1p5()
-                    .child(Textarea::new(&form.signature)),
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&form.alias_name_input).cleanable(true)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&form.alias_email_input).cleanable(true)),
+                    ),
             )
-            .into_any_element()],
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&form.alias_reply_to_input).cleanable(true)),
+                    )
+                    .child(
+                        Button::new("acct-alias-add")
+                            .outline()
+                            .compact()
+                            .disabled(demo_mode)
+                            .icon(IconName::Plus)
+                            .label("添加别名")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let email = this
+                                    .account_form
+                                    .alias_email_input
+                                    .read(cx)
+                                    .value()
+                                    .trim()
+                                    .to_string();
+                                if email.is_empty() || !email.contains('@') {
+                                    this.account_form.validation_error =
+                                        Some("请输入有效的别名邮箱地址".into());
+                                    cx.notify();
+                                    return;
+                                }
+                                let name = this
+                                    .account_form
+                                    .alias_name_input
+                                    .read(cx)
+                                    .value()
+                                    .trim()
+                                    .to_string();
+                                let reply_to = this
+                                    .account_form
+                                    .alias_reply_to_input
+                                    .read(cx)
+                                    .value()
+                                    .trim()
+                                    .to_string();
+                                let is_default = this.account_form.aliases.is_empty();
+                                this.account_form.aliases.push(SendAsAlias {
+                                    name,
+                                    email,
+                                    reply_to,
+                                    is_default,
+                                });
+                                this.account_form
+                                    .alias_name_input
+                                    .update(cx, |s, cx| s.set_value("", window, cx));
+                                this.account_form
+                                    .alias_email_input
+                                    .update(cx, |s, cx| s.set_value("", window, cx));
+                                this.account_form
+                                    .alias_reply_to_input
+                                    .update(cx, |s, cx| s.set_value("", window, cx));
+                                this.account_form.validation_error = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element(),
+    );
+    let aliases_group = setting_group(
+        "发信别名",
+        Some("为一个账号配置多个发件身份（名称 + 邮箱 + Reply-To），写信时可在发件人中切换"),
+        CARD_MAX_WIDTH,
+        alias_rows,
         p,
     );
 
-    // ---- 分组 4：同步 ----
-    let push_label = PUSH_OVERRIDE_OPTIONS
-        .iter()
-        .find(|(_, v)| *v == form.push_override)
-        .map(|(l, _)| *l)
-        .unwrap_or("跟随全局设置");
-    let win_for_push = cx.entity();
-    let mut sync_rows: Vec<AnyElement> = vec![h_flex()
-        .w_full()
-        .min_h(px(54.0))
-        .px_4()
-        .py_2()
-        .gap_3()
-        .items_center()
-        .justify_between()
+    // ---- 分组 4：多命名 HTML/文本签名 ----
+    let sig_count = form.signatures.len();
+    let active_sig_idx = form.active_sig_idx.min(sig_count.saturating_sub(1));
+    let active_sig_is_html = form
+        .signatures
+        .get(active_sig_idx)
+        .map(|s| s.is_html)
+        .unwrap_or(false);
+    let mut sig_tabs = h_flex().w_full().flex_wrap().gap_1p5().items_center();
+    for (idx, sig) in form.signatures.iter().enumerate() {
+        let selected = idx == active_sig_idx;
+        let lbl = if sig.name.trim().is_empty() {
+            format!("签名 {}", idx + 1)
+        } else {
+            sig.name.clone()
+        };
+        sig_tabs = sig_tabs.child(
+            Button::new(("acct-sig-tab", idx))
+                .compact()
+                .outline()
+                .selected(selected)
+                .label(SharedString::from(lbl))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.account_form.select_signature(idx, window, cx);
+                    cx.notify();
+                })),
+        );
+    }
+    sig_tabs = sig_tabs
         .child(
+            Button::new("acct-sig-add")
+                .ghost()
+                .compact()
+                .disabled(demo_mode)
+                .icon(IconName::Plus)
+                .label("新建签名")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.account_form.sync_active_signature_from_inputs(cx);
+                    let next_idx = this.account_form.signatures.len();
+                    this.account_form.signatures.push(NamedSignature {
+                        name: format!("签名 {}", next_idx + 1),
+                        body: String::new(),
+                        is_html: false,
+                    });
+                    this.account_form.select_signature(next_idx, window, cx);
+                    cx.notify();
+                })),
+        )
+        .when(sig_count > 1, |el| {
+            el.child(
+                Button::new("acct-sig-del")
+                    .ghost()
+                    .compact()
+                    .disabled(demo_mode)
+                    .icon(IconName::Trash)
+                    .tooltip("删除当前签名")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.account_form.signatures.len() <= 1 {
+                            return;
+                        }
+                        let rm_idx = this.account_form.active_sig_idx;
+                        this.account_form.signatures.remove(rm_idx);
+                        let next_idx = rm_idx.min(this.account_form.signatures.len() - 1);
+                        this.account_form.active_sig_idx = next_idx;
+                        let sig = this.account_form.signatures[next_idx].clone();
+                        this.account_form
+                            .sig_name_input
+                            .update(cx, |s, cx| s.set_value(sig.name, window, cx));
+                        this.account_form
+                            .signature
+                            .update(cx, |s, cx| s.set_value(sig.body, window, cx));
+                        if this.account_form.default_new_signature == Some(rm_idx) {
+                            this.account_form.default_new_signature = Some(0);
+                        }
+                        if this.account_form.default_reply_signature == Some(rm_idx) {
+                            this.account_form.default_reply_signature = Some(0);
+                        }
+                        cx.notify();
+                    })),
+            )
+        });
+
+    let mut sig_choice_options: Vec<(SharedString, String)> =
+        vec![(SharedString::from("不使用签名"), String::new())];
+    for (idx, sig) in form.signatures.iter().enumerate() {
+        let lbl = if idx == active_sig_idx {
+            let live_name = form.sig_name_input.read(cx).value().trim().to_string();
+            if live_name.is_empty() {
+                format!("签名 {}", idx + 1)
+            } else {
+                live_name
+            }
+        } else if sig.name.trim().is_empty() {
+            format!("签名 {}", idx + 1)
+        } else {
+            sig.name.clone()
+        };
+        sig_choice_options.push((SharedString::from(lbl), idx.to_string()));
+    }
+    let current_new_sig_val = form
+        .default_new_signature
+        .map(|i| i.to_string())
+        .unwrap_or_default();
+    let current_reply_sig_val = form
+        .default_reply_signature
+        .map(|i| i.to_string())
+        .unwrap_or_default();
+    let new_sig_label = sig_choice_options
+        .iter()
+        .find(|(_, v)| *v == current_new_sig_val)
+        .map(|(l, _)| l.clone())
+        .unwrap_or_else(|| SharedString::from("不使用签名"));
+    let reply_sig_label = sig_choice_options
+        .iter()
+        .find(|(_, v)| *v == current_reply_sig_val)
+        .map(|(l, _)| l.clone())
+        .unwrap_or_else(|| SharedString::from("不使用签名"));
+    let win_for_sig_new = cx.entity();
+    let win_for_sig_reply = cx.entity();
+
+    let signature_group = setting_group(
+        "签名",
+        Some("支持多个命名 HTML/纯文本签名，并分别指定新邮件与回复/转发默认签名"),
+        CARD_MAX_WIDTH,
+        vec![
             v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_0p5()
+                .w_full()
+                .p_3()
+                .gap_2p5()
+                .child(sig_tabs)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&form.sig_name_input).cleanable(true)),
+                        )
+                        .child(
+                            Button::new("acct-sig-html-toggle")
+                                .outline()
+                                .compact()
+                                .disabled(demo_mode)
+                                .label(if active_sig_is_html {
+                                    "HTML 模式"
+                                } else {
+                                    "纯文本模式"
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(sig) =
+                                        this.account_form.signatures.get_mut(active_sig_idx)
+                                    {
+                                        sig.is_html = !sig.is_html;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(border)
+                        .bg(surface)
+                        .p_1p5()
+                        .child(Textarea::new(&form.signature)),
+                )
+                .into_any_element(),
+            h_flex()
+                .w_full()
+                .min_h(px(50.0))
+                .px_4()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .justify_between()
                 .child(
                     div()
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(text)
-                        .child("实时推送（IMAP IDLE）"),
+                        .child("新邮件默认签名"),
                 )
+                .child(combo_button_dynamic(
+                    "acct-sig-default-new",
+                    new_sig_label,
+                    sig_choice_options.clone(),
+                    current_new_sig_val,
+                    demo_mode,
+                    move |val, _, cx| {
+                        let _ = win_for_sig_new.update(cx, |win, cx| {
+                            win.account_form.default_new_signature = val.parse::<usize>().ok();
+                            cx.notify();
+                        });
+                    },
+                ))
+                .into_any_element(),
+            h_flex()
+                .w_full()
+                .min_h(px(50.0))
+                .px_4()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .justify_between()
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child("为此账号单独开启或关闭实时新邮件推送"),
-                ),
-        )
-        .child(combo_button(
-            "acct-push-override",
-            push_label,
-            PUSH_OVERRIDE_OPTIONS,
-            form.push_override,
-            demo_mode,
-            move |val, _, cx| {
-                let _ = win_for_push.update(cx, |win, cx| {
-                    win.account_form.push_override = val;
-                    cx.notify();
-                });
-            },
-        ))
-        .into_any_element()];
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(text)
+                        .child("回复/转发默认签名"),
+                )
+                .child(combo_button_dynamic(
+                    "acct-sig-default-reply",
+                    reply_sig_label,
+                    sig_choice_options,
+                    current_reply_sig_val,
+                    demo_mode,
+                    move |val, _, cx| {
+                        let _ = win_for_sig_reply.update(cx, |win, cx| {
+                            win.account_form.default_reply_signature = val.parse::<usize>().ok();
+                            cx.notify();
+                        });
+                    },
+                ))
+                .into_any_element(),
+        ],
+        p,
+    );
+
+    // ---- WP-06 分组 5：特殊文件夹映射（Special Folders） ----
+    let account_folders = editing_id
+        .and_then(|id| folders_by_account.get(&id))
+        .cloned()
+        .unwrap_or_default();
+    let mut folder_choices: Vec<(SharedString, String)> =
+        vec![(SharedString::from("自动检测"), String::new())];
+    for f in &account_folders {
+        folder_choices.push((
+            SharedString::from(format!("{} ({})", f.name, f.path)),
+            f.path.clone(),
+        ));
+    }
+    let special_specs: [(&'static str, &'static str, &'static str, String); 5] = [
+        (
+            "sent",
+            "acct-sf-sent",
+            "已发送 (Sent)",
+            form.special_folders.sent.clone(),
+        ),
+        (
+            "drafts",
+            "acct-sf-drafts",
+            "草稿箱 (Drafts)",
+            form.special_folders.drafts.clone(),
+        ),
+        (
+            "trash",
+            "acct-sf-trash",
+            "废纸篓 (Trash)",
+            form.special_folders.trash.clone(),
+        ),
+        (
+            "junk",
+            "acct-sf-junk",
+            "垃圾邮件 (Junk)",
+            form.special_folders.junk.clone(),
+        ),
+        (
+            "archive",
+            "acct-sf-archive",
+            "归档 (Archive)",
+            form.special_folders.archive.clone(),
+        ),
+    ];
+    let mut special_rows: Vec<AnyElement> = Vec::new();
+    for (role_key, btn_id, role_label, current_path) in special_specs {
+        let mut opts = folder_choices.clone();
+        if !current_path.is_empty() && !opts.iter().any(|(_, p)| p == &current_path) {
+            opts.push((
+                SharedString::from(current_path.clone()),
+                current_path.clone(),
+            ));
+        }
+        let current_label = opts
+            .iter()
+            .find(|(_, p)| p == &current_path)
+            .map(|(l, _)| l.clone())
+            .unwrap_or_else(|| SharedString::from("自动检测"));
+        let win_for_sf = cx.entity();
+        special_rows.push(
+            h_flex()
+                .w_full()
+                .min_h(px(50.0))
+                .px_4()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(text)
+                        .child(role_label),
+                )
+                .child(combo_button_dynamic(
+                    btn_id,
+                    current_label,
+                    opts,
+                    current_path,
+                    demo_mode,
+                    move |val, _, cx| {
+                        let _ = win_for_sf.update(cx, |win, cx| {
+                            match role_key {
+                                "sent" => win.account_form.special_folders.sent = val,
+                                "drafts" => win.account_form.special_folders.drafts = val,
+                                "trash" => win.account_form.special_folders.trash = val,
+                                "junk" => win.account_form.special_folders.junk = val,
+                                "archive" => win.account_form.special_folders.archive = val,
+                                _ => {}
+                            }
+                            cx.notify();
+                        });
+                    },
+                ))
+                .into_any_element(),
+        );
+    }
+    let win_for_sss = cx.entity();
+    special_rows.push(
+        h_flex()
+            .w_full()
+            .min_h(px(54.0))
+            .px_4()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text)
+                            .child("服务器自动保存已发送邮件"),
+                    )
+                    .child(
+                        div().text_xs().text_color(muted_fg).child(
+                            "Gmail / Outlook 等服务商默认开启，避免重复 APPEND 到已发送文件夹",
+                        ),
+                    ),
+            )
+            .child(
+                Switch::new("acct-server-saves-sent")
+                    .checked(form.special_folders.server_saves_sent)
+                    .disabled(demo_mode)
+                    .on_click(move |checked, _, cx| {
+                        let _ = win_for_sss.update(cx, |win, cx| {
+                            win.account_form.special_folders.server_saves_sent = *checked;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element(),
+    );
+    let special_folders_group = setting_group(
+        "特殊文件夹",
+        Some("绑定各标准角色对应的远端 IMAP 文件夹"),
+        CARD_MAX_WIDTH,
+        special_rows,
+        p,
+    );
+
+    // ---- 分组 6：同步与自动清理策略 ----
+    let push_label = PUSH_OVERRIDE_OPTIONS
+        .iter()
+        .find(|(_, v)| *v == form.push_override)
+        .map(|(l, _)| *l)
+        .unwrap_or("跟随全局设置");
+    let sync_interval_label = ACCOUNT_SYNC_INTERVAL_OPTIONS
+        .iter()
+        .find(|(_, v)| *v == form.sync_interval_minutes)
+        .map(|(l, _)| *l)
+        .unwrap_or("跟随全局设置");
+    let download_window_label = DOWNLOAD_WINDOW_OPTIONS
+        .iter()
+        .find(|(_, v)| *v == form.download_window_days)
+        .map(|(l, _)| *l)
+        .unwrap_or("全部历史");
+    let auto_trash_label = AUTO_EMPTY_DAYS_OPTIONS
+        .iter()
+        .find(|(_, v)| *v == form.auto_empty_trash_days)
+        .map(|(l, _)| *l)
+        .unwrap_or("从不自动清空");
+    let auto_junk_label = AUTO_EMPTY_DAYS_OPTIONS
+        .iter()
+        .find(|(_, v)| *v == form.auto_empty_junk_days)
+        .map(|(l, _)| *l)
+        .unwrap_or("从不自动清空");
+
+    let win_for_push = cx.entity();
+    let win_for_sync_int = cx.entity();
+    let win_for_dl_win = cx.entity();
+    let win_for_trash_days = cx.entity();
+    let win_for_junk_days = cx.entity();
+
+    let mut sync_rows: Vec<AnyElement> = vec![
+        h_flex()
+            .w_full()
+            .min_h(px(54.0))
+            .px_4()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text)
+                            .child("实时推送（IMAP IDLE）"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child("为此账号单独开启或关闭实时新邮件推送"),
+                    ),
+            )
+            .child(combo_button(
+                "acct-push-override",
+                push_label,
+                PUSH_OVERRIDE_OPTIONS,
+                form.push_override,
+                demo_mode,
+                move |val, _, cx| {
+                    let _ = win_for_push.update(cx, |win, cx| {
+                        win.account_form.push_override = val;
+                        cx.notify();
+                    });
+                },
+            ))
+            .into_any_element(),
+        h_flex()
+            .w_full()
+            .min_h(px(54.0))
+            .px_4()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text)
+                            .child("轮询周期覆盖"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child("覆盖全局定时拉取间隔"),
+                    ),
+            )
+            .child(combo_button(
+                "acct-sync-interval",
+                sync_interval_label,
+                ACCOUNT_SYNC_INTERVAL_OPTIONS,
+                form.sync_interval_minutes,
+                demo_mode,
+                move |val, _, cx| {
+                    let _ = win_for_sync_int.update(cx, |win, cx| {
+                        win.account_form.sync_interval_minutes = val;
+                        cx.notify();
+                    });
+                },
+            ))
+            .into_any_element(),
+        h_flex()
+            .w_full()
+            .min_h(px(54.0))
+            .px_4()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text)
+                            .child("下载邮件时间范围"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child("控制本地缓存同步的历史时间跨度"),
+                    ),
+            )
+            .child(combo_button(
+                "acct-download-window",
+                download_window_label,
+                DOWNLOAD_WINDOW_OPTIONS,
+                form.download_window_days,
+                demo_mode,
+                move |val, _, cx| {
+                    let _ = win_for_dl_win.update(cx, |win, cx| {
+                        win.account_form.download_window_days = val;
+                        cx.notify();
+                    });
+                },
+            ))
+            .into_any_element(),
+        h_flex()
+            .w_full()
+            .min_h(px(52.0))
+            .px_4()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(text)
+                    .child("自动清空废纸篓"),
+            )
+            .child(combo_button(
+                "acct-auto-empty-trash",
+                auto_trash_label,
+                AUTO_EMPTY_DAYS_OPTIONS,
+                form.auto_empty_trash_days,
+                demo_mode,
+                move |val, _, cx| {
+                    let _ = win_for_trash_days.update(cx, |win, cx| {
+                        win.account_form.auto_empty_trash_days = val;
+                        cx.notify();
+                    });
+                },
+            ))
+            .into_any_element(),
+        h_flex()
+            .w_full()
+            .min_h(px(52.0))
+            .px_4()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(text)
+                    .child("自动清空垃圾邮件"),
+            )
+            .child(combo_button(
+                "acct-auto-empty-junk",
+                auto_junk_label,
+                AUTO_EMPTY_DAYS_OPTIONS,
+                form.auto_empty_junk_days,
+                demo_mode,
+                move |val, _, cx| {
+                    let _ = win_for_junk_days.update(cx, |win, cx| {
+                        win.account_form.auto_empty_junk_days = val;
+                        cx.notify();
+                    });
+                },
+            ))
+            .into_any_element(),
+    ];
+
+    // ---- WP-06 分组 7：隐藏文件夹（Hidden Folders） ----
+    let mut hidden_rows: Vec<AnyElement> = Vec::new();
+    let mut all_folder_paths: Vec<(String, String)> = account_folders
+        .iter()
+        .map(|f| (f.name.clone(), f.path.clone()))
+        .collect();
+    for hp in &form.hidden_folders {
+        if !all_folder_paths.iter().any(|(_, p)| p == hp) {
+            all_folder_paths.push((hp.clone(), hp.clone()));
+        }
+    }
+    if all_folder_paths.is_empty() {
+        hidden_rows.push(
+            div()
+                .w_full()
+                .px_4()
+                .py_3()
+                .text_xs()
+                .text_color(muted_fg)
+                .child(
+                    "完成首次同步后可在此勾选需要从侧边栏隐藏的远端文件夹（如 [Gmail]/Important）",
+                )
+                .into_any_element(),
+        );
+    } else {
+        for (idx, (fname, fpath)) in all_folder_paths.into_iter().enumerate() {
+            let is_hidden = form.hidden_folders.iter().any(|p| p == &fpath);
+            let win_for_hf = cx.entity();
+            let path_for_toggle = fpath.clone();
+            hidden_rows.push(
+                h_flex()
+                    .w_full()
+                    .min_h(px(46.0))
+                    .px_4()
+                    .py_1p5()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(text)
+                                    .truncate()
+                                    .child(SharedString::from(fname)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .truncate()
+                                    .child(SharedString::from(fpath)),
+                            ),
+                    )
+                    .child(
+                        Switch::new(("acct-hidden-folder", idx))
+                            .checked(is_hidden)
+                            .disabled(demo_mode)
+                            .on_click(move |checked, _, cx| {
+                                let _ = win_for_hf.update(cx, |win, cx| {
+                                    if *checked {
+                                        if !win
+                                            .account_form
+                                            .hidden_folders
+                                            .iter()
+                                            .any(|p| p == &path_for_toggle)
+                                        {
+                                            win.account_form
+                                                .hidden_folders
+                                                .push(path_for_toggle.clone());
+                                        }
+                                    } else {
+                                        win.account_form
+                                            .hidden_folders
+                                            .retain(|p| p != &path_for_toggle);
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+    }
+    let hidden_folders_group = setting_group(
+        "隐藏文件夹",
+        Some("开启后该远端文件夹将不在主窗口侧边栏显示"),
+        CARD_MAX_WIDTH,
+        hidden_rows,
+        p,
+    );
 
     if let Some(acc_id) = editing_id {
         let app_for_sync = app_entity.clone();
@@ -2407,6 +3517,7 @@ pub(crate) fn render_editor_page(
                         )
                     },
                 )
+                .when_some(storage_group, |el, sg| el.child(sg))
                 .child(setting_group(
                     "邮箱账号",
                     None,
@@ -2421,8 +3532,11 @@ pub(crate) fn render_editor_page(
                     appearance_rows,
                     p,
                 ))
+                .child(aliases_group)
                 .child(signature_group)
+                .child(special_folders_group)
                 .child(setting_group("同步", None, CARD_MAX_WIDTH, sync_rows, p))
+                .child(hidden_folders_group)
                 .child(div().px_1().pb_4().text_xs().text_color(muted_fg).child(
                     "密码与 OAuth 令牌安全保存在 Windows 凭据管理器中，本地配置仅保存非敏感设置。",
                 )),
