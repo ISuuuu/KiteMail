@@ -205,7 +205,7 @@ pub(crate) fn bool_switch(
 
 /// 静态选项下拉按钮（对齐 Linux 版 ComboRow）。
 pub(crate) fn combo_button<T: Copy + PartialEq + 'static>(
-    id: &'static str,
+    id: impl Into<ElementId>,
     current_label: impl Into<SharedString>,
     options: &'static [(&'static str, T)],
     current: T,
