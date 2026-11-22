@@ -3129,6 +3129,53 @@ impl CacheStore {
             .map_err(|e| format!("读取附件内容失败: {e}"))
     }
 
+    /// Look up `(folder_path, uid)` for a cached message ID.
+    pub fn get_message_location(&self, message_id: u32) -> Result<Option<(String, u32)>, String> {
+        self.conn
+            .query_row(
+                "SELECT f.path, m.uid FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?1",
+                params![message_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("查询邮件位置失败: {e}"))
+    }
+
+    /// Remove a stripped attachment from local cache, optionally update the
+    /// message's IMAP UID to the appended copy, refresh `has_attachment`, and
+    /// return the remaining attachments for `message_id`.
+    pub fn delete_attachment_and_update_uid(
+        &self,
+        message_id: u32,
+        attachment_id: u32,
+        new_uid: Option<u32>,
+    ) -> Result<Vec<AttachmentMeta>, String> {
+        self.conn
+            .execute(
+                "DELETE FROM attachments WHERE id = ?1 AND message_id = ?2",
+                params![attachment_id, message_id],
+            )
+            .map_err(|e| format!("删除本地附件缓存失败: {e}"))?;
+        let remaining = self.list_attachments(message_id)?;
+        let has_att = if remaining.is_empty() { 0i64 } else { 1i64 };
+        if let Some(uid) = new_uid {
+            self.conn
+                .execute(
+                    "UPDATE messages SET has_attachment = ?1, uid = ?2 WHERE id = ?3",
+                    params![has_att, uid, message_id],
+                )
+                .map_err(|e| format!("更新邮件附件状态失败: {e}"))?;
+        } else {
+            self.conn
+                .execute(
+                    "UPDATE messages SET has_attachment = ?1 WHERE id = ?2",
+                    params![has_att, message_id],
+                )
+                .map_err(|e| format!("更新邮件附件状态失败: {e}"))?;
+        }
+        Ok(remaining)
+    }
+
     /// Export all cached attachments of `message_id` into `dest_dir` (used when
     /// forwarding a message with its original attachments). Returns exported file paths.
     pub fn export_message_attachments(

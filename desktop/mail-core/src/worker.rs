@@ -1712,6 +1712,104 @@ async fn handle_request(
             });
         }
 
+        MailRequest::StripAttachment {
+            account_id,
+            message_id,
+            attachment_id,
+            attachment_name,
+            size_bytes,
+        } => {
+            let Ok(account) = load_account_config(data_dir, account_id) else {
+                let _ = evt_tx.send(WorkerEvent::AttachmentStripFailed {
+                    account_id,
+                    message_id,
+                    attachment_id,
+                    message: format!("账号 #{account_id} 未找到配置"),
+                });
+                return;
+            };
+            if account.auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                let _ = evt_tx.send(WorkerEvent::AttachmentStripFailed {
+                    account_id,
+                    message_id,
+                    attachment_id,
+                    message: "Microsoft Graph 账号暂不支持服务端剥离附件".to_string(),
+                });
+                return;
+            }
+            let loc = match cache.get_message_location(message_id) {
+                Ok(Some(loc)) => loc,
+                Ok(None) => {
+                    let _ = evt_tx.send(WorkerEvent::AttachmentStripFailed {
+                        account_id,
+                        message_id,
+                        attachment_id,
+                        message: "本地缓存中未找到该邮件".to_string(),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::AttachmentStripFailed {
+                        account_id,
+                        message_id,
+                        attachment_id,
+                        message: e,
+                    });
+                    return;
+                }
+            };
+            let (folder_path, uid) = loc;
+            let res = match secrets::load_account_secrets(account_id) {
+                Ok(sec) => {
+                    imap_client::strip_imap_attachment(
+                        &account,
+                        &sec.imap_password,
+                        &folder_path,
+                        uid,
+                        &attachment_name,
+                        size_bytes as u64,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok((new_uid, _stripped)) => {
+                    match cache.delete_attachment_and_update_uid(message_id, attachment_id, new_uid)
+                    {
+                        Ok(attachments) => {
+                            let _ = evt_tx.send(WorkerEvent::AttachmentStripped {
+                                account_id,
+                                message_id,
+                                attachment_id,
+                                attachments,
+                            });
+                            let _ = evt_tx.send(WorkerEvent::Status {
+                                account_id: Some(account_id),
+                                text: format!("已从服务器剥离附件：{attachment_name}"),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(WorkerEvent::AttachmentStripFailed {
+                                account_id,
+                                message_id,
+                                attachment_id,
+                                message: e,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::AttachmentStripFailed {
+                        account_id,
+                        message_id,
+                        attachment_id,
+                        message: e,
+                    });
+                }
+            }
+        }
+
         MailRequest::SaveLocalDraft { mut draft } => {
             draft.updated_at = chrono::Utc::now().timestamp();
             match cache.upsert_draft(&draft) {

@@ -13,21 +13,25 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::text::TextView;
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Selectable, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    div, px, AppContext, Context, DragMoveEvent, Entity, InteractiveElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display_with_options};
+use hylki_mail_core::mime::{split_quoted_html, split_quoted_plain};
 use hylki_mail_core::{AttachmentMeta, MailRequest, MessageDetail, ThreadMessage};
 
 use crate::app::{split_sender, HylkiApp, READER_OVERFLOW_BREAKPOINT};
 use crate::theme;
+use crate::ui::attachment_drawer::{self, AttachmentDrawerDrag, DrawerAttachment};
+use crate::ui::message_window::LinkPreviewTooltip;
 use crate::ui::{avatar, window_controls};
 
 /// 顶部操作栏高度。
@@ -300,6 +304,7 @@ fn render_message_card(
     show_remote_banner: bool,
     is_collapsed: bool,
     show_raw_source: bool,
+    quote_expanded: bool,
     zoom_percent: u32,
     bg_pick: Option<bool>,
     forced_theme_bg: Option<bool>,
@@ -314,6 +319,7 @@ fn render_message_card(
     unsubscribe_confirming: bool,
     more_menu: gpui_kit::AnyElement,
     p: &theme::HylkiPalette,
+    app: &mut HylkiApp,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
     let (canvas, border, muted_fg, accent) = (p.canvas, p.border, p.text_muted, p.accent);
@@ -400,28 +406,50 @@ fn render_message_card(
     let body_font_px = 14.0 * zoom_scale;
 
     // 决定原生富文本渲染内容：有 HTML 且未切纯文本模式时渲染净化后的 HTML，
-    // 否则将纯文本安全转义后通过 TextView::html(...).selectable(true) 渲染，
-    // 保证所有邮件正文均支持鼠标框选与 Ctrl+C 复制。
-    let (rendered_html, blocked_images) = if show_raw_source {
-        let raw = format_raw_source(
-            rfc_message_id,
-            sender,
-            recipients,
-            &formatted_date,
-            subject,
-            body_text,
-            body_html,
-        );
-        (plain_text_to_html(&raw), 0)
-    } else if !prefer_plain {
-        if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
-            sanitize_html_for_display_with_options(raw_html, block_remote_images, clean_links)
+    // 否则将纯文本安全转义后通过 TextView::new(&state) 渲染，
+    // 并拆出历史引用块以支持默认折叠（`⋯ 显示引用内容 (N 行)`）。
+    let (main_html, quoted_part, blocked_images): (String, Option<(String, usize)>, usize) =
+        if show_raw_source {
+            let raw = format_raw_source(
+                rfc_message_id,
+                sender,
+                recipients,
+                &formatted_date,
+                subject,
+                body_text,
+                body_html,
+            );
+            (plain_text_to_html(&raw), None, 0)
+        } else if !prefer_plain {
+            if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
+                let (sanitized, blocked) = sanitize_html_for_display_with_options(
+                    raw_html,
+                    block_remote_images,
+                    clean_links,
+                );
+                let split = split_quoted_html(&sanitized);
+                (split.main, split.quoted, blocked)
+            } else {
+                let split = split_quoted_plain(body_text);
+                (
+                    plain_text_to_html(&split.main),
+                    split
+                        .quoted
+                        .map(|(q, lines)| (plain_text_to_html(&q), lines)),
+                    0,
+                )
+            }
         } else {
-            (plain_text_to_html(body_text), 0)
-        }
-    } else {
-        (plain_text_to_html(body_text), 0)
-    };
+            let split = split_quoted_plain(body_text);
+            (
+                plain_text_to_html(&split.main),
+                split
+                    .quoted
+                    .map(|(q, lines)| (plain_text_to_html(&q), lines)),
+                0,
+            )
+        };
+    let text_state: Entity<TextViewState> = app.ensure_reader_text_state(msg_id, &main_html, cx);
 
     let card_attachment_ids: Vec<u32> = attachments.iter().map(|a| a.id).collect();
     let attachment_rows: Vec<gpui_kit::AnyElement> = attachments
@@ -749,20 +777,54 @@ fn render_message_card(
                     None => el,
                 })
                 .text_color(forced_fg.unwrap_or(if body_loaded { p.text } else { muted_fg }))
-                .child(
-                    TextView::html(
-                        SharedString::from(format!(
-                            "reader-body-{msg_id}-{}-{}-{}-{}-{}",
-                            prefer_plain as u8,
-                            block_remote_images as u8,
-                            show_raw_source as u8,
-                            zoom_percent,
-                            effective_bg_pick.map(|b| b as u8).unwrap_or(2)
-                        )),
-                        rendered_html,
+                .child(TextView::new(&text_state).link_tooltip(|url, _, cx| {
+                    let url = url.clone();
+                    cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
+                        .into()
+                }))
+        })
+        .when_some(quoted_part, |card, (q_html, lines)| {
+            card.child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        Button::new(("quote-fold-btn", msg_id))
+                            .outline()
+                            .compact()
+                            .label(SharedString::from(if quote_expanded {
+                                format!("▾ 隐藏引用内容 ({lines} 行)")
+                            } else {
+                                format!("⋯ 显示引用内容 ({lines} 行)")
+                            }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_quote_expanded(msg_id, cx);
+                            })),
                     )
-                    .selectable(true),
-                )
+                    .when(quote_expanded, |c| {
+                        c.child(
+                            div()
+                                .pl_3()
+                                .border_l_2()
+                                .border_color(accent.opacity(0.45))
+                                .text_color(muted_fg)
+                                .text_size(px((body_font_px - 1.0).max(11.0)))
+                                .child(
+                                    TextView::html(
+                                        SharedString::from(format!("reader-quote-{msg_id}")),
+                                        q_html,
+                                    )
+                                    .selectable(true)
+                                    .link_tooltip(
+                                        |url, _, cx| {
+                                            let url = url.clone();
+                                            cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
+                                                .into()
+                                        },
+                                    ),
+                                ),
+                        )
+                    }),
+            )
         })
         .when(!body_loaded, |card| {
             card.child(
@@ -813,7 +875,7 @@ fn render_message_card(
 }
 
 pub(crate) fn render(
-    app: &HylkiApp,
+    app: &mut HylkiApp,
     window: &Window,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
@@ -995,6 +1057,7 @@ pub(crate) fn render(
                     show_remote_banner,
                     is_collapsed,
                     show_raw_source,
+                    app.expanded_quote_message_ids.contains(&tm.id),
                     zoom_percent,
                     app.message_bg_picks.get(&tm.id).copied(),
                     forced_theme_bg,
@@ -1008,6 +1071,7 @@ pub(crate) fn render(
                     app.pending_unsubscribe == Some(tm.id),
                     menu,
                     &p,
+                    app,
                     cx,
                 )
             })
@@ -1046,6 +1110,7 @@ pub(crate) fn render(
             show_remote_banner,
             is_collapsed,
             show_raw_source,
+            app.expanded_quote_message_ids.contains(&detail.id),
             zoom_percent,
             app.message_bg_picks.get(&detail.id).copied(),
             forced_theme_bg,
@@ -1059,15 +1124,75 @@ pub(crate) fn render(
             app.pending_unsubscribe == Some(detail.id),
             menu,
             &p,
+            app,
             cx,
         )]
     };
+
+    // WP-09：收集底部附件抽屉条目并触发图片附件缩略图懒加载。
+    let drawer_items: Vec<DrawerAttachment> = if thread_count > 1 {
+        detail
+            .thread_messages
+            .iter()
+            .flat_map(|tm| {
+                let mid = tm.id;
+                let aid = detail.account_id;
+                tm.attachments.iter().map(move |a| DrawerAttachment {
+                    account_id: aid,
+                    message_id: mid,
+                    meta: a.clone(),
+                })
+            })
+            .collect()
+    } else {
+        detail
+            .attachments
+            .iter()
+            .map(|a| DrawerAttachment {
+                account_id: detail.account_id,
+                message_id: detail.id,
+                meta: a.clone(),
+            })
+            .collect()
+    };
+    if !app.attachment_drawer_collapsed {
+        for item in &drawer_items {
+            app.ensure_attachment_thumbnail(item.meta.id, &item.meta.mime_type);
+        }
+    }
+    let drawer_element = attachment_drawer::render_drawer(
+        &drawer_items,
+        app.attachment_drawer_collapsed,
+        app.attachment_drawer_height,
+        app.attachment_drawer_list_view,
+        app.attachment_drawer_sort_desc,
+        app.demo_mode,
+        &app.attachment_thumb_cache,
+        &app.stripping_attachment_ids,
+        app.pending_strip_attachment_id,
+        cx,
+    );
+
+    let find_open = app.reader_find_open;
+    let find_input = app.reader_find_input.clone();
+    let find_query = app.reader_find_query.clone();
+    let find_active = app.reader_find_active_match;
+    let find_total = app.reader_find_total_matches;
+    let print_detail = detail.clone();
+    let popout_detail = detail.clone();
+    let overflow_print_detail = detail.clone();
+    let overflow_popout_detail = detail.clone();
 
     v_flex()
         .flex_1()
         .min_w_0()
         .h_full()
         .bg(canvas)
+        .on_drag_move(
+            cx.listener(|this, event: &DragMoveEvent<AttachmentDrawerDrag>, _, cx| {
+                this.on_attachment_drawer_drag_move(event, cx);
+            }),
+        )
         // WP-01：点击阅读器不再使列表失焦（对齐 Linux theme.rs：选中行保持
         // accent 纯色高亮，仅写信编辑器 / 搜索输入持焦点时才转中性灰）。
         // 顶部操作栏 48px（空白区可拖拽窗口，最右侧为 Windows 原生窗口控制按钮）。
@@ -1212,6 +1337,8 @@ pub(crate) fn render(
                         .pr_1()
                         .items_center()
                         .when(!narrow_topbar, |el| {
+                            let d_print = print_detail.clone();
+                            let d_pop = popout_detail.clone();
                             el.child(
                                 Button::new("reader-toggle-seen")
                                     .ghost()
@@ -1236,8 +1363,45 @@ pub(crate) fn render(
                                         this.copy_selected_body(cx);
                                     })),
                             )
+                            .child(
+                                Button::new("reader-find-btn")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::Search)
+                                    .selected(find_open)
+                                    .tooltip("页内查找 (Ctrl+F)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_reader_find(window, cx);
+                                    })),
+                            )
+                            .child(
+                                action_button(
+                                    "reader-print-btn",
+                                    IconName::FileText,
+                                    "打印 / 导出 PDF",
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.open_print_preview(d_print.clone(), cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                action_button(
+                                    "reader-popout-btn",
+                                    IconName::ExternalLink,
+                                    "在新窗口打开邮件",
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.pop_out_message_window(d_pop.clone(), cx);
+                                    },
+                                )),
+                            )
                         })
                         .when(narrow_topbar, |el| {
+                            let d_print = overflow_print_detail.clone();
+                            let d_pop = overflow_popout_detail.clone();
                             el.child(
                                 Button::new("reader-overflow")
                                     .ghost()
@@ -1247,6 +1411,11 @@ pub(crate) fn render(
                                     .dropdown_menu(move |menu, _, _| {
                                         let e_seen = entity_for_overflow.clone();
                                         let e_copy = entity_for_overflow.clone();
+                                        let e_find = entity_for_overflow.clone();
+                                        let e_print = entity_for_overflow.clone();
+                                        let e_pop = entity_for_overflow.clone();
+                                        let dp = d_print.clone();
+                                        let dpop = d_pop.clone();
                                         menu.item(
                                             PopupMenuItem::new(if is_unread {
                                                 "标记为已读"
@@ -1273,6 +1442,36 @@ pub(crate) fn render(
                                                     });
                                                 }),
                                         )
+                                        .separator()
+                                        .item(
+                                            PopupMenuItem::new("页内查找 (Ctrl+F)")
+                                                .icon(Icon::new(IconName::Search))
+                                                .on_click(move |_, window, cx| {
+                                                    e_find.update(cx, |app, cx| {
+                                                        app.toggle_reader_find(window, cx);
+                                                    });
+                                                }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new("打印 / 导出 PDF")
+                                                .icon(Icon::new(IconName::FileText))
+                                                .on_click(move |_, _, cx| {
+                                                    let d = dp.clone();
+                                                    e_print.update(cx, |app, cx| {
+                                                        app.open_print_preview(d, cx);
+                                                    });
+                                                }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new("在新窗口打开邮件")
+                                                .icon(Icon::new(IconName::ExternalLink))
+                                                .on_click(move |_, _, cx| {
+                                                    let d = dpop.clone();
+                                                    e_pop.update(cx, |app, cx| {
+                                                        app.pop_out_message_window(d, cx);
+                                                    });
+                                                }),
+                                        )
                                     }),
                             )
                         }),
@@ -1280,6 +1479,71 @@ pub(crate) fn render(
                 // L-6：阅读器在下方时窗口控制按钮由列表顶栏承载，此处不再重复画。
                 .when(pane_top, |bar| bar.child(win_controls)),
         )
+        // WP-09：阅读器页内查找栏（Ctrl+F）。
+        .when(find_open, |root| {
+            let match_text = if find_query.trim().is_empty() {
+                String::new()
+            } else if find_total == 0 {
+                "无匹配".to_string()
+            } else {
+                format!("{} / {}", find_active + 1, find_total)
+            };
+            root.child(
+                h_flex()
+                    .px_4()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .bg(p.surface_raised)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .w(px(260.0))
+                            .child(Input::new(&find_input).small().cleanable(true)),
+                    )
+                    .when(!match_text.is_empty(), |bar| {
+                        bar.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(SharedString::from(match_text)),
+                        )
+                    })
+                    .child(
+                        Button::new("reader-find-prev")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::ChevronUp)
+                            .disabled(find_total == 0)
+                            .tooltip("上一个匹配 (Shift+Enter)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_reader_find(-1, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("reader-find-next")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::ChevronDown)
+                            .disabled(find_total == 0)
+                            .tooltip("下一个匹配 (Enter)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_reader_find(1, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("reader-find-close")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::X)
+                            .tooltip("关闭查找 (Esc)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_reader_find(window, cx);
+                            })),
+                    ),
+            )
+        })
         // 标题区（8px 24px 8px，L-5 实测顶边距）：账号胶囊 + 缩放胶囊 + 可选会话数胶囊
         // + 阅读视图 & 亮暗切换（B-5）+ 展开/折叠全部 & 保存全部附件 + 20px 粗体主题。
         .child(
@@ -1449,6 +1713,7 @@ pub(crate) fn render(
                 .gap_3()
                 .children(cards),
         )
+        .when_some(drawer_element, |root, drawer| root.child(drawer))
         .into_any_element()
 }
 

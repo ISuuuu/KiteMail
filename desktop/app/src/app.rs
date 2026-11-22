@@ -17,13 +17,15 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::resizable::{resize_handle, HandleEdge};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::text::{RangeHighlight, TextViewState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    actions, black, div, point, px, size, AnyWindowHandle, AppContext, Axis, Bounds, ClipboardItem,
-    Context, DragMoveEvent, Entity, Focusable, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, TitlebarOptions,
-    Window, WindowAppearance, WindowBounds, WindowOptions,
+    actions, black, div, img, point, px, size, AnyWindowHandle, AppContext, Axis, Bounds,
+    ClipboardItem, Context, DragMoveEvent, Entity, Focusable, Hsla, Image, InteractiveElement,
+    IntoElement, MouseButton, ObjectFit, ParentElement, Render, ScrollHandle, SharedString, Styled,
+    StyledImage, Subscription, TitlebarOptions, Window, WindowAppearance, WindowBounds,
+    WindowOptions,
 };
 use hylki_mail_core::cache::{sanitize_filename, CachedAttachment, KnownContact};
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, SettingsBackupBundle};
@@ -39,10 +41,15 @@ use hylki_mail_core::{
 
 use crate::theme;
 use crate::tray::{self, TrayCommand, TrayHandle};
+use crate::ui::attachment_drawer::{
+    self, AttachmentDrawerDrag, DRAWER_DEFAULT_HEIGHT, DRAWER_MAX_HEIGHT, DRAWER_MIN_HEIGHT,
+};
 use crate::ui::command_palette::{CommandPaletteEvent, CommandPaletteState, PaletteCommand};
 use crate::ui::contacts::{ContactExportKind, ContactsEvent, ContactsState};
 use crate::ui::gallery::{GalleryEvent, GalleryState};
+use crate::ui::message_window::{self, MessageWindow};
 use crate::ui::preferences::{PrefTab, SettingsWindow};
+use crate::ui::print_preview::{self, PrintPreviewState};
 use crate::ui::{compose, message_list, reader, sidebar, welcome, window_controls};
 
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
@@ -501,6 +508,30 @@ pub(crate) struct HylkiApp {
     pub(crate) collapsed_thread_cards: HashSet<u32>,
     /// 当前会话阅读器中处于「查看邮件原文」模式的卡片邮件 ID 集合。
     pub(crate) raw_source_message_ids: HashSet<u32>,
+    /// WP-09：阅读器中已展开历史引用块的邮件 ID 集合（默认折叠）。
+    pub(crate) expanded_quote_message_ids: HashSet<u32>,
+    /// WP-09：底部附件抽屉折叠状态、高度、列表/网格模式与排序方向。
+    pub(crate) attachment_drawer_collapsed: bool,
+    pub(crate) attachment_drawer_height: f32,
+    pub(crate) attachment_drawer_list_view: bool,
+    pub(crate) attachment_drawer_sort_desc: bool,
+    /// WP-09：附件缩略图内存缓存与已请求标记。
+    pub(crate) attachment_thumb_cache: HashMap<u32, Arc<Image>>,
+    pub(crate) attachment_thumb_requested: HashSet<u32>,
+    /// WP-09：正在从服务器剥离中的附件 ID 集合及待二次确认的附件 ID。
+    pub(crate) stripping_attachment_ids: HashSet<u32>,
+    pub(crate) pending_strip_attachment_id: Option<u32>,
+    /// WP-09：附件抽屉图片点击大图预览 `(attachment_id, filename, image)`。
+    pub(crate) drawer_image_preview: Option<(u32, String, Option<Arc<Image>>)>,
+    /// WP-09：阅读器页内查找栏状态与每个卡片的 `TextViewState` 缓存。
+    pub(crate) reader_find_open: bool,
+    pub(crate) reader_find_input: Entity<InputState>,
+    pub(crate) reader_find_query: String,
+    pub(crate) reader_find_active_match: usize,
+    pub(crate) reader_find_total_matches: usize,
+    pub(crate) reader_text_states: HashMap<u32, (String, Entity<TextViewState>)>,
+    /// WP-09：打印预览浮层状态。
+    pub(crate) print_preview: Option<PrintPreviewState>,
     /// B-2：列表行菜单挂起的后续动作（等对应正文加载完成后执行）。
     pub(crate) pending_row_action: Option<(u32, PendingRowAction)>,
     /// B-2：正在抓取原始 MIME 以导出 .eml 的邮件 ID（「导出中…」状态，防重复点击）。
@@ -743,6 +774,24 @@ impl HylkiApp {
         })
         .detach();
 
+        let reader_find_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("在邮件正文中查找..."));
+        cx.subscribe(
+            &reader_find_input,
+            |this, input, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    this.reader_find_query = input.read(cx).value().to_string();
+                    this.reader_find_active_match = 0;
+                    this.refresh_reader_find_highlights(cx);
+                }
+                InputEvent::PressEnter { secondary, shift } => {
+                    this.step_reader_find(if *secondary || *shift { -1 } else { 1 }, cx);
+                }
+                _ => {}
+            },
+        )
+        .detach();
+
         let initial_rem_scale = config::clamp_ui_text_scale(prefs.ui_text_scale_percent);
         window.set_rem_size(px(16.0 * initial_rem_scale as f32 / 100.0));
         let initial_show_accounts = prefs.show_accounts;
@@ -884,6 +933,23 @@ impl HylkiApp {
                 allowed_remote_image_ids: HashSet::new(),
                 collapsed_thread_cards: initial_collapsed,
                 raw_source_message_ids: HashSet::new(),
+                expanded_quote_message_ids: HashSet::new(),
+                attachment_drawer_collapsed: false,
+                attachment_drawer_height: DRAWER_DEFAULT_HEIGHT,
+                attachment_drawer_list_view: false,
+                attachment_drawer_sort_desc: false,
+                attachment_thumb_cache: HashMap::new(),
+                attachment_thumb_requested: HashSet::new(),
+                stripping_attachment_ids: HashSet::new(),
+                pending_strip_attachment_id: None,
+                drawer_image_preview: None,
+                reader_find_open: false,
+                reader_find_input,
+                reader_find_query: String::new(),
+                reader_find_active_match: 0,
+                reader_find_total_matches: 0,
+                reader_text_states: HashMap::new(),
+                print_preview: None,
                 pending_row_action: None,
                 pending_eml_export: None,
                 pending_undo: None,
@@ -1060,6 +1126,23 @@ impl HylkiApp {
             allowed_remote_image_ids: HashSet::new(),
             collapsed_thread_cards: HashSet::new(),
             raw_source_message_ids: HashSet::new(),
+            expanded_quote_message_ids: HashSet::new(),
+            attachment_drawer_collapsed: false,
+            attachment_drawer_height: DRAWER_DEFAULT_HEIGHT,
+            attachment_drawer_list_view: false,
+            attachment_drawer_sort_desc: false,
+            attachment_thumb_cache: HashMap::new(),
+            attachment_thumb_requested: HashSet::new(),
+            stripping_attachment_ids: HashSet::new(),
+            pending_strip_attachment_id: None,
+            drawer_image_preview: None,
+            reader_find_open: false,
+            reader_find_input,
+            reader_find_query: String::new(),
+            reader_find_active_match: 0,
+            reader_find_total_matches: 0,
+            reader_text_states: HashMap::new(),
+            print_preview: None,
             pending_row_action: None,
             pending_eml_export: None,
             pending_undo: None,
@@ -1739,13 +1822,23 @@ impl HylkiApp {
                         SharedString::from(format!("已复制邮件到 {target_folder_path}"));
                     cx.notify();
                 }
-                // F-6：附件总览图片预览字节到达（仅等待中的附件生效）。
+                // F-6：附件总览图片预览字节到达（同时回填 WP-09 底部附件抽屉缩略图与大图预览）。
                 WorkerEvent::AttachmentBytesFetched {
                     attachment_id,
                     filename,
                     mime_type,
                     bytes,
                 } => {
+                    if let Some(fmt) = attachment_drawer::image_format_for_mime(&mime_type) {
+                        let image = Arc::new(Image::from_bytes(fmt, bytes.clone()));
+                        self.attachment_thumb_cache
+                            .insert(attachment_id, image.clone());
+                        if let Some((prev_id, _, ref mut slot)) = self.drawer_image_preview {
+                            if prev_id == attachment_id {
+                                *slot = Some(image);
+                            }
+                        }
+                    }
                     if self.gallery_preview_pending == Some(attachment_id) {
                         self.gallery_preview_pending = None;
                         if let Some(ref g) = self.gallery {
@@ -1755,6 +1848,38 @@ impl HylkiApp {
                             });
                         }
                     }
+                }
+                WorkerEvent::AttachmentStripped {
+                    account_id: _,
+                    message_id,
+                    attachment_id,
+                    attachments,
+                } => {
+                    self.stripping_attachment_ids.remove(&attachment_id);
+                    if self.pending_strip_attachment_id == Some(attachment_id) {
+                        self.pending_strip_attachment_id = None;
+                    }
+                    if let Some(ref mut sel) = self.selected_message {
+                        if sel.id == message_id {
+                            sel.attachments = attachments.clone();
+                        }
+                    }
+                    if let Some(ref mut sel) = self.selected_message {
+                        for tm in &mut sel.thread_messages {
+                            if tm.id == message_id {
+                                tm.attachments = attachments.clone();
+                            }
+                        }
+                    }
+                }
+                WorkerEvent::AttachmentStripFailed {
+                    account_id: _,
+                    message_id: _,
+                    attachment_id,
+                    message,
+                } => {
+                    self.stripping_attachment_ids.remove(&attachment_id);
+                    self.status_line = SharedString::from(format!("剥离附件失败：{message}"));
                 }
             }
         }
@@ -3685,6 +3810,318 @@ impl HylkiApp {
                 });
             }
             cx.notify();
+        }
+    }
+
+    // ---- WP-09：引用折叠、附件抽屉、页内查找、打印预览与独立窗口 ----
+
+    pub(crate) fn toggle_quote_expanded(&mut self, msg_id: u32, cx: &mut Context<Self>) {
+        if !self.expanded_quote_message_ids.remove(&msg_id) {
+            self.expanded_quote_message_ids.insert(msg_id);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_attachment_drawer(&mut self, cx: &mut Context<Self>) {
+        self.attachment_drawer_collapsed = !self.attachment_drawer_collapsed;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_attachment_drawer_view(&mut self, cx: &mut Context<Self>) {
+        self.attachment_drawer_list_view = !self.attachment_drawer_list_view;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_attachment_drawer_sort(&mut self, cx: &mut Context<Self>) {
+        self.attachment_drawer_sort_desc = !self.attachment_drawer_sort_desc;
+        cx.notify();
+    }
+
+    pub(crate) fn on_attachment_drawer_drag_move(
+        &mut self,
+        event: &DragMoveEvent<AttachmentDrawerDrag>,
+        cx: &mut Context<Self>,
+    ) {
+        let pointer_y = event.event.position.y.as_f32();
+        let bottom_y = event.bounds.bottom().as_f32();
+        // 抽屉位于底部，总高度约为 bottom_y - pointer_y；减去标题与手柄高度（~48px）得到内容区高度。
+        let body_h = (bottom_y - pointer_y - 48.0).clamp(DRAWER_MIN_HEIGHT, DRAWER_MAX_HEIGHT);
+        self.attachment_drawer_collapsed = false;
+        self.attachment_drawer_height = body_h;
+        cx.notify();
+    }
+
+    pub(crate) fn ensure_attachment_thumbnail(&mut self, att_id: u32, mime_type: &str) {
+        if self.demo_mode
+            || attachment_drawer::image_format_for_mime(mime_type).is_none()
+            || self.attachment_thumb_cache.contains_key(&att_id)
+            || !self.attachment_thumb_requested.insert(att_id)
+        {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::FetchAttachmentBytes {
+                attachment_id: att_id,
+            });
+        }
+    }
+
+    pub(crate) fn ask_strip_attachment(&mut self, att_id: u32, cx: &mut Context<Self>) {
+        self.pending_strip_attachment_id = Some(att_id);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_strip_attachment(&mut self, cx: &mut Context<Self>) {
+        self.pending_strip_attachment_id = None;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_strip_attachment(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        attachment_id: u32,
+        attachment_name: String,
+        size_bytes: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_strip_attachment_id = None;
+        if self.demo_mode {
+            return;
+        }
+        self.stripping_attachment_ids.insert(attachment_id);
+        self.status_line =
+            SharedString::from(format!("正在从服务器剥离附件：{attachment_name}..."));
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::StripAttachment {
+                account_id,
+                message_id,
+                attachment_id,
+                attachment_name,
+                size_bytes,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_drawer_image_preview(
+        &mut self,
+        att_id: u32,
+        filename: String,
+        mime_type: String,
+        cx: &mut Context<Self>,
+    ) {
+        let cached = self.attachment_thumb_cache.get(&att_id).cloned();
+        if cached.is_none() {
+            self.ensure_attachment_thumbnail(att_id, &mime_type);
+        }
+        self.drawer_image_preview = Some((att_id, filename, cached));
+        cx.notify();
+    }
+
+    pub(crate) fn close_drawer_image_preview(&mut self, cx: &mut Context<Self>) {
+        self.drawer_image_preview = None;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_reader_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reader_find_open = !self.reader_find_open;
+        if self.reader_find_open {
+            self.reader_find_input
+                .update(cx, |s, cx| s.focus(window, cx));
+            self.refresh_reader_find_highlights(cx);
+        } else {
+            self.reader_find_query.clear();
+            self.reader_find_total_matches = 0;
+            self.reader_find_active_match = 0;
+            for (_, state) in self.reader_text_states.values() {
+                state.update(cx, |s, cx| s.clear_range_highlights(cx));
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn step_reader_find(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.reader_find_total_matches == 0 {
+            return;
+        }
+        let len = self.reader_find_total_matches as isize;
+        self.reader_find_active_match =
+            ((self.reader_find_active_match as isize + delta).rem_euclid(len)) as usize;
+        self.refresh_reader_find_highlights(cx);
+    }
+
+    pub(crate) fn refresh_reader_find_highlights(&mut self, cx: &mut Context<Self>) {
+        let query = self.reader_find_query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            self.reader_find_total_matches = 0;
+            self.reader_find_active_match = 0;
+            for (_, state) in self.reader_text_states.values() {
+                state.update(cx, |s, cx| s.clear_range_highlights(cx));
+            }
+            cx.notify();
+            return;
+        }
+        let mut ordered_ids: Vec<u32> = self.reader_text_states.keys().copied().collect();
+        ordered_ids.sort_unstable();
+
+        let mut all_matches = Vec::new();
+        let mut total = 0usize;
+        for id in ordered_ids {
+            if let Some((_, state)) = self.reader_text_states.get(&id) {
+                let rendered = state.read(cx).rendered_text();
+                let ranges =
+                    message_window::find_case_insensitive_ranges(rendered.as_str(), &query);
+                total += ranges.len();
+                all_matches.push((state.clone(), ranges));
+            }
+        }
+        self.reader_find_total_matches = total;
+        if total == 0 || self.reader_find_active_match >= total {
+            self.reader_find_active_match = 0;
+        }
+
+        let normal_bg = gpui_kit::hsla(48.0 / 360.0, 0.96, 0.62, 0.45);
+        let active_bg = gpui_kit::hsla(28.0 / 360.0, 0.96, 0.56, 0.78);
+        let mut cursor = 0usize;
+        for (state, ranges) in all_matches {
+            let mut highlights = Vec::with_capacity(ranges.len());
+            let mut reveal = None;
+            for r in ranges {
+                let is_active = total > 0 && cursor == self.reader_find_active_match;
+                if is_active {
+                    reveal = Some(r.clone());
+                }
+                highlights.push(RangeHighlight::new(
+                    r,
+                    if is_active { active_bg } else { normal_bg },
+                ));
+                cursor += 1;
+            }
+            state.update(cx, |s, cx| {
+                let _ = s.set_range_highlights(highlights, cx);
+                if let Some(r) = reveal {
+                    let _ = s.reveal_range(r, cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn ensure_reader_text_state(
+        &mut self,
+        msg_id: u32,
+        html: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        if let Some((cached_html, state)) = self.reader_text_states.get(&msg_id) {
+            if cached_html == html {
+                return state.clone();
+            }
+        }
+        let state = cx.new(|cx| TextViewState::html(html, cx).selectable(true));
+        self.reader_text_states
+            .insert(msg_id, (html.to_string(), state.clone()));
+        state
+    }
+
+    pub(crate) fn open_print_preview(&mut self, detail: MessageDetail, cx: &mut Context<Self>) {
+        self.print_preview = Some(PrintPreviewState::new(detail));
+        cx.notify();
+    }
+
+    pub(crate) fn close_print_preview(&mut self, cx: &mut Context<Self>) {
+        self.print_preview = None;
+        cx.notify();
+    }
+
+    pub(crate) fn export_print_preview_pdf(&mut self, cx: &mut Context<Self>) {
+        let Some(ref state) = self.print_preview else {
+            return;
+        };
+        let default_name = format!(
+            "{}.pdf",
+            sanitize_filename(&state.detail.subject)
+                .chars()
+                .take(48)
+                .collect::<String>()
+        );
+        if let Some(dest) = rfd::FileDialog::new()
+            .add_filter("PDF 文件", &["pdf"])
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            match print_preview::export_print_pdf(
+                state,
+                &dest,
+                &self.prefs.date_style,
+                &self.prefs.clock_style,
+            ) {
+                Ok(msg) => {
+                    if let Some(ref mut pp) = self.print_preview {
+                        pp.status_note = Some(SharedString::from(msg.clone()));
+                    }
+                    self.status_line = SharedString::from(msg);
+                }
+                Err(err) => {
+                    if let Some(ref mut pp) = self.print_preview {
+                        pp.status_note = Some(SharedString::from(err.clone()));
+                    }
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn run_system_print(&mut self, cx: &mut Context<Self>) {
+        let Some(ref state) = self.print_preview else {
+            return;
+        };
+        match print_preview::launch_system_print(
+            state,
+            &self.prefs.date_style,
+            &self.prefs.clock_style,
+        ) {
+            Ok(()) => {
+                if let Some(ref mut pp) = self.print_preview {
+                    pp.status_note = Some(SharedString::from(
+                        "已在系统打印页打开，请在弹出的打印对话框中确认打印",
+                    ));
+                }
+            }
+            Err(err) => {
+                if let Some(ref mut pp) = self.print_preview {
+                    pp.status_note = Some(SharedString::from(err));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn pop_out_message_window(&mut self, detail: MessageDetail, cx: &mut Context<Self>) {
+        let app_weak = cx.entity().downgrade();
+        let prefs = self.prefs.clone();
+        let title = if detail.subject.trim().is_empty() {
+            "邮件阅读".to_string()
+        } else {
+            detail.subject.clone()
+        };
+        let centered = Bounds::centered(None, size(px(860.0), px(720.0)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(centered)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.clone().into()),
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            ..Default::default()
+        };
+        if let Ok((_handle, _entity)) = gpui_kit::open_window(options, cx, move |window, cx| {
+            window.set_window_title(&title);
+            cx.new(|cx| MessageWindow::new(detail, app_weak, prefs, window, cx))
+        }) {
+            #[cfg(target_os = "windows")]
+            crate::apply_window_icon();
         }
     }
 
@@ -6785,14 +7222,27 @@ impl Render for HylkiApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                // 仅三栏视图且无浮层时展开并聚焦中栏搜索栏（Ctrl+F / `/`）。
+                // 仅三栏视图且无浮层时：若阅读器页内查找已打开或处于专注阅读模式，则聚焦页内查找，
+                // 否则展开并聚焦中栏搜索栏（Ctrl+F / `/`）。
                 if this.main_view == MainContentView::Mail && this.active_modal == ActiveModal::None
                 {
-                    this.search_open = true;
-                    this.search_input.update(cx, |state, cx| {
-                        state.focus(window, cx);
-                    });
-                    cx.notify();
+                    if this.reader_find_open
+                        || (this.focus_mode
+                            && this.right_mode == RightPaneMode::Reader
+                            && this.selected_message.is_some())
+                    {
+                        this.reader_find_open = true;
+                        this.reader_find_input.update(cx, |state, cx| {
+                            state.focus(window, cx);
+                        });
+                        cx.notify();
+                    } else {
+                        this.search_open = true;
+                        this.search_input.update(cx, |state, cx| {
+                            state.focus(window, cx);
+                        });
+                        cx.notify();
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &RefreshAllAccounts, _window, cx| {
@@ -7133,6 +7583,18 @@ impl Render for HylkiApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
+                if this.print_preview.is_some() {
+                    this.close_print_preview(cx);
+                    return;
+                }
+                if this.drawer_image_preview.is_some() {
+                    this.close_drawer_image_preview(cx);
+                    return;
+                }
+                if this.reader_find_open {
+                    this.toggle_reader_find(window, cx);
+                    return;
+                }
                 // Esc 优先级：收起抽屉侧栏 > 关闭浮层 > 清空文件夹确认 > 写信退出确认
                 // > 撤销发送 > 取消多选。WP-01：半屏抽屉对齐 Linux OverlaySplitView，
                 // Esc 先收起抽屉。
@@ -7236,6 +7698,85 @@ impl Render for HylkiApp {
                 );
             }
             ActiveModal::None => {}
+        }
+        if let Some(ref pp) = self.print_preview {
+            root = root.child(print_preview::render_modal(
+                pp,
+                &self.prefs.date_style,
+                &self.prefs.clock_style,
+                cx,
+            ));
+        }
+        if let Some((_att_id, ref filename, ref image_opt)) = self.drawer_image_preview {
+            let fname = filename.clone();
+            let img_opt = image_opt.clone();
+            root = root.child(
+                div()
+                    .id("drawer-image-lightbox")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(black().opacity(0.65))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_8()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.close_drawer_image_preview(cx);
+                        }),
+                    )
+                    .child(
+                        v_flex()
+                            .max_w(px(860.0))
+                            .max_h(px(680.0))
+                            .bg(p.surface)
+                            .rounded(px(12.0))
+                            .border_1()
+                            .border_color(border)
+                            .p_4()
+                            .gap_3()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                            .child(SharedString::from(fname)),
+                                    )
+                                    .child(
+                                        Button::new("drawer-lightbox-close")
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::X)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.close_drawer_image_preview(cx);
+                                            })),
+                                    ),
+                            )
+                            .child(if let Some(image) = img_opt {
+                                img(image)
+                                    .object_fit(ObjectFit::Contain)
+                                    .max_w(px(820.0))
+                                    .max_h(px(580.0))
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .p_8()
+                                    .text_xs()
+                                    .text_color(p.text_muted)
+                                    .child("正在加载图片预览...")
+                                    .into_any_element()
+                            }),
+                    ),
+            );
         }
         root
     }
