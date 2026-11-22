@@ -72,6 +72,10 @@ pub(crate) const BELOW_LIST_DEFAULT_HEIGHT: f32 = 360.0;
 pub(crate) const READER_OVERFLOW_BREAKPOINT: f32 = 880.0;
 /// L-2：宽度拖拽停止后的落盘防抖时长（对齐原版 mail_split.rs SAVE_AFTER = 600ms）。
 const LAYOUT_SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
+/// P3：半屏自动窄轨断点（对齐 Linux `adw::Breakpoint` MaxWidth 1094px，
+/// src/app/window.rs）：窗口宽度 ≤ 该值（gpui 逻辑像素，与 DPI 缩放无关）时
+/// 自动进入 80px 图标窄轨；扩回 > 该值时交还用户的手动折叠偏好。
+pub(crate) const AUTO_RAIL_BREAKPOINT: f32 = 1094.0;
 
 /// L-2：单行表格模式迟滞判定（对齐原版 list_header.rs：进入 ≥600、退出 <560，
 /// 两侧留余量防拖拽在阈值附近来回抖动）。
@@ -81,6 +85,20 @@ fn list_wide_next(current_wide: bool, width: f32) -> bool {
     } else {
         width >= LIST_WIDE_ON
     }
+}
+
+/// P3：半屏自动窄轨判定（对齐 Linux libadwaita MaxWidth 断点语义：宽度 ≤ 断点
+/// 即进入窄轨，无迟滞；纯函数便于单测）。
+fn auto_rail_next(width: f32) -> bool {
+    width <= AUTO_RAIL_BREAKPOINT
+}
+
+/// P3：窄窗口浮层侧栏宽度（对齐 Linux peek 面板：沿用手动宽度偏好并夹取，
+/// 上限再夹到窄轨右侧剩余空间，防止极窄窗口下面板溢出屏幕）。
+fn peek_sidebar_width(pref_width: f32, viewport_w: f32) -> f32 {
+    pref_width
+        .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+        .min((viewport_w - sidebar::RAIL_WIDTH).max(0.0))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -416,6 +434,20 @@ pub(crate) struct HylkiApp {
     pub(crate) system_dark_mode: bool,
     /// 左栏是否隐藏（中栏顶部开关）。
     pub(crate) sidebar_hidden: bool,
+    /// P3：断点驱动的自动窄轨（窗口 ≤ 1094px 时为 true）。不落盘、不覆盖
+    /// `sidebar_hidden` 手动偏好（对齐 Linux AutoRail：窄轨自动接管，扩回
+    /// 宽窗口时手动偏好原样恢复）。
+    pub(crate) auto_rail_active: bool,
+    /// P3：窄窗口浮层侧栏是否展开（完整侧栏以浮层盖在中栏之上；导航选择后
+    /// 自动关闭，对齐 Linux sidebar_peek）。
+    pub(crate) sidebar_peek_open: bool,
+    /// P3：列表焦点近似态（Linux focus-within）：最近一次列表交互（点击行 /
+    /// 键盘选择）后为 true，点击阅读器后为 false；渲染时再结合文本输入焦点
+    /// 判定，驱动选中行药丸在 0.5 / 0.3 两档间切换。
+    pub(crate) list_focused: bool,
+    /// P3：键盘游标所在邮件（j/k、方向键移动，点击行后清除；对齐 Linux
+    /// .kbd-cursor：列表持焦点时非选中行画 accent 轮廓，选中行轮廓改 accent_fg）。
+    pub(crate) kbd_cursor_message_id: Option<u32>,
     /// 中栏搜索栏是否展开（对齐原版：顶栏常驻 🔍 图标，点按或 Ctrl+F 展开）。
     pub(crate) search_open: bool,
     /// 列表排序方式（6 种，默认最新优先）。
@@ -797,6 +829,10 @@ impl HylkiApp {
                 dark_mode: initial_dark_mode,
                 system_dark_mode,
                 sidebar_hidden: initial_sidebar_hidden,
+                auto_rail_active: false,
+                sidebar_peek_open: false,
+                list_focused: false,
+                kbd_cursor_message_id: None,
                 search_open: false,
                 list_sort: MessageSort::DateNewest,
                 quick_filters: QuickFilterSet::default(),
@@ -962,6 +998,10 @@ impl HylkiApp {
             dark_mode: initial_dark_mode,
             system_dark_mode,
             sidebar_hidden: initial_sidebar_hidden,
+            auto_rail_active: false,
+            sidebar_peek_open: false,
+            list_focused: false,
+            kbd_cursor_message_id: None,
             search_open: false,
             list_sort: MessageSort::DateNewest,
             quick_filters: QuickFilterSet::default(),
@@ -1715,6 +1755,8 @@ impl HylkiApp {
 
     /// 切换左栏统一导航视图（收件箱 / 星标 / 已发送 / 草稿 / 归档）。
     pub(crate) fn select_unified_view(&mut self, view: CurrentView, cx: &mut Context<Self>) {
+        // P3：浮层侧栏里点选统一视图即导航完成，收起浮层。
+        self.close_sidebar_peek();
         self.current_view = view;
         self.reset_list_pagination();
         self.selected_message = None;
@@ -1742,6 +1784,8 @@ impl HylkiApp {
         folder_path: String,
         cx: &mut Context<Self>,
     ) {
+        // P3：浮层侧栏里点选文件夹即导航完成，收起浮层。
+        self.close_sidebar_peek();
         self.selected_folder_id = folder_id;
         self.current_view = CurrentView::AccountFolder;
         self.reset_list_pagination();
@@ -1793,6 +1837,8 @@ impl HylkiApp {
         folder_path: &str,
         cx: &mut Context<Self>,
     ) {
+        // P3：选中邮件即导航完成，收起浮层侧栏（浮层打开时列表仍可点选）。
+        self.close_sidebar_peek();
         self.right_mode = RightPaneMode::Reader;
         self.read_mark_generation = self.read_mark_generation.wrapping_add(1);
         let gen = self.read_mark_generation;
@@ -2834,6 +2880,8 @@ impl HylkiApp {
 
     pub(crate) fn start_new_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.main_view = MainContentView::Mail;
+        // P3：从浮层侧栏 / 窄轨发起写信时同步收起浮层。
+        self.close_sidebar_peek();
         let preferred_id = if !self.prefs.compose_default_from.trim().is_empty() {
             self.accounts
                 .iter()
@@ -3802,7 +3850,21 @@ impl HylkiApp {
         cx.notify();
     }
 
+    /// 左栏当前是否处于 80px 图标窄轨：手动折叠或断点自动折叠任一成立
+    /// （对齐 Linux rail_wanted = auto_rail || sidebar_collapsed）。
+    pub(crate) fn sidebar_narrow(&self) -> bool {
+        self.sidebar_hidden || self.auto_rail_active
+    }
+
+    /// P3：窄窗口浮层侧栏开关（中栏顶部按钮）。断点自动窄轨生效时不再原地
+    /// 展开窄轨，而是打开 / 关闭覆盖在中栏之上的完整侧栏浮层（对齐 Linux
+    /// toggle_sidebar：narrow 窗口下 toggle 只浮动 peek 面板，不落盘）。
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.auto_rail_active {
+            self.sidebar_peek_open = !self.sidebar_peek_open;
+            cx.notify();
+            return;
+        }
         self.sidebar_hidden = !self.sidebar_hidden;
         if self.prefs.remember_sidebar_collapsed {
             self.prefs.sidebar_collapsed = self.sidebar_hidden;
@@ -3811,11 +3873,19 @@ impl HylkiApp {
         cx.notify();
     }
 
+    /// P3：关闭窄窗口浮层侧栏（导航 / 选择完成后调用，对齐 Linux
+    /// close_sidebar_peek：在浮层里点完导航即收起，浮层不再遮挡中栏）。
+    pub(crate) fn close_sidebar_peek(&mut self) {
+        if self.sidebar_peek_open {
+            self.sidebar_peek_open = false;
+        }
+    }
+
     // ---- L-2：三栏宽度拖拽与持久化 ----
 
     /// 当前左栏在界面上的实际宽度（窄轨模式为固定 80px，不参与拖拽）。
     pub(crate) fn sidebar_visual_width(&self) -> f32 {
-        if self.sidebar_hidden {
+        if self.sidebar_narrow() {
             sidebar::RAIL_WIDTH
         } else {
             self.sidebar_width
@@ -4280,6 +4350,8 @@ impl HylkiApp {
             self.gallery_sub = Some(sub);
         }
         self.main_view = MainContentView::Gallery;
+        // P3：切到 Gallery 即导航完成，收起浮层侧栏。
+        self.close_sidebar_peek();
         // 同步账号筛选列表并按当前搜索词重新拉取缓存数据。
         let accounts = self
             .accounts
@@ -4480,6 +4552,8 @@ impl HylkiApp {
             c.update(cx, |state, _cx| state.set_demo_mode(self.demo_mode));
         }
         self.main_view = MainContentView::Contacts;
+        // P3：切到联系人页即导航完成，收起浮层侧栏。
+        self.close_sidebar_peek();
         self.request_known_contacts(cx);
         cx.notify();
     }
@@ -5207,8 +5281,9 @@ impl HylkiApp {
         }
     }
 
-    /// 检查当前窗口焦点是否位于任意文本输入框（防止 Delete / 方向键与打字冲突）。
-    fn is_text_input_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+    /// 检查当前窗口焦点是否位于任意文本输入框（防止 Delete / 方向键与打字冲突；
+    /// P3 起也供邮件行渲染判定「列表焦点近似态」使用）。
+    pub(crate) fn is_text_input_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
         self.search_input.focus_handle(cx).is_focused(window)
             || self.compose_to.focus_handle(cx).is_focused(window)
             || self.compose_cc.focus_handle(cx).is_focused(window)
@@ -5231,6 +5306,10 @@ impl HylkiApp {
             return;
         };
         let msg = items[next_idx].clone();
+        // P3：键盘导航视为列表持焦点，并把键盘游标移到该行（对齐 Linux j/k 的
+        // .kbd-cursor：点击行后由行点击处理器清除）。
+        self.list_focused = true;
+        self.kbd_cursor_message_id = Some(msg.id);
         self.selected_message_ids.clear();
         self.select_message(
             msg.account_id,
@@ -5566,15 +5645,33 @@ impl Render for HylkiApp {
             self.last_move_undo = None;
         }
 
+        // P3：半屏自动窄轨断点（对齐 Linux adw::Breakpoint MaxWidth 1094px）。
+        // gpui 无断点组件，沿用现有 render 帧读取 viewport 的模式（与
+        // preferences/reader 相同）：窗口 resize 必然触发重渲染，此处仅在跨越
+        // 断点时翻转状态，不每帧改状态。自动折叠不覆盖手动偏好 `sidebar_hidden`。
+        let viewport_w = window.viewport_size().width.as_f32();
+        let auto_rail = auto_rail_next(viewport_w);
+        if auto_rail != self.auto_rail_active {
+            self.auto_rail_active = auto_rail;
+            // 扩回宽窗口时收起浮层并还原为分栏侧栏（对齐 Linux AutoRail(false)）。
+            if !auto_rail {
+                self.sidebar_peek_open = false;
+            }
+        }
+
         let hide_sidebar = self.focus_mode && self.prefs.focus_hide_sidebar;
         let sidebar_el = if hide_sidebar {
             None
-        } else if self.sidebar_hidden {
-            // 折叠为 80px 图标窄轨（对齐原版 rail），不再整体移除左栏。
+        } else if self.sidebar_narrow() {
+            // 折叠为 80px 图标窄轨（对齐原版 rail），不再整体移除左栏；
+            // 断点自动窄轨与手动折叠共用同一窄轨形态。
             Some(sidebar::render_collapsed(self, cx))
         } else {
             Some(sidebar::render(self, cx))
         };
+        // P3：浮层侧栏渲染参数（仅断点窄轨下打开；专注模式隐藏左栏时不渲染）。
+        let peek_open = self.sidebar_peek_open && sidebar_el.is_some();
+        let peek_w = peek_sidebar_width(self.sidebar_width, viewport_w);
 
         // 主内容区路由（方案文档五.1）：Gallery / Contacts 保留左栏，
         // 中栏 + 右栏区域整体替换为对应组件。
@@ -5773,6 +5870,22 @@ impl Render for HylkiApp {
                 )
             })
             .child(body)
+            // P3：窄窗口浮层侧栏（对齐 Linux sidebar_peek：完整侧栏从窄轨右缘
+            // 滑出、盖在中栏列表 / 阅读器之上；导航选择后由各入口自动关闭）。
+            // 绝对定位 + 后挂子元素保证绘制在最上层。
+            .when(peek_open, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(sidebar::RAIL_WIDTH))
+                        .w(px(peek_w))
+                        .shadow_xl()
+                        .bg(p.sidebar)
+                        .child(sidebar::render(&*self, cx)),
+                )
+            })
             // L-2：三栏拖拽把手的移动监听（把手元素只负责发起拖拽，宽度更新在此完成），
             // 挂在根节点上使 Mail / Gallery / Contacts 等任意视图下的侧栏把手都生效。
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<SidebarDrag>, _, cx| {
@@ -7221,6 +7334,33 @@ mod tests {
         assert!(list_wide_next(true, 560.0));
         assert!(list_wide_next(true, 599.0));
         assert!(!list_wide_next(true, 559.0));
+    }
+
+    /// P3：半屏自动窄轨断点（对齐 Linux adw::Breakpoint MaxWidth 1094px：
+    /// ≤1094 进入窄轨，>1094 还原宽栏，无迟滞）。
+    #[test]
+    fn auto_rail_breakpoint_matches_linux_semantics() {
+        // 半屏 1920/2 与验收边界：1094 及以下进入窄轨。
+        assert!(auto_rail_next(960.0));
+        assert!(auto_rail_next(1093.0));
+        assert!(auto_rail_next(1094.0));
+        // 1095 起恢复宽栏。
+        assert!(!auto_rail_next(1095.0));
+        assert!(!auto_rail_next(1280.0));
+        assert!(!auto_rail_next(1440.0));
+    }
+
+    /// P3：浮层侧栏宽度夹取（沿用手动宽度偏好，上限再夹到窄轨右侧剩余空间）。
+    #[test]
+    fn peek_sidebar_width_clamps_to_preference_and_viewport() {
+        // 常规半屏窗口：夹取到偏好宽度区间 180~280。
+        assert_eq!(peek_sidebar_width(240.0, 1094.0), 240.0);
+        assert_eq!(peek_sidebar_width(120.0, 1094.0), 180.0);
+        assert_eq!(peek_sidebar_width(400.0, 1094.0), 280.0);
+        // 极窄窗口：不超过窄轨右侧剩余空间，且不为负。
+        assert_eq!(peek_sidebar_width(280.0, 700.0), 280.0);
+        assert_eq!(peek_sidebar_width(280.0, 200.0), 120.0);
+        assert_eq!(peek_sidebar_width(280.0, 60.0), 0.0);
     }
 
     /// L-2：布局常量自洽（侧栏范围、列表 / 阅读器最小值与顶栏收纳阈值关系）。
