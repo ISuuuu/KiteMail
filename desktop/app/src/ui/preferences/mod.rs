@@ -235,8 +235,7 @@ impl SettingsWindow {
         }
 
         let editor_open = initial_tab == PrefTab::MailAccounts && open_account_editor;
-        let narrow_show_content =
-            editor_open || edit_account.is_some() || preset_idx.is_some();
+        let narrow_show_content = editor_open || edit_account.is_some() || preset_idx.is_some();
 
         Self {
             app,
@@ -272,11 +271,7 @@ impl SettingsWindow {
             && self.account_form.is_dirty(cx)
     }
 
-    pub(crate) fn open_new_account_editor(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn open_new_account_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.active_tab = PrefTab::MailAccounts;
         self.narrow_show_content = true;
         self.account_editor_open = true;
@@ -450,12 +445,7 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    pub(crate) fn select_tab(
-        &mut self,
-        tab: PrefTab,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn select_tab(&mut self, tab: PrefTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_account_editor_dirty(cx) {
             self.request_leave_editor(EditorLeaveAction::SwitchTab(tab), window, cx);
             return;
@@ -1048,8 +1038,7 @@ impl SettingsWindow {
     ) -> AnyElement {
         let in_editor = self.active_tab == PrefTab::MailAccounts && self.account_editor_open;
         let demo_mode = self.app.read(cx).demo_mode;
-        let can_remove =
-            in_editor && self.account_form.editing_account_id.is_some() && !demo_mode;
+        let can_remove = in_editor && self.account_form.editing_account_id.is_some() && !demo_mode;
         let can_save = in_editor && !demo_mode;
         let header_title: SharedString = if in_editor {
             if self.account_form.editing_account_id.is_some() {
@@ -1183,8 +1172,9 @@ impl Render for SettingsWindow {
 
         let header = self.render_content_header(narrow, &p, cx);
         let show_tab_subtitle = self.active_tab != PrefTab::MailAccounts;
-        let show_unsaved_banner =
-            self.active_tab == PrefTab::MailAccounts && self.account_editor_open && self.pending_leave_action.is_some();
+        let show_unsaved_banner = self.active_tab == PrefTab::MailAccounts
+            && self.account_editor_open
+            && self.pending_leave_action.is_some();
         let unsaved_banner = if show_unsaved_banner {
             Some(self.render_unsaved_banner(&p, cx))
         } else {
@@ -1222,11 +1212,7 @@ impl Render for SettingsWindow {
                     this.pending_leave_action = None;
                     cx.notify();
                 } else if this.active_tab == PrefTab::MailAccounts && this.account_editor_open {
-                    this.request_leave_editor(
-                        EditorLeaveAction::BackToAccountList,
-                        window,
-                        cx,
-                    );
+                    this.request_leave_editor(EditorLeaveAction::BackToAccountList, window, cx);
                 } else if window.viewport_size().width.as_f32() <= NARROW_BREAKPOINT
                     && this.narrow_show_content
                 {

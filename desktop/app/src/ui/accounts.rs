@@ -360,10 +360,7 @@ pub(crate) fn brand_for_account(acc: &AccountConfig) -> Option<&'static str> {
         Some("zoho")
     } else if host.contains("gmx.") || domain.starts_with("gmx.") {
         Some("gmx")
-    } else if host.contains("yandex.")
-        || domain.starts_with("yandex.")
-        || domain == "ya.ru"
-    {
+    } else if host.contains("yandex.") || domain.starts_with("yandex.") || domain == "ya.ru" {
         Some("yandex")
     } else if host.contains("imap.mail.com") || domain == "mail.com" {
         Some("mailcom")
@@ -597,43 +594,50 @@ impl AccountFormState {
         });
 
         // 实时同步邮箱 -> 默认昵称，并随用户输入刷新 72px 外观预览与清除过期错误。
-        cx.subscribe_in(&email, window, |this, input, event: &InputEvent, window, cx| {
-            if matches!(event, InputEvent::Change) {
-                let email_val = input.read(cx).value().to_string();
-                this.account_form.validation_error = None;
-                if this.account_form.label_synced {
-                    this.account_form
-                        .label
-                        .update(cx, |s, cx| s.set_value(email_val, window, cx));
+        cx.subscribe_in(
+            &email,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let email_val = input.read(cx).value().to_string();
+                    this.account_form.validation_error = None;
+                    if this.account_form.label_synced {
+                        this.account_form
+                            .label
+                            .update(cx, |s, cx| s.set_value(email_val, window, cx));
+                    }
+                    cx.notify();
                 }
-                cx.notify();
-            }
-        })
+            },
+        )
         .detach();
 
         cx.subscribe_in(&label, window, |this, input, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
                 let label_val = input.read(cx).value().trim().to_string();
                 let email_val = this.account_form.email.read(cx).value().trim().to_string();
-                this.account_form.label_synced =
-                    label_val.is_empty() || label_val == email_val;
+                this.account_form.label_synced = label_val.is_empty() || label_val == email_val;
                 this.account_form.validation_error = None;
                 cx.notify();
             }
         })
         .detach();
 
-        cx.subscribe_in(&emoji_input, window, |this, input, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::Change) {
-                let raw = input.read(cx).value().trim().to_string();
-                this.account_form.emoji = if raw.is_empty() {
-                    None
-                } else {
-                    Some(raw.chars().take(4).collect())
-                };
-                cx.notify();
-            }
-        })
+        cx.subscribe_in(
+            &emoji_input,
+            window,
+            |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let raw = input.read(cx).value().trim().to_string();
+                    this.account_form.emoji = if raw.is_empty() {
+                        None
+                    } else {
+                        Some(raw.chars().take(4).collect())
+                    };
+                    cx.notify();
+                }
+            },
+        )
         .detach();
 
         for watched in [
@@ -702,8 +706,7 @@ impl AccountFormState {
         self.provider_idx = cfg.map(provider_index_for_account).unwrap_or(0);
         self.original_enabled = c.enabled;
         self.original_auth_backend = c.auth_backend;
-        let (initial_label, label_synced) =
-            normalize_initial_label(c.label.as_deref(), &c.email);
+        let (initial_label, label_synced) = normalize_initial_label(c.label.as_deref(), &c.email);
         let normalized_emoji = normalize_emoji_opt(c.emoji.as_deref());
         self.label_synced = label_synced;
 
@@ -1239,7 +1242,11 @@ pub(crate) fn render_list_page(
                             )
                         }),
                 )
-                .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted_fg));
+                .child(
+                    Icon::new(IconName::ChevronRight)
+                        .xsmall()
+                        .text_color(muted_fg),
+                );
 
             card = card.child(row);
             if idx + 1 < total {
@@ -1433,16 +1440,14 @@ pub(crate) fn render_editor_page(
             let cur = win_entity.read(cx).account_form.provider_idx;
             for (idx, item) in ACCOUNT_PROVIDERS.iter().enumerate() {
                 let win_for_item = win_entity.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(item.label)
-                        .checked(idx == cur)
-                        .on_click(move |_, window, cx| {
-                            let _ = win_for_item.update(cx, |win, cx| {
-                                win.account_form.select_provider(idx, window, cx);
-                                cx.notify();
-                            });
-                        }),
-                );
+                menu = menu.item(PopupMenuItem::new(item.label).checked(idx == cur).on_click(
+                    move |_, window, cx| {
+                        let _ = win_for_item.update(cx, |win, cx| {
+                            win.account_form.select_provider(idx, window, cx);
+                            cx.notify();
+                        });
+                    },
+                ));
             }
             menu
         })
@@ -1591,12 +1596,7 @@ pub(crate) fn render_editor_page(
                         ),
                 )
                 .when(expanded, |el| {
-                    el.child(
-                        div()
-                            .px_4()
-                            .pb_3()
-                            .child(Input::new(&form.oauth_client_id)),
-                    )
+                    el.child(div().px_4().pb_3().child(Input::new(&form.oauth_client_id)))
                 })
                 .into_any_element(),
         );
@@ -1625,7 +1625,12 @@ pub(crate) fn render_editor_page(
                 .gap_2()
                 .items_center()
                 .child(div().flex_1().min_w_0().child(Input::new(&form.imap_host)))
-                .child(div().w(px(74.0)).flex_shrink_0().child(Input::new(&form.imap_port)))
+                .child(
+                    div()
+                        .w(px(74.0))
+                        .flex_shrink_0()
+                        .child(Input::new(&form.imap_port)),
+                )
                 .child(combo_button(
                     "acct-imap-sec",
                     if form.imap_tls { "SSL/TLS" } else { "STARTTLS" },
@@ -1665,7 +1670,12 @@ pub(crate) fn render_editor_page(
                 .gap_2()
                 .items_center()
                 .child(div().flex_1().min_w_0().child(Input::new(&form.smtp_host)))
-                .child(div().w(px(74.0)).flex_shrink_0().child(Input::new(&form.smtp_port)))
+                .child(
+                    div()
+                        .w(px(74.0))
+                        .flex_shrink_0()
+                        .child(Input::new(&form.smtp_port)),
+                )
                 .child(combo_button(
                     "acct-smtp-sec",
                     if form.smtp_tls { "SSL/TLS" } else { "STARTTLS" },
@@ -1831,39 +1841,42 @@ pub(crate) fn render_editor_page(
     );
 
     let effective_hex = avatar::account_accent_hex(&preview_email, form.color.as_deref());
-    let swatches = ACCOUNT_ACCENT_COLORS.iter().enumerate().map(|(idx, (hex, _name))| {
-        let selected = effective_hex.eq_ignore_ascii_case(hex);
-        let swatch_color = avatar::parse_hex_color(hex).unwrap_or(accent);
-        let hex_owned = (*hex).to_string();
-        div()
-            .id(("acct-swatch", idx))
-            .size(px(26.0))
-            .rounded_full()
-            .p(px(2.0))
-            .border(px(if selected { 2.0 } else { 1.0 }))
-            .border_color(if selected { swatch_color } else { border })
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.account_form.color = Some(hex_owned.clone());
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .size_full()
-                    .rounded_full()
-                    .bg(swatch_color)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(selected, |el| {
-                        el.child(Icon::new(IconName::Check).xsmall().text_color(white()))
-                    }),
-            )
-            .into_any_element()
-    });
+    let swatches = ACCOUNT_ACCENT_COLORS
+        .iter()
+        .enumerate()
+        .map(|(idx, (hex, _name))| {
+            let selected = effective_hex.eq_ignore_ascii_case(hex);
+            let swatch_color = avatar::parse_hex_color(hex).unwrap_or(accent);
+            let hex_owned = (*hex).to_string();
+            div()
+                .id(("acct-swatch", idx))
+                .size(px(26.0))
+                .rounded_full()
+                .p(px(2.0))
+                .border(px(if selected { 2.0 } else { 1.0 }))
+                .border_color(if selected { swatch_color } else { border })
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.account_form.color = Some(hex_owned.clone());
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .size_full()
+                        .rounded_full()
+                        .bg(swatch_color)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(selected, |el| {
+                            el.child(Icon::new(IconName::Check).xsmall().text_color(white()))
+                        }),
+                )
+                .into_any_element()
+        });
 
     let mut appearance_rows: Vec<AnyElement> = vec![
         div()
@@ -1993,7 +2006,12 @@ pub(crate) fn render_editor_page(
                         .min_w_0()
                         .gap_2()
                         .items_center()
-                        .child(div().flex_1().min_w_0().child(Input::new(&form.emoji_input)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&form.emoji_input)),
+                        )
                         .child(
                             Button::new("acct-emoji-picker")
                                 .outline()
@@ -2004,21 +2022,20 @@ pub(crate) fn render_editor_page(
                                     for emoji_choice in QUICK_EMOJIS {
                                         let win_ref = win_for_emoji.clone();
                                         let glyph = *emoji_choice;
-                                        menu = menu.item(
-                                            PopupMenuItem::new(glyph).on_click(
-                                                move |_, window, cx| {
-                                                    let _ = win_ref.update(cx, |win, cx| {
-                                                        win.account_form.emoji =
-                                                            Some(glyph.to_string());
-                                                        win.account_form.emoji_input.update(
-                                                            cx,
-                                                            |s, cx| s.set_value(glyph, window, cx),
-                                                        );
-                                                        cx.notify();
-                                                    });
-                                                },
-                                            ),
-                                        );
+                                        menu = menu.item(PopupMenuItem::new(glyph).on_click(
+                                            move |_, window, cx| {
+                                                let _ = win_ref.update(cx, |win, cx| {
+                                                    win.account_form.emoji =
+                                                        Some(glyph.to_string());
+                                                    win.account_form
+                                                        .emoji_input
+                                                        .update(cx, |s, cx| {
+                                                            s.set_value(glyph, window, cx)
+                                                        });
+                                                    cx.notify();
+                                                });
+                                            },
+                                        ));
                                     }
                                     let win_clear = win_for_emoji.clone();
                                     menu.separator().item(
@@ -2026,10 +2043,11 @@ pub(crate) fn render_editor_page(
                                             move |_, window, cx| {
                                                 let _ = win_clear.update(cx, |win, cx| {
                                                     win.account_form.emoji = None;
-                                                    win.account_form.emoji_input.update(
-                                                        cx,
-                                                        |s, cx| s.set_value("", window, cx),
-                                                    );
+                                                    win.account_form
+                                                        .emoji_input
+                                                        .update(cx, |s, cx| {
+                                                            s.set_value("", window, cx)
+                                                        });
                                                     cx.notify();
                                                 });
                                             },
@@ -2309,12 +2327,9 @@ pub(crate) fn render_editor_page(
                                                 .text_color(danger)
                                                 .child("确定移除此邮箱账号？"),
                                         )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted_fg)
-                                                .child("将删除本地邮件缓存、配置与凭据管理器中的密钥。"),
-                                        ),
+                                        .child(div().text_xs().text_color(muted_fg).child(
+                                            "将删除本地邮件缓存、配置与凭据管理器中的密钥。",
+                                        )),
                                 )
                                 .child(
                                     h_flex()
@@ -2390,18 +2405,25 @@ pub(crate) fn render_editor_page(
                         )
                     },
                 )
-                .child(setting_group("邮箱账号", None, CARD_MAX_WIDTH, account_rows, p))
-                .child(setting_group("外观", None, CARD_MAX_WIDTH, appearance_rows, p))
+                .child(setting_group(
+                    "邮箱账号",
+                    None,
+                    CARD_MAX_WIDTH,
+                    account_rows,
+                    p,
+                ))
+                .child(setting_group(
+                    "外观",
+                    None,
+                    CARD_MAX_WIDTH,
+                    appearance_rows,
+                    p,
+                ))
                 .child(signature_group)
                 .child(setting_group("同步", None, CARD_MAX_WIDTH, sync_rows, p))
-                .child(
-                    div()
-                        .px_1()
-                        .pb_4()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child("密码与 OAuth 令牌安全保存在 Windows 凭据管理器中，本地配置仅保存非敏感设置。"),
-                ),
+                .child(div().px_1().pb_4().text_xs().text_color(muted_fg).child(
+                    "密码与 OAuth 令牌安全保存在 Windows 凭据管理器中，本地配置仅保存非敏感设置。",
+                )),
         )
         .into_any_element()
 }
@@ -2426,7 +2448,14 @@ mod tests {
                 .count(),
             15
         );
-        for domestic in ["qq", "netease163", "netease126", "exmail", "aliyun_qiye", "gmail"] {
+        for domestic in [
+            "qq",
+            "netease163",
+            "netease126",
+            "exmail",
+            "aliyun_qiye",
+            "gmail",
+        ] {
             assert!(ids.contains(domestic), "missing preset {domestic}");
         }
     }

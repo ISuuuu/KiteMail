@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use gpui_kit::{
-    div, hsla, img, px, white, Div, FontWeight, Hsla, Image, ImageFormat, ObjectFit,
-    ParentElement, SharedString, Styled, StyledImage,
+    div, hsla, img, px, white, Div, FontWeight, Hsla, Image, ImageFormat, ObjectFit, ParentElement,
+    SharedString, Styled, StyledImage,
 };
 use hylki_mail_core::config::{self, AccountConfig};
 
@@ -314,45 +314,35 @@ pub fn account_circle_visual(
         .child(inner)
 }
 
-fn attach_unread_badge(
-    base: Div,
-    size: f32,
-    unread: u32,
-    accent: Hsla,
-    border: Hsla,
-) -> Div {
+fn attach_unread_badge(base: Div, size: f32, unread: u32, accent: Hsla, border: Hsla) -> Div {
     if unread == 0 {
         return base;
     }
     let badge = size * 0.5;
-    div()
-        .relative()
-        .flex_shrink_0()
-        .child(base)
-        .child(
-            div()
-                .absolute()
-                .top(px(-badge * 0.3))
-                .right(px(-badge * 0.3))
-                .rounded_full()
-                .min_w(px(badge))
-                .min_h(px(badge))
-                .bg(accent)
-                .border_1()
-                .border_color(border)
-                .flex()
-                .items_center()
-                .justify_center()
-                .px_0p5()
-                .text_size(px(badge * 0.55))
-                .text_color(white())
-                .font_weight(FontWeight::BOLD)
-                .child(SharedString::from(if unread > 99 {
-                    "99+".to_string()
-                } else {
-                    unread.to_string()
-                })),
-        )
+    div().relative().flex_shrink_0().child(base).child(
+        div()
+            .absolute()
+            .top(px(-badge * 0.3))
+            .right(px(-badge * 0.3))
+            .rounded_full()
+            .min_w(px(badge))
+            .min_h(px(badge))
+            .bg(accent)
+            .border_1()
+            .border_color(border)
+            .flex()
+            .items_center()
+            .justify_center()
+            .px_0p5()
+            .text_size(px(badge * 0.55))
+            .text_color(white())
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::from(if unread > 99 {
+                "99+".to_string()
+            } else {
+                unread.to_string()
+            })),
+    )
 }
 
 /// 账号头像（左栏账号分组），复用自定义外观圆盘并叠加右上角未读角标。

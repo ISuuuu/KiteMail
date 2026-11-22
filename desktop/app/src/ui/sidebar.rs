@@ -1067,63 +1067,58 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
                     .items_center()
                     .py_1()
                     .gap_1()
-                    .children(
-                        app.accounts
-                            .iter()
-                            .filter(|acc| acc.enabled)
-                            .map(|acc| {
-                                let acc_id = acc.id;
-                                let account_unread: u32 = app
-                                    .folders_by_account
-                                    .get(&acc.id)
-                                    .map(|folders| {
-                                        folders
-                                            .iter()
-                                            .filter(|f| {
-                                                f.path.eq_ignore_ascii_case("INBOX")
-                                                    || f.name.contains("收件箱")
-                                            })
-                                            .map(|f| f.unread_count)
-                                            .sum()
+                    .children(app.accounts.iter().filter(|acc| acc.enabled).map(|acc| {
+                        let acc_id = acc.id;
+                        let account_unread: u32 = app
+                            .folders_by_account
+                            .get(&acc.id)
+                            .map(|folders| {
+                                folders
+                                    .iter()
+                                    .filter(|f| {
+                                        f.path.eq_ignore_ascii_case("INBOX")
+                                            || f.name.contains("收件箱")
                                     })
-                                    .unwrap_or(0);
-                                div()
-                                    .id(("rail-acc", acc_id))
-                                    .relative()
-                                    .cursor_pointer()
-                                    .p(px(2.0))
-                                    .rounded(px(8.0))
-                                    .hover(|s| s.bg(p.accent_soft()))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        // 点击头像恢复宽栏并展开该账号分组。
-                                        this.sidebar_hidden = false;
-                                        this.collapsed_accounts.remove(&acc_id);
-                                        cx.notify();
-                                    }))
-                                    .child(avatar::account_circle_with_badge(
-                                        acc,
-                                        &data_dir,
-                                        28.0,
-                                        if rail_dots { 0 } else { account_unread },
-                                        accent,
-                                        sidebar_bg,
-                                    ))
-                                    .when(rail_dots && account_unread > 0, |el| {
-                                        el.child(
-                                            div()
-                                                .absolute()
-                                                .top(px(0.0))
-                                                .right(px(0.0))
-                                                .rounded_full()
-                                                .w(px(8.0))
-                                                .h(px(8.0))
-                                                .bg(accent)
-                                                .border_1()
-                                                .border_color(sidebar_bg),
-                                        )
-                                    })
-                            }),
-                    ),
+                                    .map(|f| f.unread_count)
+                                    .sum()
+                            })
+                            .unwrap_or(0);
+                        div()
+                            .id(("rail-acc", acc_id))
+                            .relative()
+                            .cursor_pointer()
+                            .p(px(2.0))
+                            .rounded(px(8.0))
+                            .hover(|s| s.bg(p.accent_soft()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                // 点击头像恢复宽栏并展开该账号分组。
+                                this.sidebar_hidden = false;
+                                this.collapsed_accounts.remove(&acc_id);
+                                cx.notify();
+                            }))
+                            .child(avatar::account_circle_with_badge(
+                                acc,
+                                &data_dir,
+                                28.0,
+                                if rail_dots { 0 } else { account_unread },
+                                accent,
+                                sidebar_bg,
+                            ))
+                            .when(rail_dots && account_unread > 0, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .right(px(0.0))
+                                        .rounded_full()
+                                        .w(px(8.0))
+                                        .h(px(8.0))
+                                        .bg(accent)
+                                        .border_1()
+                                        .border_color(sidebar_bg),
+                                )
+                            })
+                    })),
             )
         })
         // 底部固定：联系人 / 附件图标入口（现有入口的窄轨形态）。

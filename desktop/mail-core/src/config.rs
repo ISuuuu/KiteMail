@@ -622,8 +622,8 @@ pub fn avatar_path_in(dir: &Path, name: &str) -> Option<PathBuf> {
 /// Validate and copy an image file into `dir/avatars/avatar-<unix_ms>.<ext>`.
 pub fn import_avatar_file_in(dir: &Path, src: &Path) -> Result<String, String> {
     const MAX_AVATAR_BYTES: u64 = 8 * 1024 * 1024;
-    let meta = fs::metadata(src)
-        .map_err(|e| format!("无法读取所选图片文件 ({}): {e}", src.display()))?;
+    let meta =
+        fs::metadata(src).map_err(|e| format!("无法读取所选图片文件 ({}): {e}", src.display()))?;
     if !meta.is_file() {
         return Err("请选择有效的图片文件".to_string());
     }

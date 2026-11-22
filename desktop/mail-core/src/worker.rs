@@ -1745,14 +1745,26 @@ async fn handle_request(
         MailRequest::SetAccountEnabled {
             account_id,
             enabled,
-        } => {
-            match config::set_account_enabled_in(data_dir, account_id, enabled) {
-                Ok(Some(updated)) => {
-                    refresh_account_watcher(watchers, data_dir, &updated, req_tx);
-                    if let Ok(accounts) = config::load_accounts_in(data_dir) {
-                        let _ = evt_tx.send(WorkerEvent::AccountsUpdated { accounts });
-                    }
-                    let page_size = pref_page_size(data_dir);
+        } => match config::set_account_enabled_in(data_dir, account_id, enabled) {
+            Ok(Some(updated)) => {
+                refresh_account_watcher(watchers, data_dir, &updated, req_tx);
+                if let Ok(accounts) = config::load_accounts_in(data_dir) {
+                    let _ = evt_tx.send(WorkerEvent::AccountsUpdated { accounts });
+                }
+                let page_size = pref_page_size(data_dir);
+                let allowed = unified_account_ids(data_dir);
+                if let Ok(page) = cache.list_unified_inbox_for_accounts(
+                    &allowed,
+                    "",
+                    QuickFilterSet::default(),
+                    MessageSort::DateNewest,
+                    0,
+                    page_size,
+                ) {
+                    let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+                }
+                if enabled {
+                    sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
                     let allowed = unified_account_ids(data_dir);
                     if let Ok(page) = cache.list_unified_inbox_for_accounts(
                         &allowed,
@@ -1764,30 +1776,16 @@ async fn handle_request(
                     ) {
                         let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
                     }
-                    if enabled {
-                        sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
-                        let allowed = unified_account_ids(data_dir);
-                        if let Ok(page) = cache.list_unified_inbox_for_accounts(
-                            &allowed,
-                            "",
-                            QuickFilterSet::default(),
-                            MessageSort::DateNewest,
-                            0,
-                            page_size,
-                        ) {
-                            let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
-                        message: e,
-                    });
                 }
             }
-        }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: e,
+                });
+            }
+        },
     }
 }
 

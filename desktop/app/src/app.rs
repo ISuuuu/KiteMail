@@ -1118,12 +1118,11 @@ impl HylkiApp {
                             .unwrap_or(1);
                     }
                     if self.current_view == CurrentView::AccountFolder {
-                        let current_disabled = self.folders_by_account.iter().any(
-                            |(&acc_id, folders)| {
+                        let current_disabled =
+                            self.folders_by_account.iter().any(|(&acc_id, folders)| {
                                 folders.iter().any(|f| f.id == self.selected_folder_id)
                                     && self.accounts.iter().any(|a| a.id == acc_id && !a.enabled)
-                            },
-                        );
+                            });
                         if current_disabled {
                             self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                             self.current_view = CurrentView::UnifiedInbox;
