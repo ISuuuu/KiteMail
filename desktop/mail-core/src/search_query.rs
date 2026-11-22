@@ -237,7 +237,9 @@ mod tests {
         let body = "本次付款包含两张增值税专用发票，合同编号 HT-2026-009。";
         let rcpt = "财务部 <finance@company.cn>";
 
-        let q1 = SearchQuery::parse(r#"from:张伟 to:finance in:archive has:attachment is:unread is:starred "合同编号 ht-2026-009""#);
+        let q1 = SearchQuery::parse(
+            r#"from:张伟 to:finance in:archive has:attachment is:unread is:starred "合同编号 ht-2026-009""#,
+        );
         assert!(q1.matches_summary(&msg, "归档", rcpt, Some(body)));
 
         let q2 = SearchQuery::parse("is:read");
