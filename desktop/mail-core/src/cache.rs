@@ -307,6 +307,7 @@ pub fn unique_attachment_path(dir: &Path, filename: &str) -> PathBuf {
 /// Persistent SQLite mail cache.
 pub struct CacheStore {
     conn: Connection,
+    own_emails: Vec<String>,
 }
 
 impl CacheStore {
@@ -318,7 +319,10 @@ impl CacheStore {
         }
         let conn = Connection::open(path)
             .map_err(|e| format!("打开缓存数据库失败 ({}): {e}", path.display()))?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            own_emails: Vec::new(),
+        };
         store.configure_and_migrate()?;
         Ok(store)
     }
@@ -326,9 +330,21 @@ impl CacheStore {
     /// Open an isolated in-memory cache database for unit tests.
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("打开内存缓存失败: {e}"))?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            own_emails: Vec::new(),
+        };
         store.configure_and_migrate()?;
         Ok(store)
+    }
+
+    /// Update configured account email addresses used by the `To Me` quick filter.
+    pub fn set_own_emails(&mut self, emails: Vec<String>) {
+        self.own_emails = emails
+            .into_iter()
+            .map(|e| e.trim().to_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect();
     }
 
     fn configure_and_migrate(&self) -> Result<(), String> {
@@ -442,6 +458,12 @@ impl CacheStore {
             "list_unsubscribe_post",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // WP-08：重要性、标签、回复/转发标记与稍后提醒时间戳。
+        self.ensure_column("messages", "importance", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("messages", "tags", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("messages", "answered", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("messages", "forwarded", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("messages", "snoozed_until_ts", "INTEGER NOT NULL DEFAULT 0")?;
         // F-5 用户手动维护的联系人（与邮件聚合联系人合并展示；新增表对旧库无侵入，
         // `CREATE TABLE IF NOT EXISTS` 即完成迁移）。
         self.conn
@@ -991,9 +1013,16 @@ impl CacheStore {
             MessageSort::DateNewest => "m.date_ts DESC, m.uid DESC",
             MessageSort::DateOldest => "m.date_ts ASC, m.uid ASC",
             MessageSort::SenderAsc => "LOWER(m.sender) ASC, m.date_ts DESC, m.uid DESC",
+            MessageSort::SenderDesc => "LOWER(m.sender) DESC, m.date_ts DESC, m.uid DESC",
             MessageSort::SubjectAsc => "LOWER(m.subject) ASC, m.date_ts DESC, m.uid DESC",
+            MessageSort::SubjectDesc => "LOWER(m.subject) DESC, m.date_ts DESC, m.uid DESC",
             MessageSort::UnreadFirst => "m.unread DESC, m.date_ts DESC, m.uid DESC",
             MessageSort::StarredFirst => "m.flagged DESC, m.date_ts DESC, m.uid DESC",
+            MessageSort::AccountAsc => "m.account_id ASC, m.date_ts DESC, m.uid DESC",
+            MessageSort::AccountDesc => "m.account_id DESC, m.date_ts DESC, m.uid DESC",
+            MessageSort::AttachmentFirst => "m.has_attachment DESC, m.date_ts DESC, m.uid DESC",
+            MessageSort::ImportanceFirst => "m.importance DESC, m.date_ts DESC, m.uid DESC",
+            MessageSort::TagsAsc => "LOWER(m.tags) ASC, m.date_ts DESC, m.uid DESC",
         }
     }
 
@@ -1003,9 +1032,16 @@ impl CacheStore {
             MessageSort::DateNewest => "date_ts DESC, uid DESC",
             MessageSort::DateOldest => "date_ts ASC, uid ASC",
             MessageSort::SenderAsc => "LOWER(sender) ASC, date_ts DESC, uid DESC",
+            MessageSort::SenderDesc => "LOWER(sender) DESC, date_ts DESC, uid DESC",
             MessageSort::SubjectAsc => "LOWER(subject) ASC, date_ts DESC, uid DESC",
+            MessageSort::SubjectDesc => "LOWER(subject) DESC, date_ts DESC, uid DESC",
             MessageSort::UnreadFirst => "unread DESC, date_ts DESC, uid DESC",
             MessageSort::StarredFirst => "flagged DESC, date_ts DESC, uid DESC",
+            MessageSort::AccountAsc => "account_id ASC, date_ts DESC, uid DESC",
+            MessageSort::AccountDesc => "account_id DESC, date_ts DESC, uid DESC",
+            MessageSort::AttachmentFirst => "has_attachment DESC, date_ts DESC, uid DESC",
+            MessageSort::ImportanceFirst => "importance DESC, date_ts DESC, uid DESC",
+            MessageSort::TagsAsc => "LOWER(tags) ASC, date_ts DESC, uid DESC",
         }
     }
 
@@ -1014,6 +1050,7 @@ impl CacheStore {
         parsed: &SearchQuery,
         quick_filters: QuickFilterSet,
         today_start_ts: i64,
+        own_emails: &[String],
         clauses: &mut Vec<String>,
         args: &mut Vec<rusqlite::types::Value>,
     ) {
@@ -1029,6 +1066,40 @@ impl CacheStore {
         if quick_filters.today {
             clauses.push("m.date_ts >= ?".to_string());
             args.push(today_start_ts.into());
+        }
+        if quick_filters.to_me {
+            if own_emails.is_empty() {
+                clauses.push("1 = 0".to_string());
+            } else {
+                let parts: Vec<&str> = own_emails
+                    .iter()
+                    .map(|_| "LOWER(m.recipients) LIKE ?")
+                    .collect();
+                clauses.push(format!("({})", parts.join(" OR ")));
+                for email in own_emails {
+                    args.push(format!("%{email}%").into());
+                }
+            }
+        }
+        if quick_filters.from_contacts {
+            clauses.push(
+                "EXISTS (SELECT 1 FROM user_contacts uc WHERE TRIM(uc.email) != '' AND LOWER(m.sender) LIKE '%' || LOWER(uc.email) || '%')"
+                    .to_string(),
+            );
+        }
+        if quick_filters.high_importance {
+            clauses.push("m.importance > 0".to_string());
+        }
+        if quick_filters.tagged {
+            clauses.push("TRIM(COALESCE(m.tags, '')) != ''".to_string());
+        }
+        if let Some(from_ts) = quick_filters.date_from_ts {
+            clauses.push("m.date_ts >= ?".to_string());
+            args.push(from_ts.into());
+        }
+        if let Some(to_ts) = quick_filters.date_to_ts {
+            clauses.push("m.date_ts < ?".to_string());
+            args.push(to_ts.into());
         }
 
         if parsed.attachment {
@@ -1132,6 +1203,7 @@ impl CacheStore {
             &parsed,
             quick_filters,
             start_of_today_ts(),
+            &self.own_emails,
             &mut clauses,
             &mut args,
         );
@@ -1164,7 +1236,7 @@ impl CacheStore {
                 "
                 SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
                        m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
-                       m.recipients
+                       m.recipients, m.importance, m.tags, m.answered, m.forwarded, m.snoozed_until_ts
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE {where_sql}
@@ -1513,6 +1585,7 @@ impl CacheStore {
             &parsed,
             quick_filters,
             start_of_today_ts(),
+            &self.own_emails,
             &mut clauses,
             &mut args,
         );
@@ -1527,7 +1600,7 @@ impl CacheStore {
             WITH ranked AS (
                 SELECT m.id, m.account_id, m.folder_id, f.path AS folder_path, m.uid, m.sender, m.subject,
                        m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
-                       m.recipients,
+                       m.recipients, m.importance, m.tags, m.answered, m.forwarded, m.snoozed_until_ts,
                        ROW_NUMBER() OVER (
                            PARTITION BY CASE
                                WHEN m.message_id != '' THEN m.message_id
@@ -1566,7 +1639,8 @@ impl CacheStore {
                 "
                 {cte}
                 SELECT id, account_id, folder_id, folder_path, uid, sender, subject,
-                       preview, date_ts, date_display, unread, flagged, has_attachment, recipients
+                       preview, date_ts, date_display, unread, flagged, has_attachment,
+                       recipients, importance, tags, answered, forwarded, snoozed_until_ts
                 FROM ranked
                 WHERE rn = 1
                 ORDER BY {order_sql}
@@ -1678,7 +1752,7 @@ impl CacheStore {
                 "
                 SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
                        m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
-                       m.recipients
+                       m.recipients, m.importance, m.tags, m.answered, m.forwarded, m.snoozed_until_ts
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE m.folder_id = ? AND m.uid IN ({marks})
@@ -1756,6 +1830,7 @@ impl CacheStore {
             &parsed,
             quick_filters,
             start_of_today_ts(),
+            &self.own_emails,
             &mut clauses,
             &mut args,
         );
@@ -1788,7 +1863,7 @@ impl CacheStore {
                 "
                 SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
                        m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
-                       m.recipients
+                       m.recipients, m.importance, m.tags, m.answered, m.forwarded, m.snoozed_until_ts
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE {where_sql}
@@ -3649,9 +3724,131 @@ impl CacheStore {
         tx.commit()
             .map_err(|e| format!("提交账号清理事务失败: {e}"))
     }
+
+    /// WP-08: Return lightweight [`MessageSummary`] items for a conversation thread
+    /// (excluding `head_message_id`), ordered oldest-first for inline tree expansion.
+    pub fn list_thread_summaries(
+        &self,
+        account_id: u32,
+        head_message_id: u32,
+        subject: &str,
+    ) -> Result<Vec<MessageSummary>, String> {
+        let thread = self.list_thread_messages(account_id, head_message_id, subject, false)?;
+        let ids: Vec<u32> = thread
+            .into_iter()
+            .filter(|m| m.id != head_message_id)
+            .map(|m| m.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let args: Vec<rusqlite::types::Value> =
+            ids.iter().map(|&id| i64::from(id).into()).collect();
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "
+                SELECT m.id, m.account_id, m.folder_id, f.path, m.uid, m.sender, m.subject,
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
+                       m.recipients, m.importance, m.tags, m.answered, m.forwarded, m.snoozed_until_ts
+                FROM messages m
+                JOIN folders f ON f.id = m.folder_id
+                WHERE m.id IN ({placeholders})
+                ORDER BY m.date_ts ASC, m.uid ASC
+                "
+            ))
+            .map_err(|e| format!("准备会话子邮件查询失败: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), map_summary_row)
+            .map_err(|e| format!("执行会话子邮件查询失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析会话子邮件失败: {e}"))?;
+        Ok(rows)
+    }
+
+    /// WP-08: Persist comma-separated tags for `message_id`.
+    pub fn set_message_tags(&mut self, message_id: u32, tags: &[String]) -> Result<(), String> {
+        let joined = tags
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn
+            .execute(
+                "UPDATE messages SET tags = ?1 WHERE id = ?2",
+                params![joined, message_id],
+            )
+            .map_err(|e| format!("更新邮件标签失败: {e}"))?;
+        Ok(())
+    }
+
+    /// WP-08: Persist snooze timestamp for `message_id` (`0` = clear).
+    pub fn snooze_message(&mut self, message_id: u32, until_ts: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE messages SET snoozed_until_ts = ?1 WHERE id = ?2",
+                params![until_ts, message_id],
+            )
+            .map_err(|e| format!("更新稍后提醒失败: {e}"))?;
+        Ok(())
+    }
+
+    /// WP-08: Copy a cached message into `target_account_id` / `target_folder_path`.
+    pub fn copy_message_to_folder(
+        &mut self,
+        message_id: u32,
+        target_account_id: u32,
+        target_folder_path: &str,
+    ) -> Result<(), String> {
+        let target_folder_id: u32 = self
+            .conn
+            .query_row(
+                "SELECT id FROM folders WHERE account_id = ?1 AND path = ?2",
+                params![target_account_id, target_folder_path],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("未找到目标文件夹 {target_folder_path}: {e}"))?;
+        let next_uid: u32 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(uid), 0) + 1 FROM messages WHERE folder_id = ?1",
+                params![target_folder_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+        self.conn
+            .execute(
+                "
+                INSERT INTO messages (
+                    account_id, folder_id, uid, remote_id, message_id, in_reply_to, references_header,
+                    sender, recipients, subject, preview, date_ts, date_display,
+                    unread, flagged, has_attachment, body_text, body_html, index_text,
+                    importance, tags, answered, forwarded, snoozed_until_ts
+                )
+                SELECT
+                    ?1, ?2, ?3, '', message_id, in_reply_to, references_header,
+                    sender, recipients, subject, preview, date_ts, date_display,
+                    unread, flagged, has_attachment, body_text, body_html, index_text,
+                    importance, tags, answered, forwarded, snoozed_until_ts
+                FROM messages
+                WHERE id = ?4
+                ",
+                params![target_account_id, target_folder_id, next_uid, message_id],
+            )
+            .map_err(|e| format!("复制邮件到本地缓存失败: {e}"))?;
+        Ok(())
+    }
 }
 
 fn map_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> {
+    let tags_raw: String = row.get(15)?;
+    let tags = tags_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     Ok(MessageSummary {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -3669,6 +3866,11 @@ fn map_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSummary> 
         recipients: row.get(13)?,
         // 会话计数由 `fill_thread_counts` 在查询后统一回填。
         thread_count: 1,
+        importance: row.get::<_, i32>(14)?.clamp(-1, 1) as i8,
+        tags,
+        answered: row.get::<_, i32>(16)? != 0,
+        forwarded: row.get::<_, i32>(17)? != 0,
+        snoozed_until_ts: row.get(18)?,
     })
 }
 
@@ -5701,12 +5903,36 @@ mod tests {
             starred: true,
             has_attachment: true,
             today: true,
+            ..QuickFilterSet::default()
         };
         let filtered = cache
             .list_messages_page_with_options(inbox, "", multi, MessageSort::DateNewest, 0, 10)
             .unwrap();
         assert_eq!(filtered.total, 1);
         assert_eq!(filtered.items[0].uid, 2);
+
+        // WP-08：标签、稍后提醒、复制到文件夹与扩展筛选
+        let msg_id = filtered.items[0].id;
+        cache
+            .set_message_tags(msg_id, &["重要".to_string(), "工作".to_string()])
+            .unwrap();
+        cache.snooze_message(msg_id, 1_900_000_000).unwrap();
+        let tagged_page = cache
+            .list_messages_page_with_options(
+                inbox,
+                "",
+                QuickFilterSet {
+                    tagged: true,
+                    ..QuickFilterSet::default()
+                },
+                MessageSort::DateNewest,
+                0,
+                10,
+            )
+            .unwrap();
+        assert_eq!(tagged_page.total, 1);
+        assert_eq!(tagged_page.items[0].tags, vec!["重要", "工作"]);
+        assert_eq!(tagged_page.items[0].snoozed_until_ts, 1_900_000_000);
     }
 
     #[test]

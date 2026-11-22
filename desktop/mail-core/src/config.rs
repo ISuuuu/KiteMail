@@ -660,7 +660,7 @@ pub struct AppPreferences {
     #[serde(default = "default_list_columns")]
     pub list_columns: Vec<String>,
     /// 宽表模式显示列标题栏。
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub list_show_headings: bool,
     // ---- WP-05：外观 ----
     /// 阅读器工具栏左组按钮（`ToolbarItem` key 顺序表，最多 7 个）。
@@ -1191,7 +1191,7 @@ impl Default for AppPreferences {
             list_layout: default_list_layout_key(),
             list_preview_lines: default_list_preview_lines(),
             list_columns: default_list_columns(),
-            list_show_headings: false,
+            list_show_headings: true,
             reader_toolbar_left: default_toolbar_left(),
             reader_toolbar_right: default_toolbar_right(),
             app_icon: default_app_icon(),

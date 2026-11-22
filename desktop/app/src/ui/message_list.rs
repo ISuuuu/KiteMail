@@ -16,7 +16,7 @@
 //!   「移回收件箱」（对齐原版 message_row / card_menu 语义）；
 //!   草稿视图行右键为「打开草稿 / 删除草稿」。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -27,15 +27,34 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
-    WindowControlArea,
+    div, px, AppContext, Context, Div, DragMoveEvent, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, SharedString, Stateful, StatefulInteractiveElement,
+    Styled, Window, WindowControlArea,
 };
+use hylki_mail_core::config::ListColumn;
 use hylki_mail_core::{date_group_label, LocalDraft, MessageSort, MessageSummary, SearchScope};
 
-use crate::app::{CurrentView, HylkiApp, PendingRowAction, ReaderPosition, RightPaneMode};
+use crate::app::{
+    ColumnResizeDrag, CurrentView, HylkiApp, PendingRowAction, ReaderPosition, RightPaneMode,
+};
 use crate::theme;
 use crate::ui::{avatar, window_controls};
+
+/// WP-08：快捷标签槽位（1..9）。
+const QUICK_TAGS: [&str; 9] = [
+    "重要",
+    "工作",
+    "个人",
+    "待办",
+    "稍后",
+    "账单",
+    "旅行",
+    "项目",
+    "归档参考",
+];
+
+/// WP-08：宽表默认单行高度（36px）。
+const WIDE_ROW_HEIGHT: f32 = 36.0;
 
 /// 中栏默认宽度（方案文档：340 ~ 380px；L-2 起可拖拽调整并持久化到偏好）。
 pub(crate) const LIST_WIDTH: f32 = 360.0;
@@ -58,6 +77,7 @@ fn row_context_menu(
     msg: &MessageSummary,
     draft: Option<LocalDraft>,
     account_folders: Vec<(String, String)>,
+    all_account_folders: Vec<(u32, String, Vec<(String, String)>)>,
     demo_mode: bool,
     exporting_eml: bool,
     in_trash_or_junk: bool,
@@ -71,6 +91,10 @@ fn row_context_menu(
     let message_id = msg.id;
     let uid = msg.uid;
     let folder_path = msg.folder_path.clone();
+    let msg_tags = msg.tags.clone();
+    let msg_sender = msg.sender.clone();
+    let msg_subject = msg.subject.clone();
+    let snoozed_until_ts = msg.snoozed_until_ts;
     row.context_menu(move |menu, window, cx| {
         let entity = entity.clone();
         if let Some(draft) = draft.clone() {
@@ -93,10 +117,16 @@ fn row_context_menu(
         let entity_for_archive = entity.clone();
         let entity_for_spam = entity.clone();
         let entity_for_move = entity.clone();
+        let entity_for_copy_to = entity.clone();
         let entity_for_delete = entity.clone();
         let entity_for_reply = entity.clone();
         let entity_for_reply_all = entity.clone();
         let entity_for_forward = entity.clone();
+        let entity_for_edit_new = entity.clone();
+        let entity_for_tags = entity.clone();
+        let entity_for_snooze = entity.clone();
+        let entity_for_add_contact = entity.clone();
+        let entity_for_filter = entity.clone();
         let entity_for_copy = entity.clone();
         let entity_for_source = entity.clone();
         let entity_for_eml = entity.clone();
@@ -106,11 +136,17 @@ fn row_context_menu(
         let folder_path_for_reply = folder_path.clone();
         let folder_path_for_reply_all = folder_path.clone();
         let folder_path_for_forward = folder_path.clone();
+        let folder_path_for_edit_new = folder_path.clone();
         let folder_path_for_copy = folder_path.clone();
         let folder_path_for_source = folder_path.clone();
         let folder_path_for_eml = folder_path.clone();
         let current_folder_path = folder_path.clone();
         let folders_for_move = account_folders.clone();
+        let all_folders_for_copy = all_account_folders.clone();
+        let tags_for_menu = msg_tags.clone();
+        let sender_for_contact = msg_sender.clone();
+        let sender_for_filter = msg_sender.clone();
+        let subject_for_filter = msg_subject.clone();
         // B-2 顶部：回复 / 回复全部 / 转发（正文未就绪时挂起动作，加载后执行）。
         let mut menu = menu
             .item(PopupMenuItem::new("回复").on_click(move |_, window, cx| {
@@ -157,6 +193,22 @@ fn row_context_menu(
                     );
                 });
             }))
+            .item(
+                PopupMenuItem::new("作为新邮件编辑").on_click(move |_, window, cx| {
+                    entity_for_edit_new.update(cx, |this, cx| {
+                        this.begin_row_action(
+                            PendingRowAction::EditAsNew,
+                            account_id,
+                            message_id,
+                            uid,
+                            unread,
+                            &folder_path_for_edit_new,
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+            )
             .separator()
             .item(
                 PopupMenuItem::new(if unread {
@@ -192,7 +244,64 @@ fn row_context_menu(
                         });
                     },
                 ),
-            );
+            )
+            .submenu("标签", window, cx, move |mut sub, _, _| {
+                for (idx, tag_name) in QUICK_TAGS.iter().enumerate() {
+                    let has_tag = tags_for_menu.iter().any(|t| t == tag_name);
+                    let e_tag = entity_for_tags.clone();
+                    let label = format!("{}. {tag_name}", idx + 1);
+                    sub = sub.item(
+                        PopupMenuItem::new(label)
+                            .when(has_tag, |item| item.icon(Icon::new(IconName::Check)))
+                            .on_click(move |_, _, cx| {
+                                e_tag.update(cx, |this, cx| {
+                                    this.toggle_message_tag(account_id, message_id, tag_name, cx);
+                                });
+                            }),
+                    );
+                }
+                let e_clear_tag = entity_for_tags.clone();
+                sub.separator().item(
+                    PopupMenuItem::new("清除所有标签")
+                        .disabled(tags_for_menu.is_empty())
+                        .on_click(move |_, _, cx| {
+                            e_clear_tag.update(cx, |this, cx| {
+                                this.clear_message_tags(account_id, message_id, cx);
+                            });
+                        }),
+                )
+            })
+            .submenu("稍后提醒", window, cx, move |mut sub, _, _| {
+                let now_ts = chrono::Local::now().timestamp();
+                let options: [(&str, i64); 5] = [
+                    ("今天晚些时候", now_ts + 3 * 3600),
+                    ("明天", now_ts + 24 * 3600),
+                    ("本周末", now_ts + 3 * 24 * 3600),
+                    ("下周一", now_ts + 7 * 24 * 3600),
+                    ("自定义...", now_ts + 2 * 24 * 3600),
+                ];
+                for (label, until_ts) in options {
+                    let e_sn = entity_for_snooze.clone();
+                    sub = sub.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        e_sn.update(cx, |this, cx| {
+                            this.snooze_message(account_id, message_id, until_ts, label, cx);
+                        });
+                    }));
+                }
+                if snoozed_until_ts > 0 {
+                    let e_unsnooze = entity_for_snooze.clone();
+                    sub = sub
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("取消稍后提醒").on_click(move |_, _, cx| {
+                                e_unsnooze.update(cx, |this, cx| {
+                                    this.snooze_message(account_id, message_id, 0, "", cx);
+                                });
+                            }),
+                        );
+                }
+                sub
+            });
         // 演示模式仅支持本地 seen / flagged / 回复 / 复制 / 原文 / 导出项；
         // 归档 / 标垃圾 / 移动 / 删除仅真实账号可用。
         if !demo_mode {
@@ -254,14 +363,56 @@ fn row_context_menu(
                     sub
                 });
             }
+            menu = menu.submenu("复制到文件夹...", window, cx, move |mut sub, _, _| {
+                if all_folders_for_copy.is_empty() {
+                    return sub.item(PopupMenuItem::new("暂无可用文件夹").disabled(true));
+                }
+                for (target_acc_id, acc_label, folders) in &all_folders_for_copy {
+                    let target_acc_id = *target_acc_id;
+                    for (fname, fpath) in folders {
+                        let target_path = fpath.clone();
+                        let e_cp = entity_for_copy_to.clone();
+                        let item_label = if all_folders_for_copy.len() > 1 {
+                            format!("{acc_label} / {fname}")
+                        } else {
+                            fname.clone()
+                        };
+                        sub = sub.item(PopupMenuItem::new(item_label).on_click(move |_, _, cx| {
+                            let p = target_path.clone();
+                            e_cp.update(cx, |this, cx| {
+                                this.copy_message_to(account_id, message_id, target_acc_id, p, cx);
+                            });
+                        }));
+                    }
+                }
+                sub
+            });
             menu = menu.item(PopupMenuItem::new("删除").on_click(move |_, _, cx| {
                 entity_for_delete.update(cx, |this, cx| {
                     this.delete_message(account_id, message_id, cx);
                 });
             }));
         }
-        // B-2 底部：复制正文 / 查看原文 / 导出 .eml（导出进行中禁用重复点击）。
+        // B-2 + WP-08 底部：添加联系人 / 创建过滤器 / 复制正文 / 查看原文 / 导出 .eml。
         menu = menu
+            .separator()
+            .item(
+                PopupMenuItem::new("添加发件人到通讯录").on_click(move |_, _, cx| {
+                    let s = sender_for_contact.clone();
+                    entity_for_add_contact.update(cx, |this, cx| {
+                        this.add_sender_to_contacts(&s, cx);
+                    });
+                }),
+            )
+            .item(
+                PopupMenuItem::new("以此邮件创建过滤器...").on_click(move |_, _, cx| {
+                    let s = sender_for_filter.clone();
+                    let sub = subject_for_filter.clone();
+                    entity_for_filter.update(cx, |this, cx| {
+                        this.create_filter_from_message(&s, &sub, cx);
+                    });
+                }),
+            )
             .separator()
             .item(
                 PopupMenuItem::new("复制邮件正文").on_click(move |_, window, cx| {
@@ -313,10 +464,202 @@ fn row_context_menu(
     })
 }
 
-/// 列表行（圆角卡片）。
+fn row_is_wide(app: &HylkiApp, drafts_view: bool) -> bool {
+    !drafts_view && (app.list_wide || app.prefs.list_layout == "wide")
+}
+
+fn column_sort_for(col: ListColumn, current_sort: MessageSort) -> MessageSort {
+    match col {
+        ListColumn::Date | ListColumn::Due => {
+            if current_sort == MessageSort::DateNewest {
+                MessageSort::DateOldest
+            } else {
+                MessageSort::DateNewest
+            }
+        }
+        ListColumn::Sender | ListColumn::Recipients | ListColumn::Correspondents => {
+            if current_sort == MessageSort::SenderAsc {
+                MessageSort::SenderDesc
+            } else {
+                MessageSort::SenderAsc
+            }
+        }
+        ListColumn::Subject => {
+            if current_sort == MessageSort::SubjectAsc {
+                MessageSort::SubjectDesc
+            } else {
+                MessageSort::SubjectAsc
+            }
+        }
+        ListColumn::Account => {
+            if current_sort == MessageSort::AccountAsc {
+                MessageSort::AccountDesc
+            } else {
+                MessageSort::AccountAsc
+            }
+        }
+        ListColumn::Star => MessageSort::StarredFirst,
+        ListColumn::Attachment => MessageSort::AttachmentFirst,
+        ListColumn::Importance => MessageSort::ImportanceFirst,
+        ListColumn::Tags => MessageSort::TagsAsc,
+        ListColumn::Replied => MessageSort::UnreadFirst,
+    }
+}
+
+fn column_sort_arrow(col: ListColumn, current_sort: MessageSort) -> Option<&'static str> {
+    match (col, current_sort) {
+        (ListColumn::Date | ListColumn::Due, MessageSort::DateNewest) => Some(" ▾"),
+        (ListColumn::Date | ListColumn::Due, MessageSort::DateOldest) => Some(" ▴"),
+        (
+            ListColumn::Sender | ListColumn::Recipients | ListColumn::Correspondents,
+            MessageSort::SenderAsc,
+        ) => Some(" ▴"),
+        (
+            ListColumn::Sender | ListColumn::Recipients | ListColumn::Correspondents,
+            MessageSort::SenderDesc,
+        ) => Some(" ▾"),
+        (ListColumn::Subject, MessageSort::SubjectAsc) => Some(" ▴"),
+        (ListColumn::Subject, MessageSort::SubjectDesc) => Some(" ▾"),
+        (ListColumn::Account, MessageSort::AccountAsc) => Some(" ▴"),
+        (ListColumn::Account, MessageSort::AccountDesc) => Some(" ▾"),
+        (ListColumn::Star, MessageSort::StarredFirst) => Some(" ▾"),
+        (ListColumn::Attachment, MessageSort::AttachmentFirst) => Some(" ▾"),
+        (ListColumn::Importance, MessageSort::ImportanceFirst) => Some(" ▾"),
+        (ListColumn::Tags, MessageSort::TagsAsc) => Some(" ▴"),
+        _ => None,
+    }
+}
+
+fn column_resizable(col: ListColumn) -> bool {
+    matches!(
+        col,
+        ListColumn::Sender
+            | ListColumn::Recipients
+            | ListColumn::Correspondents
+            | ListColumn::Account
+            | ListColumn::Tags
+            | ListColumn::Date
+            | ListColumn::Due
+    )
+}
+
+/// WP-08：宽表列头栏（`.list-headings-bar`）：显示 `config.list_columns`，点击排序，拖拽分隔线调宽。
+fn render_headings_bar(
+    app: &HylkiApp,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::AnyElement {
+    let columns = app.prefs.list_columns_shown();
+    let current_sort = app.list_sort;
+    let show_avatars = app.prefs.show_avatars;
+    let show_recipients = app.list_view_shows_recipients();
+
+    let mut bar = h_flex()
+        .id("list-headings-bar")
+        .w_full()
+        .h(px(28.0))
+        .flex_shrink_0()
+        .px(px(14.0))
+        .gap_2()
+        .items_center()
+        .border_b_1()
+        .border_color(p.border)
+        .bg(p.surface)
+        .on_drag_move(
+            cx.listener(|this, event: &DragMoveEvent<ColumnResizeDrag>, _, cx| {
+                this.on_column_drag_move(event, cx);
+            }),
+        );
+
+    if show_avatars {
+        bar = bar.child(div().w(px(18.0)).flex_shrink_0());
+    }
+    // 未读圆点占位
+    bar = bar.child(div().w(px(10.0)).flex_shrink_0());
+
+    for col in columns {
+        let width = app.column_width(col);
+        let arrow = column_sort_arrow(col, current_sort);
+        let is_sorted = arrow.is_some();
+        let next_sort = column_sort_for(col, current_sort);
+        let label_text = match col {
+            ListColumn::Sender if show_recipients => "收件人",
+            ListColumn::Star => "★",
+            ListColumn::Replied => "↩",
+            ListColumn::Attachment => "📎",
+            ListColumn::Importance => "!",
+            _ => col.label(),
+        };
+        let heading_text = format!("{label_text}{}", arrow.unwrap_or(""));
+
+        let mut cell = h_flex()
+            .id(("heading-col", col as usize))
+            .h_full()
+            .items_center()
+            .relative()
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(if is_sorted {
+                gpui_kit::FontWeight::SEMIBOLD
+            } else {
+                gpui_kit::FontWeight::MEDIUM
+            })
+            .text_color(if is_sorted { p.accent } else { p.text_muted })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_list_sort(next_sort, cx);
+            }));
+
+        if col == ListColumn::Subject {
+            cell = cell.flex_1().min_w(px(80.0));
+        } else {
+            cell = cell.w(px(width)).flex_shrink_0();
+        }
+
+        let align_right = matches!(col, ListColumn::Date | ListColumn::Due);
+        let label_el = div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .when(align_right, |d| d.text_right())
+            .child(SharedString::from(heading_text));
+        cell = cell.child(label_el);
+
+        if column_resizable(col) {
+            let drag_payload = ColumnResizeDrag {
+                column: col,
+                start_x: 0.0,
+                start_width: width,
+            };
+            cell = cell.child(
+                div()
+                    .id(("col-resize", col as usize))
+                    .w(px(6.0))
+                    .h_full()
+                    .flex_shrink_0()
+                    .cursor_col_resize()
+                    .hover(|s| s.bg(p.accent.opacity(0.6)))
+                    .on_drag(drag_payload, move |drag, position, _, cx| {
+                        let updated = ColumnResizeDrag {
+                            column: drag.column,
+                            start_x: position.x.as_f32(),
+                            start_width: drag.start_width,
+                        };
+                        cx.new(|_| updated)
+                    }),
+            );
+        }
+
+        bar = bar.child(cell);
+    }
+
+    bar.into_any_element()
+}
+
+/// 列表行（圆角卡片 / 宽表单行表格）。
 ///
 /// P3 状态参数：`list_focused` 为「列表持焦点」近似态（见 render 中的计算），
 /// `kbd_cursor` 为键盘游标行（对齐 Linux .kbd-cursor）。
+#[allow(clippy::too_many_arguments)]
 fn message_row(
     app: &HylkiApp,
     msg: &MessageSummary,
@@ -325,6 +668,7 @@ fn message_row(
     show_account_tag: bool,
     list_focused: bool,
     kbd_cursor: bool,
+    is_wide: bool,
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
 ) -> ContextMenu<Stateful<Div>> {
@@ -376,26 +720,50 @@ fn message_row(
     // 持正文色（dimming, never vanishing，如同侧栏选中项）。
     let active_sel = is_selected && list_focused;
     let inactive_sel = is_selected && !list_focused;
+    let is_thread_expanded = app.expanded_threads.contains(&msg_id);
+    let msg_for_thread = msg.clone();
+    let msg_for_thread_wide = msg.clone();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let date_text = hylki_mail_core::format_message_date(
+        msg.date_ts,
+        &msg.date_display,
+        &app.prefs.date_style,
+        &app.prefs.clock_style,
+        now_ts,
+    );
 
-    let row = h_flex()
+    let row_base = h_flex()
         .id(("msg", msg_id))
         .flex_shrink_0()
-        .min_h(px(if compact {
-            COMPACT_ROW_HEIGHT
-        } else {
-            ROW_HEIGHT
-        }))
-        // 外边距 / 内边距 / 圆角对齐 Linux 原版（margin 2px 6px、padding 13 8 13 10、radius 12px）。
-        .mx(px(6.0))
-        .my(px(2.0))
-        .pt(px(13.0))
-        .pr(px(8.0))
-        .pb(px(13.0))
-        .pl(px(10.0))
-        .gap_2()
+        .when(is_wide, |r| {
+            r.h(px(WIDE_ROW_HEIGHT))
+                .mx(px(6.0))
+                .my(px(1.0))
+                .px(px(8.0))
+                .gap_2()
+                .rounded(px(8.0))
+        })
+        .when(!is_wide, |r| {
+            r.min_h(px(if compact {
+                COMPACT_ROW_HEIGHT
+            } else {
+                ROW_HEIGHT
+            }))
+            // 外边距 / 内边距 / 圆角对齐 Linux 原版（margin 2px 6px、padding 13 8 13 10、radius 12px）。
+            .mx(px(6.0))
+            .my(px(2.0))
+            .pt(px(13.0))
+            .pr(px(8.0))
+            .pb(px(13.0))
+            .pl(px(10.0))
+            .gap_2()
+            .rounded(px(12.0))
+        })
         // 头像在整行垂直居中（对齐原版 avatar valign center）；文本列 h_full 撑满不受影响。
         .items_center()
-        .rounded(px(12.0))
         .cursor_pointer()
         .overflow_hidden()
         // WP-01 状态底色矩阵（对齐 Linux theme.rs install_scheme_css 与
@@ -456,213 +824,500 @@ fn message_row(
                     }
                 }
             })
-        })
-        // 左侧：可选 36x36 圆形头像 + 固定 10px 宽未读圆点占位（确保已读/未读文字严格左对齐）。
-        .child(
-            h_flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap_1()
-                .when(app.prefs.show_avatars, |el| {
-                    el.child(avatar::avatar(&display_name, &avatar_key, 36.0))
-                })
-                .child(
+        });
+
+    let row = if is_wide {
+        let mut r = row_base
+            .when(app.prefs.show_avatars, |el| {
+                el.child(avatar::avatar(&display_name, &avatar_key, 18.0))
+            })
+            .child(
+                div()
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(unread, |dot| {
+                        dot.child(
+                            div()
+                                .w(px(8.0))
+                                .h(px(8.0))
+                                .rounded_full()
+                                .bg(if active_sel { p.accent_fg } else { p.accent }),
+                        )
+                    }),
+            );
+        let columns = app.prefs.list_columns_shown();
+        for col in columns {
+            let width = app.column_width(col);
+            let cell = match col {
+                ListColumn::Star => div()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(msg.flagged, |el| {
+                        el.child(
+                            Icon::new(IconName::StarFill)
+                                .with_size(px(13.0))
+                                .text_color(theme::star_gold()),
+                        )
+                    }),
+                ListColumn::Replied => h_flex()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_0p5()
+                    .when(msg.answered, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(if active_sel {
+                                    p.accent_fg
+                                } else {
+                                    p.text_muted
+                                })
+                                .child("↩"),
+                        )
+                    })
+                    .when(msg.forwarded, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(if active_sel {
+                                    p.accent_fg
+                                } else {
+                                    p.text_muted
+                                })
+                                .child("↪"),
+                        )
+                    }),
+                ListColumn::Attachment => div()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(msg.has_attachment, |el| {
+                        el.child(
+                            Icon::new(IconName::Paperclip)
+                                .with_size(px(13.0))
+                                .text_color(if active_sel {
+                                    p.accent_fg
+                                } else {
+                                    p.text_muted
+                                }),
+                        )
+                    }),
+                ListColumn::Importance => div()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(msg.importance != 0, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .text_color(if active_sel {
+                                    p.accent_fg
+                                } else if msg.importance > 0 {
+                                    p.danger
+                                } else {
+                                    p.text_muted
+                                })
+                                .child(if msg.importance > 0 { "!" } else { "↓" }),
+                        )
+                    }),
+                ListColumn::Sender => div()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_sm()
+                    .font_weight(if unread {
+                        gpui_kit::FontWeight::BOLD
+                    } else {
+                        gpui_kit::FontWeight::NORMAL
+                    })
+                    .text_color(if active_sel { p.accent_fg } else { p.text })
+                    .child(SharedString::from(first_line.clone())),
+                ListColumn::Recipients => div()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(if active_sel {
+                        p.accent_fg
+                    } else {
+                        p.text_muted
+                    })
+                    .child(SharedString::from(msg.recipients.clone())),
+                ListColumn::Correspondents => {
+                    let corr = if show_recipients {
+                        msg.recipients.clone()
+                    } else {
+                        display_name.clone()
+                    };
                     div()
-                        .w(px(10.0))
-                        .h(px(10.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(unread, |dot| {
-                            // 未读圆点 10x10（原版 .unread-dot）：聚焦选中行上反白为
-                            // accent_fg（accent-on-accent 会隐形），其余保持 accent。
-                            dot.child(
-                                div()
-                                    .w(px(10.0))
-                                    .h(px(10.0))
-                                    .rounded_full()
-                                    .bg(if active_sel { p.accent_fg } else { p.accent }),
-                            )
-                        }),
-                ),
-        )
-        // 右侧三行信息。
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .gap_0p5()
-                // 第 1 行：发件人 + 附件 / 星标 / 时间。
-                .child(
+                        .w(px(width))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(if active_sel { p.accent_fg } else { p.text })
+                        .child(SharedString::from(corr))
+                }
+                ListColumn::Account => {
+                    let lbl = app.account_label_for(account_id);
+                    div()
+                        .w(px(width))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(if active_sel {
+                            p.accent_fg
+                        } else {
+                            p.text_muted
+                        })
+                        .child(SharedString::from(lbl))
+                }
+                ListColumn::Tags => h_flex()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .gap_1()
+                    .overflow_hidden()
+                    .children(msg.tags.iter().take(2).map(|t| {
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_full()
+                            .text_size(px(10.0))
+                            .bg(if active_sel {
+                                p.accent_fg.opacity(0.20)
+                            } else {
+                                p.accent_soft()
+                            })
+                            .text_color(if active_sel { p.accent_fg } else { p.accent })
+                            .child(SharedString::from(t.clone()))
+                    })),
+                ListColumn::Date | ListColumn::Due => div()
+                    .w(px(width))
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_right()
+                    .text_xs()
+                    .text_color(if active_sel {
+                        p.accent_fg
+                    } else {
+                        p.text_muted
+                    })
+                    .child(SharedString::from(date_text.clone())),
+                ListColumn::Subject => {
+                    let msg_chip = msg_for_thread_wide.clone();
                     h_flex()
-                        .justify_between()
+                        .flex_1()
+                        .min_w(px(80.0))
                         .items_center()
-                        .gap_2()
+                        .gap_1p5()
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .text_sm()
                                 .truncate()
-                                // 发件人字重层次（原版 .message-sender：已读 / 未读加粗）；
-                                // 已发送 / 草稿视图显示「致：收件人」（B-6）。
+                                .text_sm()
                                 .font_weight(if unread {
-                                    gpui_kit::FontWeight::BOLD
+                                    gpui_kit::FontWeight::SEMIBOLD
                                 } else {
-                                    gpui_kit::FontWeight::MEDIUM
+                                    gpui_kit::FontWeight::NORMAL
                                 })
-                                // WP-01：聚焦选中行（100% accent 纯色底）上反白为
-                                // accent_fg（原版 row:selected label 全量反色）。
-                                .text_color(if active_sel { p.accent_fg } else { p.text })
-                                .child(SharedString::from(first_line)),
+                                .text_color(if active_sel {
+                                    p.accent_fg
+                                } else if unread {
+                                    p.text
+                                } else {
+                                    p.text.opacity(0.85)
+                                })
+                                .child(SharedString::from(msg.subject.clone())),
                         )
-                        .child(
-                            h_flex()
-                                .flex_shrink_0()
-                                .gap_1()
-                                .items_center()
-                                .when(msg.flagged, |icons| {
-                                    icons.child(
-                                        Icon::new(IconName::StarFill)
-                                            .with_size(px(13.0))
-                                            .text_color(theme::star_gold()),
-                                    )
-                                })
-                                .when(msg.has_attachment, |icons| {
-                                    icons.child(
-                                        Icon::new(IconName::Paperclip)
-                                            .with_size(px(13.0))
-                                            // WP-01：聚焦选中行附件图标反白 accent_fg。
-                                            .text_color(if active_sel {
-                                                p.accent_fg
-                                            } else {
-                                                p.text_muted
-                                            }),
-                                    )
-                                })
-                                .child({
-                                    let now_ts = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs() as i64)
-                                        .unwrap_or(0);
-                                    let date_text = hylki_mail_core::format_message_date(
-                                        msg.date_ts,
-                                        &msg.date_display,
-                                        &app.prefs.date_style,
-                                        &app.prefs.clock_style,
-                                        now_ts,
-                                    );
-                                    div()
-                                        .text_xs()
-                                        // WP-01：聚焦选中行时间反白 accent_fg。
-                                        .text_color(if active_sel {
-                                            p.accent_fg
-                                        } else {
-                                            p.text_muted
-                                        })
-                                        .child(SharedString::from(date_text))
-                                })
-                                // B-4 会话计数胶囊（对齐原版 .thread-chip：仅 >1 封往来时显示，
-                                // 紧凑圆角、10px 粗体）。WP-01：聚焦选中行反色为白底蓝字
-                                // （bg accent_fg / 文字 accent，原版 row:selected 规则）；
-                                // 其余为中性弱底 alpha(currentColor, 0.10)。
-                                .when(msg.thread_count > 1, |icons| {
-                                    icons.child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .px(px(7.0))
-                                            .py(px(2.0))
-                                            .rounded_full()
-                                            .bg(if active_sel {
-                                                p.accent_fg
-                                            } else {
-                                                p.text.opacity(0.10)
-                                            })
-                                            .text_size(px(10.0))
-                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .text_color(if active_sel {
-                                                p.accent
-                                            } else if inactive_sel {
-                                                p.text
-                                            } else {
-                                                p.text.opacity(0.70)
-                                            })
-                                            .child(SharedString::from(format!(
-                                                "{} ▸",
-                                                msg.thread_count
-                                            ))),
-                                    )
-                                }),
-                        ),
-                )
-                // 第 2 行：主题（未读加粗；已读 85% 透明度，复刻原版 .message-subject 层次；
-                // WP-01：聚焦选中行反白 accent_fg，覆盖已读的 85% 透明度）。
-                .child(
-                    div()
-                        .text_sm()
-                        .truncate()
-                        .font_weight(if unread {
-                            gpui_kit::FontWeight::SEMIBOLD
-                        } else {
-                            gpui_kit::FontWeight::NORMAL
+                        .when(msg.thread_count > 1, |el| {
+                            el.child(
+                                div()
+                                    .id(("thread-chip", msg_id))
+                                    .flex_shrink_0()
+                                    .px(px(7.0))
+                                    .py(px(2.0))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .bg(if active_sel {
+                                        p.accent_fg
+                                    } else {
+                                        p.text.opacity(0.10)
+                                    })
+                                    .text_size(px(10.0))
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(if active_sel {
+                                        p.accent
+                                    } else if inactive_sel {
+                                        p.text
+                                    } else {
+                                        p.text.opacity(0.70)
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_thread_expand(&msg_chip, cx);
+                                    }))
+                                    .child(SharedString::from(format!(
+                                        "{} {}",
+                                        msg.thread_count,
+                                        if is_thread_expanded { "▾" } else { "▸" }
+                                    ))),
+                            )
                         })
-                        .text_color(if active_sel {
-                            p.accent_fg
-                        } else if unread {
-                            p.text
-                        } else {
-                            p.text.opacity(0.85)
-                        })
-                        .child(SharedString::from(msg.subject.clone())),
-                )
-                // 第 3 行：摘要 + 多账号小胶囊标签；紧凑密度下隐藏。
-                .when(!compact, |row| {
-                    row.child(
-                        h_flex()
+                }
+            };
+            r = r.child(cell);
+        }
+        r
+    } else {
+        row_base
+            // 左侧：可选 36x36 圆形头像 + 固定 10px 宽未读圆点占位（确保已读/未读文字严格左对齐）。
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_1()
+                    .when(app.prefs.show_avatars, |el| {
+                        el.child(avatar::avatar(&display_name, &avatar_key, 36.0))
+                    })
+                    .child(
+                        div()
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .flex()
                             .items_center()
-                            .gap_1p5()
-                            .min_w_0()
+                            .justify_center()
+                            .when(unread, |dot| {
+                                // 未读圆点 10x10（原版 .unread-dot）：聚焦选中行上反白为
+                                // accent_fg（accent-on-accent 会隐形），其余保持 accent。
+                                dot.child(
+                                    div()
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                        .rounded_full()
+                                        .bg(if active_sel { p.accent_fg } else { p.accent }),
+                                )
+                            }),
+                    ),
+            )
+            // 右侧三行信息。
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .gap_0p5()
+                    // 第 1 行：发件人 + 附件 / 星标 / 时间。
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .gap_2()
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_xs()
+                                    .text_sm()
                                     .truncate()
-                                    // 摘要 50% 透明度（原版 .message-preview）；
-                                    // WP-01：聚焦选中行反白 accent_fg。
+                                    // 发件人字重层次（原版 .message-sender：已读 / 未读加粗）；
+                                    // 已发送 / 草稿视图显示「致：收件人」（B-6）。
+                                    .font_weight(if unread {
+                                        gpui_kit::FontWeight::BOLD
+                                    } else {
+                                        gpui_kit::FontWeight::MEDIUM
+                                    })
+                                    // WP-01：聚焦选中行（100% accent 纯色底）上反白为
+                                    // accent_fg（原版 row:selected label 全量反色）。
+                                    .text_color(if active_sel { p.accent_fg } else { p.text })
+                                    .child(SharedString::from(first_line)),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .gap_1()
+                                    .items_center()
+                                    .when(msg.flagged, |icons| {
+                                        icons.child(
+                                            Icon::new(IconName::StarFill)
+                                                .with_size(px(13.0))
+                                                .text_color(theme::star_gold()),
+                                        )
+                                    })
+                                    .when(msg.has_attachment, |icons| {
+                                        icons.child(
+                                            Icon::new(IconName::Paperclip)
+                                                .with_size(px(13.0))
+                                                // WP-01：聚焦选中行附件图标反白 accent_fg。
+                                                .text_color(if active_sel {
+                                                    p.accent_fg
+                                                } else {
+                                                    p.text_muted
+                                                }),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            // WP-01：聚焦选中行时间反白 accent_fg。
+                                            .text_color(if active_sel {
+                                                p.accent_fg
+                                            } else {
+                                                p.text_muted
+                                            })
+                                            .child(SharedString::from(date_text)),
+                                    )
+                                    // B-4 + WP-08 会话计数胶囊（点击在列表内联展开/收起子邮件树）。
+                                    .when(msg.thread_count > 1, |icons| {
+                                        let msg_chip = msg_for_thread.clone();
+                                        icons.child(
+                                            div()
+                                                .id(("thread-chip", msg_id))
+                                                .flex_shrink_0()
+                                                .px(px(7.0))
+                                                .py(px(2.0))
+                                                .rounded_full()
+                                                .cursor_pointer()
+                                                .bg(if active_sel {
+                                                    p.accent_fg
+                                                } else {
+                                                    p.text.opacity(0.10)
+                                                })
+                                                .text_size(px(10.0))
+                                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                .text_color(if active_sel {
+                                                    p.accent
+                                                } else if inactive_sel {
+                                                    p.text
+                                                } else {
+                                                    p.text.opacity(0.70)
+                                                })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.toggle_thread_expand(&msg_chip, cx);
+                                                }))
+                                                .child(SharedString::from(format!(
+                                                    "{} {}",
+                                                    msg.thread_count,
+                                                    if is_thread_expanded { "▾" } else { "▸" }
+                                                ))),
+                                        )
+                                    }),
+                            ),
+                    )
+                    // 第 2 行：主题（未读加粗；已读 85% 透明度，复刻原版 .message-subject 层次；
+                    // WP-01：聚焦选中行反白 accent_fg，覆盖已读的 85% 透明度）。
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .truncate()
+                                    .font_weight(if unread {
+                                        gpui_kit::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui_kit::FontWeight::NORMAL
+                                    })
                                     .text_color(if active_sel {
                                         p.accent_fg
+                                    } else if unread {
+                                        p.text
                                     } else {
-                                        p.text.opacity(0.5)
+                                        p.text.opacity(0.85)
                                     })
-                                    .child(SharedString::from(msg.preview.clone())),
+                                    .child(SharedString::from(msg.subject.clone())),
                             )
-                            .when(!acc_label.is_empty(), |el| {
-                                el.child(
+                            .when(app.prefs.focus_show_tags && !msg.tags.is_empty(), |el| {
+                                el.children(msg.tags.iter().take(2).map(|t| {
                                     div()
                                         .flex_shrink_0()
-                                        .max_w(px(110.0))
-                                        .truncate()
                                         .px_1p5()
                                         .py_0p5()
                                         .rounded_full()
                                         .text_size(px(10.0))
-                                        // P3：选中行账号标签反转为中性胶囊（Linux 无
-                                        // 对应规则；accent 药丸上沿用账号彩色会沉底，
-                                        // 改为正文色弱底和正文色文字保层级）。
-                                        .bg(if is_selected {
-                                            p.text.opacity(0.12)
+                                        .bg(if active_sel {
+                                            p.accent_fg.opacity(0.20)
                                         } else {
-                                            acc_color.opacity(0.14)
+                                            p.accent_soft()
                                         })
-                                        .text_color(if is_selected { p.text } else { acc_color })
-                                        .child(SharedString::from(acc_label)),
-                                )
+                                        .text_color(if active_sel { p.accent_fg } else { p.accent })
+                                        .child(SharedString::from(t.clone()))
+                                }))
                             }),
                     )
-                }),
-        );
+                    // 第 3 行：摘要 + 多账号小胶囊标签；紧凑密度下隐藏。
+                    .when(!compact, |row| {
+                        let preview_lines = app.prefs.list_preview_lines.clamp(1, 3);
+                        row.child(
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .when(preview_lines == 1, |d| d.truncate())
+                                        .when(preview_lines > 1, |d| {
+                                            d.max_h(px(preview_lines as f32 * 16.0))
+                                                .overflow_hidden()
+                                        })
+                                        // 摘要 50% 透明度（原版 .message-preview）；
+                                        // WP-01：聚焦选中行反白 accent_fg。
+                                        .text_color(if active_sel {
+                                            p.accent_fg
+                                        } else {
+                                            p.text.opacity(0.5)
+                                        })
+                                        .child(SharedString::from(msg.preview.clone())),
+                                )
+                                .when(!acc_label.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .max_w(px(110.0))
+                                            .truncate()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .text_size(px(10.0))
+                                            // P3：选中行账号标签反转为中性胶囊（Linux 无
+                                            // 对应规则；accent 药丸上沿用账号彩色会沉底，
+                                            // 改为正文色弱底和正文色文字保层级）。
+                                            .bg(if is_selected {
+                                                p.text.opacity(0.12)
+                                            } else {
+                                                acc_color.opacity(0.14)
+                                            })
+                                            .text_color(if is_selected {
+                                                p.text
+                                            } else {
+                                                acc_color
+                                            })
+                                            .child(SharedString::from(acc_label)),
+                                    )
+                                }),
+                        )
+                    }),
+            )
+    };
 
     let account_folders: Vec<(String, String)> = app
         .folders_by_account
@@ -673,6 +1328,23 @@ fn message_row(
                 .collect()
         })
         .unwrap_or_default();
+    let all_account_folders: Vec<(u32, String, Vec<(String, String)>)> = app
+        .accounts
+        .iter()
+        .filter(|a| a.enabled)
+        .map(|a| {
+            let folders = app
+                .folders_by_account
+                .get(&a.id)
+                .map(|list| {
+                    list.iter()
+                        .map(|f| (f.name.clone(), f.path.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (a.id, app.account_label_for(a.id), folders)
+        })
+        .collect();
     // B-2：导出进行中状态与回收站 / 垃圾邮件文件夹语义。
     let exporting_eml = app.pending_eml_export == Some(msg.id);
     let in_trash_or_junk = app.folder_is_trash_or_junk(account_id, msg.folder_id);
@@ -682,6 +1354,7 @@ fn message_row(
         msg,
         draft,
         account_folders,
+        all_account_folders,
         app.demo_mode,
         exporting_eml,
         in_trash_or_junk,
@@ -728,6 +1401,7 @@ pub(crate) fn render(
     };
 
     // 草稿视图行（随搜索过滤）。
+    let is_wide = row_is_wide(app, drafts_view);
     let draft_rows: Vec<gpui_kit::AnyElement> = if drafts_view {
         app.drafts
             .iter()
@@ -742,6 +1416,7 @@ pub(crate) fn render(
                     show_account_tag,
                     list_focused,
                     // 草稿行不参与键盘游标（无选择语义）。
+                    false,
                     false,
                     &p,
                     cx,
@@ -778,34 +1453,90 @@ pub(crate) fn render(
         }
     }
 
-    // 常规邮件行：按时间排序且未关闭分组偏好时在列表行之间插入日期分组头（今天 / 昨天 / 本周 / 更早）。
+    // 常规邮件行：按时间排序且未关闭分组偏好时在列表行之间插入 5 档可折叠日期分组头
+    // （今天 / 昨天 / 最近 7 天 / 最近 14 天 / 更早）。
     let show_date_groups =
         !drafts_view && app.prefs.list_group_by_date && current_sort.uses_date_groups();
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let mut filtered_rows: Vec<gpui_kit::AnyElement> = Vec::with_capacity(merged_items.len() + 4);
+    let mut group_counts: HashMap<&'static str, usize> = HashMap::new();
+    if show_date_groups {
+        for msg in &merged_items {
+            let g = date_group_label(msg.date_ts, now_ts);
+            *group_counts.entry(g).or_insert(0) += 1;
+        }
+    }
+    let mut filtered_rows: Vec<gpui_kit::AnyElement> = Vec::with_capacity(merged_items.len() + 8);
     if !drafts_view {
         let mut last_group: Option<&'static str> = None;
         for msg in &merged_items {
+            let mut group_collapsed = false;
             if show_date_groups {
                 let group = date_group_label(msg.date_ts, now_ts);
+                group_collapsed = app.collapsed_day_groups.contains(group);
                 if last_group != Some(group) {
                     last_group = Some(group);
-                    filtered_rows.push(
-                        div()
-                            .flex_shrink_0()
-                            .px_4()
-                            .pt_2()
-                            .pb_1()
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(muted_fg)
-                            .child(group)
-                            .into_any_element(),
-                    );
+                    let count = group_counts.get(group).copied().unwrap_or(0);
+                    let entity_menu = cx.entity();
+                    let group_header = h_flex()
+                        .id(SharedString::from(format!("day-section-{group}")))
+                        .flex_shrink_0()
+                        .mx(px(6.0))
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded(px(8.0))
+                        .items_center()
+                        .justify_between()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(p.text.opacity(0.05)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_day_group(group, cx);
+                        }))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child(if group_collapsed { "▸" } else { "▾" }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(muted_fg)
+                                        .child(group),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(SharedString::from(format!("{count}"))),
+                        )
+                        .context_menu(move |menu, _, _| {
+                            let e1 = entity_menu.clone();
+                            let e2 = entity_menu.clone();
+                            menu.item(PopupMenuItem::new("折叠所有日期分组").on_click(
+                                move |_, _, cx| {
+                                    e1.update(cx, |this, cx| this.collapse_all_day_groups(cx));
+                                },
+                            ))
+                            .item(
+                                PopupMenuItem::new("展开所有日期分组").on_click(move |_, _, cx| {
+                                    e2.update(cx, |this, cx| this.expand_all_day_groups(cx));
+                                }),
+                            )
+                        });
+                    filtered_rows.push(group_header.into_any_element());
                 }
+            }
+            if group_collapsed {
+                continue;
             }
             let is_selected =
                 selected_id == Some(msg.id) || app.selected_message_ids.contains(&msg.id);
@@ -820,11 +1551,84 @@ pub(crate) fn render(
                     show_account_tag,
                     list_focused,
                     kbd_cursor,
+                    is_wide,
                     &p,
                     cx,
                 )
                 .into_any_element(),
             );
+            // WP-08：若当前会话已展开，在头行下方内联渲染子邮件树（.thread-child & .thread-node）。
+            if msg.thread_count > 1 && app.expanded_threads.contains(&msg.id) {
+                if let Some(children) = app.thread_children_cache.get(&msg.id) {
+                    let n = children.len();
+                    for (idx, child) in children.iter().enumerate() {
+                        let is_last = idx + 1 == n;
+                        let child_sel = selected_id == Some(child.id)
+                            || app.selected_message_ids.contains(&child.id);
+                        let child_kbd = app.kbd_cursor_message_id == Some(child.id);
+                        let rail_color = p.text.opacity(0.25);
+                        let child_wrapper = h_flex()
+                            .id(("thread-child", child.id))
+                            .w_full()
+                            .items_stretch()
+                            .pl(px(12.0))
+                            .child(
+                                // 左侧树形引导线 + 节点圆点（.thread-node）
+                                div()
+                                    .w(px(12.0))
+                                    .flex_shrink_0()
+                                    .relative()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(!is_last, |r| {
+                                        r.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(5.0))
+                                                .top_0()
+                                                .bottom_0()
+                                                .w(px(1.5))
+                                                .bg(rail_color),
+                                        )
+                                    })
+                                    .when(is_last, |r| {
+                                        r.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(5.0))
+                                                .top_0()
+                                                .h(px(20.0))
+                                                .w(px(1.5))
+                                                .bg(rail_color),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .w(px(8.0))
+                                            .h(px(8.0))
+                                            .rounded_full()
+                                            .bg(p.text_muted)
+                                            .border_1()
+                                            .border_color(p.surface),
+                                    ),
+                            )
+                            .child(div().flex_1().min_w_0().child(message_row(
+                                app,
+                                child,
+                                None,
+                                child_sel,
+                                show_account_tag,
+                                list_focused,
+                                child_kbd,
+                                is_wide,
+                                &p,
+                                cx,
+                            )));
+                        filtered_rows.push(child_wrapper.into_any_element());
+                    }
+                }
+            }
         }
     }
 
@@ -903,7 +1707,7 @@ pub(crate) fn render(
             .icon(IconName::ListFilter)
             .when(has_active_filter, |btn| btn.text_color(p.accent))
             .tooltip(active_tooltip)
-            .dropdown_menu(move |menu, _, _| {
+            .dropdown_menu(move |menu, window, cx| {
                 let mut menu = menu;
                 for sort in MessageSort::ALL {
                     let entity_for_item = entity.clone();
@@ -953,6 +1757,54 @@ pub(crate) fn render(
                         }),
                 );
 
+                let e_tome = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("直接发给我")
+                        .when(quick_filters.to_me, |item| {
+                            item.icon(Icon::new(IconName::Check))
+                        })
+                        .on_click(move |_, _, cx| {
+                            e_tome.update(cx, |this, cx| this.toggle_quick_filter_to_me(cx));
+                        }),
+                );
+
+                let e_contacts = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("来自联系人")
+                        .when(quick_filters.from_contacts, |item| {
+                            item.icon(Icon::new(IconName::Check))
+                        })
+                        .on_click(move |_, _, cx| {
+                            e_contacts.update(cx, |this, cx| {
+                                this.toggle_quick_filter_from_contacts(cx);
+                            });
+                        }),
+                );
+
+                let e_imp = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("高优先级")
+                        .when(quick_filters.high_importance, |item| {
+                            item.icon(Icon::new(IconName::Check))
+                        })
+                        .on_click(move |_, _, cx| {
+                            e_imp.update(cx, |this, cx| {
+                                this.toggle_quick_filter_high_importance(cx);
+                            });
+                        }),
+                );
+
+                let e_tagged = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("含标签")
+                        .when(quick_filters.tagged, |item| {
+                            item.icon(Icon::new(IconName::Check))
+                        })
+                        .on_click(move |_, _, cx| {
+                            e_tagged.update(cx, |this, cx| this.toggle_quick_filter_tagged(cx));
+                        }),
+                );
+
                 let e_today = entity.clone();
                 menu = menu.item(
                     PopupMenuItem::new("今天")
@@ -963,6 +1815,54 @@ pub(crate) fn render(
                             e_today.update(cx, |this, cx| this.toggle_quick_filter_today(cx));
                         }),
                 );
+
+                let has_date_range =
+                    quick_filters.date_from_ts.is_some() || quick_filters.date_to_ts.is_some();
+                let e_range = entity.clone();
+                menu = menu.submenu("日期范围", window, cx, move |sub, _, _| {
+                    let today_start = hylki_mail_core::start_of_today_ts();
+                    let e_7d = e_range.clone();
+                    let e_30d = e_range.clone();
+                    let e_90d = e_range.clone();
+                    let e_clr = e_range.clone();
+                    sub.item(PopupMenuItem::new("最近 7 天").on_click(move |_, _, cx| {
+                        e_7d.update(cx, |this, cx| {
+                            this.set_quick_filter_date_range(
+                                Some(today_start - 6 * 86_400),
+                                None,
+                                cx,
+                            );
+                        });
+                    }))
+                    .item(PopupMenuItem::new("最近 30 天").on_click(move |_, _, cx| {
+                        e_30d.update(cx, |this, cx| {
+                            this.set_quick_filter_date_range(
+                                Some(today_start - 29 * 86_400),
+                                None,
+                                cx,
+                            );
+                        });
+                    }))
+                    .item(PopupMenuItem::new("最近 90 天").on_click(move |_, _, cx| {
+                        e_90d.update(cx, |this, cx| {
+                            this.set_quick_filter_date_range(
+                                Some(today_start - 89 * 86_400),
+                                None,
+                                cx,
+                            );
+                        });
+                    }))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("清除日期范围")
+                            .disabled(!has_date_range)
+                            .on_click(move |_, _, cx| {
+                                e_clr.update(cx, |this, cx| {
+                                    this.set_quick_filter_date_range(None, None, cx);
+                                });
+                            }),
+                    )
+                });
 
                 let e_clear = entity.clone();
                 menu = menu.separator().item(
@@ -1080,6 +1980,11 @@ pub(crate) fn render(
         .when(show_bulk_bar && !bulk_bottom, |el| {
             el.child(render_bulk_bar(bulk_count, bulk_demo_mode, false, &p, cx))
         })
+        // WP-08：宽表列头栏（.list-headings-bar）。
+        .when(
+            !drafts_view && is_wide && app.prefs.list_show_headings,
+            |el| el.child(render_headings_bar(app, &p, cx)),
+        )
         // 列表（滚到底部自动预加载下一批 100 条）。
         .child(
             div()
