@@ -236,10 +236,53 @@ pub fn sender_initials(name: &str) -> String {
 
 /// 圆形头像：`size` x `size`（如 36.0 列表 / 34.0 阅读卡片）。
 ///
-/// `name` 优先于 `email`（显示名首字符）；取色键优先 `email`。
+/// 优先检查本地缓存的品牌 Logo / Gravatar 图片，其次匹配内置常见品牌图标，
+/// 未命中则回退到发件人双字母彩色头像。
 pub fn avatar(name: &str, email: &str, size: f32) -> Div {
+    let trimmed_email = email.trim();
+    if !trimmed_email.is_empty() {
+        let data_dir = config::data_dir();
+        if let Some(cached_path) =
+            hylki_mail_core::avatar::cached_avatar_path(&data_dir, trimmed_email)
+        {
+            if let Some(format) = image_format_for_path(&cached_path) {
+                if let Ok(bytes) = std::fs::read(&cached_path) {
+                    let image = Arc::new(Image::from_bytes(format, bytes));
+                    return div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .overflow_hidden()
+                        .size(px(size))
+                        .child(img(image).size_full().object_fit(ObjectFit::Cover));
+                }
+            }
+        }
+        if let Some(brand) = hylki_mail_core::avatar::lookup_builtin_brand(trimmed_email) {
+            let bg = parse_hex_color(brand.color).unwrap_or_else(|| avatar_bg_color(trimmed_email));
+            return div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .rounded_full()
+                .size(px(size))
+                .bg(bg)
+                .text_color(white())
+                .text_size(px(size * AVATAR_TEXT_SCALE))
+                .font_weight(FontWeight::BOLD)
+                .child(SharedString::from(brand.short));
+        }
+    }
+
     let initials = sender_initials(name);
-    let color_key = if email.trim().is_empty() { name } else { email };
+    let color_key = if trimmed_email.is_empty() {
+        name
+    } else {
+        trimmed_email
+    };
     let bg = avatar_bg_color(color_key);
     let font_size = size * AVATAR_TEXT_SCALE;
     div()

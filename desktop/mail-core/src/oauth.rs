@@ -341,3 +341,128 @@ fn format_ureq_error(err: ureq::Error) -> String {
         ureq::Error::Transport(t) => format!("网络请求失败: {t}"),
     }
 }
+
+pub const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+pub const GOOGLE_MAIL_SCOPES: &str = "https://mail.google.com/ email profile";
+
+/// Generic OAuth2 PKCE provider configuration (supports Google & Custom OAuth2).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OAuthProviderConfig {
+    pub auth_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    pub scopes: String,
+    #[serde(default)]
+    pub userinfo_url: Option<String>,
+}
+
+impl OAuthProviderConfig {
+    pub fn google(client_id: impl Into<String>, client_secret: Option<String>) -> Self {
+        Self {
+            auth_url: GOOGLE_AUTH_URL.to_string(),
+            token_url: GOOGLE_TOKEN_URL.to_string(),
+            client_id: client_id.into(),
+            client_secret,
+            scopes: GOOGLE_MAIL_SCOPES.to_string(),
+            userinfo_url: Some("https://www.googleapis.com/oauth2/v3/userinfo".to_string()),
+        }
+    }
+}
+
+/// Build the authorization URL for a PKCE flow (shared by Google & Custom OAuth2).
+pub fn build_pkce_auth_url(
+    cfg: &OAuthProviderConfig,
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+    login_hint: Option<&str>,
+) -> Result<String, String> {
+    let mut url =
+        url::Url::parse(&cfg.auth_url).map_err(|e| format!("无效的 OAuth2 auth_url: {e}"))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("client_id", cfg.client_id.trim());
+        q.append_pair("response_type", "code");
+        q.append_pair("redirect_uri", redirect_uri);
+        q.append_pair("scope", cfg.scopes.trim());
+        q.append_pair("code_challenge", challenge);
+        q.append_pair("code_challenge_method", "S256");
+        q.append_pair("state", state);
+        q.append_pair("access_type", "offline");
+        if let Some(hint) = login_hint.map(str::trim).filter(|s| !s.is_empty()) {
+            q.append_pair("login_hint", hint);
+        }
+    }
+    Ok(url.into())
+}
+
+/// Refresh an OAuth2 access token for Google or any custom OAuth2 provider.
+pub fn refresh_custom_token(
+    cfg: &OAuthProviderConfig,
+    refresh_token: &str,
+) -> Result<RefreshedTokens, String> {
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", cfg.client_id.trim()),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    if let Some(secret) = cfg
+        .client_secret
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        form.push(("client_secret", secret.trim()));
+    }
+    let resp = ureq::post(&cfg.token_url)
+        .send_form(&form)
+        .map_err(format_ureq_error)?;
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("解析 OAuth2 刷新响应失败: {e}"))?;
+    let access_token = json["access_token"]
+        .as_str()
+        .ok_or_else(|| "OAuth2 刷新响应缺少 access_token".to_string())?
+        .to_string();
+    let new_refresh = json["refresh_token"].as_str().map(str::to_string);
+    let expires_in_secs = json["expires_in"].as_u64().unwrap_or(3600);
+    Ok(RefreshedTokens {
+        access_token,
+        refresh_token: new_refresh,
+        expires_in_secs,
+    })
+}
+
+/// Refresh a Google OAuth2 token.
+pub fn refresh_google_token(
+    client_id: &str,
+    client_secret: Option<&str>,
+    refresh_token: &str,
+) -> Result<RefreshedTokens, String> {
+    let cfg = OAuthProviderConfig::google(client_id, client_secret.map(str::to_string));
+    refresh_custom_token(&cfg, refresh_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_google_and_custom_pkce_urls() {
+        let cfg = OAuthProviderConfig::google("google-client-123", None);
+        let url = build_pkce_auth_url(
+            &cfg,
+            "http://127.0.0.1:54321/",
+            "challenge_abc",
+            "state_xyz",
+            Some("user@gmail.com"),
+        )
+        .unwrap();
+        assert!(url.starts_with(GOOGLE_AUTH_URL));
+        assert!(url.contains("client_id=google-client-123"));
+        assert!(url.contains("code_challenge=challenge_abc"));
+        assert!(url.contains("login_hint=user%40gmail.com"));
+    }
+}

@@ -1338,55 +1338,10 @@ fn is_block_break_tag(lower: &str) -> bool {
     )
 }
 
-/// Strip common tracking query parameters from `http(s)://` URLs while preserving
-/// legitimate parameters and URL fragments.
+/// Strip redirectors (up to 4 layers) and common tracking query parameters from
+/// `http(s)://` URLs while preserving legitimate parameters and URL fragments.
 pub fn strip_tracking_params(raw_url: &str) -> String {
-    let Ok(mut parsed) = url::Url::parse(raw_url.trim()) else {
-        return raw_url.to_string();
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return raw_url.to_string();
-    }
-    let kept: Vec<(String, String)> = parsed
-        .query_pairs()
-        .filter(|(k, _)| !is_tracking_param(k))
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    if parsed.query().is_none() {
-        return raw_url.to_string();
-    }
-    if kept.is_empty() {
-        parsed.set_query(None);
-    } else {
-        let mut ser = parsed.query_pairs_mut();
-        ser.clear();
-        for (k, v) in kept {
-            ser.append_pair(&k, &v);
-        }
-        drop(ser);
-    }
-    parsed.to_string()
-}
-
-fn is_tracking_param(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    k.starts_with("utm_")
-        || matches!(
-            k.as_str(),
-            "fbclid"
-                | "gclid"
-                | "dclid"
-                | "msclkid"
-                | "mc_cid"
-                | "mc_eid"
-                | "igshid"
-                | "spm"
-                | "yclid"
-                | "ref_src"
-                | "_hsenc"
-                | "_hsmi"
-                | "mkt_tok"
-        )
+    crate::link_clean::clean_link(raw_url)
 }
 
 fn clean_anchor_tag_href(raw_tag: &str) -> String {

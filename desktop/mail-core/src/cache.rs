@@ -3842,6 +3842,36 @@ impl CacheStore {
         Ok(())
     }
 
+    /// WP-12: Wake all snoozed messages whose `snoozed_until_ts <= now_ts`,
+    /// clearing their snooze timestamp and marking them unread.
+    pub fn wake_due_snoozed(&mut self, now_ts: i64) -> Result<Vec<(u32, u32, String)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, account_id, subject FROM messages
+                 WHERE snoozed_until_ts > 0 AND snoozed_until_ts <= ?1",
+            )
+            .map_err(|e| format!("查询到期稍后提醒失败: {e}"))?;
+        let due: Vec<(u32, u32, String)> = stmt
+            .query_map(params![now_ts], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| format!("读取到期稍后提醒失败: {e}"))?
+            .filter_map(Result::ok)
+            .collect();
+        drop(stmt);
+        if !due.is_empty() {
+            self.conn
+                .execute(
+                    "UPDATE messages SET snoozed_until_ts = 0, unread = 1
+                     WHERE snoozed_until_ts > 0 AND snoozed_until_ts <= ?1",
+                    params![now_ts],
+                )
+                .map_err(|e| format!("唤醒稍后提醒邮件失败: {e}"))?;
+        }
+        Ok(due)
+    }
+
     /// WP-08: Copy a cached message into `target_account_id` / `target_folder_path`.
     pub fn copy_message_to_folder(
         &mut self,
