@@ -41,9 +41,11 @@ use crate::ui::{avatar, window_controls};
 pub(crate) const LIST_WIDTH: f32 = 360.0;
 /// 顶部栏高度（与左栏 / 右栏统一为 48px）。
 const HEADER_HEIGHT: f32 = 48.0;
-/// 列表行高度。
+/// 列表行最小高度：行内容随字体度量自适应增高（三行文本按 gpui 默认
+/// 1.618 倍行高需要约 95px，固定 82px 会把带 truncate 的主题行压扁、
+/// 中文被竖向裁切），这里只兜底。
 const ROW_HEIGHT: f32 = 82.0;
-/// 紧凑列表行高（偏好 compact_list，隐藏摘要行，方案文档五.2）。
+/// 紧凑列表行最小高度（偏好 compact_list，隐藏摘要行，方案文档五.2）。
 const COMPACT_ROW_HEIGHT: f32 = 64.0;
 
 /// 邮件行右键菜单（方案文档五.3 + B-2）。
@@ -358,7 +360,7 @@ fn message_row(
     let row = h_flex()
         .id(("msg", msg_id))
         .flex_shrink_0()
-        .h(px(if compact {
+        .min_h(px(if compact {
             COMPACT_ROW_HEIGHT
         } else {
             ROW_HEIGHT
@@ -371,7 +373,8 @@ fn message_row(
         .pb(px(13.0))
         .pl(px(10.0))
         .gap_2()
-        .items_start()
+        // 头像在整行垂直居中（对齐原版 avatar valign center）；文本列 h_full 撑满不受影响。
+        .items_center()
         .rounded(px(12.0))
         .cursor_pointer()
         .overflow_hidden()
@@ -408,7 +411,6 @@ fn message_row(
                 .flex_shrink_0()
                 .items_center()
                 .gap_1()
-                .pt_0p5()
                 .child(avatar::avatar(&display_name, &avatar_key, 36.0))
                 .child(
                     div()
