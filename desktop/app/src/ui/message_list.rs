@@ -314,12 +314,17 @@ fn row_context_menu(
 }
 
 /// 列表行（圆角卡片）。
+///
+/// P3 状态参数：`list_focused` 为「列表持焦点」近似态（见 render 中的计算），
+/// `kbd_cursor` 为键盘游标行（对齐 Linux .kbd-cursor）。
 fn message_row(
     app: &HylkiApp,
     msg: &MessageSummary,
     draft: Option<LocalDraft>,
     is_selected: bool,
     show_account_tag: bool,
+    list_focused: bool,
+    kbd_cursor: bool,
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
 ) -> ContextMenu<Stateful<Div>> {
@@ -386,7 +391,12 @@ fn message_row(
         .rounded(px(12.0))
         .cursor_pointer()
         .overflow_hidden()
-        // 悬停：选中行加深半透明 accent；未选中行用中性微灰（原版 alpha(currentColor, 0.05)）。
+        // P3 状态底色矩阵（对齐 Linux styles.css .message-row 区块）：
+        // - 悬停未选中：中性微灰（原版 alpha(currentColor, 0.05)）；
+        // - 选中且列表持焦点（或悬停经过）：accent 0.5 药丸（原版 focus-within
+        //   与 :selected:hover 同为 alpha(accent_bg_color, 0.5)）；
+        // - 选中但焦点离开列表（阅读器）：变暗为 0.3，不清除（dimming, never
+        //   vanishing）。
         .hover(move |s| {
             if is_selected {
                 s.bg(p.accent.opacity(0.50))
@@ -394,11 +404,34 @@ fn message_row(
                 s.bg(p.text.opacity(0.05))
             }
         })
-        // 选中行：半透明 accent 底（贴近原版失焦 alpha(@accent_bg_color, 0.3)）。
-        .when(is_selected, |row| row.bg(p.accent.opacity(0.35)))
+        .when(is_selected, |row| {
+            row.bg(if list_focused {
+                p.accent.opacity(0.50)
+            } else {
+                p.accent.opacity(0.30)
+            })
+        })
+        // P3：键盘游标行（原版 .kbd-cursor，列表持焦点时才画）：非选中行加
+        // accent 0.1 底 + accent 0.85 内描边；选中行药丸上改用 accent_fg 0.8
+        // 内描边（accent-on-accent 会消失）。gpui 无 inset box-shadow，用 2px
+        // 圆角边框近似（行盒内绘制，不改布局）。
+        .when(kbd_cursor && list_focused, |row| {
+            let ring = if is_selected {
+                p.accent_fg.opacity(0.8)
+            } else {
+                p.accent.opacity(0.85)
+            };
+            row.border_2()
+                .border_color(ring)
+                .when(!is_selected, |row| row.bg(p.accent.opacity(0.10)))
+        })
         .on_click({
             let draft = draft.clone();
             cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                // P3：点击行视为列表持焦点，并清除键盘游标（原版 kbd-cursor 在
+                // 点击时移除，a click never draws it）。
+                this.list_focused = true;
+                this.kbd_cursor_message_id = None;
                 match draft.as_ref() {
                     // 草稿行：点击进入写信编辑。
                     Some(d) => this.open_local_draft(d, window, cx),
@@ -430,8 +463,16 @@ fn message_row(
                         .items_center()
                         .justify_center()
                         .when(unread, |dot| {
-                            // 未读圆点 10x10（原版 .unread-dot），选中态保持 accent 色不变。
-                            dot.child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(p.accent))
+                            // 未读圆点 10x10（原版 .unread-dot）：选中行在 accent 药丸上
+                            // 反色为 accent_fg（原版 row:selected .unread-dot →
+                            // @accent_fg_color，accent-on-accent 会消失）。
+                            dot.child(
+                                div()
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .rounded_full()
+                                    .bg(if is_selected { p.accent_fg } else { p.accent }),
+                            )
                         }),
                 ),
         )
@@ -461,7 +502,9 @@ fn message_row(
                                 } else {
                                     gpui_kit::FontWeight::MEDIUM
                                 })
-                                .text_color(p.text)
+                                // P3：选中行全部文字提为 accent_fg 全强度（原版
+                                // row:selected .message-row label → @accent_fg_color）。
+                                .text_color(if is_selected { p.accent_fg } else { p.text })
                                 .child(SharedString::from(first_line)),
                         )
                         .child(
@@ -480,7 +523,12 @@ fn message_row(
                                     icons.child(
                                         Icon::new(IconName::Paperclip)
                                             .with_size(px(13.0))
-                                            .text_color(p.text_muted),
+                                            // P3：选中行附件图标同样提为 accent_fg。
+                                            .text_color(if is_selected {
+                                                p.accent_fg
+                                            } else {
+                                                p.text_muted
+                                            }),
                                     )
                                 })
                                 .child({
@@ -497,11 +545,17 @@ fn message_row(
                                     );
                                     div()
                                         .text_xs()
-                                        .text_color(p.text_muted)
+                                        // P3：选中行时间同提为 accent_fg。
+                                        .text_color(if is_selected {
+                                            p.accent_fg
+                                        } else {
+                                            p.text_muted
+                                        })
                                         .child(SharedString::from(date_text))
                                 })
                                 // B-4 会话计数胶囊（对齐原版 .thread-chip：仅 >1 封往来时显示，
-                                // 紧凑圆角、10px 粗体、主题色弱底）。
+                                // 紧凑圆角、10px 粗体、主题色弱底）；选中行整枚反色：
+                                // accent_fg 底 + accent 文字（原版 row:selected .thread-chip）。
                                 .when(msg.thread_count > 1, |icons| {
                                     icons.child(
                                         div()
@@ -509,7 +563,11 @@ fn message_row(
                                             .px(px(7.0))
                                             .py(px(2.0))
                                             .rounded_full()
-                                            .bg(p.accent_soft())
+                                            .bg(if is_selected {
+                                                p.accent_fg
+                                            } else {
+                                                p.accent_soft()
+                                            })
                                             .text_size(px(10.0))
                                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                             .text_color(p.accent)
@@ -521,7 +579,8 @@ fn message_row(
                                 }),
                         ),
                 )
-                // 第 2 行：主题（未读加粗；已读 85% 透明度，复刻原版 .message-subject 层次）。
+                // 第 2 行：主题（未读加粗；已读 85% 透明度，复刻原版 .message-subject 层次；
+                // P3：选中行提为 accent_fg 全强度，覆盖已读的 85% 透明度）。
                 .child(
                     div()
                         .text_sm()
@@ -531,7 +590,13 @@ fn message_row(
                         } else {
                             gpui_kit::FontWeight::NORMAL
                         })
-                        .text_color(if unread { p.text } else { p.text.opacity(0.85) })
+                        .text_color(if is_selected {
+                            p.accent_fg
+                        } else if unread {
+                            p.text
+                        } else {
+                            p.text.opacity(0.85)
+                        })
                         .child(SharedString::from(msg.subject.clone())),
                 )
                 // 第 3 行：摘要 + 多账号小胶囊标签；紧凑密度下隐藏。
@@ -547,8 +612,13 @@ fn message_row(
                                     .min_w_0()
                                     .text_xs()
                                     .truncate()
-                                    // 摘要 50% 透明度（原版 .message-preview）。
-                                    .text_color(p.text.opacity(0.5))
+                                    // 摘要 50% 透明度（原版 .message-preview）；
+                                    // P3：选中行提为 accent_fg 全强度。
+                                    .text_color(if is_selected {
+                                        p.accent_fg
+                                    } else {
+                                        p.text.opacity(0.5)
+                                    })
                                     .child(SharedString::from(msg.preview.clone())),
                             )
                             .when(!acc_label.is_empty(), |el| {
@@ -561,8 +631,19 @@ fn message_row(
                                         .py_0p5()
                                         .rounded_full()
                                         .text_size(px(10.0))
-                                        .bg(acc_color.opacity(0.14))
-                                        .text_color(acc_color)
+                                        // P3：选中行账号标签反转为中性胶囊（Linux 无
+                                        // 对应规则；accent 药丸上沿用账号彩色会沉底，
+                                        // 改为 accent_fg 弱底 + accent_fg 文字保层级）。
+                                        .bg(if is_selected {
+                                            p.accent_fg.opacity(0.14)
+                                        } else {
+                                            acc_color.opacity(0.14)
+                                        })
+                                        .text_color(if is_selected {
+                                            p.accent_fg
+                                        } else {
+                                            acc_color
+                                        })
                                         .child(SharedString::from(acc_label)),
                                 )
                             }),
@@ -617,6 +698,10 @@ pub(crate) fn render(
     let current_sort = app.list_sort;
     let quick_filters = app.quick_filters;
     let is_unified_list = !drafts_view;
+    // P3：「列表持焦点」近似态（gpui 没有列表级 focus-within）：最近一次列表
+    // 交互（点击行 / 键盘导航）且当前无文本输入持焦点时视为聚焦，驱动选中行
+    // 药丸 0.5 / 0.3 两档与键盘游标轮廓；点击阅读器由 reader 的 mouse_down 清除。
+    let list_focused = app.list_focused && !app.is_text_input_focused(window, cx);
 
     let search_key = app.search_query.trim().to_lowercase();
     let matches_query = |subject: &str, body: &str| {
@@ -638,6 +723,9 @@ pub(crate) fn render(
                     Some(d.clone()),
                     false,
                     show_account_tag,
+                    list_focused,
+                    // 草稿行不参与键盘游标（无选择语义）。
+                    false,
                     &p,
                     cx,
                 )
@@ -704,9 +792,21 @@ pub(crate) fn render(
             }
             let is_selected =
                 selected_id == Some(msg.id) || app.selected_message_ids.contains(&msg.id);
+            // P3：键盘游标行（j/k、方向键移动，点击行后清除）。
+            let kbd_cursor = app.kbd_cursor_message_id == Some(msg.id);
             filtered_rows.push(
-                message_row(app, msg, None, is_selected, show_account_tag, &p, cx)
-                    .into_any_element(),
+                message_row(
+                    app,
+                    msg,
+                    None,
+                    is_selected,
+                    show_account_tag,
+                    list_focused,
+                    kbd_cursor,
+                    &p,
+                    cx,
+                )
+                .into_any_element(),
             );
         }
     }
@@ -899,7 +999,9 @@ pub(crate) fn render(
                     Button::new("list-toggle-sidebar")
                         .ghost()
                         .compact()
-                        .icon(if app.sidebar_hidden {
+                        // P3：窄轨（手动折叠或断点自动折叠）且浮层未开时显示展开
+                        // 图标；断点窄轨下点击 toggle 打开 / 关闭浮层侧栏而非原地展开。
+                        .icon(if app.sidebar_narrow() && !app.sidebar_peek_open {
                             IconName::PanelLeftOpen
                         } else {
                             IconName::PanelLeftClose

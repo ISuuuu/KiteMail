@@ -1091,8 +1091,14 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
                             .rounded(px(8.0))
                             .hover(|s| s.bg(p.accent_soft()))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                // 点击头像恢复宽栏并展开该账号分组。
-                                this.sidebar_hidden = false;
+                                // P3：断点窄轨下点击头像改为打开浮层侧栏（窄轨本身
+                                // 不原地展开，对齐 Linux rail 交互）；宽窗口 / 手动
+                                // 折叠时维持原行为：恢复宽栏并展开该账号分组。
+                                if this.auto_rail_active {
+                                    this.sidebar_peek_open = true;
+                                } else {
+                                    this.sidebar_hidden = false;
+                                }
                                 this.collapsed_accounts.remove(&acc_id);
                                 cx.notify();
                             }))
