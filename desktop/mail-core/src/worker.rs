@@ -2648,12 +2648,16 @@ async fn sync_folder_inner(
             Ok(sec) => {
                 match tokio::time::timeout(
                     Duration::from_secs(60),
-                    imap_client::fetch_folder_headers(account, &sec.imap_password, folder_path),
+                    imap_client::fetch_folder_headers_with_flags(
+                        account,
+                        &sec.imap_password,
+                        folder_path,
+                    ),
                 )
                 .await
                 .unwrap_or_else(|_| Err("同步文件夹超时".to_string()))
                 {
-                    Ok((uid_validity, headers, live_uids)) => {
+                    Ok((uid_validity, headers, live_uids, flag_snapshot)) => {
                         let commit_res = cache.commit_folder_headers(
                             account.id,
                             folder_id,
@@ -2662,6 +2666,13 @@ async fn sync_folder_inner(
                             Some(&live_uids),
                         );
                         if commit_res.is_ok() {
+                            if let Some(flags) = flag_snapshot {
+                                let _ = cache.reconcile_folder_flags(
+                                    folder_id,
+                                    &flags.flagged_uids,
+                                    &flags.unseen_uids,
+                                );
+                            }
                             let min_cached_uid = cache
                                 .folder_remote_cursor(folder_id)
                                 .ok()
@@ -3360,6 +3371,22 @@ async fn retry_outbox_item(
     deliver_outbox_item(data_dir, cache, tokens, account_id, outbox_id, item, evt_tx).await;
 }
 
+/// Determine whether an SMTP-sent message needs an explicit IMAP `APPEND (\Seen)`
+/// to the Sent folder and resolve its target path.
+fn resolve_imap_sent_append_target(
+    account: &AccountConfig,
+    discovered_sent: Option<String>,
+) -> Option<String> {
+    if account.auth_backend != AuthBackend::Password || account.special_folders.server_saves_sent {
+        return None;
+    }
+    let configured = account.special_folders.sent.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    discovered_sent.filter(|p| !p.trim().is_empty())
+}
+
 /// 投递一条已领取（Sending）的发件箱记录。
 async fn deliver_outbox_item(
     data_dir: &PathBuf,
@@ -3451,9 +3478,16 @@ async fn deliver_outbox_item(
                 subject: item.subject,
             });
             // 移植方案阶段 2：服务器确认接收后，保存已发副本属于独立操作；
+            // 若 `server_saves_sent` 为 true（Gmail/Outlook/iCloud 等）则跳过 APPEND 避免重复；
             // 若 APPEND 失败仅发温和状态提示，绝不将已发邮件标记为失败或重发。
             if let (Some(raw), Some(imap_pwd)) = (sent_raw_rfc822, imap_password_for_sent) {
-                if let Ok(Some((_, sent_path))) = cache.find_sent_folder(account_id) {
+                let discovered_sent = cache
+                    .find_sent_folder(account_id)
+                    .ok()
+                    .flatten()
+                    .map(|(_, path)| path);
+                if let Some(sent_path) = resolve_imap_sent_append_target(&account, discovered_sent)
+                {
                     if let Err(e) =
                         imap_client::append_sent_message(&account, &imap_pwd, &sent_path, &raw)
                             .await
@@ -3852,5 +3886,34 @@ mod tests {
         );
         state.abandoned.insert(3);
         assert_eq!(select_backfill_target(&candidates, &allowed, &state), None);
+    }
+
+    #[test]
+    fn resolve_imap_sent_append_target_respects_server_saves_sent_and_override() {
+        let mut account = AccountConfig::default();
+        account.auth_backend = AuthBackend::Password;
+        account.special_folders.server_saves_sent = true;
+        assert_eq!(
+            resolve_imap_sent_append_target(&account, Some("Sent".to_string())),
+            None
+        );
+
+        account.special_folders.server_saves_sent = false;
+        assert_eq!(
+            resolve_imap_sent_append_target(&account, Some("Sent".to_string())),
+            Some("Sent".to_string())
+        );
+
+        account.special_folders.sent = "Custom/Sent".to_string();
+        assert_eq!(
+            resolve_imap_sent_append_target(&account, Some("Sent".to_string())),
+            Some("Custom/Sent".to_string())
+        );
+
+        account.auth_backend = AuthBackend::MicrosoftGraphOAuth2;
+        assert_eq!(
+            resolve_imap_sent_append_target(&account, Some("Sent".to_string())),
+            None
+        );
     }
 }
