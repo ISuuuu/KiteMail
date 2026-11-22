@@ -278,6 +278,7 @@ pub(crate) struct PendingSend {
     pub(crate) undo_requested: bool,
     /// 已触发投递但落盘回执未到：回执到达后立即投递。
     pub(crate) commit_requested: bool,
+    enqueue_failed: bool,
 }
 
 /// 主内容区路由（方案文档五.1）：`Mail` 默认三栏，`Gallery` 附件总览，
@@ -424,12 +425,8 @@ pub(crate) struct HylkiApp {
     pub(crate) known_contacts: Vec<KnownContact>,
     /// 撤销发送（5 秒缓冲）状态。
     pub(crate) pending_send: Option<PendingSend>,
-    /// 已触发投递但落盘回执未到的请求（token, account_id）：回执到达后立即投递。
-    /// 独立缓冲避免连续发送时被新的撤销缓冲覆盖丢失。
-    pending_commit: Option<(u64, u32)>,
-    /// 已请求撤销但落盘回执未到的缓冲 token：回执到达后删除对应记录，
-    /// 保证撤销的邮件绝不会被投递。
-    pending_undo_delete: Vec<u64>,
+    quitting: bool,
+    quit_preparing: bool,
     next_send_token: u64,
     /// 写信发送前检测到正文/主题提及附件关键词但未附带文件时触发的内联确认横幅（命中关键词）。
     pub(crate) compose_attachment_reminder: Option<String>,
@@ -598,7 +595,8 @@ impl HylkiApp {
                     }
                     return false;
                 }
-                app.read(cx).shutdown_tray();
+                app.update(cx, |this, cx| this.quit_app(cx));
+                return false;
             }
             true
         });
@@ -836,8 +834,8 @@ impl HylkiApp {
                 compose_autosaved_at: None,
                 known_contacts: demo_contacts,
                 pending_send: None,
-                pending_commit: None,
-                pending_undo_delete: Vec::new(),
+                quitting: false,
+                quit_preparing: false,
                 next_send_token: 1,
                 compose_attachment_reminder: None,
                 cfg_feedback: None,
@@ -1008,8 +1006,8 @@ impl HylkiApp {
             compose_autosaved_at: None,
             known_contacts: Vec::new(),
             pending_send: None,
-            pending_commit: None,
-            pending_undo_delete: Vec::new(),
+            quitting: false,
+            quit_preparing: false,
             next_send_token: 1,
             compose_attachment_reminder: None,
             cfg_feedback: None,
@@ -1270,11 +1268,14 @@ impl HylkiApp {
                 }
                 WorkerEvent::BackfillHistoryBatchDone {
                     folder_id: _,
-                    fetched_count: _,
+                    fetched_count,
+                    body_only,
                     has_more_remote,
                 } => {
-                    // 任务四：批次完成（单队列中已跑完），按剩余候选决定是否续排；
-                    // 侧栏计数由随批先行到达的 FoldersLoaded 刷新，不打扰界面。
+                    // 每批落盘后刷新当前查询及总数，使新历史可滚动和搜索。
+                    if fetched_count > 0 && (!body_only || !self.search_query.trim().is_empty()) {
+                        self.reload_current_page(cx);
+                    }
                     self.backfill.on_batch_done(has_more_remote);
                     self.maybe_drive_backfill(cx);
                 }
@@ -1342,28 +1343,6 @@ impl HylkiApp {
                     outbox_id,
                 } => {
                     // 撤销发送：待发记录已落盘发件箱（原草稿同步交接删除），回填缓冲 ID。
-                    if self.pending_commit.as_ref().map(|(t, _)| *t) == Some(token) {
-                        // 已让位给后续发送的挂起投递：立即触发投递。
-                        if let Some(ref w) = self.worker {
-                            w.send(MailRequest::RetryOutboxItem {
-                                account_id,
-                                outbox_id,
-                            });
-                        }
-                        self.pending_commit = None;
-                        continue;
-                    }
-                    if let Some(pos) = self.pending_undo_delete.iter().position(|t| *t == token) {
-                        // 已让位给后续发送的撤销请求：删除刚落盘的记录。
-                        self.pending_undo_delete.remove(pos);
-                        if let Some(ref w) = self.worker {
-                            w.send(MailRequest::DeleteOutboxItem {
-                                account_id,
-                                outbox_id,
-                            });
-                        }
-                        continue;
-                    }
                     let matched = self.pending_send.as_ref().is_some_and(|p| p.token == token);
                     if !matched {
                         // 已让位给后续发送或撤销流程已完成的旧回执，忽略。
@@ -1374,22 +1353,126 @@ impl HylkiApp {
                         pending.outbox_id = Some(outbox_id);
                         pending.undo_requested
                     };
-                    if undo_requested {
-                        // 撤销已在回执前生效（写信内容已恢复）：删除刚落盘的记录并清理缓冲。
-                        let pending = self.pending_send.take().unwrap();
-                        if let Some(ref w) = self.worker {
-                            w.send(MailRequest::DeleteOutboxItem {
-                                account_id: pending.account_id,
-                                outbox_id,
+                    if self.quitting && !undo_requested {
+                        self.quit_app(cx);
+                    } else if undo_requested {
+                        let result = self
+                            .worker
+                            .as_ref()
+                            .ok_or_else(|| "邮件后台线程不可用".to_string())
+                            .and_then(|w| {
+                                w.send_checked(MailRequest::UndoOutboxItem {
+                                    account_id,
+                                    outbox_id,
+                                    token,
+                                })
                             });
+                        if let Err(message) = result {
+                            self.quitting = false;
+                            if let Some(pending) = self.pending_send.as_mut() {
+                                pending.undo_requested = false;
+                            }
+                            self.error_banner = Some(SharedString::from(message.clone()));
+                            self.status_line = SharedString::from(message);
                         }
-                        self.status_line = SharedString::from("已撤销发送，返回编辑邮件");
                     } else if self
                         .pending_send
                         .as_ref()
                         .is_some_and(|p| p.commit_requested)
                     {
                         self.commit_pending_send(token, cx);
+                    } else if let Some(pending) = self.pending_send.as_ref() {
+                        self.start_send_countdown(token, pending.remaining_secs, cx);
+                    }
+                    cx.notify();
+                }
+                WorkerEvent::OutboxEnqueueFailed {
+                    token,
+                    message,
+                    recovered_draft_id,
+                } => {
+                    self.quitting = false;
+                    if self.pending_send.as_ref().is_some_and(|p| p.token == token) {
+                        if recovered_draft_id.is_some() {
+                            self.pending_send = None;
+                        } else if let Some(pending) = self.pending_send.as_mut() {
+                            pending.undo_requested = false;
+                            pending.enqueue_failed = true;
+                        }
+                    }
+                    self.error_banner = Some(SharedString::from(message.clone()));
+                    self.status_line = SharedString::from(if recovered_draft_id.is_some() {
+                        format!("{message}；邮件已保存到草稿")
+                    } else {
+                        format!("{message}；请关闭当前写信页后点击撤销发送恢复邮件")
+                    });
+                    cx.notify();
+                }
+                WorkerEvent::QuitPrepared { result } => {
+                    self.quit_preparing = false;
+                    match result {
+                        Ok(()) if self.quitting => {
+                            self.shutdown_tray();
+                            cx.quit();
+                        }
+                        Ok(()) => {}
+                        Err(message) => {
+                            self.quitting = false;
+                            self.error_banner = Some(SharedString::from(message.clone()));
+                            self.status_line = SharedString::from(message);
+                        }
+                    }
+                }
+                WorkerEvent::OutboxUndoResult { token, result } => {
+                    if self.pending_send.as_ref().map(|p| p.token) != Some(token) {
+                        continue;
+                    }
+                    match result {
+                        Ok(Some(draft_id)) => {
+                            let pending = self.pending_send.take().unwrap();
+                            let handle = self.window_handle;
+                            cx.spawn(async move |this, cx| {
+                                let _ = cx.update(|cx| {
+                                    handle.update(cx, |_, window, cx| {
+                                        let _ = this.update(cx, |app, cx| {
+                                            if app.right_mode != RightPaneMode::Compose {
+                                                app.restore_pending_send_to_compose(
+                                                    &pending, window, cx,
+                                                );
+                                                app.compose_draft_id = Some(draft_id);
+                                                app.status_line =
+                                                    SharedString::from("已撤销发送，返回编辑邮件");
+                                            } else {
+                                                app.status_line = SharedString::from(
+                                                    "已撤销发送，邮件已保存到草稿",
+                                                );
+                                            }
+                                            cx.notify();
+                                        });
+                                    })
+                                });
+                            })
+                            .detach();
+                        }
+                        Ok(None) => {
+                            self.pending_send = None;
+                            self.status_line = SharedString::from("邮件已开始投递，无法撤销");
+                        }
+                        Err(message) => {
+                            self.quitting = false;
+                            if let Some(pending) = self.pending_send.as_mut() {
+                                pending.undo_requested = false;
+                            }
+                            self.error_banner = Some(SharedString::from(message.clone()));
+                            self.status_line = SharedString::from(message);
+                        }
+                    }
+                    if self.quitting {
+                        if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
+                            self.quitting = false;
+                        } else {
+                            self.quit_app(cx);
+                        }
                     }
                     cx.notify();
                 }
@@ -1397,11 +1480,6 @@ impl HylkiApp {
                     account_id: _,
                     subject,
                 } => {
-                    self.right_mode = RightPaneMode::Reader;
-                    self.compose_draft_id = None;
-                    self.compose_attachments.clear();
-                    self.compose_in_reply_to.clear();
-                    self.error_banner = None;
                     self.status_line = SharedString::from(format!("邮件已发出：{}", subject));
                 }
                 WorkerEvent::AttachmentSaved { path } => {
@@ -1860,8 +1938,54 @@ impl HylkiApp {
         if self.layout_save_deadline.take().is_some() {
             self.persist_layout_prefs();
         }
-        self.shutdown_tray();
-        cx.quit();
+        self.quitting = true;
+        if self.pending_send.as_ref().is_some_and(|p| p.enqueue_failed) {
+            self.quitting = false;
+            self.status_line = SharedString::from("请先恢复未保存的邮件，再退出");
+            cx.notify();
+            return;
+        }
+        if !self.demo_mode
+            && self
+                .pending_send
+                .as_ref()
+                .is_some_and(|p| p.outbox_id.is_none())
+        {
+            self.status_line = SharedString::from("正在保存待发送邮件，完成后退出…");
+            cx.notify();
+            return;
+        }
+        if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
+            self.status_line = SharedString::from("正在完成撤销，然后退出…");
+            cx.notify();
+            return;
+        }
+        if self.quit_preparing {
+            return;
+        }
+        if let Some(ref worker) = self.worker {
+            match worker.send_checked(MailRequest::PrepareQuit) {
+                Ok(()) => {
+                    self.quit_preparing = true;
+                    self.status_line = SharedString::from("正在保存发件队列…");
+                    cx.notify();
+                }
+                Err(message) => {
+                    self.quitting = false;
+                    if self.pending_send.is_some() {
+                        self.error_banner = Some(SharedString::from(message.clone()));
+                        self.status_line = SharedString::from(message);
+                        cx.notify();
+                    } else {
+                        self.shutdown_tray();
+                        cx.quit();
+                    }
+                }
+            }
+        } else {
+            self.shutdown_tray();
+            cx.quit();
+        }
     }
 
     /// 切换左栏统一导航视图（收件箱 / 星标 / 已发送 / 草稿 / 归档）。
@@ -3456,6 +3580,22 @@ impl HylkiApp {
     }
 
     fn send_compose_inner(&mut self, check_attachments: bool, cx: &mut Context<Self>) {
+        if self.quitting
+            || (!self.demo_mode
+                && self
+                    .pending_send
+                    .as_ref()
+                    .is_some_and(|p| p.outbox_id.is_none()))
+        {
+            self.status_line = SharedString::from("上一封邮件尚未保存，请先完成或恢复它");
+            cx.notify();
+            return;
+        }
+        if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
+            self.status_line = SharedString::from("正在撤销上一封邮件，请稍候");
+            cx.notify();
+            return;
+        }
         let to = self.compose_to.read(cx).value().to_string();
         let cc = self.compose_cc.read(cx).value().to_string();
         let bcc = self.compose_bcc.read(cx).value().to_string();
@@ -3502,31 +3642,6 @@ impl HylkiApp {
         if let Some(prev) = self.pending_send.as_ref().map(|p| p.token) {
             self.commit_pending_send(prev, cx);
         }
-        // 投递因落盘回执未到而挂起时，转入独立等待槽，不随新缓冲覆盖丢失。
-        if self
-            .pending_send
-            .as_ref()
-            .is_some_and(|p| p.commit_requested)
-        {
-            let prev = self.pending_send.take().unwrap();
-            self.pending_commit = Some((prev.token, prev.account_id));
-        } else if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
-            // 撤销请求已登记但未完成时被新发送让位：已落盘的记录直接删除，
-            // 回执未到的登记待删 token，保证撤销的邮件绝不会被投递。
-            let prev = self.pending_send.take().unwrap();
-            match prev.outbox_id {
-                Some(outbox_id) => {
-                    if let Some(ref w) = self.worker {
-                        w.send(MailRequest::DeleteOutboxItem {
-                            account_id: prev.account_id,
-                            outbox_id,
-                        });
-                    }
-                }
-                None => self.pending_undo_delete.push(prev.token),
-            }
-        }
-
         let delay_secs = self.prefs.undo_send_secs.min(15) as u8;
         let token = self.next_send_token;
         self.next_send_token = self.next_send_token.wrapping_add(1).max(1);
@@ -3547,20 +3662,28 @@ impl HylkiApp {
             outbox_id: None,
             undo_requested: false,
             commit_requested: false,
+            enqueue_failed: false,
         };
         // 任务一：撤销发送先把待发记录持久化到发件箱（Queued + 到期时间）再启动
         // 倒计时；撤销 = 删除该记录，倒计时到期 / 立即发送 = 直接触发投递。原草稿
         // 由 worker 在记录落盘成功后交接删除（保证内容已落盘且不重复）。
         if !self.demo_mode {
-            if let Some(ref w) = self.worker {
-                let now = chrono::Utc::now().timestamp();
-                w.send(MailRequest::SendDraft {
-                    account_id: pending.account_id,
-                    draft: pending.draft.clone(),
-                    local_draft_id: pending.local_draft_id,
-                    undo_token: token,
-                    send_at: Some(now + delay_secs as i64),
-                });
+            let request = MailRequest::SendDraft {
+                account_id: pending.account_id,
+                draft: pending.draft.clone(),
+                local_draft_id: pending.local_draft_id,
+                undo_token: token,
+                send_at: Some(delay_secs as i64),
+            };
+            let result = self
+                .worker
+                .as_ref()
+                .ok_or_else(|| "邮件后台线程不可用".to_string())
+                .and_then(|w| w.send_checked(request));
+            if let Err(message) = result {
+                self.error_banner = Some(SharedString::from(message));
+                cx.notify();
+                return;
             }
         }
         self.pending_send = Some(pending);
@@ -3575,6 +3698,15 @@ impl HylkiApp {
         self.right_mode = RightPaneMode::Reader;
         self.error_banner = None;
 
+        if self.demo_mode {
+            self.start_send_countdown(token, delay_secs, cx);
+        } else {
+            self.status_line = SharedString::from("正在保存待发送邮件…");
+            cx.notify();
+        }
+    }
+
+    fn start_send_countdown(&mut self, token: u64, delay_secs: u8, cx: &mut Context<Self>) {
         if delay_secs == 0 {
             self.commit_pending_send(token, cx);
             return;
@@ -3618,7 +3750,7 @@ impl HylkiApp {
     /// 真正将 `pending_send` 投递给 Worker（倒计时到期或点击「立即发送」）。
     /// 记录已在发送时落盘发件箱，此处仅触发投递；落盘回执未到时挂起等待。
     pub(crate) fn commit_pending_send(&mut self, token: u64, cx: &mut Context<Self>) {
-        if self.pending_send.as_ref().map(|p| p.token) != Some(token) {
+        if self.quitting || self.pending_send.as_ref().map(|p| p.token) != Some(token) {
             return;
         }
         if self.demo_mode {
@@ -3672,30 +3804,46 @@ impl HylkiApp {
 
     /// 撤销发送：删除发件箱排队记录并把缓冲内容恢复到写信页。
     pub(crate) fn undo_pending_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_send.as_ref() else {
+        if self.quitting {
+            return;
+        }
+        let Some(pending) = self.pending_send.as_mut() else {
             return;
         };
-        if pending.outbox_id.is_some() {
+        if pending.undo_requested {
+            return;
+        }
+        if pending.enqueue_failed {
+            if self.right_mode == RightPaneMode::Compose {
+                self.status_line = SharedString::from("请先关闭当前写信页，再恢复未保存的邮件");
+            } else {
+                let pending = self.pending_send.take().unwrap();
+                self.restore_pending_send_to_compose(&pending, window, cx);
+                self.compose_draft_id = pending.local_draft_id;
+                self.status_line = SharedString::from("已恢复未保存的邮件，请重新保存或发送");
+            }
+            cx.notify();
+            return;
+        }
+        pending.undo_requested = true;
+        if self.demo_mode {
             let pending = self.pending_send.take().unwrap();
-            if let Some(ref w) = self.worker {
-                w.send(MailRequest::DeleteOutboxItem {
-                    account_id: pending.account_id,
-                    outbox_id: pending.outbox_id.unwrap_or_default(),
-                });
-            }
             self.restore_pending_send_to_compose(&pending, window, cx);
-        } else {
-            // 落盘回执尚未到达（毫秒级窗口）：先恢复写信内容并登记撤销请求，
-            // 回执到达后（OutboxEnqueued 处理）删除刚落盘的记录。
-            if let Some(pending) = self.pending_send.as_mut() {
-                pending.undo_requested = true;
-            }
-            let snapshot = self.pending_send.clone();
-            if let Some(pending) = snapshot.as_ref() {
-                self.restore_pending_send_to_compose(pending, window, cx);
+            self.status_line = SharedString::from("已撤销发送，返回编辑邮件");
+        } else if let (Some(outbox_id), Some(w)) = (pending.outbox_id, self.worker.as_ref()) {
+            match w.send_checked(MailRequest::UndoOutboxItem {
+                account_id: pending.account_id,
+                outbox_id,
+                token: pending.token,
+            }) {
+                Ok(()) => self.status_line = SharedString::from("正在撤销发送…"),
+                Err(message) => {
+                    pending.undo_requested = false;
+                    self.error_banner = Some(SharedString::from(message.clone()));
+                    self.status_line = SharedString::from(message);
+                }
             }
         }
-        self.status_line = SharedString::from("已撤销发送，返回编辑邮件");
         cx.notify();
     }
 
@@ -3948,7 +4096,7 @@ impl HylkiApp {
     /// 批次——已入队的读信、搜索和发信请求会先于下一批执行，当前批次跑完后
     /// 下一批才排到队尾（事件驱动，无需定时器）。
     fn maybe_drive_backfill(&mut self, cx: &mut Context<Self>) {
-        if self.demo_mode || !self.backfill.should_queue() {
+        if self.demo_mode || self.quitting || !self.backfill.should_queue() {
             return;
         }
         let Some(ref w) = self.worker else {
@@ -5012,7 +5160,7 @@ impl HylkiApp {
                                 win.request_new_account_editor(window, cx);
                             }
                             SettingsOpenTarget::PresetAccount(idx) => {
-                                win.open_preset_account_editor(idx, window, cx);
+                                win.request_preset_account_editor(idx, window, cx);
                             }
                         });
                     });
@@ -6002,7 +6150,7 @@ impl Render for HylkiApp {
                         )),
                 )
             })
-            .when_some(self.pending_send.as_ref(), |el, pending| {
+            .when_some(self.pending_send.as_ref().filter(|p| self.demo_mode || p.outbox_id.is_some() || p.enqueue_failed), |el, pending| {
                 let token = pending.token;
                 let recipient = if pending.draft.to.trim().is_empty() {
                     "(未填写收件人)".to_string()
@@ -6010,6 +6158,7 @@ impl Render for HylkiApp {
                     pending.draft.to.trim().to_string()
                 };
                 let secs = pending.remaining_secs;
+                let failed = pending.enqueue_failed;
                 el.child(
                     h_flex()
                         .px_3()
@@ -6026,9 +6175,11 @@ impl Render for HylkiApp {
                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .text_color(p.text)
                                 .truncate()
-                                .child(SharedString::from(format!(
-                                    "正在准备发送给 {recipient}（{secs} 秒后发出）..."
-                                ))),
+                                .child(SharedString::from(if failed {
+                                    format!("发给 {recipient} 的邮件未保存，请恢复编辑")
+                                } else {
+                                    format!("正在准备发送给 {recipient}（{secs} 秒后发出）...")
+                                })),
                         )
                         .child(
                             h_flex()
@@ -6039,12 +6190,12 @@ impl Render for HylkiApp {
                                     Button::new("undo-send-btn")
                                         .primary()
                                         .compact()
-                                        .label("撤销发送")
+                                        .label(if failed { "恢复邮件" } else { "撤销发送" })
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.undo_pending_send(window, cx);
                                         })),
                                 )
-                                .child(
+                                .when(!failed, |el| el.child(
                                     Button::new("send-now-btn")
                                         .outline()
                                         .compact()
@@ -6052,7 +6203,7 @@ impl Render for HylkiApp {
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.commit_pending_send(token, cx);
                                         })),
-                                ),
+                                )),
                         ),
                 )
             })

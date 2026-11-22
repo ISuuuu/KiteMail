@@ -412,12 +412,12 @@ fn message_row(
             })
         })
         // P3：键盘游标行（原版 .kbd-cursor，列表持焦点时才画）：非选中行加
-        // accent 0.1 底 + accent 0.85 内描边；选中行药丸上改用 accent_fg 0.8
+        // accent 0.1 底 + accent 0.85 内描边；选中行药丸上改用 正文色 0.8
         // 内描边（accent-on-accent 会消失）。gpui 无 inset box-shadow，用 2px
         // 圆角边框近似（行盒内绘制，不改布局）。
         .when(kbd_cursor && list_focused, |row| {
             let ring = if is_selected {
-                p.accent_fg.opacity(0.8)
+                p.text.opacity(0.8)
             } else {
                 p.accent.opacity(0.85)
             };
@@ -464,14 +464,13 @@ fn message_row(
                         .justify_center()
                         .when(unread, |dot| {
                             // 未读圆点 10x10（原版 .unread-dot）：选中行在 accent 药丸上
-                            // 反色为 accent_fg（原版 row:selected .unread-dot →
-                            // @accent_fg_color，accent-on-accent 会消失）。
+                            // 使用正文色以保证浅色选中背景上的对比度。
                             dot.child(
                                 div()
                                     .w(px(10.0))
                                     .h(px(10.0))
                                     .rounded_full()
-                                    .bg(if is_selected { p.accent_fg } else { p.accent }),
+                                    .bg(if is_selected { p.text } else { p.accent }),
                             )
                         }),
                 ),
@@ -502,9 +501,8 @@ fn message_row(
                                 } else {
                                     gpui_kit::FontWeight::MEDIUM
                                 })
-                                // P3：选中行全部文字提为 accent_fg 全强度（原版
-                                // row:selected .message-row label → @accent_fg_color）。
-                                .text_color(if is_selected { p.accent_fg } else { p.text })
+                                // 半透明选中背景使用正文色，兼顾亮色与暗色主题。
+                                .text_color(p.text)
                                 .child(SharedString::from(first_line)),
                         )
                         .child(
@@ -523,9 +521,9 @@ fn message_row(
                                     icons.child(
                                         Icon::new(IconName::Paperclip)
                                             .with_size(px(13.0))
-                                            // P3：选中行附件图标同样提为 accent_fg。
+                                            // P3：选中行附件图标使用正文色。
                                             .text_color(if is_selected {
-                                                p.accent_fg
+                                                p.text
                                             } else {
                                                 p.text_muted
                                             }),
@@ -545,17 +543,12 @@ fn message_row(
                                     );
                                     div()
                                         .text_xs()
-                                        // P3：选中行时间同提为 accent_fg。
-                                        .text_color(if is_selected {
-                                            p.accent_fg
-                                        } else {
-                                            p.text_muted
-                                        })
+                                        // P3：选中行时间使用正文色。
+                                        .text_color(if is_selected { p.text } else { p.text_muted })
                                         .child(SharedString::from(date_text))
                                 })
                                 // B-4 会话计数胶囊（对齐原版 .thread-chip：仅 >1 封往来时显示，
-                                // 紧凑圆角、10px 粗体、主题色弱底）；选中行整枚反色：
-                                // accent_fg 底 + accent 文字（原版 row:selected .thread-chip）。
+                                // 紧凑圆角、10px 粗体、主题色弱底）；选中时使用卡片底色和正文色。
                                 .when(msg.thread_count > 1, |icons| {
                                     icons.child(
                                         div()
@@ -564,13 +557,13 @@ fn message_row(
                                             .py(px(2.0))
                                             .rounded_full()
                                             .bg(if is_selected {
-                                                p.accent_fg
+                                                p.surface_raised
                                             } else {
                                                 p.accent_soft()
                                             })
                                             .text_size(px(10.0))
                                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .text_color(p.accent)
+                                            .text_color(if is_selected { p.text } else { p.accent })
                                             .child(SharedString::from(format!(
                                                 "{} ▸",
                                                 msg.thread_count
@@ -580,7 +573,7 @@ fn message_row(
                         ),
                 )
                 // 第 2 行：主题（未读加粗；已读 85% 透明度，复刻原版 .message-subject 层次；
-                // P3：选中行提为 accent_fg 全强度，覆盖已读的 85% 透明度）。
+                // P3：选中行使用正文色，覆盖已读的 85% 透明度）。
                 .child(
                     div()
                         .text_sm()
@@ -591,7 +584,7 @@ fn message_row(
                             gpui_kit::FontWeight::NORMAL
                         })
                         .text_color(if is_selected {
-                            p.accent_fg
+                            p.text
                         } else if unread {
                             p.text
                         } else {
@@ -613,9 +606,9 @@ fn message_row(
                                     .text_xs()
                                     .truncate()
                                     // 摘要 50% 透明度（原版 .message-preview）；
-                                    // P3：选中行提为 accent_fg 全强度。
+                                    // P3：选中行使用正文色。
                                     .text_color(if is_selected {
-                                        p.accent_fg
+                                        p.text
                                     } else {
                                         p.text.opacity(0.5)
                                     })
@@ -633,17 +626,13 @@ fn message_row(
                                         .text_size(px(10.0))
                                         // P3：选中行账号标签反转为中性胶囊（Linux 无
                                         // 对应规则；accent 药丸上沿用账号彩色会沉底，
-                                        // 改为 accent_fg 弱底 + accent_fg 文字保层级）。
+                                        // 改为正文色弱底和正文色文字保层级）。
                                         .bg(if is_selected {
-                                            p.accent_fg.opacity(0.14)
+                                            p.text.opacity(0.12)
                                         } else {
                                             acc_color.opacity(0.14)
                                         })
-                                        .text_color(if is_selected {
-                                            p.accent_fg
-                                        } else {
-                                            acc_color
-                                        })
+                                        .text_color(if is_selected { p.text } else { acc_color })
                                         .child(SharedString::from(acc_label)),
                                 )
                             }),

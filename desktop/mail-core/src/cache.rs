@@ -418,6 +418,7 @@ impl CacheStore {
         self.ensure_column("drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
         // HTML 正文（迭代 3）：旧库无列时补充，历史数据视为 NULL。
         self.ensure_column("messages", "body_html", "TEXT")?;
+        self.ensure_column("messages", "index_text", "TEXT")?;
         // 历史邮件增量预加载游标：标记服务端是否仍有更早邮件及 Graph nextLink。
         self.ensure_column("folders", "has_more_remote", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("folders", "remote_next_link", "TEXT NOT NULL DEFAULT ''")?;
@@ -485,6 +486,25 @@ impl CacheStore {
                     VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.preview, COALESCE(old.body_text, ''));
                     INSERT INTO messages_fts(rowid, subject, sender, recipients, preview, body_text)
                     VALUES (new.id, new.subject, new.sender, new.recipients, new.preview, COALESCE(new.body_text, ''));
+                END;
+
+                CREATE INDEX IF NOT EXISTS idx_messages_needing_index
+                    ON messages(folder_id, id) WHERE body_text IS NULL AND index_text IS NULL;
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_index_fts USING fts5(
+                    index_text, content='messages', content_rowid='id',
+                    tokenize='unicode61 remove_diacritics 2'
+                );
+                CREATE TRIGGER IF NOT EXISTS messages_index_ad AFTER DELETE ON messages
+                WHEN old.index_text <> '' BEGIN
+                    INSERT INTO messages_index_fts(messages_index_fts, rowid, index_text)
+                    VALUES ('delete', old.id, old.index_text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS messages_index_au AFTER UPDATE OF index_text ON messages BEGIN
+                    INSERT INTO messages_index_fts(messages_index_fts, rowid, index_text)
+                    SELECT 'delete', old.id, old.index_text WHERE old.index_text <> '';
+                    INSERT INTO messages_index_fts(rowid, index_text)
+                    SELECT new.id, new.index_text WHERE new.index_text <> '';
                 END;
                 ",
             )
@@ -672,6 +692,64 @@ impl CacheStore {
             .map_err(|e| format!("遍历待加载历史邮件的收件箱失败: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析待加载历史邮件的收件箱失败: {e}"))
+    }
+
+    /// 后台索引候选：尚未同步、仍有远端历史或有待索引正文的文件夹。
+    pub fn list_backfill_folders(&self) -> Result<Vec<(u32, u32, String, bool)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT f.id, f.account_id, f.path, f.uid_validity = 0
+                 FROM folders f
+                 WHERE f.has_more_remote = 1 OR f.uid_validity = 0 OR EXISTS (
+                     SELECT 1 FROM messages m
+                     WHERE m.folder_id = f.id AND m.body_text IS NULL AND m.index_text IS NULL
+                 )
+                 ORDER BY f.id",
+            )
+            .map_err(|e| format!("查询后台索引文件夹失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|e| format!("读取后台索引文件夹失败: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析后台索引文件夹失败: {e}"))
+    }
+
+    /// 返回一批仍缺少可搜索正文的邮件，包括升级前缓存的邮件头。
+    pub fn list_unindexed_messages(
+        &self,
+        folder_id: u32,
+        limit: usize,
+    ) -> Result<Vec<(u32, u32, String)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, uid, remote_id FROM messages
+                 WHERE folder_id = ?1 AND body_text IS NULL AND index_text IS NULL
+                 ORDER BY id LIMIT ?2",
+            )
+            .map_err(|e| format!("查询待索引邮件失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![folder_id, limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| format!("读取待索引邮件失败: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析待索引邮件失败: {e}"))
+    }
+
+    /// 保存独立的搜索正文，空串表示已检查此邮件。完整正文由阅读器按需缓存。
+    pub fn store_index_text(&self, message_id: u32, text: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE messages SET index_text = ?1
+                 WHERE id = ?2 AND body_text IS NULL AND index_text IS NULL",
+                params![text, message_id],
+            )
+            .map_err(|e| format!("写入邮件搜索正文失败: {e}"))?;
+        Ok(())
     }
 
     /// Persist whether `folder_id` has more older remote messages and its Graph `@odata.nextLink`.
@@ -962,13 +1040,18 @@ impl CacheStore {
         for term in &parsed.terms {
             if let Some(fts_q) = Self::fts5_term(term) {
                 clauses.push(
-                    "m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)"
-                        .to_string(),
+                    "m.id IN (
+                        SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?
+                        UNION ALL
+                        SELECT rowid FROM messages_index_fts WHERE messages_index_fts MATCH ?
+                    )"
+                    .to_string(),
                 );
+                args.push(fts_q.clone().into());
                 args.push(fts_q.into());
             } else {
                 clauses.push(
-                    "(LOWER(m.subject) LIKE ? OR LOWER(m.sender) LIKE ? OR LOWER(m.recipients) LIKE ? OR LOWER(m.preview) LIKE ? OR LOWER(COALESCE(m.body_text, '')) LIKE ?)"
+                    "(LOWER(m.subject) LIKE ? OR LOWER(m.sender) LIKE ? OR LOWER(m.recipients) LIKE ? OR LOWER(m.preview) LIKE ? OR LOWER(COALESCE(m.body_text, m.index_text, '')) LIKE ?)"
                         .to_string(),
                 );
                 let pat = format!("%{term}%");
@@ -2205,6 +2288,7 @@ impl CacheStore {
             UPDATE messages
             SET body_text = ?1,
                 body_html = ?2,
+                index_text = NULL,
                 has_attachment = CASE WHEN ?3 > 0 THEN 1 ELSE has_attachment END,
                 list_unsubscribe = ?5,
                 list_unsubscribe_post = ?6
@@ -2249,14 +2333,14 @@ impl CacheStore {
         Ok(())
     }
 
-    /// Clear all cached message bodies and attachment blobs while keeping
+    /// Clear cached bodies, search text and attachment blobs while keeping
     /// message headers (sender / subject / preview / flags) intact.
     /// Returns the number of messages whose cached body was dropped.
     pub fn clear_message_bodies(&mut self) -> Result<usize, String> {
         let cleared: usize = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM messages WHERE body_text IS NOT NULL",
+                "SELECT COUNT(*) FROM messages WHERE body_text IS NOT NULL OR index_text <> ''",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -2267,8 +2351,12 @@ impl CacheStore {
             .conn
             .transaction()
             .map_err(|e| format!("开启正文缓存清理事务失败: {e}"))?;
-        tx.execute("UPDATE messages SET body_text = NULL, body_html = NULL", [])
-            .map_err(|e| format!("清空邮件正文缓存失败: {e}"))?;
+        tx.execute(
+            "UPDATE messages SET body_text = NULL, body_html = NULL, index_text = NULL
+             WHERE body_text IS NOT NULL OR body_html IS NOT NULL OR index_text IS NOT NULL",
+            [],
+        )
+        .map_err(|e| format!("清空邮件正文缓存失败: {e}"))?;
         tx.execute("DELETE FROM attachments", [])
             .map_err(|e| format!("清空附件缓存失败: {e}"))?;
         tx.commit()
@@ -2841,32 +2929,74 @@ impl CacheStore {
         created_at: i64,
         send_at: Option<i64>,
     ) -> Result<u32, String> {
+        self.enqueue_outbox_from_draft(
+            account_id,
+            to_addr,
+            cc_addr,
+            bcc_addr,
+            subject,
+            body_text,
+            in_reply_to,
+            attachment_paths,
+            created_at,
+            send_at,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_outbox_from_draft(
+        &mut self,
+        account_id: u32,
+        to_addr: &str,
+        cc_addr: &str,
+        bcc_addr: &str,
+        subject: &str,
+        body_text: &str,
+        in_reply_to: &str,
+        attachment_paths: &[String],
+        created_at: i64,
+        send_at: Option<i64>,
+        local_draft_id: Option<u32>,
+    ) -> Result<u32, String> {
         let paths_json = serde_json::to_string(attachment_paths)
             .map_err(|e| format!("序列化附件路径失败: {e}"))?;
-        self.conn
-            .execute(
-                "
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("启动发件事务失败: {e}"))?;
+        tx.execute(
+            "
                 INSERT INTO outbox (
                     account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to,
                     attachment_paths_json, status, last_error, created_at, send_at
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', '', ?9, ?10)
                 ",
-                params![
-                    account_id,
-                    to_addr,
-                    cc_addr,
-                    bcc_addr,
-                    subject,
-                    body_text,
-                    in_reply_to,
-                    paths_json,
-                    created_at,
-                    send_at
-                ],
+            params![
+                account_id,
+                to_addr,
+                cc_addr,
+                bcc_addr,
+                subject,
+                body_text,
+                in_reply_to,
+                paths_json,
+                created_at,
+                send_at
+            ],
+        )
+        .map_err(|e| format!("写入发件箱持久化记录失败: {e}"))?;
+        let id = tx.last_insert_rowid() as u32;
+        if let Some(draft_id) = local_draft_id {
+            tx.execute(
+                "DELETE FROM drafts WHERE id = ?1 AND account_id = ?2",
+                params![draft_id, account_id],
             )
-            .map_err(|e| format!("写入发件箱持久化记录失败: {e}"))?;
-        Ok(self.conn.last_insert_rowid() as u32)
+            .map_err(|e| format!("交接草稿失败: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("提交发件事务失败: {e}"))?;
+        Ok(id)
     }
 
     /// Update the status of an Outbox item.
@@ -3005,6 +3135,45 @@ impl CacheStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析到期发件箱行失败: {e}"))?;
         Ok(rows)
+    }
+
+    pub fn expire_queued_outbox(&mut self) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE outbox SET send_at = NULL WHERE status = 'queued' AND send_at IS NOT NULL",
+                [],
+            )
+            .map_err(|e| format!("准备退出发件队列失败: {e}"))?;
+        Ok(())
+    }
+
+    /// 在同一事务中将仍排队的邮件转回草稿，避免撤销和投递同时成功。
+    pub fn undo_queued_outbox(
+        &mut self,
+        account_id: u32,
+        outbox_id: u32,
+    ) -> Result<Option<u32>, String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("撤销发送事务失败: {e}"))?;
+        let inserted = tx.execute(
+            "INSERT INTO drafts (account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, attachment_paths_json, updated_at)
+             SELECT account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, attachment_paths_json, ?3
+             FROM outbox WHERE id = ?1 AND account_id = ?2 AND status = 'queued'",
+            params![outbox_id, account_id, chrono::Utc::now().timestamp()],
+        ).map_err(|e| format!("恢复草稿失败: {e}"))?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        let draft_id = tx.last_insert_rowid() as u32;
+        tx.execute(
+            "DELETE FROM outbox WHERE id = ?1 AND account_id = ?2 AND status = 'queued'",
+            params![outbox_id, account_id],
+        )
+        .map_err(|e| format!("撤销发件箱记录失败: {e}"))?;
+        tx.commit().map_err(|e| format!("提交撤销发送失败: {e}"))?;
+        Ok(Some(draft_id))
     }
 
     /// 撤销发送：仅删除仍在排队（Queued）的记录；已被领取投递的记录返回 `false` 不可撤销。
@@ -3563,6 +3732,146 @@ mod tests {
             .claim_outbox_for_retry(uncertain_id)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn enqueue_and_draft_handoff_are_atomic() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let draft = LocalDraft {
+            id: 0,
+            account_id: 1,
+            to_addr: "to".into(),
+            cc_addr: "cc".into(),
+            bcc_addr: "bcc".into(),
+            subject: "subject".into(),
+            body_text: "body".into(),
+            in_reply_to: "ref".into(),
+            attachment_paths: vec!["file".into()],
+            updated_at: 10,
+        };
+        let id = cache.upsert_draft(&draft).unwrap();
+        cache.conn.execute_batch("CREATE TRIGGER reject_handoff BEFORE DELETE ON drafts BEGIN SELECT RAISE(ABORT, 'write failed'); END;").unwrap();
+        assert!(cache
+            .enqueue_outbox_from_draft(
+                1,
+                "to",
+                "cc",
+                "bcc",
+                "subject",
+                "body",
+                "ref",
+                &["file".into()],
+                10,
+                Some(20),
+                Some(id)
+            )
+            .is_err());
+        assert_eq!(cache.list_drafts().unwrap().len(), 1);
+        assert!(cache.list_outbox(1).unwrap().is_empty());
+        cache
+            .conn
+            .execute_batch("DROP TRIGGER reject_handoff")
+            .unwrap();
+        cache
+            .enqueue_outbox_from_draft(
+                1,
+                "to",
+                "cc",
+                "bcc",
+                "subject",
+                "body",
+                "ref",
+                &["file".into()],
+                10,
+                Some(20),
+                Some(id),
+            )
+            .unwrap();
+        assert!(cache.list_drafts().unwrap().is_empty());
+        assert_eq!(cache.list_outbox(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn undo_outbox_is_atomic_and_preserves_all_draft_fields() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let id = cache
+            .enqueue_outbox(
+                1,
+                "to",
+                "cc",
+                "bcc",
+                "subject",
+                "body",
+                "ref",
+                &["file".into()],
+                10,
+                Some(100),
+            )
+            .unwrap();
+        assert_eq!(cache.undo_queued_outbox(2, id).unwrap(), None);
+        let draft_id = cache.undo_queued_outbox(1, id).unwrap().unwrap();
+        let drafts = cache.list_drafts().unwrap();
+        let d = drafts.iter().find(|d| d.id == draft_id).unwrap();
+        assert_eq!(
+            (
+                &*d.to_addr,
+                &*d.cc_addr,
+                &*d.bcc_addr,
+                &*d.subject,
+                &*d.body_text,
+                &*d.in_reply_to
+            ),
+            ("to", "cc", "bcc", "subject", "body", "ref")
+        );
+        assert_eq!(d.attachment_paths, vec!["file"]);
+        assert!(cache.list_outbox(1).unwrap().is_empty());
+        assert!(cache.claim_outbox_for_retry(id).unwrap().is_none());
+        assert_eq!(cache.undo_queued_outbox(1, id).unwrap(), None);
+
+        let claimed = cache
+            .enqueue_outbox(1, "to", "", "", "", "", "", &[], 10, None)
+            .unwrap();
+        assert!(cache.claim_outbox_for_retry(claimed).unwrap().is_some());
+        assert_eq!(cache.undo_queued_outbox(1, claimed).unwrap(), None);
+        assert_eq!(cache.list_drafts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn undo_rolls_back_when_draft_write_fails() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let id = cache
+            .enqueue_outbox(1, "to", "", "", "subject", "body", "", &[], 10, Some(100))
+            .unwrap();
+        cache.conn.execute_batch("CREATE TRIGGER reject_draft BEFORE INSERT ON drafts BEGIN SELECT RAISE(ABORT, 'write failed'); END;").unwrap();
+        assert!(cache.undo_queued_outbox(1, id).is_err());
+        assert_eq!(cache.list_outbox(1).unwrap().len(), 1);
+        assert!(cache.list_drafts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn quit_expiry_only_changes_queued_records() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let q = cache
+            .enqueue_outbox(1, "to", "", "", "", "", "", &[], 10, Some(100))
+            .unwrap();
+        let f = cache
+            .enqueue_outbox(1, "to", "", "", "", "", "", &[], 10, Some(100))
+            .unwrap();
+        cache
+            .update_outbox_status(f, OutboxStatus::Failed, "error")
+            .unwrap();
+        cache.expire_queued_outbox().unwrap();
+        assert_eq!(cache.list_due_queued_ids(None, 10).unwrap(), vec![(1, q)]);
+        assert_eq!(
+            cache
+                .list_outbox(1)
+                .unwrap()
+                .iter()
+                .find(|i| i.id == f)
+                .unwrap()
+                .last_error,
+            "error"
+        );
     }
 
     #[test]
@@ -4826,6 +5135,76 @@ mod tests {
         let reloaded = cache.list_folders(1).unwrap();
         assert!(!reloaded[0].has_more_remote);
         assert_eq!(reloaded[0].total_count, 5);
+    }
+
+    #[test]
+    fn background_search_text_covers_cached_archive_without_marking_body_loaded() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let archive = cache.sync_folders(1, &[folder("归档", "Archive")]).unwrap()[0].id;
+        cache
+            .commit_folder_headers(1, archive, 1, &[sample_header(9, "旧邮件")], None)
+            .unwrap();
+
+        let pending = cache.list_unindexed_messages(archive, 5).unwrap();
+        assert_eq!(pending.len(), 1);
+        let (id, uid, _) = pending[0];
+        assert_eq!(uid, 9);
+        assert_eq!(
+            cache.list_backfill_folders().unwrap(),
+            vec![(archive, 1, "Archive".to_string(), false)]
+        );
+
+        let text = format!("{}末尾合同 archivecode", "正文开头".repeat(1500));
+        cache.store_index_text(id, &text).unwrap();
+        assert!(cache
+            .list_unindexed_messages(archive, 5)
+            .unwrap()
+            .is_empty());
+        assert!(cache.list_backfill_folders().unwrap().is_empty());
+        assert!(!cache.get_message_detail(id).unwrap().unwrap().2);
+
+        for query in ["archivecode", "末尾合同", "archivecode 末尾合同"] {
+            let page = cache
+                .search_all_folders(
+                    query,
+                    QuickFilterSet::default(),
+                    MessageSort::DateNewest,
+                    0,
+                    5,
+                )
+                .unwrap();
+            assert_eq!(page.items[0].id, id);
+        }
+
+        assert_eq!(cache.clear_message_bodies().unwrap(), 1);
+        assert_eq!(
+            cache
+                .list_messages_page(archive, "archivecode", 0, 5)
+                .unwrap()
+                .total,
+            0
+        );
+        assert_eq!(cache.list_unindexed_messages(archive, 5).unwrap().len(), 1);
+
+        cache.store_index_text(id, "stalesearchexample").unwrap();
+        cache
+            .store_message_body(id, "fullsearchexample", &[])
+            .unwrap();
+        assert!(cache.get_message_detail(id).unwrap().unwrap().2);
+        assert_eq!(
+            cache
+                .list_messages_page(archive, "stalesearchexample", 0, 5)
+                .unwrap()
+                .total,
+            0
+        );
+        assert_eq!(
+            cache
+                .list_messages_page(archive, "fullsearchexample", 0, 5)
+                .unwrap()
+                .total,
+            1
+        );
     }
 
     #[test]

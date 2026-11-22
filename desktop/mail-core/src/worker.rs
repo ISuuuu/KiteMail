@@ -59,6 +59,12 @@ impl MailWorkerHandle {
         let _ = self.req_tx.send(req);
     }
 
+    pub fn send_checked(&self, req: MailRequest) -> Result<(), String> {
+        self.req_tx
+            .send(req)
+            .map_err(|_| "邮件后台线程已停止".to_string())
+    }
+
     /// Non-blocking drain of all pending [`WorkerEvent`]s.
     pub fn drain_events(&self) -> Vec<WorkerEvent> {
         let mut out = Vec::new();
@@ -98,6 +104,15 @@ async fn worker_loop(
     }
 
     while let Ok(req) = req_rx.recv() {
+        if matches!(req, MailRequest::PrepareQuit) {
+            let result = cache.expire_queued_outbox();
+            let prepared = result.is_ok();
+            let _ = evt_tx.send(WorkerEvent::QuitPrepared { result });
+            if prepared {
+                break;
+            }
+            continue;
+        }
         handle_request(
             &data_dir,
             &mut cache,
@@ -1649,7 +1664,7 @@ async fn handle_request(
             send_at,
         } => {
             let now = chrono::Utc::now().timestamp();
-            let outbox_id = match cache.enqueue_outbox(
+            let outbox_id = match cache.enqueue_outbox_from_draft(
                 account_id,
                 &draft.to,
                 &draft.cc,
@@ -1659,20 +1674,38 @@ async fn handle_request(
                 &draft.in_reply_to,
                 &draft.attachment_paths,
                 now,
-                send_at,
+                send_at.map(|delay| now + delay),
+                local_draft_id,
             ) {
                 Ok(id) => id,
                 Err(e) => {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
+                    let recovered_draft_id = cache
+                        .upsert_draft(&crate::LocalDraft {
+                            id: local_draft_id.unwrap_or(0),
+                            account_id,
+                            to_addr: draft.to.clone(),
+                            cc_addr: draft.cc.clone(),
+                            bcc_addr: draft.bcc.clone(),
+                            subject: draft.subject.clone(),
+                            body_text: draft.body.clone(),
+                            in_reply_to: draft.in_reply_to.clone(),
+                            attachment_paths: draft.attachment_paths.clone(),
+                            updated_at: now,
+                        })
+                        .ok();
+                    let _ = evt_tx.send(WorkerEvent::OutboxEnqueueFailed {
+                        token: undo_token,
                         message: e,
+                        recovered_draft_id,
                     });
+                    if let Ok(drafts) = cache.list_drafts() {
+                        let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
+                    }
                     return;
                 }
             };
             // 原草稿交接给发件箱：记录落盘成功后立即删除，保证内容不丢也不重复。
-            if let Some(draft_id) = local_draft_id {
-                let _ = cache.delete_draft(draft_id);
+            if local_draft_id.is_some() {
                 if let Ok(drafts) = cache.list_drafts() {
                     let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
                 }
@@ -1722,6 +1755,26 @@ async fn handle_request(
                         account_id: Some(account_id),
                         message: e,
                     });
+                }
+            }
+        }
+
+        MailRequest::PrepareQuit => unreachable!("退出准备由 worker_loop 处理"),
+
+        MailRequest::UndoOutboxItem {
+            account_id,
+            outbox_id,
+            token,
+        } => {
+            let result = cache.undo_queued_outbox(account_id, outbox_id);
+            let success = matches!(result, Ok(Some(_)));
+            let _ = evt_tx.send(WorkerEvent::OutboxUndoResult { token, result });
+            if success {
+                if let Ok(drafts) = cache.list_drafts() {
+                    let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
+                }
+                if let Ok(items) = cache.list_outbox(account_id) {
+                    let _ = evt_tx.send(WorkerEvent::OutboxUpdated { account_id, items });
                 }
             }
         }
@@ -2327,8 +2380,12 @@ async fn sync_folder_inner(
         }
         AuthBackend::Password => match secrets::load_account_secrets(account.id) {
             Ok(sec) => {
-                match imap_client::fetch_folder_headers(account, &sec.imap_password, folder_path)
-                    .await
+                match tokio::time::timeout(
+                    Duration::from_secs(60),
+                    imap_client::fetch_folder_headers(account, &sec.imap_password, folder_path),
+                )
+                .await
+                .unwrap_or_else(|_| Err("同步文件夹超时".to_string()))
                 {
                     Ok((uid_validity, headers, live_uids)) => {
                         let commit_res = cache.commit_folder_headers(
@@ -2402,6 +2459,7 @@ async fn fetch_older_batch_for_folder(
     fid: u32,
     batch: usize,
     enforce_unified_scope: bool,
+    uid_snapshot: &mut Option<(u32, Vec<u32>)>,
     evt_tx: &mpsc::Sender<WorkerEvent>,
 ) -> Result<Option<(usize, bool)>, FolderBatchError> {
     let Some((account_id, folder_path, has_more_flag, next_link, min_cached_uid, _)) =
@@ -2472,18 +2530,25 @@ async fn fetch_older_batch_for_folder(
                     &sec.imap_password,
                     &folder_path,
                     before_uid,
+                    cache
+                        .folder_meta(fid)
+                        .ok()
+                        .flatten()
+                        .map(|(_, validity)| validity)
+                        .unwrap_or(0),
                     batch,
+                    uid_snapshot,
                 )
                 .await
                 {
-                    Ok((uid_validity, headers, live_uids, has_more)) => {
+                    Ok((uid_validity, headers, has_more)) => {
                         let count = headers.len();
                         match cache.commit_folder_headers(
                             account.id,
                             fid,
                             uid_validity,
                             &headers,
-                            Some(&live_uids),
+                            None,
                         ) {
                             Ok(()) => {
                                 let _ = cache.set_folder_remote_cursor(fid, has_more, "");
@@ -2491,6 +2556,20 @@ async fn fetch_older_batch_for_folder(
                             }
                             Err(e) => Err(e),
                         }
+                    }
+                    Err(e) if e == "UIDVALIDITY_CHANGED" => {
+                        let (background_events, _) = mpsc::channel();
+                        sync_folder_inner(
+                            cache,
+                            tokens,
+                            &account,
+                            fid,
+                            &folder_path,
+                            batch,
+                            &background_events,
+                        )
+                        .await;
+                        Ok((0, true))
                     }
                     Err(e) => Err(e),
                 },
@@ -2551,6 +2630,7 @@ async fn load_older_messages_inner(
             batch,
             // 任务四：folder_id = 0 的统一分页只覆盖 `enabled && in_unified` 账号。
             folder_id == 0,
+            &mut None,
             evt_tx,
         )
         .await
@@ -2588,6 +2668,7 @@ struct BackfillIndexState {
     abandoned: std::collections::HashSet<u32>,
     /// 上一批处理的文件夹：候选轮转的起点，避免大文件夹饿死其他账号。
     last_folder: Option<u32>,
+    uid_snapshots: HashMap<u32, Option<(u32, Vec<u32>)>>,
 }
 
 impl BackfillIndexState {
@@ -2648,21 +2729,161 @@ async fn backfill_history_batch_inner(
     state: &mut BackfillIndexState,
     evt_tx: &mpsc::Sender<WorkerEvent>,
 ) {
-    let allowed: std::collections::HashSet<u32> =
-        unified_account_ids(data_dir).into_iter().collect();
-    let candidates = cache
-        .list_inbox_folders_with_more_remote()
-        .unwrap_or_default();
+    let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
+    let allowed: std::collections::HashSet<u32> = accounts
+        .iter()
+        .filter(|a| a.enabled)
+        .map(|a| a.id)
+        .collect();
+    let folders = cache.list_backfill_folders().unwrap_or_default();
+    let candidates: Vec<_> = folders
+        .iter()
+        .map(|(id, account, path, _)| (*id, *account, path.clone()))
+        .collect();
     let Some(fid) = select_backfill_target(&candidates, &allowed, state) else {
         // 已无待索引目标（全部拉完 / 放弃 / 范围外）：通知 app 端停止续排。
         let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
             folder_id: 0,
             fetched_count: 0,
+            body_only: false,
             has_more_remote: false,
         });
         return;
     };
     state.last_folder = Some(fid);
+
+    if let Some((_, account_id, path, true)) = folders.iter().find(|(id, _, _, _)| *id == fid) {
+        if let Some(account) = accounts.iter().find(|a| a.id == *account_id && a.enabled) {
+            let (background_events, _) = mpsc::channel();
+            sync_folder_inner(
+                cache,
+                tokens,
+                account,
+                fid,
+                path,
+                BACKFILL_HISTORY_BATCH,
+                &background_events,
+            )
+            .await;
+            if let Ok(folders) = cache.list_folders(account.id) {
+                let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                    account_id: account.id,
+                    folders,
+                });
+            }
+        }
+        let still_uninitialized = cache
+            .list_backfill_folders()
+            .unwrap_or_default()
+            .iter()
+            .any(|(id, _, _, uninitialized)| *id == fid && *uninitialized);
+        if still_uninitialized {
+            state.record_failure(fid);
+        } else {
+            state.record_success(fid);
+        }
+        let remaining = cache.list_backfill_folders().unwrap_or_default();
+        let candidates: Vec<_> = remaining
+            .into_iter()
+            .map(|(id, account, path, _)| (id, account, path))
+            .collect();
+        let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
+            folder_id: fid,
+            fetched_count: 1,
+            body_only: false,
+            has_more_remote: select_backfill_target(&candidates, &allowed, state).is_some(),
+        });
+        return;
+    }
+
+    // 一次请求只补一封正文，落盘成功后由界面续排下一批。
+    let has_older = cache
+        .folder_remote_cursor(fid)
+        .ok()
+        .flatten()
+        .is_some_and(|(_, _, more, _, _, _)| more);
+    let missing = if has_older {
+        Vec::new()
+    } else {
+        cache.list_unindexed_messages(fid, 1).unwrap_or_default()
+    };
+    if let Some((message_id, uid, remote_id)) = missing.into_iter().next() {
+        let Some((_, account_id, path, _)) = folders.iter().find(|(id, _, _, _)| *id == fid) else {
+            return;
+        };
+        let Some(account) = accounts.iter().find(|a| a.id == *account_id && a.enabled) else {
+            return;
+        };
+        let result = match account.auth_backend {
+            AuthBackend::Password => match secrets::load_account_secrets(account.id) {
+                Ok(sec) => {
+                    let validity = cache
+                        .folder_meta(fid)
+                        .ok()
+                        .flatten()
+                        .map(|(_, validity)| validity)
+                        .unwrap_or(0);
+                    imap_client::fetch_index_text(account, &sec.imap_password, path, uid, validity)
+                        .await
+                }
+                Err(e) => Err(e),
+            },
+            AuthBackend::MicrosoftGraphOAuth2 => {
+                if remote_id.is_empty() {
+                    Err("缺少 Graph 邮件标识".to_string())
+                } else {
+                    match ensure_graph_token(tokens, account).await {
+                        Ok(token) => tokio::task::spawn_blocking(move || {
+                            graph_client::fetch_index_text(&token, &remote_id)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Graph 索引任务异常: {e}"))),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        };
+        let stored = match result {
+            Ok(text) => cache.store_index_text(message_id, &text).is_ok(),
+            Err(e) if e == "UIDVALIDITY_CHANGED" || e == "服务器未返回索引正文" => {
+                state.uid_snapshots.remove(&fid);
+                let (background_events, _) = mpsc::channel();
+                sync_folder_inner(
+                    cache,
+                    tokens,
+                    account,
+                    fid,
+                    path,
+                    BACKFILL_HISTORY_BATCH,
+                    &background_events,
+                )
+                .await;
+                false
+            }
+            Err(e) => {
+                eprintln!("后台正文索引失败（文件夹 {fid}）: {e}");
+                false
+            }
+        };
+        if stored {
+            state.record_success(fid);
+        } else {
+            state.record_failure(fid);
+        }
+        let remaining: Vec<_> = cache
+            .list_backfill_folders()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, account, path, _)| (id, account, path))
+            .collect();
+        let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
+            folder_id: fid,
+            fetched_count: usize::from(stored),
+            body_only: true,
+            has_more_remote: select_backfill_target(&remaining, &allowed, state).is_some(),
+        });
+        return;
+    }
 
     let outcome = fetch_older_batch_for_folder(
         data_dir,
@@ -2670,7 +2891,8 @@ async fn backfill_history_batch_inner(
         tokens,
         fid,
         BACKFILL_HISTORY_BATCH,
-        true,
+        false,
+        state.uid_snapshots.entry(fid).or_default(),
         evt_tx,
     )
     .await;
@@ -2715,14 +2937,18 @@ async fn backfill_history_batch_inner(
     // 批次后是否仍有待索引目标（已过滤范围外与放弃的文件夹）。本批无实质进展
     // （游标缺失 / 账号停用或退出统一视图）时把该文件夹从回信中排除，避免 app
     // 与 worker 对同一候选空转；下一次触发（如账号重新启用）会重新纳入。
-    let remaining = cache
-        .list_inbox_folders_with_more_remote()
-        .unwrap_or_default();
+    let remaining: Vec<_> = cache
+        .list_backfill_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, account, path, _)| (id, account, path))
+        .collect();
     let has_more_remote = select_backfill_target(&remaining, &allowed, state)
         .is_some_and(|next| !exclude_current || next != fid);
     let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
         folder_id: fid,
         fetched_count,
+        body_only: false,
         has_more_remote,
     });
 }
@@ -2787,6 +3013,23 @@ async fn retry_outbox_item(
     outbox_id: u32,
     evt_tx: &mpsc::Sender<WorkerEvent>,
 ) {
+    match load_account_config(data_dir, account_id) {
+        Ok(account) if account.enabled => {}
+        Ok(_) => {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: "账号已停用，无法重试发送".to_string(),
+            });
+            return;
+        }
+        Err(e) => {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: e.to_string(),
+            });
+            return;
+        }
+    }
     let item = match cache.claim_outbox_for_retry(outbox_id) {
         Ok(Some(item)) => item,
         Ok(None) => return,
@@ -3130,6 +3373,58 @@ mod tests {
             email: email.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn graceful_quit_makes_queued_mail_due_and_stops_processing_requests() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hylki-quit-{}-{unique}", std::process::id()));
+        let db_path = config::cache_db_in(&dir);
+        let mut cache = CacheStore::open(&db_path).unwrap();
+        let id = cache
+            .enqueue_outbox(
+                1,
+                "to@example.com",
+                "",
+                "",
+                "待发",
+                "正文",
+                "",
+                &[],
+                1,
+                Some(i64::MAX),
+            )
+            .unwrap();
+        drop(cache);
+
+        let worker = MailWorkerHandle::spawn(dir.clone()).unwrap();
+        worker.send_checked(MailRequest::PrepareQuit).unwrap();
+        worker.send(MailRequest::DeleteOutboxItem {
+            account_id: 1,
+            outbox_id: id,
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut prepared = false;
+        loop {
+            prepared |= worker
+                .drain_events()
+                .into_iter()
+                .any(|event| matches!(event, WorkerEvent::QuitPrepared { result: Ok(()) }));
+            if prepared && worker.send_checked(MailRequest::LoadAllCached).is_err() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "后台线程应在完成退出准备后停止");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let cache = CacheStore::open(&db_path).unwrap();
+        assert_eq!(cache.list_due_queued_ids(None, 1).unwrap(), vec![(1, id)]);
+        drop(cache);
+        std::fs::remove_file(&db_path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

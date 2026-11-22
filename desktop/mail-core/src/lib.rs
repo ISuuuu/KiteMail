@@ -560,7 +560,7 @@ pub enum MailRequest {
         local_draft_id: Option<u32>,
         /// 撤销发送客户端令牌（`send_at` 为 `Some` 时用于 `OutboxEnqueued` 回执匹配）。
         undo_token: u64,
-        /// `Some(到期时间戳)` = 仅入队不投递（撤销发送缓冲，到期后由启动恢复 /
+        /// `Some(延迟秒数)` = 仅入队不投递（撤销发送缓冲，到期后由启动恢复 /
         /// 重新启用账号 / 显式重试投递）；`None` = 入队后立即投递。
         send_at: Option<i64>,
     },
@@ -572,6 +572,12 @@ pub enum MailRequest {
     DeleteOutboxItem {
         account_id: u32,
         outbox_id: u32,
+    },
+    PrepareQuit,
+    UndoOutboxItem {
+        account_id: u32,
+        outbox_id: u32,
+        token: u64,
     },
     LoadUnifiedView {
         view: UnifiedView,
@@ -698,6 +704,18 @@ pub enum WorkerEvent {
     },
     /// 撤销发送缓冲：待发记录已持久化到发件箱（Queued + 到期时间），
     /// UI 据此绑定撤销 / 立即发送目标，并确认原草稿已交接落盘。
+    QuitPrepared {
+        result: Result<(), String>,
+    },
+    OutboxUndoResult {
+        token: u64,
+        result: Result<Option<u32>, String>,
+    },
+    OutboxEnqueueFailed {
+        token: u64,
+        message: String,
+        recovered_draft_id: Option<u32>,
+    },
     OutboxEnqueued {
         token: u64,
         account_id: u32,
@@ -808,6 +826,7 @@ pub enum WorkerEvent {
     BackfillHistoryBatchDone {
         folder_id: u32,
         fetched_count: usize,
+        body_only: bool,
         has_more_remote: bool,
     },
     Status {

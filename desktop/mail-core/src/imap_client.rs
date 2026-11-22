@@ -300,11 +300,13 @@ async fn fetch_headers_for_uids(
         .collect::<Vec<_>>()
         .join(",");
 
-    // 任务四：改拉全文前缀而非纯邮件头——前 4KB 覆盖头 + 正文开头，
-    // mail_parser 提取出真实预览文本后历史邮件无需打开正文即可被搜索
-    //（PEEK 不改变服务器端 \Seen 标记）。
+    // 完整头部用于解析字段；单独保留有限全文前缀以生成预览。
+    // PEEK 不改变服务器端的已读标记。
     let mut fetches = session
-        .uid_fetch(&uid_list, "(UID FLAGS BODY.PEEK[]<0.4096>)")
+        .uid_fetch(
+            &uid_list,
+            "(UID FLAGS BODY.PEEK[HEADER] BODY.PEEK[]<0.4096>)",
+        )
         .await
         .map_err(|e| format!("拉取邮件头失败: {e}"))?;
 
@@ -327,8 +329,12 @@ async fn fetch_headers_for_uids(
                 _ => {}
             }
         }
-        let raw = fetch.body().unwrap_or_default();
-        headers.push(parse_header_bytes(&parser, uid, unread, flagged, raw));
+        let raw = fetch.header().unwrap_or_default();
+        let mut header = parse_header_bytes(&parser, uid, unread, flagged, raw);
+        if let Some(prefix) = fetch.body() {
+            header.preview = parse_header_bytes(&parser, uid, unread, flagged, prefix).preview;
+        }
+        headers.push(header);
     }
     drop(fetches);
     Ok(headers)
@@ -376,8 +382,10 @@ pub async fn fetch_older_folder_headers(
     password: &str,
     folder_path: &str,
     before_uid: u32,
+    expected_validity: u32,
     limit: usize,
-) -> Result<(u32, Vec<CachedHeaderInput>, Vec<u32>, bool), String> {
+    uid_snapshot: &mut Option<(u32, Vec<u32>)>,
+) -> Result<(u32, Vec<CachedHeaderInput>, bool), String> {
     let mut session = connect_imap(account, password).await?;
     // 任务四：历史批次跑在后台，每一步网络调用都必须有限超时，
     // 避免一次卡住的服务器响应占住单队列。
@@ -387,27 +395,32 @@ pub async fn fetch_older_folder_headers(
         .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
 
     let uid_validity = mailbox.uid_validity.unwrap_or(1);
-    let uids_set = tokio::time::timeout(IO_TIMEOUT, session.uid_search("ALL"))
-        .await
-        .map_err(|_| "搜索邮件 UID 超时".to_string())?
-        .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
+    if expected_validity != 0 && uid_validity != expected_validity {
+        *uid_snapshot = None;
+        return Err("UIDVALIDITY_CHANGED".to_string());
+    }
+    if uid_snapshot
+        .as_ref()
+        .is_none_or(|(validity, _)| *validity != uid_validity)
+    {
+        let uids_set = tokio::time::timeout(IO_TIMEOUT, session.uid_search("ALL"))
+            .await
+            .map_err(|_| "搜索邮件 UID 超时".to_string())?
+            .map_err(|e| format!("搜索邮件 UID 失败: {e}"))?;
+        let mut uids: Vec<u32> = uids_set.into_iter().collect();
+        uids.sort_unstable();
+        *uid_snapshot = Some((uid_validity, uids));
+    }
+    let live_uids = &uid_snapshot.as_ref().unwrap().1;
 
-    let mut live_uids: Vec<u32> = uids_set.into_iter().collect();
-    live_uids.sort_unstable();
-
-    let older_uids: Vec<u32> = live_uids
-        .iter()
-        .copied()
-        .filter(|&u| u < before_uid)
-        .collect();
-    if older_uids.is_empty() {
+    let end_idx = live_uids.partition_point(|uid| *uid < before_uid);
+    if end_idx == 0 {
         let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
-        return Ok((uid_validity, Vec::new(), live_uids, false));
+        return Ok((uid_validity, Vec::new(), false));
     }
 
-    let batch = limit.max(1);
-    let start_idx = older_uids.len().saturating_sub(batch);
-    let target_uids = &older_uids[start_idx..];
+    let start_idx = end_idx.saturating_sub(limit.max(1));
+    let target_uids = &live_uids[start_idx..end_idx];
     let has_more = start_idx > 0;
     let headers = tokio::time::timeout(
         IO_TIMEOUT,
@@ -415,9 +428,66 @@ pub async fn fetch_older_folder_headers(
     )
     .await
     .map_err(|_| format!("拉取历史邮件头超时 ({folder_path})"))??;
+    if headers.len() != target_uids.len() {
+        *uid_snapshot = None;
+        return Err("历史邮件 UID 已变化，稍后重新读取".to_string());
+    }
     let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
 
-    Ok((uid_validity, headers, live_uids, has_more))
+    Ok((uid_validity, headers, has_more))
+}
+
+/// 读取有体积上限的 MIME 内容用于本地搜索，不下载或缓存附件。
+/// 超过上限的邮件返回空字符串，供服务器搜索覆盖。
+pub async fn fetch_index_text(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+    expected_validity: u32,
+) -> Result<String, String> {
+    const MAX_BYTES: usize = 262_144;
+    let mut session = connect_imap(account, password).await?;
+    let mailbox = tokio::time::timeout(IO_TIMEOUT, session.select(folder_path))
+        .await
+        .map_err(|_| "打开索引文件夹超时".to_string())?
+        .map_err(|e| format!("打开索引文件夹失败: {e}"))?;
+    if expected_validity != 0 && mailbox.uid_validity.unwrap_or(1) != expected_validity {
+        return Err("UIDVALIDITY_CHANGED".to_string());
+    }
+    let bytes = tokio::time::timeout(IO_TIMEOUT, async {
+        let mut stream = session
+            .uid_fetch(uid.to_string(), "(BODY.PEEK[]<0.262145>)")
+            .await
+            .map_err(|e| format!("拉取索引正文失败: {e}"))?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.map_err(|e| format!("读取索引正文失败: {e}"))?;
+            if let Some(body) = fetch.body() {
+                return Ok(body.to_vec());
+            }
+        }
+        Err("服务器未返回索引正文".to_string())
+    })
+    .await
+    .map_err(|_| "拉取索引正文超时".to_string())??;
+    let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
+    Ok(index_text_from_mime(&bytes, MAX_BYTES))
+}
+
+fn index_text_from_mime(bytes: &[u8], max_bytes: usize) -> String {
+    if bytes.len() > max_bytes {
+        return String::new();
+    }
+    let Some(parsed) = MessageParser::default().parse(bytes) else {
+        return String::new();
+    };
+    if let Some(text) = parsed.body_text(0) {
+        text.into_owned()
+    } else if let Some(html) = parsed.body_html(0) {
+        html_to_readable_text(&html)
+    } else {
+        String::new()
+    }
 }
 
 /// Fetch full RFC 822 message body and attachments for `uid` in `folder_path`.
@@ -1317,6 +1387,13 @@ pub fn plain_text_to_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn index_text_reads_mime_tail_and_limits_size() {
+        let raw = b"Subject: hello\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nfirst line\r\nunique tail keyword";
+        assert!(super::index_text_from_mime(raw, 1024).contains("unique tail keyword"));
+        assert_eq!(super::index_text_from_mime(raw, raw.len() - 1), "");
+    }
+
     use super::*;
 
     #[test]

@@ -333,6 +333,41 @@ pub fn fetch_message_body(
     })
 }
 
+/// 只取正文供搜索索引，限额读取且不请求附件。
+pub fn fetch_index_text(access_token: &str, remote_id: &str) -> Result<String, String> {
+    const MAX_BYTES: usize = 262_144;
+    let encoded_id = urlencoding_segment(remote_id);
+    let url = format!("{GRAPH_BASE}/messages/{encoded_id}?$select=body");
+    let response = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .timeout(std::time::Duration::from_secs(20))
+        .call()
+        .map_err(format_graph_error)?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取 Graph 索引正文失败: {e}"))?;
+    if bytes.len() > MAX_BYTES {
+        return Ok(String::new());
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("解析 Graph 索引正文失败: {e}"))?;
+    let content = json["body"]["content"].as_str().unwrap_or("");
+    Ok(
+        if json["body"]["contentType"]
+            .as_str()
+            .unwrap_or("text")
+            .eq_ignore_ascii_case("html")
+        {
+            html_to_readable_text(content)
+        } else {
+            content.to_string()
+        },
+    )
+}
+
 /// Fetch the complete raw MIME message via Graph `/$value` (used for .eml export).
 pub fn fetch_raw_message(access_token: &str, remote_id: &str) -> Result<Vec<u8>, String> {
     let encoded_id = urlencoding_segment(remote_id);

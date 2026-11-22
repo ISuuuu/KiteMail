@@ -38,6 +38,7 @@ pub(crate) enum EditorLeaveAction {
     EditAccount(u32),
     /// 主窗口 / 欢迎页请求新建账号（任务二：跳转前接入未保存确认）。
     NewAccount,
+    PresetAccount(usize),
 }
 
 /// 侧栏分组（对齐 Linux 版 `账号` / `设置` 2 个分组）。
@@ -381,6 +382,15 @@ impl SettingsWindow {
         self.request_leave_editor(EditorLeaveAction::NewAccount, window, cx);
     }
 
+    pub(crate) fn request_preset_account_editor(
+        &mut self,
+        provider_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_leave_editor(EditorLeaveAction::PresetAccount(provider_idx), window, cx);
+    }
+
     fn execute_leave_action(
         &mut self,
         action: EditorLeaveAction,
@@ -436,6 +446,9 @@ impl SettingsWindow {
             }
             EditorLeaveAction::NewAccount => {
                 self.open_new_account_editor(window, cx);
+            }
+            EditorLeaveAction::PresetAccount(provider_idx) => {
+                self.open_preset_account_editor(provider_idx, window, cx);
             }
         }
     }
