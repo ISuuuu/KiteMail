@@ -122,6 +122,22 @@ struct AccountsFile {
 pub const DEFAULT_ATTACHMENT_KEYWORDS: &str =
     "附件, 附上, 随信, 见附, attachment, attached, enclose";
 
+/// 侧边栏收藏 / 隐藏文件夹的引用（账号 id + IMAP 路径；WP-07）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarFolderRef {
+    pub account_id: u32,
+    pub path: String,
+}
+
+/// 用户为自定义文件夹指定的特殊角色（WP-07「Assign Special Role」；
+/// `role` 取 `inbox` / `drafts` / `sent` / `archive` / `junk` / `trash`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarFolderRole {
+    pub account_id: u32,
+    pub path: String,
+    pub role: String,
+}
+
 /// User interface & sync preferences persisted in `preferences.toml`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -510,6 +526,15 @@ pub struct AppPreferences {
     /// 邮件内链接打开方式：`"system"` / `"edge"` / `"chrome"` / `"firefox"`。
     #[serde(default = "default_link_open_mode")]
     pub link_open_mode: String,
+    /// WP-07：收藏文件夹（Favorites 分区；按收藏顺序排列）。
+    #[serde(default)]
+    pub sidebar_favorite_folders: Vec<SidebarFolderRef>,
+    /// WP-07：隐藏文件夹（不渲染在侧边栏账号树中）。
+    #[serde(default)]
+    pub sidebar_hidden_folders: Vec<SidebarFolderRef>,
+    /// WP-07：自定义文件夹的特殊角色指定（覆盖按路径推断的角色分类）。
+    #[serde(default)]
+    pub sidebar_special_roles: Vec<SidebarFolderRole>,
 }
 
 fn default_true() -> bool {
@@ -790,7 +815,7 @@ impl AppPreferences {
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
-            theme_id: "default".to_string(),
+            theme_id: "system".to_string(),
             dark_mode: None,
             compact_list: false,
             page_size: 100,
@@ -919,6 +944,9 @@ impl Default for AppPreferences {
             keep_downloads_days: 0,
             start_at_login: false,
             link_open_mode: default_link_open_mode(),
+            sidebar_favorite_folders: Vec::new(),
+            sidebar_hidden_folders: Vec::new(),
+            sidebar_special_roles: Vec::new(),
         }
     }
 }
@@ -1852,7 +1880,11 @@ smtp_separate_credentials = false
         // Missing file yields defaults without error.
         let defaults = load_preferences_in(&base).expect("load missing file");
         assert_eq!(defaults, AppPreferences::default());
-        assert_eq!(defaults.theme_id, "default");
+        // WP-07：新用户默认主题对齐 Linux 首位 `system`。
+        assert_eq!(defaults.theme_id, "system");
+        assert!(defaults.sidebar_favorite_folders.is_empty());
+        assert!(defaults.sidebar_hidden_folders.is_empty());
+        assert!(defaults.sidebar_special_roles.is_empty());
         assert_eq!(defaults.dark_mode, None);
         assert_eq!(defaults.page_size, 100);
         assert_eq!(defaults.auto_sync_minutes, 5);
@@ -1896,6 +1928,47 @@ smtp_separate_credentials = false
         };
         save_preferences_in(&base, &none_dark).expect("save None dark_mode should succeed");
         assert_eq!(load_preferences_in(&base).expect("reload"), none_dark);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// WP-07：侧边栏收藏 / 隐藏 / 特殊角色字段的 TOML 往返。
+    #[test]
+    fn preferences_sidebar_folder_refs_roundtrip() {
+        let base = std::env::temp_dir().join("hylki test 侧边栏文件夹引用");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let prefs = AppPreferences {
+            sidebar_favorite_folders: vec![
+                SidebarFolderRef {
+                    account_id: 1,
+                    path: "INBOX/Newsletters".to_string(),
+                },
+                SidebarFolderRef {
+                    account_id: 2,
+                    path: "Archive".to_string(),
+                },
+            ],
+            sidebar_hidden_folders: vec![SidebarFolderRef {
+                account_id: 1,
+                path: "INBOX/LocalFolders/Old".to_string(),
+            }],
+            sidebar_special_roles: vec![SidebarFolderRole {
+                account_id: 2,
+                path: "Mail/Outbox mirror".to_string(),
+                role: "sent".to_string(),
+            }],
+            ..AppPreferences::default()
+        };
+        save_preferences_in(&base, &prefs).expect("save should succeed");
+        let loaded = load_preferences_in(&base).expect("load should succeed");
+        assert_eq!(
+            loaded.sidebar_favorite_folders,
+            prefs.sidebar_favorite_folders
+        );
+        assert_eq!(loaded.sidebar_hidden_folders, prefs.sidebar_hidden_folders);
+        assert_eq!(loaded.sidebar_special_roles, prefs.sidebar_special_roles);
 
         let _ = fs::remove_dir_all(&base);
     }
