@@ -23,7 +23,7 @@ use crate::ui::preferences::widgets::{
     search_scroll_anchor_consumed, setting_group, setting_row, take_search_scroll_pending,
     theme_gallery, CARDS_WIDE_MAX_WIDTH, CARD_MAX_WIDTH,
 };
-use crate::ui::preferences::{PrefTab, SettingsWindow};
+use crate::ui::preferences::{extra_pages, PrefTab, SettingsWindow};
 
 const PAGE_SIZE_OPTIONS: &[(&str, usize)] = &[
     ("50 封 / 页", 50),
@@ -254,7 +254,14 @@ pub(crate) fn render_tab(
 
     let body = match win.active_tab {
         PrefTab::MailAccounts => div().into_any_element(),
+        PrefTab::Tags => extra_pages::render_tags(win, app_entity, p, cx),
+        PrefTab::Filters => extra_pages::render_filters(win, app_entity, p, cx),
+        PrefTab::SmartFolders => extra_pages::render_smart_folders(win, app_entity, p, cx),
         PrefTab::Senders => render_senders(win, app_entity, p, cx),
+        PrefTab::OpenPgp => extra_pages::render_openpgp(win, app_entity, p, cx),
+        PrefTab::CloudStorage => extra_pages::render_cloud_storage(win, app_entity, p, cx),
+        PrefTab::Translation => extra_pages::render_translation(win, app_entity, p, cx),
+        PrefTab::ContactsSources => extra_pages::render_contacts_sources(win, app_entity, p, cx),
         PrefTab::General => render_general(win, app_entity, p, cx),
         PrefTab::Appearance => render_appearance(win, app_entity, p, cx),
         PrefTab::FocusMode => render_focus_mode(win, app_entity, p, cx),
@@ -264,6 +271,7 @@ pub(crate) fn render_tab(
         PrefTab::Reading => render_reading(win, app_entity, p, cx),
         PrefTab::Composing => render_composing(win, app_entity, p, cx),
         PrefTab::Privacy => render_privacy(win, app_entity, p, cx),
+        PrefTab::Mcp => extra_pages::render_mcp(win, app_entity, p, cx),
         PrefTab::DateTime => render_date_time(win, app_entity, p, cx),
         PrefTab::System => render_system(win, app_entity, p, cx),
         PrefTab::Backup => render_backup(win, app_entity, p, window, cx),

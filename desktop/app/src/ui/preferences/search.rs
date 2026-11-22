@@ -610,6 +610,63 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         subtitle: "导出脱敏后的环境、缓存统计与偏好摘要文件",
         keywords: "export diagnostics log debug 导出 诊断 日志",
     },
+    // ---- WP-06 新增 8 个一级分类 ----
+    PrefSearchItem {
+        tab: PrefTab::OpenPgp,
+        row_id: "pref-openpgp-wkd",
+        title: "OpenPGP 密钥与加密策略",
+        subtitle: "WKD / 密钥服务器查询、本地 PGP 密钥管理与签名加密绑定",
+        keywords: "openpgp pgp gpg key encrypt sign wkd keyserver 密钥 加密 签名",
+    },
+    PrefSearchItem {
+        tab: PrefTab::CloudStorage,
+        row_id: "pref-cloud-threshold",
+        title: "云存储与超大附件自动上传",
+        subtitle: "配置 Nextcloud / WebDAV / S3 / Dropbox 云盘账号及自动上传阈值",
+        keywords: "cloud storage nextcloud webdav s3 dropbox attachment 云存储 云盘 超大附件",
+    },
+    PrefSearchItem {
+        tab: PrefTab::ContactsSources,
+        row_id: "pref-contacts-auto-collect",
+        title: "通讯录源与 CardDAV 同步",
+        subtitle: "管理 CardDAV 远程通讯录源及自动收集发件人开关",
+        keywords: "contacts carddav icloud nextcloud fastmail sync 通讯录 联系人 同步",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Tags,
+        row_id: "pref-tags-manage",
+        title: "自定义邮件标签与快捷键",
+        subtitle: "增删改自定义标签、调色板颜色圆点与快捷键 1..9 绑定",
+        keywords: "tags label color shortcut 1..9 sqlite 标签 颜色 快捷键",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Filters,
+        row_id: "pref-filters-manage",
+        title: "邮件自动化过滤器规则",
+        subtitle: "创建匹配条件与自动归档/移动/标星/打标签规则，并立即在现有邮件上运行",
+        keywords: "filters rules automation archive star move 过滤器 规则 自动",
+    },
+    PrefSearchItem {
+        tab: PrefTab::SmartFolders,
+        row_id: "pref-smart-folders",
+        title: "智能文件夹",
+        subtitle: "基于搜索表达式创建动态虚拟文件夹（名称 + 图标 + 查询语句）",
+        keywords: "smart folders saved search query virtual 智能文件夹 搜索 虚拟",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Translation,
+        row_id: "pref-translation-engine",
+        title: "邮件翻译引擎与目标语言",
+        subtitle: "配置 LibreTranslate / DeepL / Google / 本地 LLM 翻译引擎及阅读器/写信器开关",
+        keywords: "translation translate deepl libretranslate google llm language 翻译 语言",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Mcp,
+        row_id: "pref-mcp-enabled",
+        title: "MCP 服务与 AI 助手权限",
+        subtitle: "本地 MCP Server 开关、命名管道路径及读邮件/搜邮件/建草稿权限",
+        keywords: "mcp model context protocol ai assistant pipe socket 助手 权限 管道",
+    },
 ];
 
 /// 按查询词检索设置项并排序：标题前向/子串命中优先，最多返回 60 条。

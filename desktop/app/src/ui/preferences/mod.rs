@@ -1,5 +1,6 @@
 //! 独立非模态偏好设置窗口（严格复刻 Linux 版 2 分组 14 项导航 + 左侧搜索 + 640px 窄窗单栏折叠）。
 
+pub(crate) mod extra_pages;
 pub(crate) mod pages;
 pub(crate) mod search;
 pub(crate) mod widgets;
@@ -17,8 +18,10 @@ use gpui_kit::{
     ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window,
     WindowControlArea,
 };
+use hylki_mail_core::cache::TagItem;
 use hylki_mail_core::config::{
-    self, AccountConfig, AppPreferences, SettingsBackupBundle, DEFAULT_ATTACHMENT_KEYWORDS,
+    self, AccountConfig, AppPreferences, FilterField, FilterMatch, SettingsBackupBundle,
+    DEFAULT_ATTACHMENT_KEYWORDS,
 };
 
 use crate::app::{CloseOverlay, CloseSettingsWindow, FocusSearch, HylkiApp};
@@ -57,11 +60,18 @@ impl NavGroup {
     }
 }
 
-/// 偏好设置 14 个独立分页枚举（严格对齐 Linux 版两分组结构）。
+/// 偏好设置 22 个独立分页枚举（严格对齐 Linux 版两分组结构）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrefTab {
     MailAccounts,
+    Tags,
+    Filters,
+    SmartFolders,
     Senders,
+    OpenPgp,
+    CloudStorage,
+    Translation,
+    ContactsSources,
     General,
     Appearance,
     FocusMode,
@@ -71,6 +81,7 @@ pub(crate) enum PrefTab {
     Reading,
     Composing,
     Privacy,
+    Mcp,
     DateTime,
     System,
     Backup,
@@ -79,7 +90,14 @@ pub(crate) enum PrefTab {
 impl PrefTab {
     pub(crate) const ALL: &'static [Self] = &[
         Self::MailAccounts,
+        Self::Tags,
+        Self::Filters,
+        Self::SmartFolders,
         Self::Senders,
+        Self::OpenPgp,
+        Self::CloudStorage,
+        Self::Translation,
+        Self::ContactsSources,
         Self::General,
         Self::Appearance,
         Self::FocusMode,
@@ -89,6 +107,7 @@ impl PrefTab {
         Self::Reading,
         Self::Composing,
         Self::Privacy,
+        Self::Mcp,
         Self::DateTime,
         Self::System,
         Self::Backup,
@@ -96,7 +115,15 @@ impl PrefTab {
 
     pub(crate) fn group(self) -> NavGroup {
         match self {
-            Self::MailAccounts | Self::Senders => NavGroup::Accounts,
+            Self::MailAccounts
+            | Self::Tags
+            | Self::Filters
+            | Self::SmartFolders
+            | Self::Senders
+            | Self::OpenPgp
+            | Self::CloudStorage
+            | Self::Translation
+            | Self::ContactsSources => NavGroup::Accounts,
             _ => NavGroup::Settings,
         }
     }
@@ -104,7 +131,14 @@ impl PrefTab {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::MailAccounts => "邮箱账号",
+            Self::Tags => "标签",
+            Self::Filters => "过滤器",
+            Self::SmartFolders => "智能文件夹",
             Self::Senders => "发件人",
+            Self::OpenPgp => "OpenPGP 密钥",
+            Self::CloudStorage => "云存储",
+            Self::Translation => "翻译",
+            Self::ContactsSources => "通讯录源",
             Self::General => "常规",
             Self::Appearance => "外观",
             Self::FocusMode => "专注模式",
@@ -114,6 +148,7 @@ impl PrefTab {
             Self::Reading => "阅读",
             Self::Composing => "写信",
             Self::Privacy => "隐私",
+            Self::Mcp => "MCP 服务",
             Self::DateTime => "日期和时间",
             Self::System => "系统",
             Self::Backup => "备份",
@@ -123,7 +158,16 @@ impl PrefTab {
     pub(crate) fn subtitle(self) -> &'static str {
         match self {
             Self::MailAccounts => "添加与管理 IMAP / SMTP / Outlook OAuth2 邮箱账号",
-            Self::Senders => "配置始终允许加载远程图片的信任发件人列表",
+            Self::Tags => "增删改自定义邮件标签、调色板颜色与快捷键 1..9 绑定",
+            Self::Filters => "创建自动化邮件过滤规则，并在现有缓存邮件上立即执行",
+            Self::SmartFolders => "基于搜索表达式创建动态虚拟文件夹",
+            Self::Senders => "配置始终允许加载远程图片的信任发件人列表与发件人黑名单",
+            Self::OpenPgp => "管理本地 OpenPGP 密钥信息与按邮箱绑定的签名/加密策略",
+            Self::CloudStorage => {
+                "配置超大附件云盘账号（Nextcloud / WebDAV / S3 / Dropbox）与自动上传阈值"
+            }
+            Self::Translation => "配置阅读器与写信器一键翻译引擎及目标语言",
+            Self::ContactsSources => "管理 CardDAV 远程通讯录同步源与自动收集发件人开关",
             Self::General => "系统托盘、启动默认视图、自动同步与通知提示",
             Self::Appearance => "明暗模式、主题配色、界面文字缩放与状态栏位置",
             Self::FocusMode => "沉浸阅读时自动调整边栏、列表、简化视图及工具栏",
@@ -133,6 +177,7 @@ impl PrefTab {
             Self::Reading => "自动标为已读时机、阅读器布局位置、信纸主题与顶栏开关",
             Self::Composing => "默认发件人、签名位置、撤销发送秒数、回复头与附件检测",
             Self::Privacy => "默认拦截外部图片、提示横幅及链接追踪参数清理",
+            Self::Mcp => "管理本地 MCP Server 开关、命名管道路径与 AI 工具权限",
             Self::DateTime => "统一配置日期年月顺序与 12 / 24 小时时间格式",
             Self::System => "查看本地配置/缓存根目录、清理缓存与版本引擎信息",
             Self::Backup => "导出或导入便携 TOML 配置与账号服务器参数备份",
@@ -142,7 +187,14 @@ impl PrefTab {
     pub(crate) fn icon(self) -> IconName {
         match self {
             Self::MailAccounts => IconName::CircleUser,
+            Self::Tags => IconName::Tag,
+            Self::Filters => IconName::Search,
+            Self::SmartFolders => IconName::Folder,
             Self::Senders => IconName::Users,
+            Self::OpenPgp => IconName::Shield,
+            Self::CloudStorage => IconName::Upload,
+            Self::Translation => IconName::Globe,
+            Self::ContactsSources => IconName::BookOpen,
             Self::General => IconName::Settings,
             Self::Appearance => IconName::Palette,
             Self::FocusMode => IconName::Eye,
@@ -152,6 +204,7 @@ impl PrefTab {
             Self::Reading => IconName::MailOpen,
             Self::Composing => IconName::Pencil,
             Self::Privacy => IconName::Ban,
+            Self::Mcp => IconName::Bot,
             Self::DateTime => IconName::Info,
             Self::System => IconName::HardDrive,
             Self::Backup => IconName::Archive,
@@ -194,6 +247,51 @@ pub(crate) struct SettingsWindow {
     pub(crate) storage_stats: Option<config::StorageStats>,
     pub(crate) pending_backup_import: Option<(std::path::PathBuf, SettingsBackupBundle)>,
     pub(crate) backup_feedback: Option<(bool, SharedString)>,
+    // ---- WP-06：8 个新增分页控件状态 ----
+    pub(crate) pgp_name_input: Entity<InputState>,
+    pub(crate) pgp_email_input: Entity<InputState>,
+    pub(crate) pgp_fp_input: Entity<InputState>,
+    pub(crate) pgp_feedback: Option<(bool, SharedString)>,
+    pub(crate) cloud_provider: String,
+    pub(crate) cloud_name_input: Entity<InputState>,
+    pub(crate) cloud_url_input: Entity<InputState>,
+    pub(crate) cloud_user_input: Entity<InputState>,
+    pub(crate) cloud_bucket_input: Entity<InputState>,
+    pub(crate) cloud_feedback: Option<(bool, SharedString)>,
+    pub(crate) cs_provider: String,
+    pub(crate) cs_name_input: Entity<InputState>,
+    pub(crate) cs_url_input: Entity<InputState>,
+    pub(crate) cs_user_input: Entity<InputState>,
+    pub(crate) cs_feedback: Option<(bool, SharedString)>,
+    pub(crate) tag_name_input: Entity<InputState>,
+    pub(crate) tag_color: String,
+    pub(crate) tag_shortcut: Option<u8>,
+    pub(crate) editing_tag_id: Option<u32>,
+    pub(crate) cached_tags: Vec<TagItem>,
+    pub(crate) tags_loaded: bool,
+    pub(crate) tag_feedback: Option<(bool, SharedString)>,
+    pub(crate) filter_name_input: Entity<InputState>,
+    pub(crate) filter_value_input: Entity<InputState>,
+    pub(crate) filter_folder_input: Entity<InputState>,
+    pub(crate) filter_tag_input: Entity<InputState>,
+    pub(crate) filter_forward_input: Entity<InputState>,
+    pub(crate) filter_field: FilterField,
+    pub(crate) filter_matcher: FilterMatch,
+    pub(crate) filter_star: bool,
+    pub(crate) filter_mark_read: bool,
+    pub(crate) filter_archive: bool,
+    pub(crate) filter_account_email: String,
+    pub(crate) filter_feedback: Option<(bool, SharedString)>,
+    pub(crate) smart_name_input: Entity<InputState>,
+    pub(crate) smart_query_input: Entity<InputState>,
+    pub(crate) smart_icon: String,
+    pub(crate) smart_account_email: String,
+    pub(crate) smart_feedback: Option<(bool, SharedString)>,
+    pub(crate) trans_url_input: Entity<InputState>,
+    pub(crate) trans_key_input: Entity<InputState>,
+    pub(crate) trans_feedback: Option<(bool, SharedString)>,
+    pub(crate) mcp_socket_input: Entity<InputState>,
+    pub(crate) mcp_feedback: Option<(bool, SharedString)>,
     pub(crate) sidebar_scroll: ScrollHandle,
     pub(crate) content_scroll: ScrollHandle,
     last_rem_scale: u32,
@@ -274,6 +372,62 @@ impl SettingsWindow {
                 .default_value(initial_prefs.attachment_reminder_keywords.clone())
         });
 
+        let pgp_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("姓名（如：张三）"));
+        let pgp_email_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("绑定邮箱（如：user@example.com）"));
+        let pgp_fp_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("40 位指纹（留空自动生成本地标识）"));
+        let cloud_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("账号名称（如：公司 Nextcloud）"));
+        let cloud_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("服务器或 Endpoint URL（如：https://cloud.example.com）")
+        });
+        let cloud_user_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("用户名 / Access Key"));
+        let cloud_bucket_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("目录路径或 Bucket（可选）"));
+        let cs_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("通讯录名称（如：工作通讯录）"));
+        let cs_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("CardDAV 地址（如：https://contacts.icloud.com）")
+        });
+        let cs_user_input = cx.new(|cx| InputState::new(window, cx).placeholder("用户名 / 邮箱"));
+        let tag_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("标签名称（如：重要 / 待办）"));
+        let filter_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("规则名称（如：账单归档）"));
+        let filter_value_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("匹配关键词或邮箱"));
+        let filter_folder_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("目标文件夹（如：Archive）"));
+        let filter_tag_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("附加标签（可选）"));
+        let filter_forward_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("转发邮箱（可选）"));
+        let smart_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("智能文件夹名称（如：未读账单）"));
+        let smart_query_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("搜索表达式（如：from:billing is:unread）")
+        });
+        let trans_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("服务地址（如：http://127.0.0.1:5000）")
+                .default_value(initial_prefs.translation_api_url.clone())
+        });
+        let trans_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("API Key（如需鉴权）")
+        });
+        let mcp_socket_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(r"\\.\pipe\hylki-mcp")
+                .default_value(initial_prefs.mcp_socket_path.clone())
+        });
+
         let mut account_form = AccountFormState::new(edit_account.as_ref(), window, cx);
         if let Some(idx) = preset_idx {
             account_form.apply_provider_for_new(idx, window, cx);
@@ -308,6 +462,50 @@ impl SettingsWindow {
             storage_stats: None,
             pending_backup_import: None,
             backup_feedback: None,
+            pgp_name_input,
+            pgp_email_input,
+            pgp_fp_input,
+            pgp_feedback: None,
+            cloud_provider: "Nextcloud".to_string(),
+            cloud_name_input,
+            cloud_url_input,
+            cloud_user_input,
+            cloud_bucket_input,
+            cloud_feedback: None,
+            cs_provider: "CardDAV".to_string(),
+            cs_name_input,
+            cs_url_input,
+            cs_user_input,
+            cs_feedback: None,
+            tag_name_input,
+            tag_color: "#3584e4".to_string(),
+            tag_shortcut: None,
+            editing_tag_id: None,
+            cached_tags: Vec::new(),
+            tags_loaded: false,
+            tag_feedback: None,
+            filter_name_input,
+            filter_value_input,
+            filter_folder_input,
+            filter_tag_input,
+            filter_forward_input,
+            filter_field: FilterField::From,
+            filter_matcher: FilterMatch::Contains,
+            filter_star: false,
+            filter_mark_read: false,
+            filter_archive: false,
+            filter_account_email: String::new(),
+            filter_feedback: None,
+            smart_name_input,
+            smart_query_input,
+            smart_icon: "folder-search".to_string(),
+            smart_account_email: String::new(),
+            smart_feedback: None,
+            trans_url_input,
+            trans_key_input,
+            trans_feedback: None,
+            mcp_socket_input,
+            mcp_feedback: None,
             sidebar_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
             last_rem_scale: initial_scale,
@@ -1466,20 +1664,20 @@ mod tests {
 
     #[test]
     fn pref_tab_groups_and_sidebar_width_match_linux_spec() {
-        assert_eq!(PrefTab::ALL.len(), 14);
+        assert_eq!(PrefTab::ALL.len(), 22);
         assert_eq!(
             PrefTab::ALL
                 .iter()
                 .filter(|t| t.group() == NavGroup::Accounts)
                 .count(),
-            2
+            9
         );
         assert_eq!(
             PrefTab::ALL
                 .iter()
                 .filter(|t| t.group() == NavGroup::Settings)
                 .count(),
-            12
+            13
         );
         assert_eq!(compute_sidebar_width(500.0), 180.0);
         assert!((compute_sidebar_width(920.0) - 248.4).abs() < 0.01);
