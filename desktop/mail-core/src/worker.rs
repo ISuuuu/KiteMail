@@ -18,6 +18,13 @@ use crate::{
 type TokenCache = HashMap<u32, (String, Instant)>;
 type IdleWatchers = HashMap<u32, tokio::task::JoinHandle<()>>;
 
+/// 任务四：后台历史索引每批拉取的邮件数上限。比前台滚动拉取的 100 小，
+/// 让已入队的读信、搜索和发信请求能尽快插队，当前批次仍会完整跑完。
+const BACKFILL_HISTORY_BATCH: usize = 25;
+/// 任务四：后台索引连续失败达到该次数后放弃该文件夹本次会话（对齐 Linux
+/// `BACKFILL_TRIES`，避免对总是失败的文件夹紧循环；游标保留，重启后续跑）。
+const BACKFILL_HISTORY_TRIES: u32 = 3;
+
 /// Handle owned by the UI to dispatch [`MailRequest`]s and poll [`WorkerEvent`]s.
 pub struct MailWorkerHandle {
     req_tx: mpsc::Sender<MailRequest>,
@@ -81,6 +88,7 @@ async fn worker_loop(
     };
     let mut tokens: TokenCache = HashMap::new();
     let mut watchers: IdleWatchers = HashMap::new();
+    let mut backfill = BackfillIndexState::default();
 
     if let Ok(accounts) = config::load_accounts_in(&data_dir) {
         for acc in &accounts {
@@ -95,6 +103,7 @@ async fn worker_loop(
             &mut cache,
             &mut tokens,
             &mut watchers,
+            &mut backfill,
             &req_tx,
             req,
             &evt_tx,
@@ -134,11 +143,17 @@ fn stop_account_idle_watcher(watchers: &mut IdleWatchers, account_id: u32) {
     }
 }
 
+/// 账号是否在统一视图范围内：已启用且加入统一收件箱。任务四起统一视图的
+/// 列表、未读数、历史可用性与后台索引都以此为账号范围。
+fn is_unified_scope_account(acc: &AccountConfig) -> bool {
+    acc.enabled && acc.in_unified
+}
+
 fn unified_account_ids(data_dir: &std::path::Path) -> Vec<u32> {
     config::load_accounts_in(data_dir)
         .unwrap_or_default()
         .into_iter()
-        .filter(|acc| acc.enabled && acc.in_unified)
+        .filter(is_unified_scope_account)
         .map(|acc| acc.id)
         .collect()
 }
@@ -359,6 +374,7 @@ async fn handle_request(
     cache: &mut CacheStore,
     tokens: &mut TokenCache,
     watchers: &mut IdleWatchers,
+    backfill: &mut BackfillIndexState,
     req_tx: &mpsc::Sender<MailRequest>,
     req: MailRequest,
     evt_tx: &mpsc::Sender<WorkerEvent>,
@@ -1781,6 +1797,10 @@ async fn handle_request(
             load_older_messages_inner(data_dir, cache, tokens, folder_id, limit, evt_tx).await;
         }
 
+        MailRequest::BackfillHistoryBatch => {
+            backfill_history_batch_inner(data_dir, cache, tokens, backfill, evt_tx).await;
+        }
+
         MailRequest::ClearBodyCaches => match cache.clear_message_bodies() {
             Ok(_) => {
                 let _ = evt_tx.send(WorkerEvent::Status {
@@ -2364,8 +2384,141 @@ async fn sync_folder_inner(
     }
 }
 
+/// 任务四：单文件夹历史批次失败信息（游标未推进，错误呈现由调用方决定）。
+struct FolderBatchError {
+    account_id: u32,
+    account_email: String,
+    message: String,
+}
+
+/// 任务四：单文件夹单批历史拉取（双协议共用，前台分页与后台索引都走这里）。
+/// 读游标 → 载账号 → 拉取 → 提交缓存与游标 → 发 `FoldersLoaded` 刷新侧栏。
+/// 返回 `Ok(None)` = 无需拉取（游标缺失 / 已无更早 / 账号不在允许范围）；
+/// `Ok(Some((条数, 是否仍有更早)))` = 批次已提交；`Err` = 失败且游标未推进。
+async fn fetch_older_batch_for_folder(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    fid: u32,
+    batch: usize,
+    enforce_unified_scope: bool,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) -> Result<Option<(usize, bool)>, FolderBatchError> {
+    let Some((account_id, folder_path, has_more_flag, next_link, min_cached_uid, _)) =
+        cache.folder_remote_cursor(fid).ok().flatten()
+    else {
+        return Ok(None);
+    };
+    if !has_more_flag {
+        return Ok(None);
+    }
+    let Ok(account) = load_account_config(data_dir, account_id) else {
+        return Ok(None);
+    };
+    // folder_id = 0 的统一视图路径与后台索引只覆盖 `enabled && in_unified` 的账号；
+    // 指定 folder_id 的独立文件夹浏览不受限（退出统一视图的账号继续独立同步）。
+    if enforce_unified_scope && !is_unified_scope_account(&account) {
+        return Ok(None);
+    }
+
+    let res: Result<(usize, bool), String> = match account.auth_backend {
+        AuthBackend::MicrosoftGraphOAuth2 => {
+            if next_link.is_empty() {
+                let _ = cache.set_folder_remote_cursor(fid, false, "");
+                Ok((0, false))
+            } else {
+                match ensure_graph_token(tokens, &account).await {
+                    Ok(token) => {
+                        let url = next_link.clone();
+                        let fetched = tokio::task::spawn_blocking(move || {
+                            graph_client::fetch_folder_headers_next(&token, &url)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Graph 拉取历史邮件任务异常: {e}")));
+                        match fetched {
+                            Ok((items, new_next)) => {
+                                let count = items.len();
+                                let more = new_next.is_some();
+                                match cache.commit_folder_headers_with_remote(
+                                    account.id, fid, 1, &items, None,
+                                ) {
+                                    Ok(()) => {
+                                        let _ = cache.set_folder_remote_cursor(
+                                            fid,
+                                            more,
+                                            new_next.as_deref().unwrap_or(""),
+                                        );
+                                        Ok((count, more))
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        AuthBackend::Password => match min_cached_uid {
+            None => {
+                let _ = cache.set_folder_remote_cursor(fid, false, "");
+                // 游标已收口（无更早历史），与 Graph 空游标分支同样视为完成。
+                Ok((0, false))
+            }
+            Some(before_uid) => match secrets::load_account_secrets(account.id) {
+                Ok(sec) => match imap_client::fetch_older_folder_headers(
+                    &account,
+                    &sec.imap_password,
+                    &folder_path,
+                    before_uid,
+                    batch,
+                )
+                .await
+                {
+                    Ok((uid_validity, headers, live_uids, has_more)) => {
+                        let count = headers.len();
+                        match cache.commit_folder_headers(
+                            account.id,
+                            fid,
+                            uid_validity,
+                            &headers,
+                            Some(&live_uids),
+                        ) {
+                            Ok(()) => {
+                                let _ = cache.set_folder_remote_cursor(fid, has_more, "");
+                                Ok((count, has_more))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
+        },
+    };
+
+    match res {
+        Ok((count, more)) => {
+            if let Ok(folders) = cache.list_folders(account.id) {
+                let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                    account_id: account.id,
+                    folders,
+                });
+            }
+            Ok(Some((count, more)))
+        }
+        Err(e) => Err(FolderBatchError {
+            account_id: account.id,
+            account_email: account.email.clone(),
+            message: e,
+        }),
+    }
+}
+
 /// Fetch the next older batch (up to `limit`, default 100) from the remote server for `folder_id`
-/// (`0` = all inbox folders that still have older remote messages).
+/// (`0` = all unified-scope inbox folders that still have older remote messages).
 async fn load_older_messages_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -2390,115 +2543,29 @@ async fn load_older_messages_inner(
     let mut any_more_remote = false;
 
     for fid in targets {
-        let Some((account_id, folder_path, has_more_flag, next_link, min_cached_uid, _)) =
-            cache.folder_remote_cursor(fid).ok().flatten()
-        else {
-            continue;
-        };
-        if !has_more_flag {
-            continue;
-        }
-        let Ok(account) = load_account_config(data_dir, account_id) else {
-            continue;
-        };
-        if folder_id == 0 && !account.enabled {
-            continue;
-        }
-
-        let res: Result<(usize, bool), String> = match account.auth_backend {
-            AuthBackend::MicrosoftGraphOAuth2 => {
-                if next_link.is_empty() {
-                    let _ = cache.set_folder_remote_cursor(fid, false, "");
-                    Ok((0, false))
-                } else {
-                    match ensure_graph_token(tokens, &account).await {
-                        Ok(token) => {
-                            let url = next_link.clone();
-                            let fetched = tokio::task::spawn_blocking(move || {
-                                graph_client::fetch_folder_headers_next(&token, &url)
-                            })
-                            .await
-                            .unwrap_or_else(|e| Err(format!("Graph 拉取历史邮件任务异常: {e}")));
-                            match fetched {
-                                Ok((items, new_next)) => {
-                                    let count = items.len();
-                                    let more = new_next.is_some();
-                                    match cache.commit_folder_headers_with_remote(
-                                        account.id, fid, 1, &items, None,
-                                    ) {
-                                        Ok(()) => {
-                                            let _ = cache.set_folder_remote_cursor(
-                                                fid,
-                                                more,
-                                                new_next.as_deref().unwrap_or(""),
-                                            );
-                                            Ok((count, more))
-                                        }
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(e) => Err(e),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            }
-            AuthBackend::Password => {
-                let Some(before_uid) = min_cached_uid else {
-                    let _ = cache.set_folder_remote_cursor(fid, false, "");
-                    continue;
-                };
-                match secrets::load_account_secrets(account.id) {
-                    Ok(sec) => match imap_client::fetch_older_folder_headers(
-                        &account,
-                        &sec.imap_password,
-                        &folder_path,
-                        before_uid,
-                        batch,
-                    )
-                    .await
-                    {
-                        Ok((uid_validity, headers, live_uids, has_more)) => {
-                            let count = headers.len();
-                            match cache.commit_folder_headers(
-                                account.id,
-                                fid,
-                                uid_validity,
-                                &headers,
-                                Some(&live_uids),
-                            ) {
-                                Ok(()) => {
-                                    let _ = cache.set_folder_remote_cursor(fid, has_more, "");
-                                    Ok((count, has_more))
-                                }
-                                Err(e) => Err(e),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                }
-            }
-        };
-
-        match res {
-            Ok((count, more)) => {
+        match fetch_older_batch_for_folder(
+            data_dir,
+            cache,
+            tokens,
+            fid,
+            batch,
+            // 任务四：folder_id = 0 的统一分页只覆盖 `enabled && in_unified` 账号。
+            folder_id == 0,
+            evt_tx,
+        )
+        .await
+        {
+            Ok(Some((count, more))) => {
                 total_fetched += count;
                 if more {
                     any_more_remote = true;
                 }
-                if let Ok(folders) = cache.list_folders(account.id) {
-                    let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
-                        account_id: account.id,
-                        folders,
-                    });
-                }
             }
-            Err(e) => {
+            Ok(None) => {}
+            Err(err) => {
                 let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: Some(account.id),
-                    message: format!("[{}] 加载更早邮件失败: {e}", account.email),
+                    account_id: Some(err.account_id),
+                    message: format!("[{}] 加载更早邮件失败: {}", err.account_email, err.message),
                 });
             }
         }
@@ -2508,6 +2575,155 @@ async fn load_older_messages_inner(
         folder_id,
         fetched_count: total_fetched,
         has_more_remote: any_more_remote,
+    });
+}
+
+/// 任务四：后台历史索引的会话内状态（worker 进程生命周期；重启自动清零，
+/// 持久化游标续跑，对齐 Linux 本会话放弃语义）。
+#[derive(Default)]
+struct BackfillIndexState {
+    /// folder_id -> 连续失败次数（成功一批即清零）。
+    failures: HashMap<u32, u32>,
+    /// 连续失败达 [`BACKFILL_HISTORY_TRIES`] 的文件夹：本次会话不再索引。
+    abandoned: std::collections::HashSet<u32>,
+    /// 上一批处理的文件夹：候选轮转的起点，避免大文件夹饿死其他账号。
+    last_folder: Option<u32>,
+}
+
+impl BackfillIndexState {
+    /// 登记一次批次失败；连续失败达 [`BACKFILL_HISTORY_TRIES`] 时放弃该文件夹
+    /// 本次会话（游标保留），返回是否刚刚被放弃。
+    fn record_failure(&mut self, folder_id: u32) -> bool {
+        let count = self
+            .failures
+            .entry(folder_id)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        if *count >= BACKFILL_HISTORY_TRIES {
+            self.abandoned.insert(folder_id);
+            self.failures.remove(&folder_id);
+            return true;
+        }
+        false
+    }
+
+    /// 登记一次批次成功：清零该文件夹的连续失败计数。
+    fn record_success(&mut self, folder_id: u32) {
+        self.failures.remove(&folder_id);
+    }
+}
+
+/// 任务四：从缓存候选中选出下一个后台索引批次目标。过滤账号不在统一视图
+/// 范围（停用 / 退出统一视图）与本会话已放弃的文件夹；候选按文件夹 ID 升序，
+/// 从 `last_folder` 之后轮转，避免大文件夹饿死其他账号。
+fn select_backfill_target(
+    candidates: &[(u32, u32, String)],
+    allowed: &std::collections::HashSet<u32>,
+    state: &BackfillIndexState,
+) -> Option<u32> {
+    let in_scope: Vec<u32> = candidates
+        .iter()
+        .filter(|(_, account_id, _)| allowed.contains(account_id))
+        .filter(|(fid, _, _)| !state.abandoned.contains(fid))
+        .map(|(fid, _, _)| *fid)
+        .collect();
+    match state.last_folder {
+        Some(last) => in_scope
+            .iter()
+            .copied()
+            .find(|fid| *fid > last)
+            .or_else(|| in_scope.first().copied()),
+        None => in_scope.first().copied(),
+    }
+}
+
+/// 任务四：后台历史索引批次。单队列事件驱动——每批只处理一个收件箱文件夹的
+/// [`BACKFILL_HISTORY_BATCH`] 条；完成后发 `BackfillHistoryBatchDone`，由 app 端
+/// 决定是否续排下一批（读写信、搜索、发信请求自然插队）。失败时游标保留，
+/// 连续失败 3 次放弃该文件夹本次会话并日志说明（不打扰界面）。
+async fn backfill_history_batch_inner(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &mut TokenCache,
+    state: &mut BackfillIndexState,
+    evt_tx: &mpsc::Sender<WorkerEvent>,
+) {
+    let allowed: std::collections::HashSet<u32> =
+        unified_account_ids(data_dir).into_iter().collect();
+    let candidates = cache
+        .list_inbox_folders_with_more_remote()
+        .unwrap_or_default();
+    let Some(fid) = select_backfill_target(&candidates, &allowed, state) else {
+        // 已无待索引目标（全部拉完 / 放弃 / 范围外）：通知 app 端停止续排。
+        let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
+            folder_id: 0,
+            fetched_count: 0,
+            has_more_remote: false,
+        });
+        return;
+    };
+    state.last_folder = Some(fid);
+
+    let outcome = fetch_older_batch_for_folder(
+        data_dir,
+        cache,
+        tokens,
+        fid,
+        BACKFILL_HISTORY_BATCH,
+        true,
+        evt_tx,
+    )
+    .await;
+
+    let exclude_current = matches!(outcome, Ok(None));
+    let mut fetched_count = 0usize;
+    match outcome {
+        Ok(Some((0, true))) => {
+            // 空批次但服务端仍声称有更早历史：无实质进展，按失败计数防止紧循环空转。
+            if state.record_failure(fid) {
+                eprintln!(
+                    "后台历史索引: 文件夹 {fid} 连续 {} 次空批次，本次会话放弃（游标保留，重启后自动续跑）",
+                    BACKFILL_HISTORY_TRIES
+                );
+            }
+        }
+        Ok(Some((count, _more))) => {
+            state.record_success(fid);
+            fetched_count = count;
+            if count > 0 {
+                eprintln!("后台历史索引: 文件夹 {fid} 本批入库 {count} 封");
+            }
+        }
+        Ok(None) => {
+            // 游标缺失 / 账号已停用或退出统一视图：无工作量，游标保持不动。
+        }
+        Err(err) => {
+            if state.record_failure(fid) {
+                eprintln!(
+                    "后台历史索引: 文件夹 {fid} 连续失败 {} 次，本次会话放弃（游标保留，重启后自动续跑）: {}",
+                    BACKFILL_HISTORY_TRIES, err.message
+                );
+            } else {
+                eprintln!(
+                    "后台历史索引: 文件夹 {fid} 本批失败，游标保留待重试: {}",
+                    err.message
+                );
+            }
+        }
+    }
+
+    // 批次后是否仍有待索引目标（已过滤范围外与放弃的文件夹）。本批无实质进展
+    // （游标缺失 / 账号停用或退出统一视图）时把该文件夹从回信中排除，避免 app
+    // 与 worker 对同一候选空转；下一次触发（如账号重新启用）会重新纳入。
+    let remaining = cache
+        .list_inbox_folders_with_more_remote()
+        .unwrap_or_default();
+    let has_more_remote = select_backfill_target(&remaining, &allowed, state)
+        .is_some_and(|next| !exclude_current || next != fid);
+    let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
+        folder_id: fid,
+        fetched_count,
+        has_more_remote,
     });
 }
 
@@ -2952,5 +3168,77 @@ mod tests {
             resolve_oauth_account_match(None, &existing, "fresh@outlook.com"),
             OAuthAccountMatch::Bind(4)
         );
+    }
+
+    /// 任务四：统一视图账号范围 = 已启用且加入统一收件箱。
+    #[test]
+    fn unified_scope_requires_enabled_and_in_unified() {
+        let mut acc = account(1, "a@qq.com");
+        assert!(is_unified_scope_account(&acc));
+        acc.enabled = false;
+        assert!(!is_unified_scope_account(&acc), "停用账号不在统一视图范围");
+        acc.enabled = true;
+        acc.in_unified = false;
+        assert!(
+            !is_unified_scope_account(&acc),
+            "退出统一视图的账号不在范围"
+        );
+    }
+
+    /// 任务四：连续失败达 BACKFILL_HISTORY_TRIES 次放弃文件夹本次会话；
+    /// 成功一批即清零计数，不会误伤偶发失败的文件夹。
+    #[test]
+    fn backfill_gives_up_folder_after_consecutive_failures() {
+        let mut state = BackfillIndexState::default();
+        assert!(!state.record_failure(7), "第 1 次失败不放弃");
+        assert!(!state.record_failure(7), "第 2 次失败不放弃");
+        assert!(state.record_failure(7), "第 3 次连续失败放弃该文件夹");
+        assert!(state.abandoned.contains(&7));
+
+        // 放弃后不再计数；成功清零的文件夹重新从头计数。
+        assert!(!state.record_failure(7), "已放弃的文件夹重新计数");
+        state.record_success(7);
+        assert!(!state.record_failure(7), "成功后计数从零开始");
+        assert!(!state.record_failure(7));
+        assert!(state.record_failure(7));
+    }
+
+    /// 任务四：批次目标在候选间轮转，跳过范围外账号与本会话放弃的文件夹。
+    #[test]
+    fn backfill_target_rotates_and_skips_out_of_scope_folders() {
+        let mut state = BackfillIndexState::default();
+        let candidates = vec![
+            (1u32, 10u32, "INBOX".to_string()),
+            (2, 11, "INBOX".to_string()),
+            (3, 10, "INBOX".to_string()),
+        ];
+        // 账号 11 停用 / 退出统一视图：只有账号 10 的文件夹（1、3）在范围。
+        let allowed: std::collections::HashSet<u32> = [10u32].into_iter().collect();
+
+        assert_eq!(
+            select_backfill_target(&candidates, &allowed, &state),
+            Some(1)
+        );
+        state.last_folder = Some(1);
+        assert_eq!(
+            select_backfill_target(&candidates, &allowed, &state),
+            Some(3)
+        );
+        state.last_folder = Some(3);
+        // 轮转到末尾后回到队首（避免大文件夹独占后台索引）。
+        assert_eq!(
+            select_backfill_target(&candidates, &allowed, &state),
+            Some(1)
+        );
+
+        // 放弃文件夹 1 后只剩 3；全部放弃 / 范围外时无目标。
+        state.abandoned.insert(1);
+        state.last_folder = Some(3);
+        assert_eq!(
+            select_backfill_target(&candidates, &allowed, &state),
+            Some(3)
+        );
+        state.abandoned.insert(3);
+        assert_eq!(select_backfill_target(&candidates, &allowed, &state), None);
     }
 }
