@@ -20,6 +20,7 @@ pub mod oauth;
 pub mod pop3;
 pub mod privacy;
 pub mod receipt;
+pub mod remote_http;
 pub mod search_query;
 pub mod secrets;
 pub mod smtp_client;

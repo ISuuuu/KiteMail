@@ -1572,7 +1572,359 @@ pub fn sanitize_html_for_display_with_options(
         }
     }
 
-    (out, blocked_images)
+    (normalize_layout_tables_for_display(&out), blocked_images)
+}
+
+/// Unwrap email layout `<table>` wrappers into `<div>` blocks so GPUI's
+/// `TextViewState::html` preserves line breaks across nested blocks, while
+/// keeping multi-column leaf data tables intact (turning inner `<p>`/`<div>`
+/// into `<br>` inside their cells).
+fn normalize_layout_tables_for_display(html: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum TokenKind<'a> {
+        Text(&'a str),
+        Tag {
+            raw: &'a str,
+            name_end: usize,
+            is_closing: bool,
+        },
+    }
+
+    let mut tokens: Vec<TokenKind<'_>> = Vec::new();
+    let mut pos = 0usize;
+    let bytes = html.as_bytes();
+    while pos < bytes.len() {
+        let Some(rel_lt) = html[pos..].find('<') else {
+            tokens.push(TokenKind::Text(&html[pos..]));
+            break;
+        };
+        let lt = pos + rel_lt;
+        if lt > pos {
+            tokens.push(TokenKind::Text(&html[pos..lt]));
+        }
+        let Some(rel_gt) = html[lt + 1..].find('>') else {
+            tokens.push(TokenKind::Text(&html[lt..]));
+            break;
+        };
+        let gt = lt + 1 + rel_gt;
+        let inner = html[lt + 1..gt].trim();
+        let is_closing = inner.starts_with('/');
+        let name_slice = inner.trim_start_matches('/');
+        let name_end = name_slice
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(name_slice.len());
+        tokens.push(TokenKind::Tag {
+            raw: &html[lt..=gt],
+            name_end,
+            is_closing,
+        });
+        pos = gt + 1;
+    }
+
+    struct TableMeta {
+        open_idx: usize,
+        is_presentation: bool,
+        has_nested_table: bool,
+        cur_row_cols: usize,
+        max_cols: usize,
+    }
+
+    let mut is_layout_table = vec![false; tokens.len()];
+    let mut table_of_token: Vec<Option<usize>> = vec![None; tokens.len()];
+    let mut stack: Vec<TableMeta> = Vec::new();
+
+    for (idx, tok) in tokens.iter().enumerate() {
+        let TokenKind::Tag {
+            raw,
+            name_end,
+            is_closing,
+        } = *tok
+        else {
+            continue;
+        };
+        let inner = raw[1..raw.len() - 1].trim();
+        let name_slice = inner.trim_start_matches('/');
+        let tag = name_slice[..name_end].to_ascii_lowercase();
+
+        if !is_closing && tag == "table" {
+            if let Some(parent) = stack.last_mut() {
+                parent.has_nested_table = true;
+            }
+            let lower = inner.to_ascii_lowercase();
+            let is_presentation = lower.contains("role=\"presentation\"")
+                || lower.contains("role='presentation'")
+                || lower.contains("role=presentation")
+                || lower.contains("role=\"none\"")
+                || lower.contains("role='none'");
+            table_of_token[idx] = Some(idx);
+            stack.push(TableMeta {
+                open_idx: idx,
+                is_presentation,
+                has_nested_table: false,
+                cur_row_cols: 0,
+                max_cols: 0,
+            });
+        } else if is_closing && tag == "table" {
+            if let Some(meta) = stack.pop() {
+                let max_cols = meta.max_cols.max(meta.cur_row_cols);
+                let layout = meta.is_presentation || meta.has_nested_table || max_cols <= 1;
+                is_layout_table[meta.open_idx] = layout;
+                is_layout_table[idx] = layout;
+                table_of_token[idx] = Some(meta.open_idx);
+            }
+        } else if let Some(top) = stack.last_mut() {
+            table_of_token[idx] = Some(top.open_idx);
+            if !is_closing && tag == "tr" {
+                top.max_cols = top.max_cols.max(top.cur_row_cols);
+                top.cur_row_cols = 0;
+            } else if is_closing && tag == "tr" {
+                top.max_cols = top.max_cols.max(top.cur_row_cols);
+                top.cur_row_cols = 0;
+            } else if !is_closing && (tag == "td" || tag == "th") {
+                top.cur_row_cols += 1;
+            }
+        }
+    }
+    // Unclosed tables default to layout unwrapping.
+    for meta in stack {
+        is_layout_table[meta.open_idx] = true;
+    }
+
+    fn extract_style_attr(inner: &str) -> Option<&str> {
+        let lower = inner.to_ascii_lowercase();
+        let mut search_from = 0usize;
+        while let Some(rel) = lower[search_from..].find("style") {
+            let pos = search_from + rel;
+            let before_ok = pos == 0 || inner.as_bytes()[pos - 1].is_ascii_whitespace();
+            let after = pos + 5;
+            if before_ok {
+                let rest = &inner[after..];
+                let trimmed = rest.trim_start();
+                if let Some(after_eq) = trimmed.strip_prefix('=') {
+                    let after_eq = after_eq.trim_start();
+                    if let Some(q) = after_eq.bytes().next().filter(|&b| b == b'"' || b == b'\'') {
+                        let content = &after_eq[1..];
+                        if let Some(end) = content.find(q as char) {
+                            return Some(&content[..end]);
+                        }
+                    }
+                }
+            }
+            search_from = after;
+        }
+        None
+    }
+
+    fn style_prop<'a>(style: &'a str, prop: &str) -> Option<&'a str> {
+        for decl in style.split(';') {
+            let Some((name, val)) = decl.split_once(':') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case(prop) {
+                return Some(val.trim());
+            }
+        }
+        None
+    }
+
+    fn has_bold_font_weight(style: &str) -> bool {
+        let Some(val) = style_prop(style, "font-weight") else {
+            return false;
+        };
+        let v = val.trim().trim_end_matches("!important").trim();
+        if v.eq_ignore_ascii_case("bold") || v.eq_ignore_ascii_case("bolder") {
+            return true;
+        }
+        v.parse::<u32>().is_ok_and(|n| n >= 600)
+    }
+
+    fn large_font_heading(style: &str) -> Option<&'static str> {
+        let val = style_prop(style, "font-size")?;
+        let v = val.trim().trim_end_matches("!important").trim();
+        let lower = v.to_ascii_lowercase();
+        let px = if let Some(num) = lower.strip_suffix("px") {
+            num.trim().parse::<f32>().ok()?
+        } else if let Some(num) = lower.strip_suffix("pt") {
+            num.trim().parse::<f32>().ok()? * 1.333
+        } else {
+            return None;
+        };
+        if px >= 20.0 {
+            Some("h3")
+        } else if px >= 17.0 {
+            Some("h4")
+        } else {
+            None
+        }
+    }
+
+    fn is_void_tag(tag: &str) -> bool {
+        matches!(
+            tag,
+            "br" | "img" | "hr" | "meta" | "link" | "input" | "wbr" | "col" | "area" | "base"
+        )
+    }
+
+    struct OpenTagState {
+        orig_tag: String,
+        heading: Option<&'static str>,
+        bold: bool,
+    }
+
+    let mut out = String::with_capacity(html.len());
+    let mut in_data_cell = false;
+    let mut data_cell_has_content = false;
+    let mut open_tags: Vec<OpenTagState> = Vec::new();
+
+    for (idx, tok) in tokens.iter().enumerate() {
+        match *tok {
+            TokenKind::Text(t) => {
+                if in_data_cell && !t.trim().is_empty() {
+                    data_cell_has_content = true;
+                }
+                out.push_str(t);
+            }
+            TokenKind::Tag {
+                raw,
+                name_end,
+                is_closing,
+            } => {
+                let inner = raw[1..raw.len() - 1].trim();
+                let name_slice = inner.trim_start_matches('/');
+                let tag = name_slice[..name_end].to_ascii_lowercase();
+                let self_closing = inner.ends_with('/') || is_void_tag(&tag);
+
+                if tag == "center" {
+                    out.push_str(if is_closing { "</div>" } else { "<div>" });
+                    continue;
+                }
+
+                if let Some(open_idx) = table_of_token[idx] {
+                    if is_layout_table[open_idx] {
+                        match tag.as_str() {
+                            "table" | "tr" | "td" | "th" => {
+                                if is_closing {
+                                    if let Some(pos) =
+                                        open_tags.iter().rposition(|s| s.orig_tag == tag)
+                                    {
+                                        let state = open_tags.remove(pos);
+                                        if state.bold {
+                                            out.push_str("</b>");
+                                        }
+                                    }
+                                    out.push_str("</div>");
+                                } else {
+                                    let bold =
+                                        extract_style_attr(inner).is_some_and(has_bold_font_weight);
+                                    out.push_str("<div>");
+                                    if !self_closing {
+                                        if bold {
+                                            out.push_str("<b>");
+                                        }
+                                        open_tags.push(OpenTagState {
+                                            orig_tag: tag,
+                                            heading: None,
+                                            bold,
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            "thead" | "tbody" | "tfoot" => continue,
+                            _ => {}
+                        }
+                    } else {
+                        // Data table: keep <table>/<tr>/<td>/<th>, but turn block
+                        // wrappers inside cells into <br> so cell lines don't merge.
+                        match tag.as_str() {
+                            "td" | "th" => {
+                                in_data_cell = !is_closing;
+                                data_cell_has_content = false;
+                            }
+                            "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                                if in_data_cell =>
+                            {
+                                if is_closing {
+                                    if let Some(pos) =
+                                        open_tags.iter().rposition(|s| s.orig_tag == tag)
+                                    {
+                                        let state = open_tags.remove(pos);
+                                        if state.bold {
+                                            out.push_str("</b>");
+                                        }
+                                    }
+                                    if data_cell_has_content {
+                                        out.push_str("<br>");
+                                        data_cell_has_content = false;
+                                    }
+                                } else if !self_closing {
+                                    let bold = tag.starts_with('h')
+                                        || extract_style_attr(inner)
+                                            .is_some_and(has_bold_font_weight);
+                                    if bold {
+                                        out.push_str("<b>");
+                                    }
+                                    open_tags.push(OpenTagState {
+                                        orig_tag: tag,
+                                        heading: None,
+                                        bold,
+                                    });
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if is_closing {
+                    if let Some(pos) = open_tags.iter().rposition(|s| s.orig_tag == tag) {
+                        let state = open_tags.remove(pos);
+                        if state.bold {
+                            out.push_str("</b>");
+                        }
+                        if let Some(h) = state.heading {
+                            out.push_str(&format!("</{h}>"));
+                            continue;
+                        }
+                    }
+                    out.push_str(raw);
+                } else {
+                    let style = extract_style_attr(inner);
+                    let heading = if !in_data_cell && matches!(tag.as_str(), "div" | "p") {
+                        style.and_then(large_font_heading)
+                    } else {
+                        None
+                    };
+                    let already_bold = matches!(
+                        tag.as_str(),
+                        "b" | "strong" | "th" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                    );
+                    let bold = heading.is_none()
+                        && !already_bold
+                        && style.is_some_and(has_bold_font_weight);
+
+                    if let Some(h) = heading {
+                        out.push_str(&format!("<{h}>"));
+                    } else {
+                        out.push_str(raw);
+                    }
+                    if !self_closing {
+                        if bold {
+                            out.push_str("<b>");
+                        }
+                        open_tags.push(OpenTagState {
+                            orig_tag: tag,
+                            heading,
+                            bold,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// Sanitize HTML email bodies for safe native display (legacy default without link cleaning).
@@ -1727,5 +2079,31 @@ mod tests {
         assert!(cleaned.contains("https://example.com/doc?page=2\""));
         assert!(!cleaned.contains("utm_campaign"));
         assert!(!cleaned.contains("msclkid"));
+    }
+
+    #[test]
+    fn unwraps_layout_tables_and_preserves_data_table_cell_breaks() {
+        let raw = r#"<table role="presentation"><tbody><tr><td><h3>Title</h3><center>Sub</center><table><tr><th>Status</th><th>Job</th></tr><tr><td>Fail</td><td><div>Build</div><div>1m</div></td></tr></table></td></tr></tbody></table>"#;
+        let (cleaned, _) = sanitize_html_for_display_with_options(raw, false, false);
+        assert!(cleaned.contains("<h3>Title</h3>"));
+        assert!(cleaned.contains("<div>Sub</div>"));
+        assert!(cleaned.contains("<table><tr><th>Status</th><th>Job</th></tr>"));
+        assert!(cleaned.contains("<td>Build<br>1m<br></td>"));
+    }
+
+    #[test]
+    fn maps_inline_font_weight_and_large_font_size() {
+        let raw = r#"<div style="font-size: 20px; font-weight: 600;">Heading</div><p style="font-size: 18px;">Subhead</p><span style="font-weight: bold;">Bold</span><table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td><div style="font-weight: 700;">Build</div><div>1m</div></td></tr></table>"#;
+        let (cleaned, _) = sanitize_html_for_display_with_options(raw, false, false);
+        assert!(cleaned.contains("<h3>Heading</h3>"), "got: {cleaned}");
+        assert!(cleaned.contains("<h4>Subhead</h4>"), "got: {cleaned}");
+        assert!(
+            cleaned.contains(r#"<span style="font-weight: bold;"><b>Bold</b></span>"#),
+            "got: {cleaned}"
+        );
+        assert!(
+            cleaned.contains("<td><b>Build</b><br>1m<br></td>"),
+            "got: {cleaned}"
+        );
     }
 }

@@ -225,6 +225,47 @@ pub(crate) fn apply_window_icon() {
     }
 }
 
+struct HylkiHttpClient;
+
+impl gpui_kit::http_client::HttpClient for HylkiHttpClient {
+    fn user_agent(&self) -> Option<&gpui_kit::http_client::http::HeaderValue> {
+        None
+    }
+
+    fn proxy(&self) -> Option<&gpui_kit::http_client::Url> {
+        None
+    }
+
+    fn send(
+        &self,
+        req: gpui_kit::http_client::Request<gpui_kit::http_client::AsyncBody>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = gpui_kit::Result<
+                        gpui_kit::http_client::Response<gpui_kit::http_client::AsyncBody>,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let url = req.uri().to_string();
+        Box::pin(async move {
+            let (status, content_type, bytes) =
+                hylki_mail_core::remote_http::fetch_remote_image_async(url)
+                    .await
+                    .map_err(std::io::Error::other)?;
+            let mut builder = gpui_kit::http_client::Response::builder().status(status);
+            if !content_type.is_empty() {
+                builder = builder.header("Content-Type", content_type);
+            }
+            builder
+                .body(gpui_kit::http_client::AsyncBody::from(bytes))
+                .map_err(|e| std::io::Error::other(e).into())
+        })
+    }
+}
+
 fn main() {
     let demo_mode = std::env::args().any(|arg| arg == "--demo");
 
@@ -233,6 +274,7 @@ fn main() {
         .with_assets(HylkiAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.set_http_client(std::sync::Arc::new(HylkiHttpClient));
 
             // 阶段 3：读取持久化偏好并按 theme_id / dark_mode 安装初始主题
             //（dark_mode: None 跟随系统时先保持现有默认亮色，由用户切换时固化）。
