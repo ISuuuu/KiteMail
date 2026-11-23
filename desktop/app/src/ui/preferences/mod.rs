@@ -227,6 +227,7 @@ pub(crate) struct SettingsWindow {
     pub(crate) search_input: Entity<InputState>,
     pub(crate) highlighted_row_id: Option<&'static str>,
     pub(crate) highlight_token: u64,
+    pub(crate) file_dialog_open: bool,
     pub(crate) account_form: AccountFormState,
     pub(crate) account_editor_open: bool,
     pub(crate) confirm_remove_in_editor: bool,
@@ -441,6 +442,7 @@ impl SettingsWindow {
             search_input,
             highlighted_row_id: None,
             highlight_token: 0,
+            file_dialog_open: false,
             account_form,
             account_editor_open: editor_open,
             confirm_remove_in_editor: false,
@@ -900,25 +902,40 @@ impl SettingsWindow {
             app.prefs.blocked_senders.len(),
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         );
-        if let Some(dest) = rfd::FileDialog::new()
-            .set_file_name("hylki-diagnostics.txt")
-            .add_filter("诊断信息文本 (*.txt)", &["txt"])
-            .save_file()
-        {
-            match std::fs::write(&dest, report) {
-                Ok(()) => {
-                    self.backup_feedback = Some((
-                        true,
-                        SharedString::from(format!("诊断信息已导出至：{}", dest.display())),
-                    ));
-                }
-                Err(e) => {
-                    self.backup_feedback =
-                        Some((false, SharedString::from(format!("写出诊断信息失败: {e}"))));
-                }
-            }
-            cx.notify();
+        if self.file_dialog_open {
+            return;
         }
+        self.file_dialog_open = true;
+        cx.spawn(async move |this, cx| {
+            let dest = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_file_name("hylki-diagnostics.txt")
+                        .add_filter("诊断信息文本 (*.txt)", &["txt"])
+                        .save_file()
+                })
+                .await;
+            let _ = this.update(cx, |this, _| this.file_dialog_open = false);
+            if let Some(dest) = dest {
+                let _ = this.update(cx, |this, cx| {
+                    match std::fs::write(&dest, report) {
+                        Ok(()) => {
+                            this.backup_feedback = Some((
+                                true,
+                                SharedString::from(format!("诊断信息已导出至：{}", dest.display())),
+                            ));
+                        }
+                        Err(e) => {
+                            this.backup_feedback =
+                                Some((false, SharedString::from(format!("写出诊断信息失败: {e}"))));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn apply_reply_header_input(
@@ -994,53 +1011,84 @@ impl SettingsWindow {
                 return;
             }
         };
-        if let Some(dest) = rfd::FileDialog::new()
-            .set_file_name("hylki-settings-backup.toml")
-            .add_filter("Hylki 配置备份 (*.toml)", &["toml"])
-            .save_file()
-        {
-            match std::fs::write(&dest, exported) {
-                Ok(()) => {
-                    self.backup_feedback = Some((
-                        true,
-                        SharedString::from(format!("配置备份已保存至：{}", dest.display())),
-                    ));
-                }
-                Err(e) => {
-                    self.backup_feedback =
-                        Some((false, SharedString::from(format!("写出备份文件失败: {e}"))));
-                }
-            }
-            cx.notify();
+        if self.file_dialog_open {
+            return;
         }
+        self.file_dialog_open = true;
+        cx.spawn(async move |this, cx| {
+            let dest = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_file_name("hylki-settings-backup.toml")
+                        .add_filter("Hylki 配置备份 (*.toml)", &["toml"])
+                        .save_file()
+                })
+                .await;
+            let _ = this.update(cx, |this, _| this.file_dialog_open = false);
+            if let Some(dest) = dest {
+                let _ = this.update(cx, |this, cx| {
+                    match std::fs::write(&dest, exported) {
+                        Ok(()) => {
+                            this.backup_feedback = Some((
+                                true,
+                                SharedString::from(format!("配置备份已保存至：{}", dest.display())),
+                            ));
+                        }
+                        Err(e) => {
+                            this.backup_feedback =
+                                Some((false, SharedString::from(format!("写出备份文件失败: {e}"))));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn pick_settings_backup(&mut self, cx: &mut Context<Self>) {
-        let Some(src) = rfd::FileDialog::new()
-            .add_filter("Hylki 配置备份 (*.toml)", &["toml"])
-            .pick_file()
-        else {
+        if self.file_dialog_open {
             return;
-        };
-        let text = match std::fs::read_to_string(&src) {
-            Ok(t) => t,
-            Err(e) => {
-                self.backup_feedback = Some((false, SharedString::from(format!("读取失败: {e}"))));
-                cx.notify();
-                return;
-            }
-        };
-        match config::parse_settings_bundle(&text) {
-            Ok(bundle) => {
-                self.pending_backup_import = Some((src, bundle));
-                self.backup_feedback = None;
-            }
-            Err(e) => {
-                self.pending_backup_import = None;
-                self.backup_feedback = Some((false, SharedString::from(e)));
-            }
         }
-        cx.notify();
+        self.file_dialog_open = true;
+        cx.spawn(async move |this, cx| {
+            let src = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .add_filter("Hylki 配置备份 (*.toml)", &["toml"])
+                        .pick_file()
+                })
+                .await;
+            let _ = this.update(cx, |this, _| this.file_dialog_open = false);
+            let Some(src) = src else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                let text = match std::fs::read_to_string(&src) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        this.backup_feedback =
+                            Some((false, SharedString::from(format!("读取失败: {e}"))));
+                        cx.notify();
+                        return;
+                    }
+                };
+                match config::parse_settings_bundle(&text) {
+                    Ok(bundle) => {
+                        this.pending_backup_import = Some((src, bundle));
+                        this.backup_feedback = None;
+                    }
+                    Err(e) => {
+                        this.pending_backup_import = None;
+                        this.backup_feedback = Some((false, SharedString::from(e)));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn confirm_import_backup(

@@ -553,14 +553,17 @@ impl Render for MessageWindow {
                             .tooltip("打印 / 导出 PDF")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let pp = print_preview::PrintPreviewState::new(d_print.clone());
-                                if let Err(err) = print_preview::launch_system_print(
-                                    &pp,
-                                    &this.prefs.date_style,
-                                    &this.prefs.clock_style,
-                                ) {
-                                    let _ = err;
-                                }
-                                cx.notify();
+                                let date_style = this.prefs.date_style.clone();
+                                let clock_style = this.prefs.clock_style.clone();
+                                cx.background_executor()
+                                    .spawn(async move {
+                                        let _ = print_preview::launch_system_print(
+                                            &pp,
+                                            &date_style,
+                                            &clock_style,
+                                        );
+                                    })
+                                    .detach();
                             })),
                     )
                     .child(

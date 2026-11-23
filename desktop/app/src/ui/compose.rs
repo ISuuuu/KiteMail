@@ -747,87 +747,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 .text_size(px(12.0))
                                 .label("CSV 邮件合并")
                                 .tooltip("导入 CSV 表格并使用 {{字段}} 占位符批量生成个性化邮件")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("CSV 表格", &["csv", "tsv", "txt"])
-                                        .pick_file()
-                                    {
-                                        if let Ok(bytes) = std::fs::read(&path) {
-                                            if let Ok(table) =
-                                                hylki_mail_core::merge::Table::from_csv_bytes(
-                                                    &bytes,
-                                                )
-                                            {
-                                                let cols = table.columns.join(", ");
-                                                let tpl = hylki_mail_core::merge::Letter {
-                                                    to: this
-                                                        .compose_to
-                                                        .read(cx)
-                                                        .value()
-                                                        .to_string(),
-                                                    cc: this
-                                                        .compose_cc
-                                                        .read(cx)
-                                                        .value()
-                                                        .to_string(),
-                                                    bcc: this
-                                                        .compose_bcc
-                                                        .read(cx)
-                                                        .value()
-                                                        .to_string(),
-                                                    reply_to: String::new(),
-                                                    subject: this
-                                                        .compose_subject
-                                                        .read(cx)
-                                                        .value()
-                                                        .to_string(),
-                                                    body: this
-                                                        .compose_body
-                                                        .read(cx)
-                                                        .value()
-                                                        .to_string(),
-                                                };
-                                                let generated = table.generate_all(&tpl, false);
-                                                if let Some(first) = generated.first() {
-                                                    if !first.to.trim().is_empty() {
-                                                        this.compose_to.update(cx, |s, cx| {
-                                                            s.set_value(
-                                                                first.to.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        });
-                                                    }
-                                                    if !first.subject.trim().is_empty() {
-                                                        this.compose_subject.update(cx, |s, cx| {
-                                                            s.set_value(
-                                                                first.subject.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        });
-                                                    }
-                                                    if !first.body.trim().is_empty() {
-                                                        this.compose_body.update(cx, |s, cx| {
-                                                            s.set_value(
-                                                                first.body.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        });
-                                                    }
-                                                }
-                                                this.compose_autosaved_at = Some(
-                                                    format!(
-                                                        "已合并 CSV（{} 行，字段：{cols}）",
-                                                        generated.len()
-                                                    )
-                                                    .into(),
-                                                );
-                                                cx.notify();
-                                            }
-                                        }
-                                    }
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pick_mail_merge_csv(cx);
                                 })),
                         ),
                 )

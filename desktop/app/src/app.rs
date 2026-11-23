@@ -788,6 +788,7 @@ pub(crate) struct HylkiApp {
     /// F-4 草稿自动保存：防抖代际（每次输入变更 +1，旧定时器醒来后失效）。
     compose_autosave_generation: u64,
     compose_session_generation: u64,
+    file_dialog_open: bool,
     print_preview_generation: u64,
     /// F-4 自上次落库以来写信内容有变更（变更事件仅由真实编辑触发）。
     compose_autosave_dirty: bool,
@@ -1322,6 +1323,7 @@ impl HylkiApp {
                 compose_pill_resume: None,
                 compose_autosave_generation: 0,
                 compose_session_generation: 0,
+                file_dialog_open: false,
                 print_preview_generation: 0,
                 compose_autosave_dirty: false,
                 compose_autosave_pending: false,
@@ -1549,6 +1551,7 @@ impl HylkiApp {
             compose_pill_resume: None,
             compose_autosave_generation: 0,
             compose_session_generation: 0,
+            file_dialog_open: false,
             print_preview_generation: 0,
             compose_autosave_dirty: false,
             compose_autosave_pending: false,
@@ -5322,6 +5325,73 @@ impl HylkiApp {
         cx.notify();
     }
 
+    pub(crate) fn pick_mail_merge_csv(&mut self, cx: &mut Context<Self>) {
+        if self.file_dialog_open {
+            return;
+        }
+        self.file_dialog_open = true;
+        let generation = self.compose_session_generation;
+        cx.spawn(async move |this, cx| {
+            let table = cx
+                .background_executor()
+                .spawn(async move {
+                    let path = rfd::FileDialog::new()
+                        .add_filter("CSV 表格", &["csv", "tsv", "txt"])
+                        .pick_file()?;
+                    let bytes = std::fs::read(path).ok()?;
+                    hylki_mail_core::merge::Table::from_csv_bytes(&bytes).ok()
+                })
+                .await;
+            cx.update(|cx| {
+                let Ok(handle) = this.update(cx, |app, _| {
+                    app.file_dialog_open = false;
+                    app.compose_window.unwrap_or(app.window_handle)
+                }) else {
+                    return;
+                };
+                let Some(table) = table else { return };
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = this.update(cx, |app, cx| {
+                        if app.compose_session_generation != generation {
+                            return;
+                        }
+                        let cols = table.columns.join(", ");
+                        let tpl = hylki_mail_core::merge::Letter {
+                            to: app.compose_to.read(cx).value().to_string(),
+                            cc: app.compose_cc.read(cx).value().to_string(),
+                            bcc: app.compose_bcc.read(cx).value().to_string(),
+                            reply_to: String::new(),
+                            subject: app.compose_subject.read(cx).value().to_string(),
+                            body: app.compose_body.read(cx).value().to_string(),
+                        };
+                        let generated = table.generate_all(&tpl, false);
+                        if let Some(first) = generated.first() {
+                            if !first.to.trim().is_empty() {
+                                app.compose_to
+                                    .update(cx, |s, cx| s.set_value(first.to.clone(), window, cx));
+                            }
+                            if !first.subject.trim().is_empty() {
+                                app.compose_subject.update(cx, |s, cx| {
+                                    s.set_value(first.subject.clone(), window, cx)
+                                });
+                            }
+                            if !first.body.trim().is_empty() {
+                                app.compose_body.update(cx, |s, cx| {
+                                    s.set_value(first.body.clone(), window, cx)
+                                });
+                            }
+                        }
+                        app.compose_autosaved_at = Some(
+                            format!("已合并 CSV（{} 行，字段：{cols}）", generated.len()).into(),
+                        );
+                        cx.notify();
+                    });
+                });
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn pick_attachments(&mut self, cx: &mut Context<Self>) {
         let generation = self.compose_session_generation;
         cx.spawn(async move |this, cx| {
@@ -5718,28 +5788,33 @@ impl HylkiApp {
     }
 
     pub(crate) fn run_system_print(&mut self, cx: &mut Context<Self>) {
-        let Some(ref state) = self.print_preview else {
+        let Some(state) = self.print_preview.clone() else {
             return;
         };
-        match print_preview::launch_system_print(
-            state,
-            &self.prefs.date_style,
-            &self.prefs.clock_style,
-        ) {
-            Ok(()) => {
-                if let Some(ref mut pp) = self.print_preview {
-                    pp.status_note = Some(SharedString::from(
-                        "已在系统打印页打开，请在弹出的打印对话框中确认打印",
-                    ));
+        let date_style = self.prefs.date_style.clone();
+        let clock_style = self.prefs.clock_style.clone();
+        let generation = self.print_preview_generation;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    print_preview::launch_system_print(&state, &date_style, &clock_style)
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.print_preview_generation != generation {
+                    return;
                 }
-            }
-            Err(err) => {
-                if let Some(ref mut pp) = self.print_preview {
-                    pp.status_note = Some(SharedString::from(err));
+                if let Some(ref mut pp) = app.print_preview {
+                    pp.status_note = Some(SharedString::from(match result {
+                        Ok(()) => "已在系统打印页打开，请在弹出的打印对话框中确认打印".to_string(),
+                        Err(err) => err,
+                    }));
                 }
-            }
-        }
-        cx.notify();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn pop_out_message_window(&mut self, detail: MessageDetail, cx: &mut Context<Self>) {
@@ -7710,38 +7785,54 @@ impl HylkiApp {
             cx.notify();
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("联系人文件 (vCard / CSV)", &["vcf", "csv"])
-            .pick_file()
-        else {
+        if self.file_dialog_open {
             return;
-        };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) => {
-                self.error_banner = Some(SharedString::from(format!("读取联系人文件失败: {e}")));
-                cx.notify();
+        }
+        self.file_dialog_open = true;
+        cx.spawn(async move |this, cx| {
+            let path = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .add_filter("联系人文件 (vCard / CSV)", &["vcf", "csv"])
+                        .pick_file()
+                })
+                .await;
+            let _ = this.update(cx, |app, _| app.file_dialog_open = false);
+            let Some(path) = path else {
                 return;
-            }
-        };
-        // 按扩展名或内容特征（BEGIN:VCARD）识别格式；解析失败的行被跳过。
-        let contacts = if contacts_io::looks_like_vcard(&path, &text) {
-            contacts_io::parse_vcards(&text)
-        } else {
-            contacts_io::parse_csv_contacts(&text)
-        };
-        if contacts.is_empty() {
-            self.status_line =
-                SharedString::from("未在文件中找到带邮箱的联系人（支持 vCard 与 CSV）");
-            cx.notify();
-            return;
-        }
-        let count = contacts.len();
-        if let Some(ref w) = self.worker {
-            self.status_line = SharedString::from(format!("正在导入 {count} 个联系人..."));
-            w.send(MailRequest::ImportUserContacts { contacts });
-        }
-        cx.notify();
+            };
+            let _ = this.update(cx, |app, cx| {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        app.error_banner =
+                            Some(SharedString::from(format!("读取联系人文件失败: {e}")));
+                        cx.notify();
+                        return;
+                    }
+                };
+                // 按扩展名或内容特征（BEGIN:VCARD）识别格式；解析失败的行被跳过。
+                let contacts = if contacts_io::looks_like_vcard(&path, &text) {
+                    contacts_io::parse_vcards(&text)
+                } else {
+                    contacts_io::parse_csv_contacts(&text)
+                };
+                if contacts.is_empty() {
+                    app.status_line =
+                        SharedString::from("未在文件中找到带邮箱的联系人（支持 vCard 与 CSV）");
+                    cx.notify();
+                    return;
+                }
+                let count = contacts.len();
+                if let Some(ref w) = app.worker {
+                    app.status_line = SharedString::from(format!("正在导入 {count} 个联系人..."));
+                    w.send(MailRequest::ImportUserContacts { contacts });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 联系人导出：把联系人页当前列表写入 vCard / CSV 文件（demo 模式同样可用）。
@@ -7800,27 +7891,44 @@ impl HylkiApp {
             cx.notify();
             return;
         }
-        let Some(dest) = rfd::FileDialog::new()
-            .set_title(title)
-            .add_filter(filter.0, filter.1)
-            .set_file_name(default_name)
-            .save_file()
-        else {
+        let count = items.len();
+        if self.file_dialog_open {
             return;
-        };
-        match std::fs::write(&dest, content) {
-            Ok(()) => {
-                self.status_line = SharedString::from(format!(
-                    "已导出 {} 个联系人至 {}",
-                    items.len(),
-                    dest.display()
-                ));
-            }
-            Err(e) => {
-                self.error_banner = Some(SharedString::from(format!("写入联系人文件失败: {e}")));
-            }
         }
-        cx.notify();
+        self.file_dialog_open = true;
+        cx.spawn(async move |this, cx| {
+            let dest = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_title(title)
+                        .add_filter(filter.0, filter.1)
+                        .set_file_name(default_name)
+                        .save_file()
+                })
+                .await;
+            let _ = this.update(cx, |app, _| app.file_dialog_open = false);
+            let Some(dest) = dest else {
+                return;
+            };
+            let _ = this.update(cx, |app, cx| {
+                match std::fs::write(&dest, content) {
+                    Ok(()) => {
+                        app.status_line = SharedString::from(format!(
+                            "已导出 {} 个联系人至 {}",
+                            count,
+                            dest.display()
+                        ));
+                    }
+                    Err(e) => {
+                        app.error_banner =
+                            Some(SharedString::from(format!("写入联系人文件失败: {e}")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 打开统一设置窗口（侧栏菜单 / 命令面板 / Ctrl+,）。
@@ -8950,7 +9058,9 @@ impl Render for HylkiApp {
                 && self.print_preview.is_none()
                 && !self.reader_find_open
                 && !self.compose_split
-                && !self.sidebar_peek_open;
+                && !self.sidebar_peek_open
+                && self.drawer_image_preview.is_none()
+                && !self.reader_popup_open;
             if !visible {
                 cx.defer_in(window, move |_, _, _| host.set_visible(false));
             }

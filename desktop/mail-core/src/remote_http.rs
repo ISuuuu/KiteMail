@@ -6,7 +6,11 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
 const MAX_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_CONCURRENT_FETCHES: u32 = 8;
+static FETCH_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_FETCHES as usize);
 
 fn build_agent() -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
@@ -79,10 +83,13 @@ pub fn fetch_remote_image_async(
     url: String,
 ) -> Pin<Box<dyn Future<Output = Result<(u16, String, Vec<u8>), String>> + Send + 'static>> {
     Box::pin(async move {
+        let permit = FETCH_SLOTS.acquire().await.map_err(|e| e.to_string())?;
         let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::Builder::new()
             .name("hylki-remote-img".to_string())
             .spawn(move || {
+                // A canceled caller can drop the receiver while this request is still running.
+                let _permit = permit;
                 let _ = tx.send(fetch_remote_image(&url));
             })
             .map_err(|e| e.to_string())?;
@@ -93,6 +100,7 @@ pub fn fetch_remote_image_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
 
     #[test]
     fn rejects_non_http_schemes() {
@@ -100,5 +108,15 @@ mod tests {
         assert!(fetch_remote_image("javascript:alert(1)").is_err());
         assert!(is_http_url("https://example.com/a.png"));
         assert!(is_http_url("HTTP://example.com/a.png"));
+    }
+
+    #[test]
+    fn waits_for_a_slot_before_starting_another_fetch() {
+        let _permits = FETCH_SLOTS
+            .try_acquire_many(MAX_CONCURRENT_FETCHES)
+            .unwrap();
+        assert!(fetch_remote_image_async("https://example.com/a.png".into())
+            .now_or_never()
+            .is_none());
     }
 }

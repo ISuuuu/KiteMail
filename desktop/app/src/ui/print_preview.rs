@@ -283,19 +283,16 @@ pub(crate) fn export_print_pdf(
     let html = build_print_html(state, date_style, clock_style, false);
     let tmp_html = create_print_temp_file(&html)?;
 
-    if let Some(edge) = find_msedge() {
+    #[cfg(windows)]
+    if let (Some(edge), Ok(file_url)) = (find_msedge(), url::Url::from_file_path(&tmp_html)) {
         let out_arg = format!("--print-to-pdf={}", dest_pdf.display());
-        let file_url = format!(
-            "file:///{}",
-            tmp_html.display().to_string().replace('\\', "/")
-        );
         let status = Command::new(edge)
             .args([
                 "--headless",
                 "--disable-gpu",
                 "--no-pdf-header-footer",
                 &out_arg,
-                &file_url,
+                file_url.as_str(),
             ])
             .status();
         if let Ok(s) = status {
@@ -355,22 +352,41 @@ fn write_fallback_html(path: &Path, html: &str) -> Result<(), String> {
         .map_err(|e| format!("导出打印文件失败（{}）: {e}", path.display()))
 }
 
-/// 在系统默认浏览器中打开自动触发 `window.print()` 的打印页面。
+/// 在后台线程打开自动触发 `window.print()` 的打印页面。
 pub(crate) fn launch_system_print(
     state: &PrintPreviewState,
     date_style: &str,
     clock_style: &str,
 ) -> Result<(), String> {
     let html = build_print_html(state, date_style, clock_style, true);
-    let tmp_html = std::env::temp_dir().join(format!("hylki-print-job-{}.html", state.detail.id));
-    std::fs::write(&tmp_html, html.as_bytes()).map_err(|e| format!("创建打印临时页失败: {e}"))?;
+    let tmp_html = create_print_temp_file(&html)?;
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", &tmp_html.display().to_string()])
-            .spawn()
-            .map_err(|e| format!("打开系统打印页失败: {e}"))?;
+        use windows::core::{w, HSTRING};
+        use windows::Win32::System::Com::{
+            CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        };
+        use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWDEFAULT};
+
+        let path = HSTRING::from(tmp_html.as_os_str());
+        let result = unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
+                .ok()
+                .map(|()| {
+                    let result = ShellExecuteW(None, w!("open"), &path, None, None, SW_SHOWDEFAULT);
+                    CoUninitialize();
+                    result.0 as isize
+                })
+        };
+        let error = match result {
+            Ok(code) if code > 32 => return Ok(()),
+            Ok(code) => format!("ShellExecuteW 返回 {code}"),
+            Err(error) => error.to_string(),
+        };
+        let _ = std::fs::remove_file(&tmp_html);
+        return Err(format!("打开系统打印页失败: {error}"));
     }
+    #[cfg(not(windows))]
     Ok(())
 }
 

@@ -488,6 +488,7 @@ impl Render for AccountRowDrag {
 /// 账号表单输入与编辑器状态（在设置窗口自己的 Window 上创建，避免跨窗口持有 InputState）。
 pub(crate) struct AccountFormState {
     pub(crate) editing_account_id: Option<u32>,
+    pub(crate) session_generation: u64,
     pub(crate) provider_idx: usize,
     pub(crate) original_enabled: bool,
     pub(crate) original_auth_backend: AuthBackend,
@@ -746,6 +747,7 @@ impl AccountFormState {
         let picture_mode = cfg.avatar.is_some();
         let mut form = Self {
             editing_account_id,
+            session_generation: 0,
             provider_idx,
             original_enabled: cfg.enabled,
             original_auth_backend: cfg.auth_backend,
@@ -804,6 +806,7 @@ impl AccountFormState {
         window: &mut Window,
         cx: &mut Context<SettingsWindow>,
     ) {
+        self.session_generation = self.session_generation.wrapping_add(1);
         let c = cfg.cloned().unwrap_or_default();
         self.editing_account_id = cfg.map(|a| a.id);
         self.provider_idx = cfg.map(provider_index_for_account).unwrap_or(0);
@@ -2330,30 +2333,53 @@ pub(crate) fn render_editor_page(
                                 .icon(IconName::Image)
                                 .label("选择图片…")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(src) = rfd::FileDialog::new()
-                                        .set_title("选择账号头像图片")
-                                        .add_filter(
-                                            "图片文件",
-                                            &["png", "jpg", "jpeg", "webp", "gif"],
-                                        )
-                                        .pick_file()
-                                    {
-                                        match config::import_avatar_file_in(
-                                            &config::data_dir(),
-                                            &src,
-                                        ) {
-                                            Ok(filename) => {
-                                                this.account_form.avatar = Some(filename);
-                                                this.account_form.picture_mode = true;
-                                                this.account_form.validation_error = None;
-                                            }
-                                            Err(err) => {
-                                                this.account_form.validation_error =
-                                                    Some(SharedString::from(err));
-                                            }
-                                        }
-                                        cx.notify();
+                                    if this.file_dialog_open {
+                                        return;
                                     }
+                                    this.file_dialog_open = true;
+                                    let generation = this.account_form.session_generation;
+                                    cx.spawn(async move |this, cx| {
+                                        let src = cx
+                                            .background_executor()
+                                            .spawn(async move {
+                                                rfd::FileDialog::new()
+                                                    .set_title("选择账号头像图片")
+                                                    .add_filter(
+                                                        "图片文件",
+                                                        &["png", "jpg", "jpeg", "webp", "gif"],
+                                                    )
+                                                    .pick_file()
+                                            })
+                                            .await;
+                                        let _ = this
+                                            .update(cx, |this, _| this.file_dialog_open = false);
+                                        if let Some(src) = src {
+                                            let _ = this.update(cx, |this, cx| {
+                                                if !this.account_editor_open
+                                                    || this.account_form.session_generation
+                                                        != generation
+                                                {
+                                                    return;
+                                                }
+                                                match config::import_avatar_file_in(
+                                                    &config::data_dir(),
+                                                    &src,
+                                                ) {
+                                                    Ok(filename) => {
+                                                        this.account_form.avatar = Some(filename);
+                                                        this.account_form.picture_mode = true;
+                                                        this.account_form.validation_error = None;
+                                                    }
+                                                    Err(err) => {
+                                                        this.account_form.validation_error =
+                                                            Some(SharedString::from(err));
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        }
+                                    })
+                                    .detach();
                                 })),
                         )
                         .when(has_avatar, |el| {
