@@ -332,6 +332,8 @@ fn render_message_card(
     app: &mut HylkiApp,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
+    let app_for_link = cx.entity().downgrade();
+    let app_for_quote_link = app_for_link.clone();
     let (canvas, border, muted_fg, accent) = (p.canvas, p.border, p.text_muted, p.accent);
     let formatted_date =
         hylki_mail_core::format_message_datetime(date_ts, date_display, date_style, clock_style);
@@ -341,8 +343,6 @@ fn render_message_card(
     } else {
         sender_name
     };
-    let sender_for_trust = sender.to_string();
-    let can_trust_sender = sender.contains('@');
     let sender_check = hylki_mail_core::verify::check_sender_summary(sender, None);
     let (badge_label, badge_color) = match sender_check.trust {
         hylki_mail_core::verify::SenderTrust::Pass => {
@@ -888,30 +888,13 @@ fn render_message_card(
                             format!("已拦截 {blocked_images} 张远程图片以保护隐私"),
                         )))
                         .child(
-                            h_flex()
-                                .gap_1p5()
-                                .items_center()
-                                .child(
-                                    Button::new(("allow-remote-img", msg_id))
-                                        .outline()
-                                        .compact()
-                                        .label("显示远程图片")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.allow_remote_images_for(msg_id, cx);
-                                        })),
-                                )
-                                .when(can_trust_sender, |el| {
-                                    let trust_sender = sender_for_trust.clone();
-                                    el.child(
-                                        Button::new(("trust-remote-sender", msg_id))
-                                            .outline()
-                                            .compact()
-                                            .label("始终信任此发件人")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.trust_remote_sender(&trust_sender, cx);
-                                            })),
-                                    )
-                                }),
+                            Button::new(("allow-remote-img", msg_id))
+                                .outline()
+                                .compact()
+                                .label("显示远程图片")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.allow_remote_images_for(msg_id, cx);
+                                })),
                         ),
                 )
             },
@@ -1025,13 +1008,20 @@ fn render_message_card(
                         None => el,
                     })
                     .text_color(forced_fg.unwrap_or(if body_loaded { p.text } else { muted_fg }))
-                    .child(TextView::new(text_state.as_ref().unwrap()).link_tooltip(
-                        |url, _, cx| {
-                            let url = url.clone();
-                            cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
-                                .into()
-                        },
-                    ))
+                    .child(
+                        TextView::new(text_state.as_ref().unwrap())
+                            .image_source(move |uri| {
+                                crate::webview_host::mail_image_source(uri, !block_remote_images)
+                            })
+                            .on_link_click(move |url, event, _, cx| {
+                                HylkiApp::open_clicked_mail_link(&app_for_link, url, event, cx);
+                            })
+                            .link_tooltip(|url, _, cx| {
+                                let url = url.clone();
+                                cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
+                                    .into()
+                            }),
+                    )
             })
         })
         .when(show_webview, |card| {
@@ -1102,6 +1092,20 @@ fn render_message_card(
                                         q_html,
                                     )
                                     .selectable(true)
+                                    .image_source(move |uri| {
+                                        crate::webview_host::mail_image_source(
+                                            uri,
+                                            !block_remote_images,
+                                        )
+                                    })
+                                    .on_link_click(move |url, event, _, cx| {
+                                        HylkiApp::open_clicked_mail_link(
+                                            &app_for_quote_link,
+                                            url,
+                                            event,
+                                            cx,
+                                        );
+                                    })
                                     .link_tooltip(
                                         |url, _, cx| {
                                             let url = url.clone();
@@ -1282,9 +1286,7 @@ pub(crate) fn render_with_pane_top(
         };
         let body_pending = body_pending
             || (thread_count > 1 && !anchor.is_some_and(|message| message.body_loaded));
-        let block_remote = app.prefs.block_remote_images
-            && !app.allowed_remote_image_ids.contains(&detail.id)
-            && !app.prefs.is_remote_sender_allowed(&detail.sender);
+        let block_remote = !app.remote_images_allowed(detail.id);
         let eligible = webview_eligible(
             html,
             body_pending,
@@ -1339,33 +1341,58 @@ pub(crate) fn render_with_pane_top(
                     let message_id = detail.id;
                     cx.defer_in(window, move |this, window, cx| {
                         if this.reader_webview_key != Some(key)
-                            || this.selected_message.as_ref().map(|message| message.id) != Some(message_id)
-                        { return; }
+                            || this.selected_message.as_ref().map(|message| message.id)
+                                != Some(message_id)
+                        {
+                            return;
+                        }
                         if let Ok(handle) = HasWindowHandle::window_handle(window) {
                             if let RawWindowHandle::Win32(handle) = handle.as_raw() {
-                                let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
+                                let hwnd =
+                                    windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
                                 if let Ok(host) = WebViewHost::create(hwnd) {
                                     if host.load_with_remote(document, !block_remote).is_ok() {
                                         this.reader_webview = Some(std::rc::Rc::new(host));
                                         cx.spawn(async move |this, cx| {
                                             let mut previous = (false, false, None);
                                             loop {
-                                                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
-                                                if this.update(cx, |this, cx| {
-                                                    let Some(host) = this.reader_webview.clone() else { return; };
-                                                    let state = (host.ready(), host.failed(), this.reader_webview_key);
-                                                    if state != previous {
-                                                        previous = state;
-                                                        cx.notify();
-                                                    }
-                                                    for link in host.take_links() {
-                                                        if this.active_modal != crate::app::ActiveModal::None || this.reader_find_open || this.reader_popup_open { continue; }
-                                                        let link = if this.prefs.clean_links { hylki_mail_core::link_clean::clean_link(&link) } else { link };
-                                                        if crate::webview_host::allowed_external_url(&link) { this.open_link(&link, cx); }
-                                                    }
-                                                }).is_err() { break; }
+                                                cx.background_executor()
+                                                    .timer(std::time::Duration::from_millis(100))
+                                                    .await;
+                                                if this
+                                                    .update(cx, |this, cx| {
+                                                        let Some(host) =
+                                                            this.reader_webview.clone()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        let state = (
+                                                            host.ready(),
+                                                            host.failed(),
+                                                            this.reader_webview_key,
+                                                        );
+                                                        if state != previous {
+                                                            previous = state;
+                                                            cx.notify();
+                                                        }
+                                                        for link in host.take_links() {
+                                                            if this.active_modal
+                                                                != crate::app::ActiveModal::None
+                                                                || this.reader_find_open
+                                                                || this.reader_popup_open
+                                                            {
+                                                                continue;
+                                                            }
+                                                            this.open_mail_link(&link, cx);
+                                                        }
+                                                    })
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
                                             }
-                                        }).detach();
+                                        })
+                                        .detach();
                                         cx.notify();
                                     }
                                 }
@@ -1438,9 +1465,7 @@ pub(crate) fn render_with_pane_top(
                 let is_current = tm.id == detail.id;
                 let is_collapsed = app.collapsed_thread_cards.contains(&tm.id);
                 let show_raw_source = app.raw_source_message_ids.contains(&tm.id);
-                let block_remote = app.prefs.block_remote_images
-                    && !app.allowed_remote_image_ids.contains(&tm.id)
-                    && !app.prefs.is_remote_sender_allowed(&tm.sender);
+                let block_remote = !app.remote_images_allowed(tm.id);
                 let card_subject = if tm.subject.trim().is_empty() {
                     detail.subject.clone()
                 } else {
@@ -1533,9 +1558,7 @@ pub(crate) fn render_with_pane_top(
     } else {
         let is_collapsed = app.collapsed_thread_cards.contains(&detail.id);
         let show_raw_source = app.raw_source_message_ids.contains(&detail.id);
-        let block_remote = app.prefs.block_remote_images
-            && !app.allowed_remote_image_ids.contains(&detail.id)
-            && !app.prefs.is_remote_sender_allowed(&detail.sender);
+        let block_remote = !app.remote_images_allowed(detail.id);
         let eml_exporting = app.pending_eml_export == Some(detail.id);
         let menu = build_card_more_menu(
             detail.clone(),

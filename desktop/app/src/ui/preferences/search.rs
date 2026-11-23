@@ -22,14 +22,6 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         subtitle: "QQ/163/126/企业邮/Gmail/Outlook 等服务商预设、账号昵称/强调色/头像、推送覆盖、统一收件箱与拖拽排序",
         keywords: "account mail provider imap smtp oauth outlook qq 163 126 exmail aliyun gmail icloud yahoo proton fastmail aol zoho gmx yandex nickname label color emoji avatar unified push reorder 邮箱 账号 服务商 网易 腾讯企业邮 阿里企业邮 登录 密码 签名 昵称 颜色 强调色 头像 推送 排序 统一收件箱",
     },
-    // ---- 账号：发件人 ----
-    PrefSearchItem {
-        tab: PrefTab::Senders,
-        row_id: "senders-allowlist",
-        title: "允许加载远程图像的发件人",
-        subtitle: "将可信发件人加入或移出远程图片白名单",
-        keywords: "sender whitelist allowlist remote images 发件人 白名单 远程 图片 图像",
-    },
     // ---- 常规 ----
     PrefSearchItem {
         tab: PrefTab::General,
@@ -386,7 +378,7 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         tab: PrefTab::Privacy,
         row_id: "pref-show-remote-banner",
         title: "显示远程图像已拦截横幅",
-        subtitle: "关闭后静默屏蔽远程图片，不在阅读卡片顶部显示信任提示条",
+        subtitle: "关闭后静默屏蔽远程图片，不在阅读卡片顶部显示提示条",
         keywords: "remote banner notification blocked 拦截 横幅 提示",
     },
     PrefSearchItem {
@@ -722,7 +714,7 @@ mod tests {
 
         let remote = filter_search_items("远程图像");
         assert!(!remote.is_empty());
-        assert!(remote.iter().any(|item| item.tab == PrefTab::Senders));
+        assert!(!remote.iter().any(|item| item.tab == PrefTab::Senders));
         assert!(remote.iter().any(|item| item.tab == PrefTab::Privacy));
 
         let privacy_prefix = filter_search_items("默认屏蔽");

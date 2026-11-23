@@ -310,99 +310,13 @@ fn render_senders(
 ) -> AnyElement {
     let prefs = &app_entity.read(cx).prefs;
     let filter = win.senders_filter.trim().to_ascii_lowercase();
-    let total_allowed = prefs.allowed_remote_senders.len();
     let total_blocked = prefs.blocked_senders.len();
-    let mut sorted_senders = prefs.allowed_remote_senders.clone();
-    sorted_senders.sort();
-    if !filter.is_empty() {
-        sorted_senders.retain(|s| s.to_ascii_lowercase().contains(&filter));
-    }
     let mut sorted_blocked = prefs.blocked_senders.clone();
     sorted_blocked.sort();
     if !filter.is_empty() {
         sorted_blocked.retain(|s| s.to_ascii_lowercase().contains(&filter));
     }
     let block_images = prefs.block_remote_images;
-
-    let app_for_add = app_entity.clone();
-    let mut rows: Vec<AnyElement> = Vec::new();
-    rows.push(
-        h_flex()
-            .id("senders-add-bar")
-            .px_4()
-            .py_3()
-            .gap_2()
-            .items_center()
-            .when(is_hit(win, "senders-allowlist"), |el| {
-                el.bg(p.accent.opacity(0.18))
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&win.sender_input)),
-            )
-            .child(
-                Button::new("sender-add-btn")
-                    .primary()
-                    .compact()
-                    .label("添加到白名单")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.add_allowed_sender(&app_for_add, window, cx);
-                    })),
-            )
-            .into_any_element(),
-    );
-
-    if sorted_senders.is_empty() {
-        let empty_msg = if total_allowed == 0 {
-            "白名单暂无发件人；阅读邮件点击「始终允许来自此发件人」也会自动收录到此处。"
-        } else {
-            "没有匹配当前搜索词的白名单发件人。"
-        };
-        rows.push(
-            h_flex()
-                .px_4()
-                .py_6()
-                .justify_center()
-                .items_center()
-                .gap_2()
-                .child(
-                    Icon::new(IconName::CircleUser)
-                        .small()
-                        .text_color(p.text_muted),
-                )
-                .child(div().text_xs().text_color(p.text_muted).child(empty_msg))
-                .into_any_element(),
-        );
-    } else {
-        for (idx, email) in sorted_senders.into_iter().enumerate() {
-            let email_for_remove = email.clone();
-            let app_for_remove = app_entity.clone();
-            let remove_btn = Button::new(("sender-remove", idx))
-                .ghost()
-                .compact()
-                .icon(IconName::Trash)
-                .label("移除")
-                .on_click(move |_, _, cx| {
-                    app_for_remove.update(cx, |app, cx| {
-                        app.mutate_preferences(cx, |prefs| {
-                            prefs.remove_remote_sender(&email_for_remove);
-                        });
-                    });
-                })
-                .into_any_element();
-            rows.push(setting_row(
-                ("sender-row", idx),
-                email,
-                None,
-                remove_btn,
-                false,
-                false,
-                p,
-            ));
-        }
-    }
 
     let app_for_block_add = app_entity.clone();
     let mut blocked_rows: Vec<AnyElement> = Vec::new();
@@ -559,13 +473,6 @@ fn render_senders(
     }
 
     stack
-        .child(setting_group(
-            format!("远程图像发件人白名单（{}）", total_allowed),
-            Some("列出的邮箱地址将在阅读 HTML 邮件时自动放行外链图片"),
-            CARDS_WIDE_MAX_WIDTH,
-            rows,
-            p,
-        ))
         .child(setting_group(
             format!("已屏蔽发件人黑名单（{}）", total_blocked),
             Some("支持填写完整邮箱（user@example.com）或域名（example.com）"),
@@ -2873,7 +2780,6 @@ fn render_privacy(
     let a2 = app_entity.clone();
     let a3 = app_entity.clone();
     let a_receipt = app_entity.clone();
-    let win_entity = cx.entity().clone();
 
     v_flex()
         .w_full()
@@ -2887,7 +2793,7 @@ fn render_privacy(
                 setting_row(
                     "pref-block-remote-images",
                     "默认屏蔽远程图像",
-                    Some("阻止未知发件人通过外部图片链接追踪您的阅读时间与 IP"),
+                    Some("阻止外部图片链接追踪您的阅读时间与 IP"),
                     bool_switch(
                         "sw-block-img",
                         prefs.block_remote_images,
@@ -2905,7 +2811,7 @@ fn render_privacy(
                 setting_row(
                     "pref-show-remote-banner",
                     "显示已屏蔽远程图像提示横幅",
-                    Some("关闭后静默屏蔽外链图片，不再显示「信任发件人」横幅"),
+                    Some("关闭后静默屏蔽外链图片，不再显示提示横幅"),
                     bool_switch(
                         "sw-remote-banner",
                         prefs.show_remote_banner,
@@ -2947,31 +2853,6 @@ fn render_privacy(
                     false,
                     is_hit(win, "pref-spoof-banner"),
                     |p, v| p.show_spoof_banner = v,
-                    p,
-                ),
-                setting_row(
-                    "senders-link",
-                    "管理允许加载远程图像的发件人白名单",
-                    Some(
-                        format!(
-                            "当前已收录 {} 位可信发件人",
-                            prefs.allowed_remote_senders.len()
-                        )
-                        .as_str(),
-                    ),
-                    Button::new("privacy-open-senders")
-                        .outline()
-                        .compact()
-                        .icon(IconName::ChevronRight)
-                        .label("前往管理")
-                        .on_click(move |_, window, cx| {
-                            win_entity.update(cx, |w, cx| {
-                                w.select_tab(PrefTab::Senders, window, cx);
-                            });
-                        })
-                        .into_any_element(),
-                    false,
-                    false,
                     p,
                 ),
             ],

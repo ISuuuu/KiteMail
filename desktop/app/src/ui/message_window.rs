@@ -27,7 +27,7 @@ use hylki_mail_core::{format_message_datetime, MessageDetail};
 use crate::app::{split_sender, HylkiApp};
 use crate::theme;
 use crate::ui::{avatar, print_preview, window_controls};
-use crate::webview_host::{allowed_external_url, build_document, supports_document, WebViewHost};
+use crate::webview_host::{build_document, supports_document, WebViewHost};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 pub(crate) struct MessageWindow {
@@ -65,13 +65,6 @@ impl MessageWindow {
                             previous = status;
                             cx.notify();
                         }
-                        let allowed = !this.prefs.block_remote_images
-                            || this.prefs.is_remote_sender_allowed(&this.detail.sender)
-                            || this.app_entity.upgrade().is_some_and(|app| {
-                                app.read(cx)
-                                    .allowed_remote_image_ids
-                                    .contains(&this.detail.id)
-                            });
                         let app_dark = this
                             .app_entity
                             .upgrade()
@@ -81,28 +74,15 @@ impl MessageWindow {
                             "dark" => true,
                             _ => app_dark,
                         };
-                        if allowed != this.webview_appearance.2 || dark != this.webview_appearance.0
-                        {
+                        if dark != this.webview_appearance.0 {
                             cx.notify();
                         }
                         let links = host.take_links();
                         if !this.prefer_plain && !this.find_open && this.print_preview.is_none() {
                             for link in links {
-                                let link = if this.prefs.clean_links {
-                                    hylki_mail_core::link_clean::clean_link(&link)
-                                } else {
-                                    link
-                                };
-                                if !allowed_external_url(&link) {
-                                    continue;
-                                }
-                                if link.to_ascii_lowercase().starts_with("mailto:") {
-                                    cx.open_url(&link);
-                                } else {
-                                    let _ = this
-                                        .app_entity
-                                        .update(cx, |app, cx| app.open_link(&link, cx));
-                                }
+                                let _ = this
+                                    .app_entity
+                                    .update(cx, |app, cx| app.open_mail_link(&link, cx));
                             }
                         }
                     })
@@ -155,17 +135,24 @@ impl MessageWindow {
             _ => app_dark,
         };
         let zoom_percent = prefs.reader_zoom_percent;
-        let allow_remote = !prefs.block_remote_images
-            || prefs.is_remote_sender_allowed(&detail.sender)
-            || app_entity
-                .upgrade()
-                .is_some_and(|app| app.read(cx).allowed_remote_image_ids.contains(&detail.id));
+        let allow_remote = app_entity.upgrade().is_some_and(|app| {
+            cx.observe(&app, |this, app, cx| {
+                if app.read(cx).remote_images_allowed(this.detail.id) != this.webview_appearance.2 {
+                    cx.notify();
+                }
+            })
+            .detach();
+            app.read(cx).remote_images_allowed(detail.id)
+        });
         if let Some(html) = eligible_html {
             cx.defer_in(window, move |this, window, cx| {
                 if let Ok(handle) = window.window_handle() {
                     if let RawWindowHandle::Win32(handle) = handle.as_raw() {
                         let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
                         if let Ok(host) = WebViewHost::create(hwnd) {
+                            let allow_remote = this.app_entity.upgrade().is_some_and(|app| {
+                                app.read(cx).remote_images_allowed(this.detail.id)
+                            });
                             if host
                                 .load_with_remote(
                                     build_document(
@@ -347,14 +334,22 @@ impl Render for MessageWindow {
             sender_name
         };
 
+        let allow_remote = self
+            .app_entity
+            .upgrade()
+            .is_some_and(|app| app.read(cx).remote_images_allowed(d.id));
+        let app_for_link = self.app_entity.clone();
+        let app_for_quote_link = self.app_entity.clone();
+        let mut blocked_images = 0;
         let (main_html, quoted_opt) = if !self.prefer_plain {
             if let Some(ref raw_html) = d.body_html {
                 if !raw_html.trim().is_empty() {
-                    let (clean, _) = sanitize_html_for_display_with_options(
+                    let (clean, blocked) = sanitize_html_for_display_with_options(
                         raw_html,
-                        false,
+                        !allow_remote,
                         self.prefs.clean_links,
                     );
+                    blocked_images = blocked;
                     let split = split_quoted_html(&clean);
                     (split.main, split.quoted.map(|(q, lines)| (q, lines)))
                 } else {
@@ -396,12 +391,7 @@ impl Render for MessageWindow {
             "dark" => true,
             _ => app_dark,
         };
-        let allow_remote = !self.prefs.block_remote_images
-            || self.prefs.is_remote_sender_allowed(&d.sender)
-            || self
-                .app_entity
-                .upgrade()
-                .is_some_and(|app| app.read(cx).allowed_remote_image_ids.contains(&d.id));
+
         let appearance = (dark_mode, self.prefs.reader_zoom_percent, allow_remote);
         if self.webview_appearance != appearance {
             self.webview_appearance = appearance;
@@ -653,6 +643,14 @@ impl Render for MessageWindow {
                         ),
                 )
             })
+            .when(blocked_images > 0 && self.prefs.show_remote_banner && self.print_preview.is_none(), |root| {
+                let id = d.id;
+                root.child(Button::new("popout-allow-remote").outline().compact().label("显示此邮件的远程图片")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let _ = this.app_entity.update(cx, |app, cx| app.allow_remote_images_for(id, cx));
+                        cx.notify();
+                    })))
+            })
             // 邮件正文滚动区。
             .when(show_webview, |root| {
                 let host = self.webview.as_ref().unwrap().clone();
@@ -736,7 +734,10 @@ impl Render for MessageWindow {
                                         ),
                                 )
                                 .child(div().text_size(px(14.0)).child(
-                                    TextView::new(&text_state).link_tooltip(|url, _, cx| {
+                                    TextView::new(&text_state)
+                                        .image_source(move |uri| crate::webview_host::mail_image_source(uri, allow_remote))
+                                        .on_link_click(move |url, event, _, cx| HylkiApp::open_clicked_mail_link(&app_for_link, url, event, cx))
+                                        .link_tooltip(|url, _, cx| {
                                         let url = url.clone();
                                         cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
                                             .into()
@@ -784,7 +785,9 @@ impl Render for MessageWindow {
                                                                 )),
                                                                 q_html,
                                                             )
-                                                            .selectable(true),
+                                                            .selectable(true)
+                                                            .image_source(move |uri| crate::webview_host::mail_image_source(uri, allow_remote))
+                                                            .on_link_click(move |url, event, _, cx| HylkiApp::open_clicked_mail_link(&app_for_quote_link, url, event, cx)),
                                                         ),
                                                 )
                                             }),

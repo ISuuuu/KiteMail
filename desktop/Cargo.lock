@@ -3005,8 +3005,11 @@ name = "hylki-windows"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "data-url",
  "gpui-kit",
+ "html5ever",
  "hylki-mail-core",
+ "markup5ever_rcdom",
  "raw-window-handle",
  "rfd",
  "url",

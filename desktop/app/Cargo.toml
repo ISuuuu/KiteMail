@@ -7,8 +7,11 @@ description = "Native Windows GPUI client for Hylki"
 
 [dependencies]
 chrono = { workspace = true }
+data-url = "0.3"
 gpui-kit = { workspace = true }
 hylki-mail-core = { path = "../mail-core" }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
 rfd = { workspace = true }
 winreg = "0.55"
 

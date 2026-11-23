@@ -3134,19 +3134,6 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 永久信任该发件人（写入 `prefs.allowed_remote_senders` 并落盘）。
-    pub(crate) fn trust_remote_sender(&mut self, sender: &str, cx: &mut Context<Self>) {
-        if let Some(email) = self.prefs.allow_remote_sender(sender) {
-            if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
-                self.error_banner = Some(SharedString::from(e));
-            } else {
-                self.status_line =
-                    SharedString::from(format!("已将 {email} 加入远程图片发件人白名单"));
-            }
-            cx.notify();
-        }
-    }
-
     /// 按偏好顺序返回演示邮件详情。
     fn demo_message_detail(&self, message_id: u32) -> Option<MessageDetail> {
         let mut detail = self.demo_store.get_message_detail(message_id)?;
@@ -6664,6 +6651,39 @@ impl HylkiApp {
         if self.focus_mode != on {
             self.toggle_focus_mode(cx);
         }
+    }
+
+    pub(crate) fn open_mail_link(&mut self, value: &str, cx: &mut Context<Self>) {
+        if let Some(link) = crate::webview_host::prepared_mail_link(value, self.prefs.clean_links) {
+            if link.starts_with("mailto:") {
+                cx.open_url(&link);
+            } else {
+                self.open_link(&link, cx);
+            }
+        }
+    }
+
+    pub(crate) fn open_clicked_mail_link(
+        app: &gpui_kit::WeakEntity<Self>,
+        url: &str,
+        event: &gpui_kit::ClickEvent,
+        cx: &mut gpui_kit::App,
+    ) {
+        let activate = match event {
+            gpui_kit::ClickEvent::Mouse(click) => matches!(
+                click.up.button,
+                gpui_kit::MouseButton::Left | gpui_kit::MouseButton::Middle
+            ),
+            gpui_kit::ClickEvent::Keyboard(_) => true,
+            gpui_kit::ClickEvent::Touch(click) => !click.long_press,
+        };
+        if activate {
+            let _ = app.update(cx, |app, cx| app.open_mail_link(url, cx));
+        }
+    }
+
+    pub(crate) fn remote_images_allowed(&self, id: u32) -> bool {
+        !self.prefs.block_remote_images || self.allowed_remote_image_ids.contains(&id)
     }
 
     /// WP-05：按「系统 → 链接打开方式」偏好打开邮件内链接。`system` 走

@@ -17,8 +17,10 @@ use gpui_kit::{
     black, div, hsla, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled,
 };
-use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display_with_options};
+use html5ever::{parse_document, tendril::TendrilSink};
+use hylki_mail_core::imap_client::plain_text_to_html;
 use hylki_mail_core::{format_message_datetime, MessageDetail};
+use markup5ever_rcdom::{Handle, NodeData, RcDom};
 
 use crate::app::HylkiApp;
 use crate::theme;
@@ -54,6 +56,120 @@ fn escape_html(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn safe_print_html(html: &str) -> String {
+    fn emit(node: &Handle, output: &mut String, remaining_depth: usize) {
+        if remaining_depth == 0 {
+            return;
+        }
+        match &node.data {
+            NodeData::Text { contents } => output.push_str(&escape_html(&contents.borrow())),
+            NodeData::Element { name, attrs, .. } => {
+                let tag = name.local.as_ref();
+                if name.ns.as_ref() != "http://www.w3.org/1999/xhtml"
+                    || matches!(
+                        tag,
+                        "head" | "script" | "style" | "iframe" | "object" | "template"
+                    )
+                {
+                    return;
+                }
+                if tag == "img" {
+                    if let Some(src) = attrs
+                        .borrow()
+                        .iter()
+                        .find(|attr| attr.name.local.as_ref() == "src")
+                        .map(|attr| attr.value.as_ref())
+                        .filter(|src| crate::webview_host::decode_inline_mail_image(src).is_some())
+                    {
+                        output.push_str(&format!("<img src=\"{}\">", escape_html(src)));
+                    }
+                    return;
+                }
+                if tag == "a" {
+                    let href = attrs
+                        .borrow()
+                        .iter()
+                        .find(|attr| attr.name.local.as_ref() == "href")
+                        .and_then(|attr| {
+                            crate::webview_host::prepared_mail_link(&attr.value, false)
+                        });
+                    if let Some(ref href) = href {
+                        output.push_str(&format!("<a href=\"{}\">", escape_html(href)));
+                    }
+                    for child in node.children.borrow().iter() {
+                        emit(child, output, remaining_depth - 1);
+                    }
+                    if href.is_some() {
+                        output.push_str("</a>");
+                    }
+                    return;
+                }
+                let keep = matches!(
+                    tag,
+                    "p" | "div"
+                        | "span"
+                        | "br"
+                        | "hr"
+                        | "blockquote"
+                        | "pre"
+                        | "code"
+                        | "ul"
+                        | "ol"
+                        | "li"
+                        | "table"
+                        | "thead"
+                        | "tbody"
+                        | "tfoot"
+                        | "tr"
+                        | "th"
+                        | "td"
+                        | "strong"
+                        | "b"
+                        | "em"
+                        | "i"
+                        | "u"
+                        | "s"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                );
+                if keep {
+                    output.push_str(&format!("<{tag}>"));
+                }
+                for child in node.children.borrow().iter() {
+                    emit(child, output, remaining_depth - 1);
+                }
+                if keep && !matches!(tag, "br" | "hr") {
+                    output.push_str(&format!("</{tag}>"));
+                }
+            }
+            _ => {
+                for child in node.children.borrow().iter() {
+                    emit(child, output, remaining_depth - 1);
+                }
+            }
+        }
+    }
+    let dom = parse_document(RcDom::default(), Default::default()).one(html);
+    let mut result = String::new();
+    emit(&dom.document, &mut result, 128);
+    result
+}
+
+fn safe_print_body(detail: &MessageDetail) -> String {
+    match detail
+        .body_html
+        .as_deref()
+        .filter(|html| !html.trim().is_empty())
+    {
+        Some(html) => safe_print_html(html),
+        None => plain_text_to_html(&detail.body_text),
+    }
+}
+
 /// 生成独立可打印 HTML 文档（含 `@page` 纸张与边距样式）。
 pub(crate) fn build_print_html(
     state: &PrintPreviewState,
@@ -67,15 +183,7 @@ pub(crate) fn build_print_html(
     let page_size = if state.paper_a4 { "A4" } else { "Letter" };
     let left_mm = if state.wider_left_margin { 25 } else { 15 };
 
-    let body_fragment = if let Some(ref html) = d.body_html {
-        if !html.trim().is_empty() {
-            sanitize_html_for_display_with_options(html, false, false).0
-        } else {
-            plain_text_to_html(&d.body_text)
-        }
-    } else {
-        plain_text_to_html(&d.body_text)
-    };
+    let body_fragment = safe_print_body(d);
 
     let headers_html = if state.include_headers {
         format!(
@@ -114,10 +222,13 @@ pub(crate) fn build_print_html(
         String::new()
     };
 
-    let script = if auto_print_script {
-        "<script>window.addEventListener('load', () => setTimeout(() => window.print(), 150));</script>"
+    let (script, script_policy) = if auto_print_script {
+        (
+            "<script>window.addEventListener('load', () => setTimeout(() => window.print(), 150));</script>",
+            "'sha256-03cAtnQrar3eNxsFUHdrM0gX366FLCI7x6FnkYpr4bg='",
+        )
     } else {
-        ""
+        ("", "'none'")
     };
 
     format!(
@@ -125,6 +236,7 @@ pub(crate) fn build_print_html(
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src {script_policy}; base-uri 'none'; form-action 'none'">
 <title>{title}</title>
 <style>
   @page {{ size: {page_size}; margin: 15mm 15mm 18mm {left_mm}mm; }}
@@ -235,15 +347,9 @@ pub(crate) fn render_modal(
     let d = &state.detail;
     let formatted_date =
         format_message_datetime(d.date_ts, &d.date_display, date_style, clock_style);
-    let body_html = if let Some(ref html) = d.body_html {
-        if !html.trim().is_empty() {
-            sanitize_html_for_display_with_options(html, false, false).0
-        } else {
-            plain_text_to_html(&d.body_text)
-        }
-    } else {
-        plain_text_to_html(&d.body_text)
-    };
+    let body_html = safe_print_body(d);
+
+    let app_for_link = cx.entity().downgrade();
     let paper_bg = hsla(0.0, 0.0, 1.0, 1.0);
     let paper_fg = hsla(0.0, 0.0, 0.13, 1.0);
     let paper_muted = hsla(0.0, 0.0, 0.42, 1.0);
@@ -470,7 +576,17 @@ pub(crate) fn render_modal(
                                             )),
                                             body_html,
                                         )
-                                        .selectable(true),
+                                        .selectable(true)
+                                        .on_link_click(
+                                            move |url, event, _, cx| {
+                                                HylkiApp::open_clicked_mail_link(
+                                                    &app_for_link,
+                                                    url,
+                                                    event,
+                                                    cx,
+                                                );
+                                            },
+                                        ),
                                     ),
                                 )
                                 .when(
@@ -518,4 +634,38 @@ pub(crate) fn render_modal(
                 ),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn print_html_preserves_safe_layout_and_inline_images() {
+        let html = "<p>First <strong>important</strong></p><ul><li>Item</li></ul><table><tr><td>Cell</td></tr></table><img src=\"data:image/png;base64,iVBORw0KGgo=\">";
+        let clean = safe_print_html(html);
+        assert!(clean.contains("<p>First <strong>important</strong></p>"));
+        assert!(clean.contains("<li>Item</li>"));
+        assert!(clean.contains("<td>Cell</td>"));
+        assert!(safe_print_html("<a href=\"https://example.com\">Link</a>")
+            .contains("<a href=\"https://example.com/\">Link</a>"));
+        assert!(!safe_print_html("<a href=\"file:///test\">Link</a>").contains("href"));
+        assert!(clean.contains("data:image/png;base64,iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn print_html_drops_remote_resources_and_active_content() {
+        let html = "<p>Visible</p><img src=\"https://example.com/image.png\"><script>ignored</script><div style=\"background:url(https://example.com/a)\">Text</div>";
+        let clean = safe_print_html(html);
+        assert!(clean.contains("<p>Visible</p>"));
+        assert!(clean.contains("<div>Text</div>"));
+        assert!(!clean.contains("example.com"));
+        assert!(!clean.contains("ignored"));
+    }
+
+    #[test]
+    fn print_html_accepts_html_only_body() {
+        let clean = safe_print_html("<html><body><p>HTML only &amp; readable</p></body></html>");
+        assert!(clean.contains("<p>HTML only &amp; readable</p>"));
+    }
 }

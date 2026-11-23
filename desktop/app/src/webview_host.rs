@@ -44,14 +44,77 @@ fn allow_frame_navigation(url: &str) -> bool {
     matches!(url, "about:srcdoc" | "about:blank")
 }
 
-pub(crate) fn allowed_external_url(value: &str) -> bool {
-    url::Url::parse(value).is_ok_and(|url| match url.scheme() {
+fn parse_external_url(value: &str) -> Option<url::Url> {
+    let url = url::Url::parse(value).ok()?;
+    let allowed = match url.scheme() {
         "http" | "https" => {
             url.host_str().is_some() && url.username().is_empty() && url.password().is_none()
         }
         "mailto" => !url.path().is_empty(),
         _ => false,
-    })
+    };
+    allowed.then_some(url)
+}
+
+pub(crate) fn allowed_external_url(value: &str) -> bool {
+    parse_external_url(value).is_some()
+}
+
+fn allowed_mail_image_url(value: &str, allow_remote: bool) -> bool {
+    allow_remote
+        && url::Url::parse(value).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+}
+
+/// Apply the same URL policy to native mail images after HTML parsing.
+pub(crate) fn mail_image_source(
+    uri: &gpui_kit::SharedUri,
+    allow_remote: bool,
+) -> gpui_kit::ImageSource {
+    if let Some((format, bytes)) = decode_inline_mail_image(uri.as_ref()) {
+        return gpui_kit::ImageSource::Image(std::sync::Arc::new(gpui_kit::Image::from_bytes(
+            format, bytes,
+        )));
+    }
+    if allowed_mail_image_url(uri.as_ref(), allow_remote) {
+        uri.clone().into()
+    } else {
+        gpui_kit::ImageSource::Custom(std::sync::Arc::new(|_, _| None))
+    }
+}
+
+pub(crate) fn decode_inline_mail_image(value: &str) -> Option<(gpui_kit::ImageFormat, Vec<u8>)> {
+    use gpui_kit::ImageFormat;
+
+    let data = data_url::DataUrl::process(value).ok()?;
+    let mime = data.mime_type();
+    if mime.type_ != "image" {
+        return None;
+    }
+    let format = match mime.subtype.as_str() {
+        "png" => ImageFormat::Png,
+        "jpeg" => ImageFormat::Jpeg,
+        "gif" => ImageFormat::Gif,
+        "webp" => ImageFormat::Webp,
+        "bmp" => ImageFormat::Bmp,
+        _ => return None,
+    };
+    let (bytes, _) = data.decode_to_vec().ok()?;
+    Some((format, bytes))
+}
+
+pub(crate) fn prepared_mail_link(value: &str, clean: bool) -> Option<String> {
+    let url = parse_external_url(value)?;
+    let url = if clean {
+        parse_external_url(&hylki_mail_core::link_clean::clean_link(url.as_str()))?
+    } else {
+        url
+    };
+    Some(url.into())
 }
 
 fn document_headers(allow_remote_images: bool) -> String {
@@ -70,11 +133,9 @@ fn allow_remote_request(
     referer: &str,
     version: u64,
 ) -> bool {
-    allowed
-        && context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE
+    context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE
         && referer == document_url(version)
-        && url::Url::parse(url)
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        && allowed_mail_image_url(url, allowed)
 }
 
 fn clipped_rects(content: RECT, viewport: RECT) -> Option<(RECT, RECT)> {
@@ -722,6 +783,51 @@ unsafe fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_images_follow_the_message_permission() {
+        use gpui_kit::{ImageSource, SharedUri};
+
+        let remote = SharedUri::from("https://example.com/image.png");
+        let inline = SharedUri::from("data:image/png;base64,iVBORw0KGgo=");
+        assert!(matches!(
+            mail_image_source(&remote, false),
+            ImageSource::Custom(_)
+        ));
+        assert!(matches!(
+            mail_image_source(&remote, true),
+            ImageSource::Resource(_)
+        ));
+        assert!(matches!(
+            mail_image_source(&inline, false),
+            ImageSource::Image(_)
+        ));
+        for path in [
+            "file:///C:/image.png",
+            "/image.png",
+            "data:text/plain,hello",
+        ] {
+            assert!(matches!(
+                mail_image_source(&SharedUri::from(path), true),
+                ImageSource::Custom(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn prepared_links_are_checked_and_cleaned_for_dispatch() {
+        let tracked = "https://example.com/path?id=42&utm_source=mail";
+        assert_eq!(
+            prepared_mail_link(tracked, true).as_deref(),
+            Some("https://example.com/path?id=42")
+        );
+        assert_eq!(prepared_mail_link(tracked, false).as_deref(), Some(tracked));
+        assert_eq!(
+            prepared_mail_link("MAILTO:user@example.com", false).as_deref(),
+            Some("mailto:user@example.com")
+        );
+        assert!(prepared_mail_link("file:///C:/test", true).is_none());
+    }
 
     #[test]
     fn navigation_is_limited_to_the_document_and_inert_frames() {

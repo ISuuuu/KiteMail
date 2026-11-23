@@ -161,7 +161,7 @@ impl PrefTab {
             Self::Tags => "增删改自定义邮件标签、调色板颜色与快捷键 1..9 绑定",
             Self::Filters => "创建自动化邮件过滤规则，并在现有缓存邮件上立即执行",
             Self::SmartFolders => "基于搜索表达式创建动态虚拟文件夹",
-            Self::Senders => "配置始终允许加载远程图片的信任发件人列表与发件人黑名单",
+            Self::Senders => "管理发件人黑名单",
             Self::OpenPgp => "管理本地 OpenPGP 密钥信息与按邮箱绑定的签名/加密策略",
             Self::CloudStorage => {
                 "配置超大附件云盘账号（Nextcloud / WebDAV / S3 / Dropbox）与自动上传阈值"
@@ -232,9 +232,8 @@ pub(crate) struct SettingsWindow {
     pub(crate) confirm_remove_in_editor: bool,
     pub(crate) pending_leave_action: Option<EditorLeaveAction>,
     pub(crate) after_save_action: Option<EditorLeaveAction>,
-    pub(crate) sender_input: Entity<InputState>,
     pub(crate) sender_feedback: Option<(bool, SharedString)>,
-    /// WP-05：发件人页实时过滤关键词（同时作用于白名单与黑名单列表）。
+    /// WP-05：发件人页实时过滤关键词（用于黑名单列表）。
     pub(crate) senders_filter: String,
     pub(crate) sender_search_input: Entity<InputState>,
     /// WP-05：发件人页黑名单添加输入框。
@@ -343,9 +342,6 @@ impl SettingsWindow {
         })
         .detach();
 
-        let sender_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("输入邮箱地址添加，如 newsletter@example.com")
-        });
         let sender_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索发件人..."));
         cx.subscribe(
@@ -450,7 +446,6 @@ impl SettingsWindow {
             confirm_remove_in_editor: false,
             pending_leave_action: None,
             after_save_action: None,
-            sender_input,
             sender_feedback: None,
             senders_filter: String::new(),
             sender_search_input,
@@ -822,35 +817,6 @@ impl SettingsWindow {
         });
     }
 
-    pub(crate) fn add_allowed_sender(
-        &mut self,
-        app_entity: &Entity<HylkiApp>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let raw = self.sender_input.read(cx).value().trim().to_string();
-        if raw.is_empty() || !raw.contains('@') {
-            self.sender_feedback = Some((false, SharedString::from("请输入包含 @ 的合法邮箱地址")));
-            cx.notify();
-            return;
-        }
-        let mut added = None;
-        app_entity.update(cx, |app, cx| {
-            app.mutate_preferences(cx, |prefs| {
-                added = prefs.allow_remote_sender(&raw);
-            });
-        });
-        if let Some(email) = added {
-            self.sender_input
-                .update(cx, |s, cx| s.set_value("", window, cx));
-            self.sender_feedback =
-                Some((true, SharedString::from(format!("已添加到白名单：{email}"))));
-        } else {
-            self.sender_feedback = Some((false, SharedString::from("请输入包含 @ 的合法邮箱地址")));
-        }
-        cx.notify();
-    }
-
     /// WP-05：把输入框中的邮箱或域名加入黑名单（非法输入给出行内反馈）。
     pub(crate) fn add_blocked_sender(
         &mut self,
@@ -909,7 +875,7 @@ impl SettingsWindow {
              已配置账号: {} 个（{} 个含邮箱域名）\n\
              偏好设置: 主题={} 明暗={:?} 列表布局={} 字号缩放={}%\n\
              自动同步: {} 分钟 推送={} 计费省流={}\n\
-             黑名单发件人: {} 条 远程图像白名单: {} 条\n\
+             黑名单发件人: {} 条\n\
              导出时间: {}\n",
             env!("CARGO_PKG_VERSION"),
             if app.demo_mode {
@@ -932,7 +898,6 @@ impl SettingsWindow {
             app.prefs.push_enabled,
             app.prefs.metered_save_data,
             app.prefs.blocked_senders.len(),
-            app.prefs.allowed_remote_senders.len(),
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         );
         if let Some(dest) = rfd::FileDialog::new()
