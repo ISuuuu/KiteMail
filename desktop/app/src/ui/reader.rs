@@ -89,6 +89,7 @@ fn format_raw_source(
     rfc_message_id: &str,
     sender: &str,
     recipients: &str,
+    cc: &str,
     date_display: &str,
     subject: &str,
     body_text: &str,
@@ -96,7 +97,7 @@ fn format_raw_source(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "Message-ID: {}\nFrom: {}\nTo: {}\nDate: {}\nSubject: {}\n",
+        "Message-ID: {}\nFrom: {}\nTo: {}\nCc: {}\nDate: {}\nSubject: {}\n",
         if rfc_message_id.trim().is_empty() {
             "(无)"
         } else {
@@ -108,6 +109,7 @@ fn format_raw_source(
         } else {
             recipients
         },
+        if cc.trim().is_empty() { "(无)" } else { cc },
         date_display,
         subject,
     ));
@@ -139,6 +141,8 @@ fn build_card_more_menu(
     let body_for_copy = card_detail.body_text.clone();
     let reply_detail = card_detail.clone();
     let reply_all_detail = card_detail.clone();
+    let unsubscribe_url = card_detail.unsubscribe_url.clone();
+    let unsubscribe_one_click = card_detail.unsubscribe_one_click;
     let forward_detail = card_detail;
 
     Button::new(("reader-card-more", msg_id))
@@ -157,6 +161,7 @@ fn build_card_more_menu(
             let e_eml = entity.clone();
             let e_copy = entity.clone();
             let e_raw = entity.clone();
+            let e_unsub = entity.clone();
             let d_reply = reply_detail.clone();
             let d_reply_all = reply_all_detail.clone();
             let d_forward = forward_detail.clone();
@@ -164,6 +169,7 @@ fn build_card_more_menu(
             let folder_seen = folder_path.clone();
             let folder_flag = folder_path.clone();
             let folder_eml = folder_path.clone();
+            let unsub_url = unsubscribe_url.clone();
             let mut menu = menu
                 .item(
                     PopupMenuItem::new("回复")
@@ -277,6 +283,18 @@ fn build_card_more_menu(
                         e_raw.update(cx, |this, cx| this.toggle_raw_source(msg_id, cx));
                     }),
                 );
+            if let Some(url) = unsub_url {
+                menu = menu.separator().item(
+                    PopupMenuItem::new("退订")
+                        .icon(Icon::new(IconName::MailX))
+                        .on_click(move |_, _, cx| {
+                            let u = url.clone();
+                            e_unsub.update(cx, |this, cx| {
+                                this.trigger_unsubscribe(&u, unsubscribe_one_click, cx);
+                            });
+                        }),
+                );
+            }
             menu
         })
         .on_open_change(move |open, _, cx| {
@@ -300,6 +318,7 @@ fn render_message_card(
     subject: &str,
     sender: &str,
     recipients: &str,
+    cc: &str,
     // 收件方网关写入的 `Authentication-Results` 头（无则不做真实性判定）。
     auth_results: Option<&str>,
     date_display: &str,
@@ -325,10 +344,6 @@ fn render_message_card(
     card_attachments: bool,
     attachments: &[AttachmentMeta],
     is_current: bool,
-    unsubscribe_url: Option<&str>,
-    unsubscribe_one_click: bool,
-    // F-7 该卡片是否处于「退订确认中」（全局待确认邮件 ID 匹配本卡片）。
-    unsubscribe_confirming: bool,
     more_menu: gpui_kit::AnyElement,
     body_view: BodyView,
     webview_in_thread: bool,
@@ -448,6 +463,7 @@ fn render_message_card(
             .into_any_element();
     }
 
+    let cc_list = recipient_list(cc);
     let recipient_list = recipient_list(recipients);
     let zoom_scale = (zoom_percent.clamp(50, 250) as f32) / 100.0;
     let body_font_px = 14.0 * zoom_scale;
@@ -465,6 +481,7 @@ fn render_message_card(
                 rfc_message_id,
                 sender,
                 recipients,
+                cc,
                 &formatted_date,
                 subject,
                 body_text,
@@ -643,16 +660,31 @@ fn render_message_card(
                         )
                         .child(more_menu),
                 )
-                .when(always_show_recipients && !recipient_list.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .pl(px(CARD_AVATAR + 28.0))
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .truncate()
-                            .child(SharedString::from(format!("收件人：{recipient_list}"))),
-                    )
-                }),
+                .when(
+                    always_show_recipients && (!recipient_list.is_empty() || !cc_list.is_empty()),
+                    |el| {
+                        el.child(
+                            v_flex()
+                                // 与发件人姓名块左对齐：头像宽度 + 头部 gap_2。
+                                .pl(px(CARD_AVATAR + 8.0))
+                                .gap_0p5()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .when(!recipient_list.is_empty(), |row| {
+                                    row.child(div().truncate().child(SharedString::from(format!(
+                                        "收件人：{recipient_list}"
+                                    ))))
+                                })
+                                .when(!cc_list.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .truncate()
+                                            .child(SharedString::from(format!("抄送：{cc_list}"))),
+                                    )
+                                }),
+                        )
+                    },
+                ),
         )
         .when(show_raw_source, |card| {
             card.child(
@@ -865,6 +897,7 @@ fn render_message_card(
         .when(
             !show_raw_source && blocked_images > 0 && show_remote_banner,
             |card| {
+                let sender_str = sender.to_string();
                 card.child(
                     h_flex()
                         .px_3()
@@ -878,97 +911,31 @@ fn render_message_card(
                             format!("已拦截 {blocked_images} 张远程图片以保护隐私"),
                         )))
                         .child(
-                            Button::new(("allow-remote-img", msg_id))
-                                .outline()
-                                .compact()
-                                .label("显示远程图片")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.allow_remote_images_for(msg_id, cx);
-                                })),
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new(("allow-remote-img", msg_id))
+                                        .outline()
+                                        .compact()
+                                        .label("显示本次图片")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.allow_remote_images_for(msg_id, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("trust-remote-sender", msg_id))
+                                        .outline()
+                                        .compact()
+                                        .label("总是信任此发件人")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.allow_remote_images_for(msg_id, cx);
+                                            this.trust_remote_sender(&sender_str, cx);
+                                        })),
+                                ),
                         ),
                 )
             },
         )
-        // F-7 一键退订横幅：仅当邮件携带 List-Unsubscribe 头时显示在卡片头部下
-        // 方（不触碰阅读器顶栏与标题区）；点击「退订」后进入卡内二次确认。
-        .when(unsubscribe_url.is_some(), |card| {
-            let confirming = unsubscribe_confirming;
-            let one_click = unsubscribe_one_click;
-            card.child(
-                h_flex()
-                    .px_3()
-                    .py_1p5()
-                    .gap_2()
-                    .items_center()
-                    .justify_between()
-                    .rounded(px(8.0))
-                    .bg(canvas)
-                    .border_1()
-                    .border_color(border)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .min_w_0()
-                            .child(
-                                Icon::new(IconName::MailX)
-                                    .with_size(px(14.0))
-                                    .text_color(muted_fg),
-                            )
-                            .child(div().text_xs().text_color(muted_fg).truncate().child(
-                                SharedString::from(if confirming {
-                                    format!(
-                                        "确认退订该邮件列表？{}",
-                                        if one_click {
-                                            "将直接发送一键退订请求"
-                                        } else {
-                                            "将打开退订页面 / 邮件客户端"
-                                        }
-                                    )
-                                } else {
-                                    "这是来自邮件列表的邮件，可以一键退订".to_string()
-                                }),
-                            )),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .items_center()
-                            .when(!confirming, |el| {
-                                el.child(
-                                    Button::new(("unsubscribe-ask", msg_id))
-                                        .outline()
-                                        .compact()
-                                        .label("退订")
-                                        .icon(IconName::MailX)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.request_unsubscribe(msg_id, cx);
-                                        })),
-                                )
-                            })
-                            .when(confirming, |el| {
-                                el.child(
-                                    Button::new(("unsubscribe-cancel", msg_id))
-                                        .outline()
-                                        .compact()
-                                        .label("取消")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.cancel_unsubscribe(cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new(("unsubscribe-confirm", msg_id))
-                                        .primary()
-                                        .compact()
-                                        .label("确认退订")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.confirm_unsubscribe(msg_id, cx);
-                                        })),
-                                )
-                            }),
-                    ),
-            )
-        })
         .when_some(text_state, |card, text_state| {
             card.child({
                 div()
@@ -1192,8 +1159,7 @@ pub(crate) fn render(
 
 /// 同 [`render`]，但由调用方决定是否在阅读器顶栏画窗口控制按钮。
 ///
-/// WP-10-4：内联分屏回复时阅读器独占窗格上半部分、位于窗格顶端，
-/// 无论阅读器位置偏好如何都应当画出窗口控制按钮。
+/// WP-10-4：内联分屏回复时阅读器在窗格下半部分，窗口控制按钮由上方写信面板承载。
 pub(crate) fn render_with_pane_top(
     app: &mut HylkiApp,
     window: &Window,
@@ -1280,7 +1246,7 @@ pub(crate) fn render_with_pane_top(
         };
         let body_pending = body_pending
             || (thread_count > 1 && !anchor.is_some_and(|message| message.body_loaded));
-        let block_remote = !app.remote_images_allowed(detail.id);
+        let block_remote = !app.remote_images_allowed(detail.id, &detail.sender);
         let eligible = webview_eligible(
             html,
             body_pending,
@@ -1445,7 +1411,7 @@ pub(crate) fn render_with_pane_top(
                 let is_current = tm.id == detail.id;
                 let is_collapsed = app.collapsed_thread_cards.contains(&tm.id);
                 let show_raw_source = app.raw_source_message_ids.contains(&tm.id);
-                let block_remote = !app.remote_images_allowed(tm.id);
+                let block_remote = !app.remote_images_allowed(tm.id, &tm.sender);
                 let card_subject = if tm.subject.trim().is_empty() {
                     detail.subject.clone()
                 } else {
@@ -1474,6 +1440,7 @@ pub(crate) fn render_with_pane_top(
                     rfc_message_id: tm.rfc_message_id.clone(),
                     sender: tm.sender.clone(),
                     recipients: tm.recipients.clone(),
+                    cc: tm.cc.clone(),
                     subject: card_subject.clone(),
                     date_display: tm.date_display.clone(),
                     date_ts: tm.date_ts,
@@ -1505,6 +1472,7 @@ pub(crate) fn render_with_pane_top(
                     &card_subject,
                     &tm.sender,
                     &tm.recipients,
+                    &tm.cc,
                     if is_anchor {
                         detail.auth_results.as_deref()
                     } else {
@@ -1533,9 +1501,6 @@ pub(crate) fn render_with_pane_top(
                     card_attachments,
                     &tm.attachments,
                     is_current,
-                    card_unsubscribe_url,
-                    card_unsubscribe_one_click,
-                    app.pending_unsubscribe == Some(tm.id),
                     menu,
                     if is_current {
                         body_view
@@ -1552,7 +1517,7 @@ pub(crate) fn render_with_pane_top(
     } else {
         let is_collapsed = app.collapsed_thread_cards.contains(&detail.id);
         let show_raw_source = app.raw_source_message_ids.contains(&detail.id);
-        let block_remote = !app.remote_images_allowed(detail.id);
+        let block_remote = !app.remote_images_allowed(detail.id, &detail.sender);
         let eml_exporting = app.pending_eml_export == Some(detail.id);
         let menu = build_card_more_menu(
             detail.clone(),
@@ -1568,6 +1533,7 @@ pub(crate) fn render_with_pane_top(
             &detail.subject,
             &detail.sender,
             &detail.recipients,
+            &detail.cc,
             detail.auth_results.as_deref(),
             &detail.date_display,
             detail.date_ts,
@@ -1592,9 +1558,6 @@ pub(crate) fn render_with_pane_top(
             card_attachments,
             &detail.attachments,
             false,
-            detail.unsubscribe_url.as_deref(),
-            detail.unsubscribe_one_click,
-            app.pending_unsubscribe == Some(detail.id),
             menu,
             body_view,
             false,
@@ -2247,6 +2210,7 @@ mod tests {
             "<id@example.com>",
             "Alice <a@example.com>",
             "b@example.com",
+            "c@example.com",
             "10:00",
             "主题",
             "纯文本正文",
@@ -2255,6 +2219,7 @@ mod tests {
         assert!(raw.contains("Message-ID: <id@example.com>"));
         assert!(raw.contains("From: Alice <a@example.com>"));
         assert!(raw.contains("To: b@example.com"));
+        assert!(raw.contains("Cc: c@example.com"));
         assert!(raw.contains("Subject: 主题"));
         assert!(raw.contains("纯文本正文"));
         assert!(raw.contains("<p>HTML正文</p>"));

@@ -113,7 +113,9 @@ impl MessageWindow {
         if let Some(app) = app_entity.upgrade() {
             cx.observe(&app, |this, app, cx| {
                 if this.webview_appearance.is_some_and(|(_, allowed)| {
-                    app.read(cx).remote_images_allowed(this.detail.id) != allowed
+                    app.read(cx)
+                        .remote_images_allowed(this.detail.id, &this.detail.sender)
+                        != allowed
                 }) {
                     cx.notify();
                 }
@@ -282,7 +284,7 @@ impl Render for MessageWindow {
         let allow_remote = self
             .app_entity
             .upgrade()
-            .is_some_and(|app| app.read(cx).remote_images_allowed(d.id));
+            .is_some_and(|app| app.read(cx).remote_images_allowed(d.id, &d.sender));
         let app_for_link = self.app_entity.clone();
         let app_for_quote_link = self.app_entity.clone();
         let mut blocked_images = 0;
@@ -618,11 +620,34 @@ impl Render for MessageWindow {
             })
             .when(blocked_images > 0 && self.prefs.show_remote_banner && self.print_preview.is_none(), |root| {
                 let id = d.id;
-                root.child(Button::new("popout-allow-remote").outline().compact().label("显示此邮件的远程图片")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let _ = this.app_entity.update(cx, |app, cx| app.allow_remote_images_for(id, cx));
-                        cx.notify();
-                    })))
+                let sender = d.sender.clone();
+                root.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("popout-allow-remote")
+                                .outline()
+                                .compact()
+                                .label("显示本次图片")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let _ = this.app_entity.update(cx, |app, cx| app.allow_remote_images_for(id, cx));
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("popout-trust-remote")
+                                .outline()
+                                .compact()
+                                .label("总是信任此发件人")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let _ = this.app_entity.update(cx, |app, cx| {
+                                        app.allow_remote_images_for(id, cx);
+                                        app.trust_remote_sender(&sender, cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                )
             })
             // 邮件正文滚动区。
             .when(body_view == BodyView::Loading, |root| {
