@@ -28,9 +28,18 @@ jobs:
   check:
     name: Format, check and test
     runs-on: windows-latest
+    outputs:
+      checkout_sha: ${{ steps.checkout_sha.outputs.sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Record checkout SHA
+        id: checkout_sha
+        shell: pwsh
+        run: echo "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -71,7 +80,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          ref: ${{ needs.check.outputs.checkout_sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -92,6 +101,8 @@ jobs:
             ${{ runner.os }}-desktop-cargo-
 
       - name: Build release binary
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
         run: cargo build --manifest-path desktop/Cargo.toml -p hylki-windows --release --target x86_64-pc-windows-msvc --locked
 
       - name: Package Windows x64 ZIP
@@ -104,7 +115,7 @@ jobs:
           Copy-Item "README.md" $stage
           @"
           Hylki Windows x64 — AGPL-3.0-or-later Source Offer
-          Commit: ${{ github.sha }}
+          Commit: $(git rev-parse HEAD)
           Repository: https://github.com/${{ github.repository }}
           License: GNU Affero General Public License v3.0 or later (see LICENSE)
           "@ | Set-Content -Encoding UTF8 "$stage/SOURCE_OFFER.txt"
@@ -120,7 +131,7 @@ jobs:
       # adds the asset: to the release if it exists, otherwise to a draft that
       # carries the notes tools/release-notes.sh would have produced.
       - name: Attach the zip to the release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.check.outputs.checkout_sha == github.sha
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

@@ -702,15 +702,46 @@ impl CacheStore {
         &mut self,
         account_id: u32,
         folder_id: u32,
+        old_path: &str,
         new_path: &str,
         new_name: &str,
+        delimiter: Option<&str>,
     ) -> Result<Vec<FolderSummary>, String> {
-        self.conn
-            .execute(
-                "UPDATE folders SET path = ?1, name = ?2 WHERE id = ?3 AND account_id = ?4",
-                params![new_path, new_name, folder_id, account_id],
-            )
-            .map_err(|e| format!("更新文件夹名称失败: {e}"))?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("创建文件夹事务失败: {e}"))?;
+        if let Some(delimiter) = delimiter.filter(|d| !d.is_empty()) {
+            let prefix = format!("{old_path}{delimiter}");
+            let descendants = {
+                let mut stmt = tx
+                    .prepare("SELECT id, path FROM folders WHERE account_id = ?1")
+                    .map_err(|e| format!("查询文件夹失败: {e}"))?;
+                let rows = stmt
+                    .query_map(params![account_id], |row| {
+                        Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| format!("查询文件夹失败: {e}"))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("读取文件夹失败: {e}"))?
+            };
+            for (id, path) in descendants {
+                if let Some(suffix) = path.strip_prefix(&prefix) {
+                    tx.execute(
+                        "UPDATE folders SET path = ?1 WHERE id = ?2 AND account_id = ?3",
+                        params![format!("{new_path}{delimiter}{suffix}"), id, account_id],
+                    )
+                    .map_err(|e| format!("更新子文件夹失败: {e}"))?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE folders SET path = ?1, name = ?2 WHERE id = ?3 AND account_id = ?4",
+            params![new_path, new_name, folder_id, account_id],
+        )
+        .map_err(|e| format!("更新文件夹名称失败: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("提交文件夹事务失败: {e}"))?;
         self.list_folders(account_id)
     }
 
@@ -5874,6 +5905,37 @@ mod tests {
         let subjects: Vec<&str> = unified.items.iter().map(|m| m.subject.as_str()).collect();
         assert!(subjects.contains(&"带正文与附件"));
         assert!(subjects.contains(&"仅邮件头"));
+    }
+
+    #[test]
+    fn rename_folder_moves_only_descendants_and_preserves_ids() {
+        let mut cache = CacheStore::open_in_memory().unwrap();
+        let folders = cache
+            .sync_folders(
+                1,
+                &[
+                    folder("A", "A"),
+                    folder("Child", "A/Child"),
+                    folder("Nested", "A/Child/Nested"),
+                    folder("AB", "AB/Child"),
+                ],
+            )
+            .unwrap();
+        let id = |path: &str| folders.iter().find(|f| f.path == path).unwrap().id;
+        let renamed = cache
+            .rename_folder_entry(1, id("A"), "A", "B", "B", Some("/"))
+            .unwrap();
+        for (path, original) in [
+            ("B", "A"),
+            ("B/Child", "A/Child"),
+            ("B/Child/Nested", "A/Child/Nested"),
+            ("AB/Child", "AB/Child"),
+        ] {
+            assert_eq!(
+                renamed.iter().find(|f| f.path == path).unwrap().id,
+                id(original)
+            );
+        }
     }
 
     #[test]

@@ -281,8 +281,7 @@ pub(crate) fn export_print_pdf(
     clock_style: &str,
 ) -> Result<String, String> {
     let html = build_print_html(state, date_style, clock_style, false);
-    let tmp_html = std::env::temp_dir().join(format!("hylki-print-{}.html", state.detail.id));
-    std::fs::write(&tmp_html, html.as_bytes()).map_err(|e| format!("写入临时打印文件失败: {e}"))?;
+    let tmp_html = create_print_temp_file(&html)?;
 
     if let Some(edge) = find_msedge() {
         let out_arg = format!("--print-to-pdf={}", dest_pdf.display());
@@ -299,22 +298,61 @@ pub(crate) fn export_print_pdf(
                 &file_url,
             ])
             .status();
-        let _ = std::fs::remove_file(&tmp_html);
         if let Ok(s) = status {
             if s.success() && dest_pdf.exists() {
+                let _ = std::fs::remove_file(&tmp_html);
                 return Ok(format!("已导出 PDF：{}", dest_pdf.display()));
             }
         }
     }
+    let _ = std::fs::remove_file(&tmp_html);
 
     // 回退：保存为可打印 HTML 并提示用户。
     let fallback_html = dest_pdf.with_extension("html");
-    std::fs::write(&fallback_html, html.as_bytes())
-        .map_err(|e| format!("导出打印文件失败: {e}"))?;
+    write_fallback_html(&fallback_html, &html)?;
     Ok(format!(
         "未检测到 Edge 无头打印，已导出为可打印网页：{}",
         fallback_html.display()
     ))
+}
+
+fn create_print_temp_file(html: &str) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "hylki-print-{}-{}.html",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(html.as_bytes()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("写入临时打印文件失败: {e}"));
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("创建临时打印文件失败: {e}")),
+        }
+    }
+}
+
+fn write_fallback_html(path: &Path, html: &str) -> Result<(), String> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(html.as_bytes()))
+        .map_err(|e| format!("导出打印文件失败（{}）: {e}", path.display()))
 }
 
 /// 在系统默认浏览器中打开自动触发 `window.print()` 的打印页面。
@@ -639,6 +677,33 @@ pub(crate) fn render_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_print_jobs_use_distinct_temp_files() {
+        let first = create_print_temp_file("first").unwrap();
+        let second = create_print_temp_file("second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+    }
+
+    #[test]
+    fn fallback_html_does_not_overwrite_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "hylki-fallback-test-{}-{}.html",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_fallback_html(&path, "first").unwrap();
+        assert!(write_fallback_html(&path, "second").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn print_html_preserves_safe_layout_and_inline_images() {

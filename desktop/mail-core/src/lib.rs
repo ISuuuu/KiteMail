@@ -865,7 +865,7 @@ pub enum MailRequest {
         account_id: u32,
         folder_id: u32,
         old_path: String,
-        new_path: String,
+        new_name: String,
     },
     /// WP-07: Delete a custom IMAP folder on the server and remove it from local cache.
     DeleteFolder {

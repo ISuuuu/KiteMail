@@ -2522,10 +2522,10 @@ async fn handle_request(
             account_id,
             folder_id,
             old_path,
-            new_path,
+            new_name,
         } => {
-            let trimmed = new_path.trim().to_string();
-            if trimmed.is_empty() || trimmed == old_path {
+            let trimmed = new_name.trim().to_string();
+            if trimmed.is_empty() {
                 return;
             }
             let account = match load_account_config(data_dir, account_id) {
@@ -2553,19 +2553,30 @@ async fn handle_request(
                 Err(e) => Err(e),
             };
             match res {
-                Ok(()) => {
-                    let leaf_name = trimmed
-                        .rsplit(['/', '.'])
-                        .next()
-                        .unwrap_or(&trimmed)
-                        .to_string();
-                    if let Ok(folders) =
-                        cache.rename_folder_entry(account_id, folder_id, &trimmed, &leaf_name)
-                    {
-                        let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
-                            account_id,
-                            folders,
-                        });
+                Ok(None) => {}
+                Ok(Some((new_path, delimiter))) => {
+                    let leaf_name = trimmed;
+                    match cache.rename_folder_entry(
+                        account_id,
+                        folder_id,
+                        &old_path,
+                        &new_path,
+                        &leaf_name,
+                        delimiter.as_deref(),
+                    ) {
+                        Ok(folders) => {
+                            let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                                account_id,
+                                folders,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(WorkerEvent::Error {
+                                account_id: Some(account_id),
+                                message: format!("远端文件夹已重命名，但更新本地缓存失败: {e}"),
+                            });
+                            return;
+                        }
                     }
                     let _ = evt_tx.send(WorkerEvent::Status {
                         account_id: Some(account_id),

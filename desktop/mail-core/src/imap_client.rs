@@ -824,20 +824,52 @@ pub async fn create_folder(
     Ok(())
 }
 
-/// Rename an existing mailbox from `old_path` to `new_path` on the IMAP server (`RENAME`).
+/// Rename an existing mailbox using a new leaf name and the server hierarchy delimiter.
 pub async fn rename_folder(
     account: &AccountConfig,
     password: &str,
     old_path: &str,
-    new_path: &str,
-) -> Result<(), String> {
+    new_name: &str,
+) -> Result<Option<(String, Option<String>)>, String> {
     let mut session = connect_imap(account, password).await?;
+    let mut stream = session
+        .list(None, Some("*"))
+        .await
+        .map_err(|e| format!("拉取文件夹列表失败: {e}"))?;
+    let mut delimiter = None;
+    let mut found = false;
+    while let Some(item) = stream.next().await {
+        let entry = item.map_err(|e| format!("读取文件夹列表失败: {e}"))?;
+        if entry.name() == old_path {
+            delimiter = entry.delimiter().map(str::to_owned);
+            found = true;
+        }
+    }
+    drop(stream);
+    if !found {
+        return Err(format!("文件夹不存在: {old_path}"));
+    }
+    let new_path = renamed_folder_path(old_path, new_name, delimiter.as_deref());
+    if new_path == old_path {
+        let _ = session.logout().await;
+        return Ok(None);
+    }
     session
-        .rename(old_path, new_path)
+        .rename(old_path, &new_path)
         .await
         .map_err(|e| format!("重命名文件夹 {old_path} -> {new_path} 失败: {e}"))?;
     let _ = session.logout().await;
-    Ok(())
+    Ok(Some((new_path, delimiter)))
+}
+
+fn renamed_folder_path(old_path: &str, new_name: &str, delimiter: Option<&str>) -> String {
+    match delimiter
+        .filter(|d| !d.is_empty())
+        .and_then(|d| old_path.rfind(d).map(|i| (d, i)))
+    {
+        Some((d, i)) => format!("{}{}{}", &old_path[..i], d, new_name),
+        None => new_name.to_string(),
+    }
 }
 
 /// Delete a mailbox `folder_path` on the IMAP server (`DELETE`).
@@ -1964,6 +1996,23 @@ pub fn plain_text_to_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rename_path_keeps_unchanged_nested_names_and_uses_server_delimiter() {
+        assert_eq!(
+            renamed_folder_path("Parent/Child", "Child", Some("/")),
+            "Parent/Child"
+        );
+        assert_eq!(
+            renamed_folder_path("Parent/Child.name", "New", Some("/")),
+            "Parent/New"
+        );
+        assert_eq!(
+            renamed_folder_path("Parent.Child", "New", Some(".")),
+            "Parent.New"
+        );
+        assert_eq!(renamed_folder_path("Parent", "New", None), "New");
+    }
+
     #[test]
     fn index_text_reads_mime_tail_and_limits_size() {
         let raw = b"Subject: hello\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nfirst line\r\nunique tail keyword";

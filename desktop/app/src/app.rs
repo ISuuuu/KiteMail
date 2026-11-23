@@ -787,6 +787,8 @@ pub(crate) struct HylkiApp {
     compose_pill_resume: Option<(ComposeAddressField, usize)>,
     /// F-4 草稿自动保存：防抖代际（每次输入变更 +1，旧定时器醒来后失效）。
     compose_autosave_generation: u64,
+    compose_session_generation: u64,
+    print_preview_generation: u64,
     /// F-4 自上次落库以来写信内容有变更（变更事件仅由真实编辑触发）。
     compose_autosave_dirty: bool,
     /// F-4 自动保存请求已发出（`DraftSaved` 回执到达后显示提示并绑定草稿 ID）。
@@ -1319,6 +1321,8 @@ impl HylkiApp {
                 compose_bcc_pills: Vec::new(),
                 compose_pill_resume: None,
                 compose_autosave_generation: 0,
+                compose_session_generation: 0,
+                print_preview_generation: 0,
                 compose_autosave_dirty: false,
                 compose_autosave_pending: false,
                 compose_autosaved_new: false,
@@ -1544,6 +1548,8 @@ impl HylkiApp {
             compose_bcc_pills: Vec::new(),
             compose_pill_resume: None,
             compose_autosave_generation: 0,
+            compose_session_generation: 0,
+            print_preview_generation: 0,
             compose_autosave_dirty: false,
             compose_autosave_pending: false,
             compose_autosaved_new: false,
@@ -2850,18 +2856,14 @@ impl HylkiApp {
                     account_id,
                     folder_id,
                     old_path,
-                    ..
+                    current_name,
                 } => {
-                    if !input_val.is_empty() {
-                        let new_path = match old_path.rfind(['/', '.']) {
-                            Some(pos) => format!("{}{}", &old_path[..=pos], input_val),
-                            None => input_val,
-                        };
+                    if !input_val.is_empty() && input_val != current_name {
                         w.send(MailRequest::RenameFolder {
                             account_id,
                             folder_id,
                             old_path,
-                            new_path,
+                            new_name: input_val,
                         });
                     }
                 }
@@ -3657,18 +3659,36 @@ impl HylkiApp {
     /// B-2：弹系统保存对话框并把 .eml 字节写出（文件名 = 过滤非法字符后的主题）。
     fn export_eml_bytes(&mut self, subject: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
         let filename = format!("{}.eml", sanitize_filename(subject));
-        if let Some(dest) = rfd::FileDialog::new().set_file_name(&filename).save_file() {
-            match std::fs::write(&dest, &bytes) {
-                Ok(()) => {
-                    self.status_line =
-                        SharedString::from(format!("已导出邮件原文至：{}", dest.display()));
-                }
-                Err(e) => {
-                    self.error_banner = Some(SharedString::from(format!("保存邮件原文失败: {e}")));
-                }
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_file_name(&filename)
+                        .save_file()
+                        .map(|dest| {
+                            let result = std::fs::write(&dest, &bytes);
+                            (dest, result)
+                        })
+                })
+                .await;
+            if let Some((dest, result)) = result {
+                let _ = this.update(cx, |app, cx| {
+                    match result {
+                        Ok(()) => {
+                            app.status_line =
+                                SharedString::from(format!("已导出邮件原文至：{}", dest.display()))
+                        }
+                        Err(e) => {
+                            app.error_banner =
+                                Some(SharedString::from(format!("保存邮件原文失败: {e}")))
+                        }
+                    }
+                    cx.notify();
+                });
             }
-        }
-        cx.notify();
+        })
+        .detach();
     }
 
     /// 查找账号的收件箱文件夹路径（B-2 Trash/Junk 恢复目标）。
@@ -4724,6 +4744,7 @@ impl HylkiApp {
     ///
     /// 若此时写信正弹在独立窗口里，先把窗口收回，避免同一份表单在两处渲染。
     fn begin_compose_session(&mut self, split: bool, cx: &mut Context<Self>) {
+        self.compose_session_generation += 1;
         if self.compose_detached {
             self.close_compose_window(cx);
         }
@@ -4820,6 +4841,7 @@ impl HylkiApp {
     /// 结束写信会话：清掉分屏 / 独立窗口形态，回到阅读器。
     /// 发送成功、放弃、保存草稿退出三条路径共用。
     fn finish_compose_session(&mut self, cx: &mut Context<Self>) {
+        self.compose_session_generation += 1;
         self.compose_split = false;
         if self.compose_detached {
             self.close_compose_window(cx);
@@ -5301,17 +5323,29 @@ impl HylkiApp {
     }
 
     pub(crate) fn pick_attachments(&mut self, cx: &mut Context<Self>) {
-        if let Some(files) = rfd::FileDialog::new().pick_files() {
-            for file in files {
-                let p = file.to_string_lossy().to_string();
-                if !self.compose_attachments.contains(&p) {
-                    self.compose_attachments.push(p);
-                }
+        let generation = self.compose_session_generation;
+        cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { rfd::FileDialog::new().pick_files() })
+                .await;
+            if let Some(files) = files {
+                let _ = this.update(cx, |app, cx| {
+                    if app.compose_session_generation != generation {
+                        return;
+                    }
+                    for file in files {
+                        let p = file.to_string_lossy().to_string();
+                        if !app.compose_attachments.contains(&p) {
+                            app.compose_attachments.push(p);
+                        }
+                    }
+                    app.schedule_draft_autosave(cx);
+                    cx.notify();
+                });
             }
-            // F-4：附件变化也属于写信内容变更，重置自动保存定时器。
-            self.schedule_draft_autosave(cx);
-            cx.notify();
-        }
+        })
+        .detach();
     }
 
     pub(crate) fn save_attachment(&self, att_id: u32, filename: &str, cx: &mut Context<Self>) {
@@ -5614,11 +5648,13 @@ impl HylkiApp {
     }
 
     pub(crate) fn open_print_preview(&mut self, detail: MessageDetail, cx: &mut Context<Self>) {
+        self.print_preview_generation += 1;
         self.print_preview = Some(PrintPreviewState::new(detail));
         cx.notify();
     }
 
     pub(crate) fn close_print_preview(&mut self, cx: &mut Context<Self>) {
+        self.print_preview_generation += 1;
         self.print_preview = None;
         cx.notify();
     }
@@ -5634,31 +5670,51 @@ impl HylkiApp {
                 .take(48)
                 .collect::<String>()
         );
-        if let Some(dest) = rfd::FileDialog::new()
-            .add_filter("PDF 文件", &["pdf"])
-            .set_file_name(&default_name)
-            .save_file()
-        {
-            match print_preview::export_print_pdf(
-                state,
-                &dest,
-                &self.prefs.date_style,
-                &self.prefs.clock_style,
-            ) {
-                Ok(msg) => {
-                    if let Some(ref mut pp) = self.print_preview {
-                        pp.status_note = Some(SharedString::from(msg.clone()));
+        let state = state.clone();
+        let date_style = self.prefs.date_style.clone();
+        let clock_style = self.prefs.clock_style.clone();
+        let generation = self.print_preview_generation;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .add_filter("PDF 文件", &["pdf"])
+                        .set_file_name(&default_name)
+                        .save_file()
+                        .map(|dest| {
+                            print_preview::export_print_pdf(
+                                &state,
+                                &dest,
+                                &date_style,
+                                &clock_style,
+                            )
+                        })
+                })
+                .await;
+            if let Some(result) = result {
+                let _ = this.update(cx, |app, cx| {
+                    if app.print_preview_generation != generation {
+                        return;
                     }
-                    self.status_line = SharedString::from(msg);
-                }
-                Err(err) => {
-                    if let Some(ref mut pp) = self.print_preview {
-                        pp.status_note = Some(SharedString::from(err.clone()));
+                    match result {
+                        Ok(msg) => {
+                            if let Some(ref mut pp) = app.print_preview {
+                                pp.status_note = Some(SharedString::from(msg.clone()));
+                            }
+                            app.status_line = SharedString::from(msg);
+                        }
+                        Err(err) => {
+                            if let Some(ref mut pp) = app.print_preview {
+                                pp.status_note = Some(SharedString::from(err));
+                            }
+                        }
                     }
-                }
+                    cx.notify();
+                });
             }
-            cx.notify();
-        }
+        })
+        .detach();
     }
 
     pub(crate) fn run_system_print(&mut self, cx: &mut Context<Self>) {
