@@ -1,6 +1,9 @@
 //! 异步 WebView2 宿主。调用方必须在创建父窗口的 STA 线程使用。
 #![allow(dead_code)]
 
+use gpui_kit::{
+    point, px, AsyncWindowContext, PlatformInput, ScrollDelta, ScrollEvent, TouchPhase,
+};
 use std::{
     cell::RefCell,
     os::windows::ffi::OsStrExt,
@@ -10,18 +13,18 @@ use webview2_com::{
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
-    WebResourceRequestedEventHandler,
+    WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
 };
 use windows::{
     core::w,
     Win32::{
-        Foundation::{HWND, RECT},
+        Foundation::{HWND, POINT, RECT},
         UI::{
             Shell::SHCreateMemStream,
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE,
-                SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_CHILD,
-                WS_CLIPCHILDREN,
+                CreateWindowExW, DestroyWindow, GetCursorPos, GetParent, GetWindowInfo,
+                GetWindowRect, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
+                SW_SHOWNOACTIVATE, WINDOWINFO, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
             },
         },
     },
@@ -243,6 +246,8 @@ struct State {
     navigation_id: Option<u64>,
     loaded: bool,
     links: Vec<(u64, String)>,
+    scroll_window: Option<AsyncWindowContext>,
+    in_thread: bool,
     bounds: RECT,
     visible: bool,
     has_area: bool,
@@ -327,7 +332,10 @@ fn create_controller(
 pub(crate) struct WebViewHost(Rc<RefCell<State>>);
 
 impl WebViewHost {
-    pub(crate) fn create(parent: HWND) -> windows::core::Result<Self> {
+    pub(crate) fn create(
+        parent: HWND,
+        scroll_window: Option<AsyncWindowContext>,
+    ) -> windows::core::Result<Self> {
         let clip_window = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -346,6 +354,7 @@ impl WebViewHost {
         };
         let state = Rc::new(RefCell::new(State {
             clip_window,
+            scroll_window,
             ..State::default()
         }));
         let weak = Rc::downgrade(&state);
@@ -515,9 +524,18 @@ impl WebViewHost {
         document: Vec<u8>,
         allow_remote_images: bool,
     ) -> windows::core::Result<()> {
+        self.load_document(document, allow_remote_images, false)
+    }
+    pub(crate) fn load_document(
+        &self,
+        document: Vec<u8>,
+        allow_remote_images: bool,
+        in_thread: bool,
+    ) -> windows::core::Result<()> {
         let mut state = self.0.borrow_mut();
         state.document = document;
         state.allow_remote_images = false;
+        state.in_thread = in_thread;
         state.version = state.version.wrapping_add(1);
         state.loaded = false;
         state.navigation_id = None;
@@ -568,6 +586,77 @@ impl Drop for WebViewHost {
     }
 }
 
+fn thread_wheel_delta(message: &str) -> Option<f32> {
+    let delta: f32 = message.strip_prefix("thread-wheel:")?.parse().ok()?;
+    (delta.is_finite() && delta != 0.0).then_some(delta)
+}
+
+fn forward_thread_wheel(
+    state: Rc<RefCell<State>>,
+    source: String,
+    delta: f32,
+) -> windows::core::Result<()> {
+    let (window, clip_window) = {
+        let state = state.borrow();
+        let Some(window) = state.scroll_window.clone() else {
+            return Ok(());
+        };
+        (window, state.clip_window)
+    };
+    let mut cursor = POINT::default();
+    unsafe { GetCursorPos(&mut cursor)? };
+
+    // Schedule GPUI input after the WebView2 callback returns.
+    window
+        .spawn(async move |cx| {
+            {
+                let state = state.borrow();
+                if state.closed
+                    || !state.loaded
+                    || !state.window_shown
+                    || !state.in_thread
+                    || !allow_main_navigation(&source, state.version)
+                {
+                    return;
+                }
+            }
+            let mut clip = RECT::default();
+            let mut info = WINDOWINFO {
+                cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+                ..Default::default()
+            };
+            let position = unsafe {
+                GetWindowRect(clip_window, &mut clip)
+                    .and_then(|_| GetWindowInfo(GetParent(clip_window)?, &mut info))
+            };
+            if position.is_err()
+                || cursor.x < clip.left
+                || cursor.x >= clip.right
+                || cursor.y < clip.top
+                || cursor.y >= clip.bottom
+            {
+                return;
+            }
+            let _ = cx.update(|window, cx| {
+                let scale = window.scale_factor();
+                window.dispatch_event(
+                    PlatformInput::Scroll(ScrollEvent {
+                        position: point(
+                            px((cursor.x - info.rcClient.left) as f32 / scale),
+                            px((cursor.y - info.rcClient.top) as f32 / scale),
+                        ),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-delta))),
+                        touch_phase: TouchPhase::Moved,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+        })
+        .detach();
+    Ok(())
+}
+
 unsafe fn configure(
     env: &ICoreWebView2Environment,
     controller: &ICoreWebView2Controller,
@@ -603,7 +692,7 @@ unsafe fn configure(
     }));
     view.add_NavigationStarting(&nav, &mut token)?;
     let complete_state = state.clone();
-    let complete = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
+    let complete = NavigationCompletedEventHandler::create(Box::new(move |view, args| {
         if let (Some(state), Some(args)) = (complete_state.upgrade(), args) {
             let mut id = 0;
             let mut success = windows::core::BOOL::default();
@@ -615,11 +704,47 @@ unsafe fn configure(
             if state.navigation_id == Some(id) {
                 state.loaded = success.as_bool();
                 state.failed = !state.loaded;
+                let install_scroll =
+                    state.loaded && state.in_thread && state.scroll_window.is_some();
+                drop(state);
+                if let Some(view) = view.filter(|_| install_scroll) {
+                    // Run the trusted listener in the wrapper. The mail frame stays scriptless.
+                    let script: Vec<u16> = include_str!("thread_scroll.js")
+                        .encode_utf16()
+                        .chain(Some(0))
+                        .collect();
+                    unsafe {
+                        let _ = view.ExecuteScript(
+                            windows::core::PCWSTR(script.as_ptr()),
+                            None::<&ICoreWebView2ExecuteScriptCompletedHandler>,
+                        );
+                    }
+                }
             }
         }
         Ok(())
     }));
     view.add_NavigationCompleted(&complete, &mut token)?;
+    if state
+        .upgrade()
+        .is_some_and(|state| state.borrow().scroll_window.is_some())
+    {
+        let scroll_state = state.clone();
+        let wheel = WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+            if let (Some(state), Some(args)) = (scroll_state.upgrade(), args) {
+                let mut message = windows::core::PWSTR::null();
+                if unsafe { args.TryGetWebMessageAsString(&mut message) }.is_ok() {
+                    if let Some(delta) = thread_wheel_delta(&webview2_com::take_pwstr(message)) {
+                        let mut source = windows::core::PWSTR::null();
+                        unsafe { args.Source(&mut source)? };
+                        forward_thread_wheel(state, webview2_com::take_pwstr(source), delta)?;
+                    }
+                }
+            }
+            Ok(())
+        }));
+        view.add_WebMessageReceived(&wheel, &mut token)?;
+    }
     let failure_state = state.clone();
     let failure = ProcessFailedEventHandler::create(Box::new(move |_, _| {
         if let Some(state) = failure_state.upgrade() {
@@ -783,6 +908,21 @@ unsafe fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_wheel_messages_require_a_finite_nonzero_delta() {
+        assert_eq!(thread_wheel_delta("thread-wheel:42.5"), Some(42.5));
+        assert_eq!(thread_wheel_delta("thread-wheel:-120"), Some(-120.0));
+        for message in [
+            "42",
+            "thread-wheel:",
+            "thread-wheel:0",
+            "thread-wheel:NaN",
+            "thread-wheel:inf",
+        ] {
+            assert_eq!(thread_wheel_delta(message), None);
+        }
+    }
 
     #[test]
     fn native_images_follow_the_message_permission() {

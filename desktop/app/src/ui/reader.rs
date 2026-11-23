@@ -1275,6 +1275,7 @@ pub(crate) fn render_with_pane_top(
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         use std::hash::{Hash, Hasher};
 
+        let in_thread = thread_count > 1;
         let anchor = detail
             .thread_messages
             .iter()
@@ -1317,6 +1318,7 @@ pub(crate) fn render_with_pane_top(
             dark.hash(&mut hasher);
             zoom_percent.hash(&mut hasher);
             block_remote.hash(&mut hasher);
+            in_thread.hash(&mut hasher);
             hasher.finish()
         });
         if key.is_none() && app.reader_webview_key.take().is_some() {
@@ -1335,7 +1337,7 @@ pub(crate) fn render_with_pane_top(
                 if let Some(host) = app.reader_webview.clone() {
                     cx.defer_in(window, move |_, _, _| {
                         host.set_visible(false);
-                        let _ = host.load_with_remote(document, !block_remote);
+                        let _ = host.load_document(document, !block_remote, in_thread);
                     });
                 } else {
                     let message_id = detail.id;
@@ -1350,8 +1352,13 @@ pub(crate) fn render_with_pane_top(
                             if let RawWindowHandle::Win32(handle) = handle.as_raw() {
                                 let hwnd =
                                     windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
-                                if let Ok(host) = WebViewHost::create(hwnd) {
-                                    if host.load_with_remote(document, !block_remote).is_ok() {
+                                if let Ok(host) =
+                                    WebViewHost::create(hwnd, Some(window.to_async(cx)))
+                                {
+                                    if host
+                                        .load_document(document, !block_remote, in_thread)
+                                        .is_ok()
+                                    {
                                         this.reader_webview = Some(std::rc::Rc::new(host));
                                         cx.spawn(async move |this, cx| {
                                             let mut previous = (false, false, None);

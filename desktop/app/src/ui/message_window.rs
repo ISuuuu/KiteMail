@@ -149,7 +149,7 @@ impl MessageWindow {
                 if let Ok(handle) = window.window_handle() {
                     if let RawWindowHandle::Win32(handle) = handle.as_raw() {
                         let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
-                        if let Ok(host) = WebViewHost::create(hwnd) {
+                        if let Ok(host) = WebViewHost::create(hwnd, None) {
                             let allow_remote = this.app_entity.upgrade().is_some_and(|app| {
                                 app.read(cx).remote_images_allowed(this.detail.id)
                             });
