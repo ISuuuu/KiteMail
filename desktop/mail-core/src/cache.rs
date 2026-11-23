@@ -31,6 +31,8 @@ pub struct CachedHeaderInput {
     pub references_header: String,
     pub sender: String,
     pub recipients: String,
+    /// 逗号分隔的抄送人（Cc 头 / Graph ccRecipients），无抄送时为空。
+    pub cc: String,
     pub subject: String,
     pub preview: String,
     pub date_ts: i64,
@@ -482,6 +484,8 @@ impl CacheStore {
         // RFC 会话线程关联头（In-Reply-To / References 或 Graph conversationId）。
         self.ensure_column("messages", "in_reply_to", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("messages", "references_header", "TEXT NOT NULL DEFAULT ''")?;
+        // 抄送人（Cc 头，逗号分隔）；旧库补列，历史邮件在下次同步前视为无抄送。
+        self.ensure_column("messages", "cc", "TEXT NOT NULL DEFAULT ''")?;
         // F-7 一键退订：`List-Unsubscribe` 第一个可执行地址与 RFC 8058 one-click
         // 标记（正文抓取时随头解析写入；旧库补列，历史数据视为无退订头）。
         self.ensure_column("messages", "list_unsubscribe", "TEXT NOT NULL DEFAULT ''")?;
@@ -1029,9 +1033,9 @@ impl CacheStore {
                 "
                 INSERT INTO messages (
                     account_id, folder_id, uid, remote_id, message_id, in_reply_to, references_header,
-                    sender, recipients, subject, preview, date_ts, date_display, unread, flagged, has_attachment
+                    sender, recipients, cc, subject, preview, date_ts, date_display, unread, flagged, has_attachment
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                 ON CONFLICT(folder_id, uid) DO UPDATE SET
                     remote_id = CASE
                         WHEN excluded.remote_id = '' THEN messages.remote_id
@@ -1048,6 +1052,7 @@ impl CacheStore {
                     END,
                     sender = excluded.sender,
                     recipients = excluded.recipients,
+                    cc = excluded.cc,
                     subject = excluded.subject,
                     preview = CASE
                         WHEN messages.body_text IS NULL THEN excluded.preview
@@ -1069,6 +1074,7 @@ impl CacheStore {
                     item.references_header,
                     item.sender,
                     item.recipients,
+                    item.cc,
                     item.subject,
                     item.preview,
                     item.date_ts,
@@ -2205,7 +2211,7 @@ impl CacheStore {
                 "
                 SELECT m.id, m.account_id, m.folder_id, m.uid, m.message_id, m.sender, m.recipients,
                        m.subject, m.date_ts, m.date_display, m.body_text, m.body_html, m.flagged, f.path,
-                       m.list_unsubscribe, m.list_unsubscribe_post, m.auth_results
+                       m.list_unsubscribe, m.list_unsubscribe_post, m.auth_results, m.cc
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE m.id = ?1
@@ -2234,6 +2240,7 @@ impl CacheStore {
                         (!unsub.trim().is_empty()).then_some(unsub),
                         row.get::<_, i32>(15)? != 0,
                         (!auth_results.trim().is_empty()).then_some(auth_results),
+                        row.get::<_, String>(17)?,
                     ))
                 },
             )
@@ -2258,6 +2265,7 @@ impl CacheStore {
             unsubscribe_url,
             unsubscribe_one_click,
             auth_results,
+            cc,
         )) = row
         else {
             return Ok(None);
@@ -2278,6 +2286,7 @@ impl CacheStore {
             rfc_message_id,
             sender,
             recipients,
+            cc,
             subject,
             date_ts,
             date_display,
@@ -2339,6 +2348,7 @@ impl CacheStore {
             references_header: String,
             sender: String,
             recipients: String,
+            cc: String,
             subject: String,
             date_ts: i64,
             date_display: String,
@@ -2457,7 +2467,7 @@ impl CacheStore {
                     SELECT m.id, m.folder_id, f.name, f.path, m.uid, m.message_id,
                            m.in_reply_to, m.references_header, m.sender, m.recipients,
                            m.subject, m.date_ts, m.date_display, m.body_text, m.body_html,
-                           m.preview, m.unread, m.flagged
+                           m.preview, m.unread, m.flagged, m.cc
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
                     WHERE m.id = ?1
@@ -2486,6 +2496,7 @@ impl CacheStore {
                             preview: row.get(15)?,
                             unread: row.get::<_, i32>(16)? != 0,
                             flagged: row.get::<_, i32>(17)? != 0,
+                            cc: row.get(18)?,
                         })
                     })
                     .optional()
@@ -2513,7 +2524,7 @@ impl CacheStore {
                     SELECT m.id, m.folder_id, f.name, f.path, m.uid, m.message_id,
                            m.in_reply_to, m.references_header, m.sender, m.recipients,
                            m.subject, m.date_ts, m.date_display, m.body_text, m.body_html,
-                           m.preview, m.unread, m.flagged
+                           m.preview, m.unread, m.flagged, m.cc
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
                     WHERE m.account_id = ?1 AND LOWER(m.subject) LIKE ?2
@@ -2544,6 +2555,7 @@ impl CacheStore {
                         preview: row.get(15)?,
                         unread: row.get::<_, i32>(16)? != 0,
                         flagged: row.get::<_, i32>(17)? != 0,
+                        cc: row.get(18)?,
                     })
                 })
                 .map_err(|e| format!("执行会话查询失败: {e}"))?
@@ -2644,6 +2656,7 @@ impl CacheStore {
                 subject: row.subject,
                 sender: row.sender,
                 recipients: row.recipients,
+                cc: row.cc,
                 date_ts: row.date_ts,
                 date_display: row.date_display,
                 body_text,
@@ -4548,6 +4561,7 @@ mod tests {
             references_header: String::new(),
             sender: "Alice <alice@example.com>".to_string(),
             recipients: "bob@example.com".to_string(),
+            cc: String::new(),
             subject: subject.to_string(),
             preview: "正文摘要".to_string(),
             date_ts: 1_700_000_000 + uid as i64,
@@ -4584,6 +4598,7 @@ mod tests {
             references_header: String::new(),
             sender: sender.to_string(),
             recipients: recipients.to_string(),
+            cc: String::new(),
             subject: subject.to_string(),
             preview: String::new(),
             date_ts,
@@ -4592,6 +4607,23 @@ mod tests {
             flagged,
             has_attachment: false,
         }
+    }
+
+    #[test]
+    fn header_cc_is_cached_and_exposed_in_detail() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let inbox = folders[0].id;
+        let mut header = sample_header(1, "抄送可见");
+        header.cc = "Carol <carol@example.com>".to_string();
+        cache
+            .commit_folder_headers(1, inbox, 1, &[header], None)
+            .unwrap();
+        let page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let id = page.items[0].id;
+        let (detail, _, _) = cache.get_message_detail(id).unwrap().unwrap();
+        assert_eq!(detail.recipients, "bob@example.com");
+        assert_eq!(detail.cc, "Carol <carol@example.com>");
     }
 
     #[test]
@@ -6078,6 +6110,7 @@ mod tests {
                         references_header: String::new(),
                         sender: "Alice <a@test>".to_string(),
                         recipients: "me@test".to_string(),
+                        cc: String::new(),
                         subject: "未读且星标".to_string(),
                         preview: String::new(),
                         date_ts: 300,
@@ -6093,6 +6126,7 @@ mod tests {
                         references_header: String::new(),
                         sender: "Bob <b@test>".to_string(),
                         recipients: "me@test".to_string(),
+                        cc: String::new(),
                         subject: "仅未读".to_string(),
                         preview: String::new(),
                         date_ts: 200,
@@ -6108,6 +6142,7 @@ mod tests {
                         references_header: String::new(),
                         sender: "Carol <c@test>".to_string(),
                         recipients: "me@test".to_string(),
+                        cc: String::new(),
                         subject: "已读星标".to_string(),
                         preview: String::new(),
                         date_ts: 100,
@@ -6187,6 +6222,7 @@ mod tests {
                         references_header: String::new(),
                         sender: "Alice <a@test>".to_string(),
                         recipients: "me@test".to_string(),
+                        cc: String::new(),
                         subject: "Q3 Roadmap".to_string(),
                         preview: "第一封".to_string(),
                         date_ts: 100,
@@ -6202,6 +6238,7 @@ mod tests {
                         references_header: String::new(),
                         sender: "Bob <b@test>".to_string(),
                         recipients: "me@test".to_string(),
+                        cc: String::new(),
                         subject: "Re: Q3 Roadmap".to_string(),
                         preview: "第二封回复".to_string(),
                         date_ts: 200,
@@ -6266,6 +6303,7 @@ mod tests {
                         references_header: String::new(),
                         sender: "Alice <alice@example.com>".to_string(),
                         recipients: "me@example.com".to_string(),
+                        cc: String::new(),
                         subject: "原始需求讨论".to_string(),
                         preview: "第一封".to_string(),
                         date_ts: 1000,
@@ -6281,6 +6319,7 @@ mod tests {
                         references_header: "<root@example.com> <reply1@example.com>".to_string(),
                         sender: "Alice <alice@example.com>".to_string(),
                         recipients: "me@example.com".to_string(),
+                        cc: String::new(),
                         subject: "全新主题名（依然同线程）".to_string(),
                         preview: "第三封".to_string(),
                         date_ts: 3000,
@@ -6306,6 +6345,7 @@ mod tests {
                     references_header: "<root@example.com>".to_string(),
                     sender: "Me <me@example.com>".to_string(),
                     recipients: "alice@example.com".to_string(),
+                    cc: String::new(),
                     subject: "改过标题的回复".to_string(),
                     preview: "第二封".to_string(),
                     date_ts: 2000,
@@ -6331,6 +6371,7 @@ mod tests {
                     references_header: String::new(),
                     sender: "Alice <alice@example.com>".to_string(),
                     recipients: "me@example.com".to_string(),
+                    cc: String::new(),
                     subject: "原始需求讨论".to_string(),
                     preview: "回收站副本".to_string(),
                     date_ts: 1000,
@@ -6420,6 +6461,7 @@ mod tests {
                     references_header: String::new(),
                     sender: "Alice <alice@example.com>".to_string(),
                     recipients: "me@example.com".to_string(),
+                    cc: String::new(),
                     subject: "Thread Cleanup".to_string(),
                     preview: "root".to_string(),
                     date_ts: 1000,
@@ -6443,6 +6485,7 @@ mod tests {
                     references_header: "<root@example.com>".to_string(),
                     sender: "Bob <bob@example.com>".to_string(),
                     recipients: "me@example.com".to_string(),
+                    cc: String::new(),
                     subject: "Re: Thread Cleanup".to_string(),
                     preview: "in trash".to_string(),
                     date_ts: 2000,
@@ -6466,6 +6509,7 @@ mod tests {
                     references_header: "<root@example.com>".to_string(),
                     sender: "Spammer <spam@example.com>".to_string(),
                     recipients: "me@example.com".to_string(),
+                    cc: String::new(),
                     subject: "Re: Thread Cleanup".to_string(),
                     preview: "in junk".to_string(),
                     date_ts: 3000,
@@ -6517,6 +6561,7 @@ mod tests {
             references_header: String::new(),
             sender: "Alice <alice@example.com>".to_string(),
             recipients: "me@example.com".to_string(),
+            cc: String::new(),
             subject: format!("Mail {uid}"),
             preview: "preview".to_string(),
             date_ts: 1000 + uid as i64,

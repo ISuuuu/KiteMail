@@ -97,7 +97,7 @@ pub fn fetch_folder_headers(
     let url = format!(
         "{GRAPH_BASE}/mailFolders/{encoded_folder}/messages?\
          $top=100&$orderby=receivedDateTime%20desc&\
-         $select=id,subject,from,toRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId,conversationId"
+         $select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId,conversationId"
     );
     fetch_headers_from_url(access_token, &url)
 }
@@ -126,7 +126,7 @@ pub fn search_messages(
     let top = limit.clamp(1, 100);
     let url = format!(
         "{GRAPH_BASE}/messages?$search={encoded_search}&$top={top}&\
-         $select=id,subject,from,toRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId"
+         $select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId"
     );
     let resp = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(15))
@@ -197,6 +197,16 @@ fn parse_graph_messages_json(
                         .join(", ")
                 })
                 .unwrap_or_default();
+            let cc = msg["ccRecipients"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .map(|r| format_graph_address(&r["emailAddress"]))
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
             let subject = msg["subject"]
                 .as_str()
                 .map(str::trim)
@@ -233,6 +243,7 @@ fn parse_graph_messages_json(
                     references_header: conversation_id,
                     sender,
                     recipients,
+                    cc,
                     subject,
                     preview,
                     date_ts,

@@ -1245,6 +1245,7 @@ fn parse_header_bytes(
             references_header: String::new(),
             sender: "(未知发件人)".to_string(),
             recipients: String::new(),
+            cc: String::new(),
             subject: "(无法解析标题)".to_string(),
             preview: String::new(),
             date_ts: uid as i64,
@@ -1263,6 +1264,16 @@ fn parse_header_bytes(
 
     let recipients = msg
         .to()
+        .map(|list| {
+            list.iter()
+                .map(format_address)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+
+    let cc = msg
+        .cc()
         .map(|list| {
             list.iter()
                 .map(format_address)
@@ -1331,6 +1342,7 @@ fn parse_header_bytes(
         references_header,
         sender,
         recipients,
+        cc,
         subject,
         preview,
         date_ts,
