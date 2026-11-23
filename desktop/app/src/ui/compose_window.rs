@@ -26,7 +26,9 @@ impl ComposeWindow {
         let weak_app = app.downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             if let Some(app) = weak_app.upgrade() {
-                app.update(cx, |app, cx| app.set_compose_detached(false, cx));
+                app.update(cx, |app, cx| {
+                    app.set_compose_detached(false, cx);
+                });
             }
             true
         });

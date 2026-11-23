@@ -2536,6 +2536,7 @@ fn render_composing(
 
     let a_from = app_entity.clone();
     let a_inline = app_entity.clone();
+    let a_reply_inline = app_entity.clone();
     let a_above = app_entity.clone();
     let a_dash = app_entity.clone();
     let a_undo = app_entity.clone();
@@ -2586,11 +2587,8 @@ fn render_composing(
                 ),
                 setting_row(
                     "pref-compose-inline",
-                    "回复与转发在阅读器内联分屏",
-                    Some(
-                        "开启后原邮件留在上半部分可随时对照滚动，写信面板贴在下半部分；\
-                         也可随时点写信栏右上角的 ↗ 弹出为独立窗口",
-                    ),
+                    "在主窗口中新建邮件",
+                    Some("关闭时点击写信将在独立窗口中打开新邮件"),
                     bool_switch(
                         "sw-compose-inline",
                         prefs.compose_inline,
@@ -2603,6 +2601,24 @@ fn render_composing(
                     ),
                     false,
                     is_hit(win, "pref-compose-inline"),
+                    p,
+                ),
+                setting_row(
+                    "pref-reply-inline",
+                    "在主窗口中回复与转发",
+                    Some("关闭时回复与转发将在独立窗口中打开；开启时在主窗口分屏对照原邮件"),
+                    bool_switch(
+                        "sw-reply-inline",
+                        prefs.reply_inline,
+                        false,
+                        move |val, _, cx| {
+                            a_reply_inline.update(cx, |app, cx| {
+                                app.mutate_preferences(cx, |p| p.reply_inline = val);
+                            });
+                        },
+                    ),
+                    false,
+                    is_hit(win, "pref-reply-inline"),
                     p,
                 ),
                 setting_row(

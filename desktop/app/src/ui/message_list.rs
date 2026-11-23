@@ -101,11 +101,22 @@ fn row_context_menu(
             // 本地草稿行：打开编辑 / 删除草稿（走现有 DeleteLocalDraft）。
             let draft_id = draft.id;
             let entity_for_open = entity.clone();
+            let draft_for_open = draft.clone();
+            let entity_for_popout = entity.clone();
+            let draft_for_popout = draft.clone();
             return menu
                 .item(
                     PopupMenuItem::new("打开草稿").on_click(move |_, window, cx| {
                         entity_for_open.update(cx, |this, cx| {
-                            this.open_local_draft(&draft, window, cx);
+                            this.open_local_draft(&draft_for_open, window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("在独立窗口中编辑").on_click(move |_, window, cx| {
+                        entity_for_popout.update(cx, |this, cx| {
+                            this.open_local_draft(&draft_for_popout, window, cx);
+                            this.pop_out_compose(cx);
                         });
                     }),
                 )
@@ -147,8 +158,34 @@ fn row_context_menu(
         let sender_for_contact = msg_sender.clone();
         let sender_for_filter = msg_sender.clone();
         let subject_for_filter = msg_subject.clone();
-        // B-2 顶部：回复 / 回复全部 / 转发（正文未就绪时挂起动作，加载后执行）。
+        let entity_for_popout = entity.clone();
+        let folder_path_for_popout = folder_path.clone();
+        // B-2 顶部：独立窗口 / 回复 / 回复全部 / 转发（正文未就绪时挂起动作，加载后执行）。
         let mut menu = menu
+            .item(
+                PopupMenuItem::new("在独立窗口中打开").on_click(move |_, _, cx| {
+                    entity_for_popout.update(cx, |this, cx| {
+                        this.select_message(
+                            account_id,
+                            message_id,
+                            uid,
+                            unread,
+                            &folder_path_for_popout,
+                            cx,
+                        );
+                        if let Some(ref detail) = this
+                            .selected_message
+                            .as_ref()
+                            .filter(|m| m.id == message_id)
+                        {
+                            this.pop_out_message_window((*detail).clone(), cx);
+                        } else {
+                            this.pending_popout_message_ids.insert(message_id);
+                        }
+                    });
+                }),
+            )
+            .separator()
             .item(PopupMenuItem::new("回复").on_click(move |_, window, cx| {
                 entity_for_reply.update(cx, |this, cx| {
                     this.begin_row_action(
@@ -806,20 +843,39 @@ fn message_row(
         })
         .on_click({
             let draft = draft.clone();
+            let folder_path = folder_path.clone();
             cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
                 // P3：点击行视为列表持焦点，并清除键盘游标（原版 kbd-cursor 在
                 // 点击时移除，a click never draws it）。
                 this.list_focused = true;
                 this.kbd_cursor_message_id = None;
+                let is_double_click = match event {
+                    gpui_kit::ClickEvent::Mouse(m) => m.up.click_count >= 2,
+                    _ => false,
+                };
                 match draft.as_ref() {
-                    // 草稿行：点击进入写信编辑。
-                    Some(d) => this.open_local_draft(d, window, cx),
+                    // 草稿行：点击进入写信编辑；双击直接在独立窗口中打开。
+                    Some(d) => {
+                        this.open_local_draft(d, window, cx);
+                        if is_double_click {
+                            this.pop_out_compose(cx);
+                        }
+                    }
                     None => {
                         if event.modifiers().control {
                             this.toggle_message_selection(msg_id, cx);
                         } else {
                             this.selected_message_ids.clear();
                             this.select_message(account_id, msg_id, uid, unread, &folder_path, cx);
+                            if is_double_click {
+                                if let Some(ref detail) =
+                                    this.selected_message.as_ref().filter(|m| m.id == msg_id)
+                                {
+                                    this.pop_out_message_window((*detail).clone(), cx);
+                                } else {
+                                    this.pending_popout_message_ids.insert(msg_id);
+                                }
+                            }
                         }
                     }
                 }

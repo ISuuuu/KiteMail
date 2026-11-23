@@ -928,6 +928,8 @@ pub(crate) struct HylkiApp {
     pub(crate) print_preview: Option<PrintPreviewState>,
     /// B-2：列表行菜单挂起的后续动作（等对应正文加载完成后执行）。
     pub(crate) pending_row_action: Option<(u32, PendingRowAction)>,
+    /// 双击列表行时若正文尚未拉取完成，记录此邮件 ID 集合，待 MessageBodyLoaded 时自动弹出独立窗口。
+    pub(crate) pending_popout_message_ids: std::collections::HashSet<u32>,
     /// B-2：正在抓取原始 MIME 以导出 .eml 的邮件 ID（「导出中…」状态，防重复点击）。
     pub(crate) pending_eml_export: Option<u32>,
     /// F-3：进行中的移动 / 删除 / 归档（成功回执到达后转成 `last_move_undo`）。
@@ -1414,6 +1416,7 @@ impl HylkiApp {
                 reader_popup_open: false,
                 print_preview: None,
                 pending_row_action: None,
+                pending_popout_message_ids: std::collections::HashSet::new(),
                 pending_eml_export: None,
                 pending_undo: None,
                 last_move_undo: None,
@@ -1644,6 +1647,7 @@ impl HylkiApp {
             reader_popup_open: false,
             print_preview: None,
             pending_row_action: None,
+            pending_popout_message_ids: std::collections::HashSet::new(),
             pending_eml_export: None,
             pending_undo: None,
             last_move_undo: None,
@@ -1927,6 +1931,9 @@ impl HylkiApp {
                     let pending = self.pending_row_action.take();
                     self.set_selected_message(detail.clone());
                     self.error_banner = None;
+                    if self.pending_popout_message_ids.remove(&detail.id) {
+                        self.pop_out_message_window(detail.clone(), cx);
+                    }
                     // B-2：行菜单挂起的动作（回复 / 复制正文 / 查看原文）在正文就绪后执行。
                     if let Some((msg_id, action)) = pending {
                         if msg_id == detail.id {
@@ -4874,6 +4881,11 @@ impl HylkiApp {
             return;
         }
         self.close_compose_window(cx);
+        self.compose_detached = true;
+        self.compose_split = false;
+        // 独立窗口写信时，主窗口保持在阅读模式，不展示回信页面。
+        self.right_mode = RightPaneMode::Reader;
+
         let subject = self.compose_subject.read(cx).value().to_string();
         let title = if subject.trim().is_empty() {
             "写邮件".to_string()
@@ -4891,28 +4903,41 @@ impl HylkiApp {
             }),
             ..Default::default()
         };
-        let opened = gpui_kit::open_window(options, cx, move |window, cx| {
-            window.set_window_title(&title);
-            cx.new(|cx| ComposeWindow::new(app_entity, window, cx))
+        // 独立窗口首帧渲染会借用主窗口实体，等当前更新释放实体借用后再打开，避免重入 panic。
+        let app_entity_for_new = app_entity.clone();
+        cx.defer(move |cx| {
+            let opened = gpui_kit::open_window(options, cx, move |window, cx| {
+                window.set_window_title(&title);
+                cx.new(|cx| ComposeWindow::new(app_entity_for_new, window, cx))
+            });
+            match opened {
+                Ok((handle, _entity)) => {
+                    #[cfg(target_os = "windows")]
+                    crate::apply_window_icon();
+                    let _ = app_entity.update(cx, |app, cx| {
+                        app.compose_window = Some(handle);
+                        app.compose_detached = true;
+                        cx.notify();
+                    });
+                }
+                Err(err) => {
+                    let _ = app_entity.update(cx, |app, cx| {
+                        app.compose_detached = false;
+                        app.status_line =
+                            SharedString::from(format!("无法打开独立写信窗口：{err}"));
+                        cx.notify();
+                    });
+                }
+            }
         });
-        match opened {
-            Ok((handle, _entity)) => {
-                #[cfg(target_os = "windows")]
-                crate::apply_window_icon();
-                self.compose_window = Some(handle);
-                self.compose_detached = true;
-            }
-            Err(err) => {
-                self.status_line = SharedString::from(format!("无法打开独立写信窗口：{err}"));
-            }
-        }
         cx.notify();
     }
 
     /// 把独立窗口里的写信收回主窗口（`↙` 按钮；窗口关闭回调也走这里）。
     pub(crate) fn attach_compose_back(&mut self, cx: &mut Context<Self>) {
-        self.compose_window = None;
+        self.close_compose_window(cx);
         self.set_compose_detached(false, cx);
+        self.right_mode = RightPaneMode::Compose;
     }
 
     /// 标记写信是否仍寄居在独立窗口（窗口被关掉时由关闭回调复位）。
@@ -4932,6 +4957,7 @@ impl HylkiApp {
     fn finish_compose_session(&mut self, cx: &mut Context<Self>) {
         self.compose_session_generation += 1;
         self.compose_split = false;
+        self.right_mode = RightPaneMode::Reader;
         if self.compose_detached {
             self.close_compose_window(cx);
             self.compose_detached = false;
@@ -4943,6 +4969,7 @@ impl HylkiApp {
         if let Some(handle) = self.compose_window.take() {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
+        self.compose_detached = false;
     }
 
     pub(crate) fn start_new_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4998,6 +5025,9 @@ impl HylkiApp {
         self.begin_compose_session(false, cx);
         self.right_mode = RightPaneMode::Compose;
         self.ensure_contacts_loaded();
+        if !self.prefs.compose_inline {
+            self.pop_out_compose(cx);
+        }
         cx.notify();
     }
 
@@ -5164,6 +5194,9 @@ impl HylkiApp {
                 });
             }
         }
+        if !self.prefs.reply_inline {
+            self.pop_out_compose(cx);
+        }
         cx.notify();
     }
 
@@ -5197,6 +5230,9 @@ impl HylkiApp {
         self.begin_compose_session(true, cx);
         self.right_mode = RightPaneMode::Compose;
         self.ensure_contacts_loaded();
+        if !self.prefs.reply_inline {
+            self.pop_out_compose(cx);
+        }
         cx.notify();
     }
 
@@ -5261,6 +5297,9 @@ impl HylkiApp {
         self.begin_compose_session(true, cx);
         self.right_mode = RightPaneMode::Compose;
         self.ensure_contacts_loaded();
+        if !self.prefs.reply_inline {
+            self.pop_out_compose(cx);
+        }
         cx.notify();
     }
 

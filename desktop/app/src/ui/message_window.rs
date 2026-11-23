@@ -13,6 +13,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::{RangeHighlight, TextView, TextViewState};
+use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -28,8 +29,9 @@ use crate::app::{split_sender, HylkiApp};
 use crate::theme;
 use crate::ui::{avatar, print_preview, reader, window_controls};
 use crate::webview_host::{
-    build_document, supports_document, BodyView, DocumentAppearance, WebViewHost,
+    build_document_content, supports_document, BodyView, DocumentAppearance, WebViewHost,
 };
+use hylki_mail_core::verify::{check_sender_summary, SenderTrust};
 
 pub(crate) struct MessageWindow {
     detail: MessageDetail,
@@ -355,7 +357,7 @@ impl Render for MessageWindow {
                 .as_deref()
                 .filter(|html| supports_document(html))
             {
-                let document = build_document(html, &d.subject, &d.sender, appearance);
+                let document = build_document_content(html, appearance);
                 load_scheduled = true;
                 cx.defer_in(window, move |this, window, cx| {
                     if this.webview_appearance != settings {
@@ -452,7 +454,11 @@ impl Render for MessageWindow {
                                 let d = d_reply.clone();
                                 let _ = app_weak.update(cx, |app, cx| {
                                     app.start_reply(&d, window, cx);
+                                    if !app.compose_detached {
+                                        app.pop_out_compose(cx);
+                                    }
                                 });
+                                window.remove_window();
                             }),
                     )
                     .child({
@@ -466,7 +472,11 @@ impl Render for MessageWindow {
                                 let d = d_reply_all.clone();
                                 let _ = app_w.update(cx, |app, cx| {
                                     app.start_reply_all(&d, window, cx);
+                                    if !app.compose_detached {
+                                        app.pop_out_compose(cx);
+                                    }
                                 });
+                                window.remove_window();
                             })
                     })
                     .child({
@@ -480,7 +490,11 @@ impl Render for MessageWindow {
                                 let d = d_fwd.clone();
                                 let _ = app_w.update(cx, |app, cx| {
                                     app.start_forward(&d, window, cx);
+                                    if !app.compose_detached {
+                                        app.pop_out_compose(cx);
+                                    }
                                 });
+                                window.remove_window();
                             })
                     })
                     .child({
@@ -649,6 +663,169 @@ impl Render for MessageWindow {
                         ),
                 )
             })
+            // 邮件头部信息区：主题、发件人头像/姓名/邮箱/认证状态/时间、收件人/抄送、附件列表。
+            .child({
+                let sender_check = check_sender_summary(&d.sender, d.auth_results.as_deref());
+                let trust_badge = match sender_check.trust {
+                    SenderTrust::Pass => Some(("已验证", hsla(0.38, 0.65, 0.36, 1.0))),
+                    SenderTrust::Suspicious => Some(("疑似仿冒", hsla(0.10, 0.85, 0.45, 1.0))),
+                    SenderTrust::Fail => Some(("校验失败", p.danger)),
+                    SenderTrust::Unverified => None,
+                };
+                let app_for_att = self.app_entity.clone();
+                let has_recipients = !d.recipients.trim().is_empty();
+                let has_cc = !d.cc.trim().is_empty();
+                let has_att = !d.attachments.is_empty();
+
+                v_flex()
+                    .px_6()
+                    .pt_4()
+                    .pb_3()
+                    .gap_3()
+                    .bg(p.surface_raised)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_size(px(20.0))
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .text_color(p.text)
+                            .child(SharedString::from(if d.subject.trim().is_empty() {
+                                "(无主题)".to_string()
+                            } else {
+                                d.subject.clone()
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(avatar::avatar(&display_name, &sender_email, 34.0))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                                    .text_color(p.text)
+                                                    .truncate()
+                                                    .child(SharedString::from(display_name)),
+                                            )
+                                            .when(!sender_email.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(muted_fg)
+                                                        .truncate()
+                                                        .child(SharedString::from(format!(
+                                                            "<{sender_email}>"
+                                                        ))),
+                                                )
+                                            })
+                                            .when_some(trust_badge, |el, (label, color)| {
+                                                el.child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded_full()
+                                                        .bg(canvas)
+                                                        .border_1()
+                                                        .border_color(color.opacity(0.45))
+                                                        .text_color(color)
+                                                        .text_xs()
+                                                        .child(SharedString::from(label)),
+                                                )
+                                            }),
+                                    )
+                                    .when(has_recipients || has_cc, |el| {
+                                        let d_recip = d.recipients.trim().to_string();
+                                        let d_cc = d.cc.trim().to_string();
+                                        el.child(
+                                            v_flex()
+                                                .gap_0p5()
+                                                .text_xs()
+                                                .text_color(muted_fg)
+                                                .when(has_recipients, |row| {
+                                                    row.child(div().truncate().child(SharedString::from(format!(
+                                                        "收件人：{d_recip}"
+                                                    ))))
+                                                })
+                                                .when(has_cc, |row| {
+                                                    row.child(div().truncate().child(SharedString::from(format!(
+                                                        "抄送：{d_cc}"
+                                                    ))))
+                                                }),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(SharedString::from(formatted_date)),
+                            ),
+                    )
+                    .when(has_att, |el| {
+                        el.child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .children(d.attachments.iter().map(|att| {
+                                    let att_id = att.id;
+                                    let filename = att.filename.clone();
+                                    let size_kb = (att.size_bytes + 1023) / 1024;
+                                    let app_w = app_for_att.clone();
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(8.0))
+                                        .border_1()
+                                        .border_color(border)
+                                        .bg(canvas)
+                                        .child(
+                                            Icon::new(IconName::Paperclip)
+                                                .with_size(px(14.0))
+                                                .text_color(muted_fg),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .max_w(px(200.0))
+                                                .truncate()
+                                                .child(SharedString::from(filename.clone())),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted_fg)
+                                                .child(SharedString::from(format!("{size_kb} KB"))),
+                                        )
+                                        .child(
+                                            Button::new(("popout-save-att", att_id))
+                                                .ghost()
+                                                .compact()
+                                                .icon(IconName::Download)
+                                                .tooltip("保存附件")
+                                                .on_click(move |_, _, cx| {
+                                                    let fn_clone = filename.clone();
+                                                    let _ = app_w.update(cx, |app, cx| {
+                                                        app.save_attachment(att_id, &fn_clone, cx);
+                                                    });
+                                                }),
+                                        )
+                                })),
+                        )
+                    })
+            })
             // 邮件正文滚动区。
             .when(body_view == BodyView::Loading, |root| {
                 root.child(reader::body_loading(background, body_muted).flex_1().min_h_0())
@@ -694,53 +871,12 @@ impl Render for MessageWindow {
                         .p_6()
                         .gap_4()
                         .child(
-                            div()
-                                .text_size(px(20.0))
-                                .font_weight(gpui_kit::FontWeight::BOLD)
-                                .child(SharedString::from(d.subject.clone())),
-                        )
-                        .child(
                             v_flex()
                                 .p_5()
                                 .gap_3()
                                 .rounded(px(12.0))
                                 .border_1()
                                 .border_color(border)
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(avatar::avatar(&display_name, &sender_email, 34.0))
-                                        .child(
-                                            v_flex()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .font_weight(gpui_kit::FontWeight::BOLD)
-                                                        .truncate()
-                                                        .child(SharedString::from(display_name)),
-                                                )
-                                                .when(!sender_email.is_empty(), |el| {
-                                                    el.child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(body_muted)
-                                                            .truncate()
-                                                            .child(SharedString::from(format!(
-                                                                "<{sender_email}>"
-                                                            ))),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(body_muted)
-                                                .child(SharedString::from(formatted_date)),
-                                        ),
-                                )
                                 .child(div().text_size(px(14.0)).child(
                                     TextView::new(&text_state)
                                         .image_source(move |uri| crate::webview_host::mail_image_source(uri, allow_remote))

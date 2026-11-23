@@ -197,6 +197,10 @@ pub(crate) fn build_document(
     make_document(html, Some((subject, sender)), appearance)
 }
 
+pub(crate) fn build_document_content(html: &str, appearance: DocumentAppearance) -> Vec<u8> {
+    make_document(html, None, appearance)
+}
+
 fn make_document(
     html: &str,
     header: Option<(&str, &str)>,
@@ -1196,5 +1200,19 @@ mod tests {
         ))
         .unwrap();
         assert!(clamped.contains("zoom:250%"));
+    }
+
+    #[test]
+    fn build_document_content_omits_header() {
+        let (background, foreground) = crate::theme::reader_body_colors(false);
+        let light = DocumentAppearance {
+            dark: false,
+            zoom_percent: 100,
+            background,
+            foreground,
+        };
+        let document = String::from_utf8(build_document_content("<p>正文内容</p>", light)).unwrap();
+        assert!(!document.contains("<header>"));
+        assert!(document.contains("<iframe"));
     }
 }

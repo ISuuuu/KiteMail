@@ -494,11 +494,12 @@ pub struct AppPreferences {
     /// Default sender account email for new messages (`""` = auto / current account).
     #[serde(default)]
     pub compose_default_from: String,
-    /// Whether reply / reply-all / forward open as an inline split under the
-    /// reader (original `compose_inline` / `reply_inline`, default on) instead
-    /// of taking over the whole reading pane.
+    /// Whether new messages open in the main window (true) or their own window (false).
     #[serde(default = "default_true")]
     pub compose_inline: bool,
+    /// Whether reply / reply-all / forward open in the main window (true) or their own window (false).
+    #[serde(default = "default_true")]
+    pub reply_inline: bool,
     /// Place signature above quoted text when replying or forwarding.
     #[serde(default = "default_true")]
     pub signature_above_quote: bool,
@@ -1147,6 +1148,7 @@ impl Default for AppPreferences {
             reader_default_mode: "remember".to_string(),
             compose_default_from: String::new(),
             compose_inline: true,
+            reply_inline: true,
             signature_above_quote: true,
             signature_dashes: false,
             undo_send_secs: 5,
@@ -2435,6 +2437,18 @@ smtp_separate_credentials = false
         assert!(prefs.remove_remote_sender("Alice <ALICE@EXAMPLE.COM>"));
         assert!(prefs.allowed_remote_senders.is_empty());
         assert!(!prefs.remove_remote_sender("missing@example.com"));
+    }
+
+    #[test]
+    fn compose_and_reply_inline_preferences_roundtrip() {
+        let defaults = AppPreferences::default();
+        assert!(defaults.compose_inline);
+        assert!(defaults.reply_inline);
+
+        let toml_str = "compose_inline = false\nreply_inline = false\n";
+        let parsed: AppPreferences = toml::from_str(toml_str).expect("parse toml");
+        assert!(!parsed.compose_inline);
+        assert!(!parsed.reply_inline);
     }
 
     #[test]
