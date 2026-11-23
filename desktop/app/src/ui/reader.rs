@@ -563,6 +563,7 @@ fn render_message_card(
                                 .id(("reader-card-hdr", msg_id))
                                 .flex_1()
                                 .min_w_0()
+                                .overflow_hidden()
                                 .items_center()
                                 .gap_2()
                                 .cursor_pointer()

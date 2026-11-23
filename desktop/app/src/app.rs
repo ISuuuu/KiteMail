@@ -8412,11 +8412,12 @@ impl HylkiApp {
                     .children(sidebar_el)
                     .child(
                         v_flex()
-                            .w(px(self.list_width))
+                            .flex_1()
+                            .min_w_0()
                             .h_full()
-                            .flex_shrink_0()
                             .child(
                                 div()
+                                    .w_full()
                                     .h(px(self.list_below_height))
                                     .min_h(px(BELOW_LIST_MIN_HEIGHT))
                                     .flex_shrink_0()

@@ -1899,7 +1899,12 @@ pub(crate) fn render(
         .h_full()
         .flex_shrink_0()
         .bg(surface)
-        .border_r_1()
+        .when(app.reader_position == ReaderPosition::Right, |el| {
+            el.border_r_1()
+        })
+        .when(app.reader_position == ReaderPosition::Below, |el| {
+            el.border_b_1()
+        })
         .border_color(border)
         // 顶部栏 48px（与左栏、右栏对齐）：折叠开关 + 🔍 图标 + 计数 + 筛选下拉。
         // 搜索框收纳进顶栏下方按需展开的搜索栏行（对齐原版 L-3）。
