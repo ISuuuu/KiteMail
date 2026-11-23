@@ -5312,18 +5312,29 @@ impl HylkiApp {
         }
     }
 
-    pub(crate) fn save_attachment(&self, att_id: u32, filename: &str) {
+    pub(crate) fn save_attachment(&self, att_id: u32, filename: &str, cx: &mut Context<Self>) {
         if self.demo_mode {
             return;
         }
-        if let Some(dest) = rfd::FileDialog::new().set_file_name(filename).save_file() {
-            if let Some(ref w) = self.worker {
-                w.send(MailRequest::SaveAttachment {
-                    attachment_id: att_id,
-                    dest_path: dest,
+        // 在后台线程弹出系统文件保存对话框，避免嵌套 Win32 消息循环阻塞主线程并在事件分发期间重入 AppCell::borrow_mut。
+        let filename = filename.to_string();
+        cx.spawn(async move |this, cx| {
+            let dest = cx
+                .background_executor()
+                .spawn(async move { rfd::FileDialog::new().set_file_name(&filename).save_file() })
+                .await;
+            if let Some(dest) = dest {
+                let _ = this.update(cx, |app, _cx| {
+                    if let Some(ref w) = app.worker {
+                        w.send(MailRequest::SaveAttachment {
+                            attachment_id: att_id,
+                            dest_path: dest,
+                        });
+                    }
                 });
             }
-        }
+        })
+        .detach();
     }
 
     /// 选择目标目录并批量导出指定附件列表（重名自动追加 `(1)` 后缀）。
@@ -5340,20 +5351,30 @@ impl HylkiApp {
             cx.notify();
             return;
         }
-        if let Some(dest_dir) = rfd::FileDialog::new().pick_folder() {
-            if let Some(ref w) = self.worker {
-                self.status_line = SharedString::from(format!(
-                    "正在保存 {} 个附件至 {}...",
-                    attachment_ids.len(),
-                    dest_dir.display()
-                ));
-                w.send(MailRequest::SaveAllAttachments {
-                    attachment_ids,
-                    dest_dir,
+        // 同上，放到后台线程执行，避免模态目录选择器嵌套消息循环触发 AppCell 重入 panic。
+        cx.spawn(async move |this, cx| {
+            let dest_dir = cx
+                .background_executor()
+                .spawn(async move { rfd::FileDialog::new().pick_folder() })
+                .await;
+            if let Some(dest_dir) = dest_dir {
+                let _ = this.update(cx, |app, cx| {
+                    if let Some(ref w) = app.worker {
+                        app.status_line = SharedString::from(format!(
+                            "正在保存 {} 个附件至 {}...",
+                            attachment_ids.len(),
+                            dest_dir.display()
+                        ));
+                        w.send(MailRequest::SaveAllAttachments {
+                            attachment_ids,
+                            dest_dir,
+                        });
+                    }
+                    cx.notify();
                 });
             }
-            cx.notify();
-        }
+        })
+        .detach();
     }
 
     // ---- WP-09：引用折叠、附件抽屉、页内查找、打印预览与独立窗口 ----
@@ -7262,7 +7283,7 @@ impl HylkiApp {
                     // 账号筛选由组件内部做客户端过滤，无需重新请求。
                     GalleryEvent::AccountFilterChanged(_) => {}
                     GalleryEvent::SaveAttachment(attachment_id) => {
-                        this.save_gallery_attachment(*attachment_id);
+                        this.save_gallery_attachment(*attachment_id, cx);
                     }
                     GalleryEvent::LocateMessage(message_id) => {
                         this.locate_gallery_message(*message_id, cx);
@@ -7304,14 +7325,14 @@ impl HylkiApp {
     }
 
     /// 附件总览「保存」：复用现有 rfd 保存对话框 + `SaveAttachment` 流程。
-    fn save_gallery_attachment(&self, attachment_id: u32) {
+    fn save_gallery_attachment(&self, attachment_id: u32, cx: &mut Context<Self>) {
         let filename = self
             .gallery_items
             .iter()
             .find(|item| item.id == attachment_id)
             .map(|item| item.filename.clone())
             .unwrap_or_else(|| "attachment".to_string());
-        self.save_attachment(attachment_id, &filename);
+        self.save_attachment(attachment_id, &filename, cx);
     }
 
     /// 附件总览「定位到原邮件」：切回三栏并加载该邮件正文。

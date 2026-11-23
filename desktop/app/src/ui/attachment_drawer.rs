@@ -222,8 +222,8 @@ pub(crate) fn render_drawer(
                                 .compact()
                                 .icon(IconName::Download)
                                 .tooltip("保存附件")
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.save_attachment(att_id, &save_name);
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.save_attachment(att_id, &save_name, cx);
                                 })),
                         )
                         .when(!demo_mode && !is_confirming, |r| {
@@ -369,8 +369,8 @@ pub(crate) fn render_drawer(
                                                 .compact()
                                                 .icon(IconName::Download)
                                                 .tooltip("保存附件")
-                                                .on_click(cx.listener(move |this, _, _, _| {
-                                                    this.save_attachment(att_id, &save_name);
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.save_attachment(att_id, &save_name, cx);
                                                 })),
                                         )
                                         .when(!demo_mode && !is_confirming, |r| {

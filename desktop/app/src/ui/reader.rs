@@ -528,8 +528,8 @@ fn render_message_card(
                         .compact()
                         .icon(IconName::Download)
                         .tooltip("保存附件")
-                        .on_click(cx.listener(move |this, _, _, _| {
-                            this.save_attachment(att_id, &filename);
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save_attachment(att_id, &filename, cx);
                         })),
                 )
                 .into_any_element()
