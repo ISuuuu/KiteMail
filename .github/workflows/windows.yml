@@ -9,10 +9,12 @@ on:
     tags: ['v*']
     paths:
       - "desktop/**"
+      - ".github/nsis/**"
       - ".github/workflows/windows.yml"
   pull_request:
     paths:
       - "desktop/**"
+      - ".github/nsis/**"
       - ".github/workflows/windows.yml"
   workflow_dispatch:
     inputs:
@@ -100,37 +102,105 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-desktop-cargo-
 
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          if ("${{ github.event_name }}" -ne 'push' -or $version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') {
+            $version = '0.0.0-dev'
+          }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          $nsis = 'C:\Program Files (x86)\NSIS'
+          if (-not (Test-Path "$nsis\makensis.exe")) { throw 'NSIS not found' }
+          $nsis | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Build release binary
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+          HYLKI_VERSION: ${{ steps.version.outputs.version }}
         run: cargo build --manifest-path desktop/Cargo.toml -p hylki-windows --release --target x86_64-pc-windows-msvc --locked
 
-      - name: Package Windows x64 ZIP
+      - name: Build NSIS installer
         shell: pwsh
         run: |
-          $stage = "dist/hylki-windows-x64"
+          $version = "${{ steps.version.outputs.version }}"
+          # VIProductVersion 只接受四段纯数字，去掉预发布后缀。
+          $vi = ($version -split '-')[0] + '.0'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          makensis /DVERSION=$version /DVI_VERSION=$vi .github/nsis/hylki.nsi
+          $setup = "dist/Hylki_${version}_x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "Installer was not produced: $setup" }
+
+      - name: Package portable ZIP
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $stage = "dist/Hylki_v${version}_portable"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/hylki-windows.exe" $stage
           Copy-Item "LICENSE" $stage
           Copy-Item "README.md" $stage
-          @"
-          Hylki Windows x64 — AGPL-3.0-or-later Source Offer
-          Commit: $(git rev-parse HEAD)
-          Repository: https://github.com/${{ github.repository }}
-          License: GNU Affero General Public License v3.0 or later (see LICENSE)
-          "@ | Set-Content -Encoding UTF8 "$stage/SOURCE_OFFER.txt"
-          Compress-Archive -Path "$stage/*" -DestinationPath "dist/hylki-windows-x64.zip" -Force
+          # 便携版标记：客户端据此选择 zip 就地更新，而不是运行安装包。
+          New-Item -ItemType File -Path "$stage/portable.flag" | Out-Null
+          @(
+            'Hylki Windows x64 - AGPL-3.0-or-later Source Offer',
+            ('Commit: ' + (git rev-parse HEAD)),
+            'Repository: https://github.com/${{ github.repository }}',
+            'License: GNU Affero General Public License v3.0 or later (see LICENSE)'
+          ) | Set-Content -Encoding UTF8 "$stage/SOURCE_OFFER.txt"
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/Hylki_v${version}_portable.zip" -Force
 
-      - name: Upload Windows x64 ZIP artifact
+      - name: Generate update manifest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = "v$version"
+          $base = "https://github.com/${{ github.repository }}/releases/download/$tag"
+          $setup = "Hylki_${version}_x64-setup.exe"
+          $portable = "Hylki_v${version}_portable.zip"
+          $notes = ''
+          if (Test-Path 'tools/release-notes.sh') {
+            $notes = (bash tools/release-notes.sh $version 2>$null) -join "`n"
+          }
+          $manifest = [ordered]@{
+            version = $version
+            notes = $notes
+            pub_date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            platforms = [ordered]@{
+              'windows-x86_64' = [ordered]@{
+                url = "$base/$setup"
+                sha256 = (Get-FileHash "dist/$setup" -Algorithm SHA256).Hash.ToLower()
+              }
+              'windows-x86_64-portable' = [ordered]@{
+                url = "$base/$portable"
+                sha256 = (Get-FileHash "dist/$portable" -Algorithm SHA256).Hash.ToLower()
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 'dist/latest.json'
+
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: hylki-windows-x64
-          path: dist/hylki-windows-x64.zip
+          path: |
+            dist/Hylki_*_x64-setup.exe
+            dist/Hylki_v*_portable.zip
+            dist/latest.json
+          if-no-files-found: error
 
       # The release page is written by hand (docs/RELEASING.md), so this only
-      # adds the asset: to the release if it exists, otherwise to a draft that
+      # adds the assets: to the release if it exists, otherwise to a draft that
       # carries the notes tools/release-notes.sh would have produced.
-      - name: Attach the zip to the release
+      - name: Attach artifacts to the release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.check.outputs.checkout_sha == github.sha
         shell: bash
         env:
@@ -139,10 +209,11 @@ jobs:
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
           version="${tag#v}"
+          assets=(dist/Hylki_*_x64-setup.exe dist/Hylki_v*_portable.zip dist/latest.json)
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/hylki-windows-x64.zip --clobber
+            gh release upload "$tag" "${assets[@]}" --clobber
             exit 0
           fi
           notes=$(mktemp)
           tools/release-notes.sh "$version" >"$notes" 2>/dev/null || printf 'Hylki %s\n' "$version" >"$notes"
-          gh release create "$tag" --draft --title "Hylki $version" --notes-file "$notes" dist/hylki-windows-x64.zip
+          gh release create "$tag" --draft --title "Hylki $version" --notes-file "$notes" "${assets[@]}"

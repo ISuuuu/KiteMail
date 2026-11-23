@@ -358,6 +358,9 @@ pub struct AppPreferences {
     /// Show desktop notifications when background sync finds new unread mail.
     #[serde(default = "default_true")]
     pub desktop_notifications: bool,
+    /// Check GitHub releases for a newer Windows build shortly after launch.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
     /// Show sender and subject in desktop notifications.
     #[serde(default = "default_true")]
     pub notification_show_content: bool,
@@ -1097,6 +1100,7 @@ impl Default for AppPreferences {
             close_to_minimize: true,
             minimize_to_tray: true,
             desktop_notifications: true,
+            check_updates: true,
             notification_show_content: true,
             ui_text_scale_percent: 100,
             settings_open_accounts: false,

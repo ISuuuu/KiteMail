@@ -24,6 +24,7 @@ dirs = "5"
 toml = "0.8"
 rfd = "0.15"
 ureq = { version = "2", features = ["json"] }
+semver = "1"
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"

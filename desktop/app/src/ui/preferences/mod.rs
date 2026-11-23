@@ -879,7 +879,7 @@ impl SettingsWindow {
              自动同步: {} 分钟 推送={} 计费省流={}\n\
              黑名单发件人: {} 条\n\
              导出时间: {}\n",
-            env!("CARGO_PKG_VERSION"),
+            crate::app::app_version(),
             if app.demo_mode {
                 "演示模式（内存模拟）"
             } else {

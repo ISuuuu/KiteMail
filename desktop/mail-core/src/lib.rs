@@ -26,6 +26,7 @@ pub mod secrets;
 pub mod smtp_client;
 pub mod snooze;
 pub mod strip;
+pub mod update;
 pub mod verify;
 pub mod worker;
 
@@ -131,6 +132,9 @@ pub struct ThreadMessage {
     pub subject: String,
     pub sender: String,
     pub recipients: String,
+    /// 逗号分隔的抄送人（Cc 头）；无抄送或旧缓存为空串。
+    #[serde(default)]
+    pub cc: String,
     #[serde(default)]
     pub date_ts: i64,
     pub date_display: String,
@@ -160,6 +164,9 @@ pub struct MessageDetail {
     pub rfc_message_id: String,
     pub sender: String,
     pub recipients: String,
+    /// 逗号分隔的抄送人（Cc 头）；旧缓存为空串。
+    #[serde(default)]
+    pub cc: String,
     pub subject: String,
     #[serde(default)]
     pub date_ts: i64,

@@ -455,6 +455,13 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     },
     PrefSearchItem {
         tab: PrefTab::System,
+        row_id: "pref-check-updates",
+        title: "启动时检查更新",
+        subtitle: "启动后读取 GitHub 最新发布并在状态栏提示可用的新版本",
+        keywords: "update upgrade release github 更新 升级 新版本",
+    },
+    PrefSearchItem {
+        tab: PrefTab::System,
         row_id: "pref-about-version",
         title: "Hylki Windows 版本与引擎信息",
         subtitle: "查看当前客户端版本与桌面底层框架说明",

@@ -3390,6 +3390,23 @@ fn render_system(
             p,
         ))
         .child(setting_group(
+            "软件更新",
+            None,
+            CARD_MAX_WIDTH,
+            vec![prefs_switch_row(
+                &app_entity,
+                "pref-check-updates",
+                "启动时检查更新",
+                Some("启动约 10 秒后读取 GitHub 最新发布；发现新版本时在状态栏提示，可在「关于 Hylki」中安装"),
+                prefs.check_updates,
+                false,
+                is_hit(win, "pref-check-updates"),
+                |p, val| p.check_updates = val,
+                p,
+            )],
+            p,
+        ))
+        .child(setting_group(
             "关于 Hylki Windows",
             None,
             CARD_MAX_WIDTH,
@@ -3397,7 +3414,7 @@ fn render_system(
                 info_row(
                     "pref-about-version",
                     "版本号",
-                    format!("v{}", env!("CARGO_PKG_VERSION")),
+                    format!("v{}", crate::app::app_version()),
                     is_hit(win, "pref-about-version"),
                     p,
                 ),

@@ -19,7 +19,7 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{resize_handle, HandleEdge};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::{RangeHighlight, TextViewState};
-use gpui_kit::component::{h_flex, v_flex, Icon};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Icon};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     actions, black, div, img, point, px, size, AnyWindowHandle, AppContext, Axis, Bounds,
@@ -625,6 +625,22 @@ enum SettingsOpenTarget {
     PresetAccount(usize),
 }
 
+/// 检查更新流程状态（关于浮层里展示；启动检查只写状态栏）。
+#[derive(Default)]
+pub(crate) struct UpdateState {
+    pub(crate) checking: bool,
+    pub(crate) downloading: bool,
+    pub(crate) info: Option<hylki_mail_core::update::UpdateInfo>,
+    pub(crate) error: Option<SharedString>,
+    /// 最近一次检查的结论（已是最新 / 正在检查）。
+    pub(crate) status: Option<SharedString>,
+}
+
+/// 构建版本：发布流水线注入 `HYLKI_VERSION`（标签去掉 v），本地构建回落到 Cargo 版本。
+pub(crate) fn app_version() -> &'static str {
+    option_env!("HYLKI_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// 当前全局浮层（命令面板、快捷键、关于）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActiveModal {
@@ -819,6 +835,8 @@ pub(crate) struct HylkiApp {
 
     pub(crate) status_line: SharedString,
     pub(crate) error_banner: Option<SharedString>,
+    /// 更新检查 / 下载 / 安装状态。
+    pub(crate) update: UpdateState,
 
     // 迭代 1 新增：纯视觉状态（不影响后端行为）
     /// 当前主题（`theme::THEME_LIST` 中的 id）。
@@ -1340,6 +1358,7 @@ impl HylkiApp {
                 cfg_feedback: None,
                 status_line: SharedString::from("演示模式 (--demo)：已加载 10,000 封模拟邮件"),
                 error_banner: None,
+                update: UpdateState::default(),
                 theme_id: initial_theme_id,
                 dark_mode: initial_dark_mode,
                 system_dark_mode,
@@ -1569,6 +1588,7 @@ impl HylkiApp {
             cfg_feedback: None,
             status_line,
             error_banner: None,
+            update: UpdateState::default(),
             theme_id: initial_theme_id,
             dark_mode: initial_dark_mode,
             system_dark_mode,
@@ -1658,6 +1678,18 @@ impl HylkiApp {
         // 启动视图非统一收件箱时立即请求对应列表（LoadAllCached 只覆盖收件箱）。
         if app.current_view != CurrentView::UnifiedInbox {
             app.reload_current_page(cx);
+        }
+
+        // 启动后延迟检查更新：避开首屏加载，结果只写状态栏（设置中可关闭）。
+        // 调试构建的版本号与发布标签不一致，自动检查只会误报，跳过。
+        if app.prefs.check_updates && !cfg!(debug_assertions) {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_secs(10))
+                    .await;
+                let _ = this.update(cx, |app, cx| app.check_updates(false, cx));
+            })
+            .detach();
         }
         app
     }
@@ -3144,6 +3176,15 @@ impl HylkiApp {
     /// 临时允许指定邮件加载远程图片。
     pub(crate) fn allow_remote_images_for(&mut self, message_id: u32, cx: &mut Context<Self>) {
         self.allowed_remote_image_ids.insert(message_id);
+        cx.notify();
+    }
+
+    /// 总是信任并允许指定发件人加载远程图片（持久化到偏好设置）。
+    pub(crate) fn trust_remote_sender(&mut self, sender: &str, cx: &mut Context<Self>) {
+        let sender = sender.to_string();
+        self.mutate_preferences(cx, |p| {
+            p.allow_remote_sender(&sender);
+        });
         cx.notify();
     }
 
@@ -6837,8 +6878,10 @@ impl HylkiApp {
         }
     }
 
-    pub(crate) fn remote_images_allowed(&self, id: u32) -> bool {
-        !self.prefs.block_remote_images || self.allowed_remote_image_ids.contains(&id)
+    pub(crate) fn remote_images_allowed(&self, id: u32, sender: &str) -> bool {
+        !self.prefs.block_remote_images
+            || self.allowed_remote_image_ids.contains(&id)
+            || self.prefs.is_remote_sender_allowed(sender)
     }
 
     /// WP-05：按「系统 → 链接打开方式」偏好打开邮件内链接。`system` 走
@@ -7314,6 +7357,88 @@ impl HylkiApp {
         cx.notify();
     }
 
+    /// 检查 GitHub 最新发布；`manual` 为 true 时在关于浮层展示进度与结论。
+    pub(crate) fn check_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.update.checking || self.update.downloading {
+            return;
+        }
+        self.update.checking = true;
+        self.update.error = None;
+        if manual {
+            self.update.status = Some(SharedString::from("正在检查更新…"));
+        }
+        cx.notify();
+        let current = app_version();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { hylki_mail_core::update::check(current) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.update.checking = false;
+                match result {
+                    Ok(Some(info)) => {
+                        app.update.status = Some(SharedString::from(format!(
+                            "发现新版本 v{}（当前 v{}）",
+                            info.version, info.current_version
+                        )));
+                        app.status_line = SharedString::from(format!(
+                            "发现新版本 v{}，可在「关于 Hylki」中更新",
+                            info.version
+                        ));
+                        app.update.info = Some(info);
+                    }
+                    Ok(None) => {
+                        app.update.info = None;
+                        app.update.status = Some(SharedString::from("当前已是最新版本"));
+                    }
+                    Err(error) => {
+                        app.update.error = Some(SharedString::from(error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 下载已发现的更新并安装；安装版静默运行安装包，便携版替换 exe 后重启。
+    pub(crate) fn download_and_install_update(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = self.update.info.clone() else {
+            return;
+        };
+        if self.update.downloading {
+            return;
+        }
+        self.update.downloading = true;
+        self.update.error = None;
+        self.update.status = Some(SharedString::from(format!("正在下载 v{}…", info.version)));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let bytes = hylki_mail_core::update::download(&info)?;
+                    hylki_mail_core::update::install(&info, &bytes)
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| match result {
+                Ok(()) => {
+                    app.status_line = SharedString::from("正在安装更新，程序即将重启…");
+                    cx.notify();
+                    app.quit_app(cx);
+                }
+                Err(error) => {
+                    app.update.downloading = false;
+                    app.update.status = None;
+                    app.update.error = Some(SharedString::from(error));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     // ---- 阶段二：文件夹右键动作（对齐原版 sidebar/menus.rs 的 folder_menu_items）----
 
     /// 右键「刷新此文件夹」：复用现有 `MailRequest::SyncFolder`（demo 模式禁用）。
@@ -7606,28 +7731,28 @@ impl HylkiApp {
     // ---- F-7 一键退订 ----
 
     /// 退订横幅「退订」按钮：进入卡内二次确认（对齐原版 confirm 流程）。
+    #[allow(dead_code)]
     pub(crate) fn request_unsubscribe(&mut self, message_id: u32, cx: &mut Context<Self>) {
         self.pending_unsubscribe = Some(message_id);
         cx.notify();
     }
 
     /// 退订确认条「取消」。
+    #[allow(dead_code)]
     pub(crate) fn cancel_unsubscribe(&mut self, cx: &mut Context<Self>) {
         self.pending_unsubscribe = None;
         cx.notify();
     }
 
-    /// 确认退订：one-click 句柄直接 POST（原版行为）；https 打开浏览器；
+    /// 执行退订：one-click 句柄直接 POST（原版行为）；https 打开浏览器；
     /// mailto 交给系统处理（gpui open_url 走系统 shell，可唤起默认邮件客户端）。
-    pub(crate) fn confirm_unsubscribe(&mut self, _message_id: u32, cx: &mut Context<Self>) {
+    pub(crate) fn trigger_unsubscribe(
+        &mut self,
+        url: &str,
+        one_click: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.pending_unsubscribe = None;
-        let Some((url, one_click)) = self.selected_message.as_ref().and_then(|d| {
-            d.unsubscribe_url
-                .clone()
-                .map(|u| (u, d.unsubscribe_one_click))
-        }) else {
-            return;
-        };
         let lower = url.to_ascii_lowercase();
         if one_click && lower.starts_with("https://") {
             if self.demo_mode {
@@ -7638,21 +7763,35 @@ impl HylkiApp {
             }
             if let Some(ref w) = self.worker {
                 self.status_line = SharedString::from("正在发送一键退订请求...");
-                w.send(MailRequest::UnsubscribeOneClick { url: url.clone() });
+                w.send(MailRequest::UnsubscribeOneClick {
+                    url: url.to_string(),
+                });
             }
         } else if lower.starts_with("http://") || lower.starts_with("https://") {
             self.status_line = SharedString::from("已在浏览器打开退订页面");
-            self.open_link(&url, cx);
+            self.open_link(url, cx);
         } else if lower.starts_with("mailto:") {
             // gpui open_url 经系统 shell 打开，mailto 唤起默认邮件客户端。
             self.status_line = SharedString::from("已调用系统邮件客户端发送退订邮件");
-            cx.open_url(&url);
+            cx.open_url(url);
         } else {
             self.error_banner = Some(SharedString::from(
                 "该退订地址不受支持（仅支持 http/https/mailto）",
             ));
         }
         cx.notify();
+    }
+
+    /// 确认退订（保留兼容）。
+    #[allow(dead_code)]
+    pub(crate) fn confirm_unsubscribe(&mut self, _message_id: u32, cx: &mut Context<Self>) {
+        if let Some((url, one_click)) = self.selected_message.as_ref().and_then(|d| {
+            d.unsubscribe_url
+                .clone()
+                .map(|u| (u, d.unsubscribe_one_click))
+        }) {
+            self.trigger_unsubscribe(&url, one_click, cx);
+        }
     }
 
     /// 联系人数据请求（进入视图 / 搜索词变化时触发；demo 模式直接聚合模拟发件人）。
@@ -9855,7 +9994,7 @@ impl Render for HylkiApp {
                             h_flex().size_full().items_center().justify_center().child(
                                 v_flex()
                                     .w(px(440.0))
-                                    .h(px(540.0))
+                                    .h(px(620.0))
                                     .bg(p.surface)
                                     .rounded(px(12.0))
                                     .border_1()
@@ -9868,7 +10007,7 @@ impl Render for HylkiApp {
                                             cx.stop_propagation();
                                         }),
                                     )
-                                    .child(about_modal(&p, border, cx)),
+                                    .child(about_modal(self, &p, border, cx)),
                             ),
                         ),
                 );
@@ -10110,13 +10249,58 @@ fn shortcuts_modal(p: &theme::HylkiPalette, cx: &mut Context<HylkiApp>) -> gpui_
 
 /// 「关于 Hylki」弹窗内容（对齐原版 about.rs：版本、描述、协议、链接与致谢）。
 fn about_modal(
+    app: &HylkiApp,
     p: &theme::HylkiPalette,
     border: gpui_kit::Hsla,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
     let (text, muted_fg, accent, accent_soft) = (p.text, p.text_muted, p.accent, p.accent_soft());
-    let repo = "https://github.com/hyprlab/hylki";
-    let issues = "https://github.com/hyprlab/hylki/issues";
+    let has_update = app.update.info.is_some();
+    let busy = app.update.checking || app.update.downloading;
+    let update_status: SharedString = if app.update.downloading {
+        "正在下载更新包…".into()
+    } else if app.update.checking {
+        "正在检查更新…".into()
+    } else if let Some(error) = &app.update.error {
+        error.clone()
+    } else if let Some(info) = &app.update.info {
+        format!(
+            "发现新版本 v{}（当前 v{}）",
+            info.version, info.current_version
+        )
+        .into()
+    } else if let Some(status) = &app.update.status {
+        status.clone()
+    } else {
+        SharedString::default()
+    };
+    let update_status_color = if app.update.error.is_some() {
+        p.danger
+    } else {
+        muted_fg
+    };
+    let update_button = if app.update.downloading {
+        "正在下载…"
+    } else if app.update.checking {
+        "检查中…"
+    } else if has_update {
+        "下载并安装"
+    } else {
+        "检查更新"
+    };
+    let notes = app.update.info.as_ref().and_then(|info| {
+        let notes = info.notes.trim().replace("\r\n", "\n");
+        if notes.is_empty() {
+            return None;
+        }
+        let mut short: String = notes.chars().take(280).collect();
+        if notes.chars().count() > 280 {
+            short.push('…');
+        }
+        Some(short)
+    });
+    let repo = "https://github.com/ISuuuu/hylki";
+    let issues = "https://github.com/ISuuuu/hylki/issues";
     let license_url = "https://www.gnu.org/licenses/agpl-3.0.html";
     let link_row =
         |cx: &mut Context<HylkiApp>, id: &'static str, label: &'static str, url: &'static str| {
@@ -10182,10 +10366,7 @@ fn about_modal(
                 .bg(accent_soft)
                 .text_xs()
                 .text_color(accent)
-                .child(SharedString::from(format!(
-                    "版本 {}",
-                    env!("CARGO_PKG_VERSION")
-                ))),
+                .child(SharedString::from(format!("版本 {}", app_version()))),
         )
         .child(
             div()
@@ -10222,6 +10403,54 @@ fn about_modal(
                 license_url,
             ),
         ])
+        .child(div().mt_3().w_full().h(px(1.0)).bg(border))
+        .child(
+            div()
+                .mt_2()
+                .text_sm()
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(accent)
+                .child("更新"),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .min_h(px(30.0))
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(update_status_color)
+                        .child(update_status),
+                )
+                .child(
+                    Button::new("about-update")
+                        .outline()
+                        .compact()
+                        .disabled(busy)
+                        .label(update_button)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.update.info.is_some() {
+                                this.download_and_install_update(cx);
+                            } else {
+                                this.check_updates(true, cx);
+                            }
+                        })),
+                ),
+        )
+        .when_some(notes, |el, notes| {
+            el.child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(SharedString::from(notes)),
+            )
+        })
         .child(div().mt_3().w_full().h(px(1.0)).bg(border))
         .child(
             div()
@@ -11327,5 +11556,17 @@ mod tests {
         assert!(text.contains("Subject: 周报\r\n"));
         assert!(text.contains("Message-ID: <demo-7@hylki.example>\r\n"));
         assert!(text.contains("\r\n\r\n正文第一行"));
+    }
+
+    #[test]
+    fn remote_images_allowed_respects_whitelist_and_sender_trust() {
+        let mut prefs = hylki_mail_core::config::AppPreferences::default();
+        prefs.block_remote_images = true;
+        prefs.allow_remote_sender("trusted@example.com");
+
+        // 验证发件人白名单解析与放行
+        assert!(prefs.is_remote_sender_allowed("trusted@example.com"));
+        assert!(prefs.is_remote_sender_allowed("Trusted User <trusted@example.com>"));
+        assert!(!prefs.is_remote_sender_allowed("untrusted@example.com"));
     }
 }
