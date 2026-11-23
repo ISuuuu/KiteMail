@@ -78,10 +78,10 @@ pub(crate) const BELOW_PANE_MIN_HEIGHT: f32 = 200.0;
 pub(crate) const BELOW_LIST_MIN_HEIGHT: f32 = 240.0;
 /// 下方模式列表默认高度（无持久化值时）。
 pub(crate) const BELOW_LIST_DEFAULT_HEIGHT: f32 = 360.0;
-/// WP-10-4：内联分屏写信面板的默认高度（贴底）与最小高度。
-pub(crate) const COMPOSE_SPLIT_DEFAULT_HEIGHT: f32 = 380.0;
+/// WP-10-4：内联分屏写信面板的默认高度（贴顶）与最小高度。
+pub(crate) const COMPOSE_SPLIT_DEFAULT_HEIGHT: f32 = 440.0;
 pub(crate) const COMPOSE_SPLIT_MIN_HEIGHT: f32 = 220.0;
-/// 内联分屏里上方阅读器的最小高度（再高就把写信面板压得只剩标题栏了）。
+/// 内联分屏里下方阅读器的最小高度（再高就把写信面板压得只剩标题栏了）。
 pub(crate) const COMPOSE_SPLIT_READER_MIN_HEIGHT: f32 = 160.0;
 /// B-5：窗口宽度低于该值时阅读器顶栏低频动作收进「⋯」菜单（≈ 左栏最小 + 列表最小
 /// + 阅读器最小 441 的下限组合，此时右栏已被压至最小宽度附近，平铺按钮放不下）。
@@ -4803,7 +4803,7 @@ impl HylkiApp {
     /// 对齐原版 "where composers live"（`src/app/compose_host.rs`）：
     /// - `split = true`（回复 / 回复全部 / 转发 / 作为新邮件编辑）且偏好
     ///   `compose_inline` 打开、阅读器里还留着一封可对照的邮件时，写信面板贴在
-    ///   阅读器下半部分，中间带可拖拽的 `.split-grab-pill`；
+    ///   分屏上半部分（默认落点），原邮件在下方对照，中间带可拖拽的 `.split-grab-pill`；
     /// - `split = false`（新写信 / 打开草稿 / 撤销发送回填）时整栏呈现。
     ///
     /// 若此时写信正弹在独立窗口里，先把窗口收回，避免同一份表单在两处渲染。
@@ -4824,8 +4824,8 @@ impl HylkiApp {
         }
     }
 
-    /// 内联分屏把手移动：写信面板贴底，高度 = 分屏容器底 − 指针 y；
-    /// 上方阅读器保底 [`COMPOSE_SPLIT_READER_MIN_HEIGHT`]。
+    /// 内联分屏把手移动：写信面板贴顶，高度 = 指针 y − 分屏容器顶；
+    /// 下方阅读器保底 [`COMPOSE_SPLIT_READER_MIN_HEIGHT`]。
     fn on_compose_split_drag_move(
         &mut self,
         event: &DragMoveEvent<ComposeSplitDrag>,
@@ -4837,7 +4837,7 @@ impl HylkiApp {
         let max =
             (container_height - COMPOSE_SPLIT_READER_MIN_HEIGHT).max(COMPOSE_SPLIT_MIN_HEIGHT);
         self.compose_split_height =
-            (container_top + container_height - pointer_y).clamp(COMPOSE_SPLIT_MIN_HEIGHT, max);
+            (pointer_y - container_top).clamp(COMPOSE_SPLIT_MIN_HEIGHT, max);
         cx.notify();
     }
 
@@ -8894,34 +8894,37 @@ impl HylkiApp {
                 if self.compose_detached {
                     return reader::render(self, window, cx);
                 }
-                // WP-10-4：内联上下分屏——原邮件留在上半部分可随时对照滚动，
-                // 写信面板贴底，中间是 `.split-grab-pill` 拖拽手柄。
+                // WP-10-4：内联上下分屏——写信面板贴顶（默认落点就在手边），
+                // 原邮件留在下半部分可随时对照滚动，中间是 `.split-grab-pill` 拖拽手柄。
                 if self.compose_split && self.selected_message.is_some() {
                     let p = theme::current(cx);
-                    // 窗口控制按钮画在上半部分阅读器的顶栏里。
-                    let reader_el = reader::render_with_pane_top(self, window, cx, true);
-                    let compose_el = self.render_compose_pane(window, cx, false, false);
+                    // 窗口控制按钮画在上半部分写信面板的顶栏里。
+                    let compose_el = self.render_compose_pane(window, cx, true, false);
+                    let reader_el = reader::render_with_pane_top(self, window, cx, false);
                     return v_flex()
                         .flex_1()
                         .min_w_0()
                         .h_full()
                         .bg(p.canvas)
-                        .child(div().flex_1().min_h_0().child(reader_el))
-                        .child(
-                            resize_handle::<ComposeSplitDrag, ComposeSplitDrag>(
-                                "compose-split-handle",
-                                Axis::Vertical,
-                            )
-                            .inside(HandleEdge::Leading)
-                            .on_drag(ComposeSplitDrag, |_, _, _, cx| cx.new(|_| ComposeSplitDrag)),
-                        )
                         .child(
                             div()
+                                .relative()
                                 .h(px(self.compose_split_height))
                                 .min_h(px(COMPOSE_SPLIT_MIN_HEIGHT))
                                 .flex_shrink_0()
-                                .child(compose_el),
+                                .child(compose_el)
+                                .child(
+                                    resize_handle::<ComposeSplitDrag, ComposeSplitDrag>(
+                                        "compose-split-handle",
+                                        Axis::Vertical,
+                                    )
+                                    .inside(HandleEdge::Trailing)
+                                    .on_drag(ComposeSplitDrag, |_, _, _, cx| {
+                                        cx.new(|_| ComposeSplitDrag)
+                                    }),
+                                ),
                         )
+                        .child(div().flex_1().min_h_0().child(reader_el))
                         .on_drag_move(cx.listener(
                             |this, event: &DragMoveEvent<ComposeSplitDrag>, _, cx| {
                                 this.on_compose_split_drag_move(event, cx);
@@ -8938,7 +8941,7 @@ impl HylkiApp {
     }
     /// 写信页（标题栏 + 表单），供主窗口与独立写信窗口共用。
     ///
-    /// - `pane_top`：是否在本页顶栏画窗口控制按钮（内联分屏时由上面阅读器承载）；
+    /// - `pane_top`：是否在本页顶栏画窗口控制按钮（内联分屏时由上方写信面板承载）；
     /// - `detached`：本页已在独立窗口里，标题栏换成「收回」按钮。
     pub(crate) fn render_compose_pane(
         &mut self,
@@ -9025,6 +9028,7 @@ impl HylkiApp {
                         // WP-10-5 写信模板：套用 / 存为模板 / 删除。
                         let templates = self.templates.clone();
                         let ent_tpl = cx.entity();
+                        let ent_tpl_popup = cx.entity();
                         Button::new("compose-bar-template")
                             .ghost()
                             .compact()
@@ -9081,11 +9085,18 @@ impl HylkiApp {
                                 }
                                 menu
                             })
+                            .on_open_change(move |open, _, cx| {
+                                ent_tpl_popup.update(cx, |app, cx| {
+                                    app.reader_popup_open = *open;
+                                    cx.notify();
+                                });
+                            })
                     })
                     .child({
                         // WP-10-5 定时发送：预设时间与「自定义时间…」。
                         let presets = self.compose_later_presets();
                         let ent_schedule = cx.entity();
+                        let ent_schedule_popup = cx.entity();
                         Button::new("compose-bar-schedule")
                             .ghost()
                             .compact()
@@ -9115,6 +9126,12 @@ impl HylkiApp {
                                             });
                                         }),
                                 )
+                            })
+                            .on_open_change(move |open, _, cx| {
+                                ent_schedule_popup.update(cx, |app, cx| {
+                                    app.reader_popup_open = *open;
+                                    cx.notify();
+                                });
                             })
                     })
                     .child(
@@ -9984,6 +10001,9 @@ impl Render for HylkiApp {
                         .left(px(0.0))
                         .size_full()
                         .bg(black().opacity(0.4))
+                        // 挡住下层（收件箱列表）的 hover/cursor：否则指针移到浮层上，
+                        // 下层命中盒仍判定为悬停，出现行高亮和手型光标。
+                        .occlude()
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -10375,6 +10395,14 @@ fn about_modal(
                 .text_sm()
                 .text_color(muted_fg)
                 .child("一个快速、原生的电子邮件客户端"),
+        )
+        .child(
+            div()
+                .mt_1()
+                .text_center()
+                .text_xs()
+                .text_color(muted_fg)
+                .child("Windows 版：GPUI 原生界面，共享邮件内核。"),
         )
         .child(
             div()

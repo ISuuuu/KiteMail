@@ -1690,6 +1690,7 @@ pub(crate) fn render(
     // 顶部排序与多条件筛选下拉菜单。
     let filter_menu_button = {
         let entity = cx.entity();
+        let entity_for_popup = entity.clone();
         let active_labels = quick_filters.active_labels();
         let active_tooltip = if active_labels.is_empty() {
             format!("排序与筛选（{}）", current_sort.label())
@@ -1873,6 +1874,12 @@ pub(crate) fn render(
                         }),
                 );
                 menu
+            })
+            .on_open_change(move |open, _, cx| {
+                entity_for_popup.update(cx, |app, cx| {
+                    app.reader_popup_open = *open;
+                    cx.notify();
+                });
             })
     };
 

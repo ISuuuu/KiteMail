@@ -1940,6 +1940,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     ),
                 )
                 .when(!templates.is_empty(), |el| {
+                    let entity_for_tpl_popup = entity_for_templates.clone();
                     el.child(
                         Button::new("sb-compose-templates")
                             .primary()
@@ -1961,6 +1962,12 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                     ));
                                 }
                                 menu
+                            })
+                            .on_open_change(move |open, _, cx| {
+                                entity_for_tpl_popup.update(cx, |app, cx| {
+                                    app.reader_popup_open = *open;
+                                    cx.notify();
+                                });
                             }),
                     )
                 })
@@ -2348,6 +2355,7 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
     let entity_for_quit = entity.clone();
     let entity_for_reader_pos = entity.clone();
     let entity_for_focus = entity.clone();
+    let entity_for_popup = entity.clone();
     Button::new("sb-menu")
         .ghost()
         .compact()
@@ -2494,6 +2502,12 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
                         });
                     }),
             )
+        })
+        .on_open_change(move |open, _, cx| {
+            entity_for_popup.update(cx, |app, cx| {
+                app.reader_popup_open = *open;
+                cx.notify();
+            });
         })
 }
 
