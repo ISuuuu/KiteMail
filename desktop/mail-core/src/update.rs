@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+#[cfg(windows)]
 use std::path::Path;
 use std::time::Duration;
 
@@ -137,7 +138,9 @@ fn is_newer(remote: &str, current: &str) -> Result<bool, String> {
         semver::Version::parse(value.trim().trim_start_matches('v'))
             .map_err(|e| format!("版本号无效（{value}）: {e}"))
     };
-    Ok(parse(remote)? > parse(current)?)
+    let remote = parse(remote)?;
+    let current = parse(current)?;
+    Ok((!current.pre.is_empty() || remote.pre.is_empty()) && remote > current)
 }
 
 /// 下载更新包并在返回前校验 SHA-256。
@@ -184,14 +187,43 @@ pub fn install(info: &UpdateInfo, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn unique_update_dir() -> Result<std::path::PathBuf, String> {
+    for attempt in 0..100 {
+        let path = std::env::temp_dir().join(format!(
+            "hylki-update-{}-{}-{attempt}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("创建更新目录失败: {e}")),
+        }
+    }
+    Err("创建更新目录失败".into())
+}
+
+#[cfg(windows)]
 fn install_installer(bytes: &[u8]) -> Result<(), String> {
+    use std::ffi::OsString;
+    use std::os::windows::process::CommandExt;
+
     if !bytes.starts_with(b"MZ") {
         return Err("更新包不是有效的安装程序".into());
     }
-    let path = std::env::temp_dir().join("hylki-update-setup.exe");
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位当前程序: {e}"))?;
+    let install_dir = exe.parent().ok_or("无法定位安装目录")?;
+    let mut directory_arg = OsString::from("/D=");
+    directory_arg.push(install_dir);
+    let path = unique_update_dir()?.join("setup.exe");
     std::fs::write(&path, bytes).map_err(|e| format!("写入安装程序失败: {e}"))?;
     std::process::Command::new(&path)
-        .args(["/S", "/R"])
+        .args(["/S", "/R", &format!("/PID={}", std::process::id())])
+        // NSIS 要求 /D 参数位于末尾，带空格的路径也不加引号。
+        .raw_arg(directory_arg)
         .spawn()
         .map_err(|e| format!("启动安装程序失败: {e}"))?;
     Ok(())
@@ -213,7 +245,7 @@ fn install_portable(bytes: &[u8]) -> Result<(), String> {
     {
         return Err("当前不是便携版运行环境".into());
     }
-    let zip = std::env::temp_dir().join("hylki-update-portable.zip");
+    let zip = unique_update_dir()?.join("portable.zip");
     std::fs::write(&zip, bytes).map_err(|e| format!("写入便携更新包失败: {e}"))?;
     let script = portable_script(std::process::id(), &zip, &exe);
     let encoded = utf16le_base64(&script);
@@ -248,17 +280,28 @@ fn portable_script(pid: u32, zip: &Path, exe: &Path) -> String {
     let quote = |path: &Path| path.display().to_string().replace('\'', "\'\'");
     format!(
         "$ErrorActionPreference = 'Stop'\n\
-         Wait-Process -Id {pid} -Timeout 60 -ErrorAction SilentlyContinue\n\
-         Start-Sleep -Milliseconds 400\n\
-         $stage = Join-Path $env:TEMP 'hylki-update-extract'\n\
-         if (Test-Path $stage) {{ Remove-Item -Recurse -Force $stage }}\n\
+         $zip = '{zip}'; $exe = '{exe}'\n\
+         $stage = Join-Path (Split-Path -LiteralPath $zip) 'extract'\n\
+         $new = $exe + '.new-' + {pid}; $backup = $exe + '.old-' + {pid}; $exited = $false\n\
          try {{\n\
-           Expand-Archive -LiteralPath '{zip}' -DestinationPath $stage -Force\n\
-           Copy-Item -LiteralPath (Join-Path $stage 'hylki-windows.exe') -Destination '{exe}' -Force\n\
-           Remove-Item -LiteralPath '{zip}' -Force -ErrorAction SilentlyContinue\n\
-           Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue\n\
+           $process = Get-Process -Id {pid} -ErrorAction SilentlyContinue\n\
+           if ($process -and -not $process.WaitForExit(60000)) {{ exit 1 }}\n\
+           $exited = $true\n\
+           Expand-Archive -LiteralPath $zip -DestinationPath $stage\n\
+           Copy-Item -LiteralPath (Join-Path $stage 'hylki-windows.exe') -Destination $new\n\
+           [System.IO.File]::Replace($new, $exe, $backup)\n\
+           Start-Process -FilePath $exe\n\
+           Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue\n\
+         }} catch {{\n\
+           if (Test-Path -LiteralPath $backup) {{\n\
+             if (Test-Path -LiteralPath $exe) {{ [System.IO.File]::Replace($backup, $exe, $new) }}\n\
+             else {{ [System.IO.File]::Move($backup, $exe) }}\n\
+           }}\n\
+           if ($exited -and (Test-Path -LiteralPath $exe)) {{ Start-Process -FilePath $exe -ErrorAction SilentlyContinue }}\n\
+           exit 1\n\
          }} finally {{\n\
-           Start-Process -FilePath '{exe}'\n\
+           Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue\n\
+           Remove-Item -LiteralPath (Split-Path -LiteralPath $zip) -Recurse -Force -ErrorAction SilentlyContinue\n\
          }}\n",
         zip = quote(zip),
         exe = quote(exe),
@@ -315,6 +358,16 @@ mod tests {
                 .is_none()
         );
         assert!(
+            select_update(manifest("2.0.0-beta.1"), "1.49.0", TARGET_INSTALLER)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_update(manifest("2.0.0-beta.2"), "2.0.0-beta.1", TARGET_INSTALLER)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
             select_update(manifest("1.49.0-beta.1"), "1.49.0", TARGET_INSTALLER)
                 .unwrap()
                 .is_none()
@@ -340,14 +393,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn portable_script_restarts_the_app_and_quotes_paths() {
         let script = portable_script(
             42,
             Path::new(r"C:\temp\it's.zip"),
             Path::new(r"C:\Hylki\hylki-windows.exe"),
         );
-        assert!(script.contains("Wait-Process -Id 42"));
+        assert!(script.contains("$process.WaitForExit(60000)"));
         assert!(script.contains("it''s.zip"));
-        assert!(script.contains(r"Start-Process -FilePath 'C:\Hylki\hylki-windows.exe'"));
+        assert!(script.contains("[System.IO.File]::Replace($new, $exe, $backup)"));
+        assert!(script.contains("if ($process -and -not $process.WaitForExit(60000)) { exit 1 }"));
+        assert!(script.contains("[System.IO.File]::Replace($backup, $exe, $new)"));
     }
 }

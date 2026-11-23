@@ -51,6 +51,18 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 Var PassiveMode
 Var Relaunch
 Var Elevated
+Var CallerPid
+
+!macro LockSetup
+  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\Hylki.Setup") p .r1 ?e'
+  Pop $2
+  ${If} $1 == 0
+  ${OrIf} $2 == 183
+    MessageBox MB_OK|MB_ICONSTOP "另一个 Hylki 安装或卸载程序正在运行。" /SD IDOK
+    SetErrorLevel 2
+    Quit
+  ${EndIf}
+!macroend
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
@@ -66,22 +78,10 @@ Var Elevated
 !insertmacro MUI_LANGUAGE "English"
 
 Function .onInit
-  ; 升级时沿用上次的安装目录
-  ${If} $INSTDIR == "$LOCALAPPDATA\Hylki"
-    ReadRegStr $0 HKCU "${UNINST_KEY}" "InstallLocation"
-    ${If} $0 != ""
-      StrCpy $INSTDIR $0
-    ${Else}
-      ReadRegStr $0 HKCU "${REG_KEY}" ""
-      ${If} $0 != ""
-        StrCpy $INSTDIR $0
-      ${EndIf}
-    ${EndIf}
-  ${EndIf}
-
   StrCpy $PassiveMode 0
   StrCpy $Relaunch 0
   StrCpy $Elevated 0
+  StrCpy $CallerPid ""
 
   ${GetParameters} $R0
   ${GetOptions} $R0 "/P" $R1
@@ -101,6 +101,8 @@ Function .onInit
     StrCpy $Relaunch 1
   ${EndIf}
 
+  ${GetOptions} $R0 "/PID=" $CallerPid
+
   ${GetOptions} $R0 "/ELEVATED" $R1
   ${IfNot} ${Errors}
     StrCpy $Elevated 1
@@ -110,32 +112,45 @@ Function .onInit
     StrCpy $PassiveMode 1
   ${EndIf}
 
-  Call EnsureWritableInstallDir
 FunctionEnd
 
-; 安装目录不可写时（例如装在 Program Files 却以普通权限静默更新）先提权重试一次，
-; 仍不可写就退回当前用户目录，避免更新把程序弄丢。
+; 安装目录不可写时尝试提权一次，始终使用原目标目录。
 Function EnsureWritableInstallDir
   CreateDirectory "$INSTDIR"
   ClearErrors
-  FileOpen $9 "$INSTDIR\.hylki-write-test" w
+  GetTempFileName $9 "$INSTDIR"
   ${IfNot} ${Errors}
-    FileClose $9
-    Delete "$INSTDIR\.hylki-write-test"
+    Delete "$9"
     Return
   ${EndIf}
 
   ${If} $Elevated == 1
-    StrCpy $INSTDIR "$LOCALAPPDATA\Hylki"
-    Return
+    SetErrorLevel 2
+    Quit
   ${EndIf}
 
-  ExecShell "runas" '"$EXEPATH" $R0 /ELEVATED'
+  StrCpy $0 "/ELEVATED"
+  ${If} $PassiveMode == 1
+    StrCpy $0 "$0 /S"
+  ${EndIf}
+  ${If} $Relaunch == 1
+    StrCpy $0 "$0 /R"
+  ${EndIf}
+  ${If} $CallerPid != ""
+    StrCpy $0 "$0 /PID=$CallerPid"
+  ${EndIf}
+  ClearErrors
+  ExecShell "runas" "$EXEPATH" '$0 /D=$INSTDIR'
+  ${If} ${Errors}
+    SetErrorLevel 2
+  ${EndIf}
   Quit
 FunctionEnd
 
 Section "MainSection" SecMain
   SetShellVarContext current
+  Call EnsureWritableInstallDir
+  !insertmacro LockSetup
 
   ; 先把新程序释放成临时文件：复制失败（目录不可写、磁盘满）时旧程序仍能启动。
   CreateDirectory "$INSTDIR"
@@ -147,20 +162,35 @@ Section "MainSection" SecMain
     Call AbortWithOldApp
   ${EndIf}
 
-  nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
-  Pop $0
-  Sleep 800
+  ; 仅等待发起更新的进程；超时或无法打开时停止更新。
+  ${If} $CallerPid != ""
+    System::Call 'kernel32::OpenProcess(i 0x100000, i 0, i $CallerPid) p .r1 ?e'
+    Pop $2
+    ${If} $1 == 0
+      ${If} $2 != 87
+        Call AbortWithOldApp
+      ${EndIf}
+    ${Else}
+      System::Call 'kernel32::WaitForSingleObject(p r1, i 60000) i .r2'
+      System::Call 'kernel32::CloseHandle(p r1)'
+      ${If} $2 != 0
+        Call AbortWithOldApp
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
 
-  Delete "$INSTDIR\${APP_EXE}.old"
-  ClearErrors
-  Rename "$INSTDIR\${APP_EXE}" "$INSTDIR\${APP_EXE}.old"
-  ${If} ${Errors}
-    Sleep 700
+  ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
+    System::Call 'kernel32::CreateFileW(w "$INSTDIR\${APP_EXE}", i 0xC0000000, i 0, p 0, i 3, i 0, p 0) p .r1'
+    ${If} $1 == -1
+      Call AbortWithOldApp
+    ${EndIf}
+    System::Call 'kernel32::CloseHandle(p r1)'
+    Delete "$INSTDIR\${APP_EXE}.old"
     ClearErrors
     Rename "$INSTDIR\${APP_EXE}" "$INSTDIR\${APP_EXE}.old"
-  ${EndIf}
-  ${If} ${Errors}
-    Call AbortWithOldApp
+    ${If} ${Errors}
+      Call AbortWithOldApp
+    ${EndIf}
   ${EndIf}
 
   ClearErrors
@@ -208,23 +238,25 @@ Function AbortWithOldApp
   ${If} $PassiveMode != 1
     MessageBox MB_ICONSTOP "无法写入 $\"$INSTDIR$\"，安装已取消。请换一个可写目录，或以管理员身份运行安装包。"
   ${EndIf}
-  ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
-    Exec '"$INSTDIR\${APP_EXE}"'
-  ${EndIf}
   SetErrorLevel 2
   Quit
 FunctionEnd
 
 Section "Uninstall"
   SetShellVarContext current
+  !insertmacro LockSetup
 
-  nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
-  Sleep 500
+  ClearErrors
+  Delete "$INSTDIR\${APP_EXE}"
+  ${If} ${Errors}
+    MessageBox MB_OK|MB_ICONSTOP "请先退出 Hylki，然后重新卸载。" /SD IDOK
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
 
   Delete "$SMPROGRAMS\${PRODUCT_NAME}.lnk"
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
 
-  Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\uninstall.exe"
   Delete "$INSTDIR\LICENSE"
 

@@ -630,10 +630,20 @@ enum SettingsOpenTarget {
 pub(crate) struct UpdateState {
     pub(crate) checking: bool,
     pub(crate) downloading: bool,
+    pending_install: Option<(hylki_mail_core::update::UpdateInfo, Vec<u8>)>,
     pub(crate) info: Option<hylki_mail_core::update::UpdateInfo>,
     pub(crate) error: Option<SharedString>,
     /// 最近一次检查的结论（已是最新 / 正在检查）。
     pub(crate) status: Option<SharedString>,
+}
+
+impl UpdateState {
+    fn cancel_install(&mut self) {
+        if self.pending_install.take().is_some() {
+            self.downloading = false;
+            self.status = None;
+        }
+    }
 }
 
 /// 构建版本：发布流水线注入 `HYLKI_VERSION`（标签去掉 v），本地构建回落到 Cargo 版本。
@@ -2010,6 +2020,7 @@ impl HylkiApp {
                             });
                         if let Err(message) = result {
                             self.quitting = false;
+                            self.update.cancel_install();
                             if let Some(pending) = self.pending_send.as_mut() {
                                 pending.undo_requested = false;
                             }
@@ -2033,6 +2044,7 @@ impl HylkiApp {
                     recovered_draft_id,
                 } => {
                     self.quitting = false;
+                    self.update.cancel_install();
                     if self.pending_send.as_ref().is_some_and(|p| p.token == token) {
                         if recovered_draft_id.is_some() {
                             self.pending_send = None;
@@ -2059,6 +2071,7 @@ impl HylkiApp {
                         Ok(()) => {}
                         Err(message) => {
                             self.quitting = false;
+                            self.update.cancel_install();
                             self.error_banner = Some(SharedString::from(message.clone()));
                             self.status_line = SharedString::from(message);
                         }
@@ -2101,6 +2114,7 @@ impl HylkiApp {
                         }
                         Err(message) => {
                             self.quitting = false;
+                            self.update.cancel_install();
                             if let Some(pending) = self.pending_send.as_mut() {
                                 pending.undo_requested = false;
                             }
@@ -2111,6 +2125,7 @@ impl HylkiApp {
                     if self.quitting {
                         if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
                             self.quitting = false;
+                            self.update.cancel_install();
                         } else {
                             self.quit_app(cx);
                         }
@@ -2712,6 +2727,7 @@ impl HylkiApp {
         self.quitting = true;
         if self.pending_send.as_ref().is_some_and(|p| p.enqueue_failed) {
             self.quitting = false;
+            self.update.cancel_install();
             self.status_line = SharedString::from("请先恢复未保存的邮件，再退出");
             cx.notify();
             return;
@@ -2740,17 +2756,25 @@ impl HylkiApp {
             // 耗时的同步或超时重连，异步请求会排在队尾导致关窗毫无反应。
             if worker.prepare_quit_now().is_err() && self.pending_send.is_some() {
                 self.quitting = false;
+                self.update.cancel_install();
                 self.error_banner = Some(SharedString::from("退出时保存发件队列失败，请重试"));
                 self.status_line = SharedString::from("退出时保存发件队列失败，请重试");
                 cx.notify();
                 return;
             }
-            self.shutdown_tray();
-            cx.quit();
-        } else {
-            self.shutdown_tray();
-            cx.quit();
         }
+        if let Some((info, bytes)) = self.update.pending_install.take() {
+            if let Err(error) = hylki_mail_core::update::install(&info, &bytes) {
+                self.quitting = false;
+                self.update.downloading = false;
+                self.update.status = None;
+                self.update.error = Some(SharedString::from(error));
+                cx.notify();
+                return;
+            }
+        }
+        self.shutdown_tray();
+        cx.quit();
     }
 
     /// 切换左栏统一导航视图（收件箱 / 星标 / 已发送 / 草稿 / 归档）。
@@ -7419,11 +7443,12 @@ impl HylkiApp {
                 .background_executor()
                 .spawn(async move {
                     let bytes = hylki_mail_core::update::download(&info)?;
-                    hylki_mail_core::update::install(&info, &bytes)
+                    Ok::<_, String>((info, bytes))
                 })
                 .await;
             let _ = this.update(cx, |app, cx| match result {
-                Ok(()) => {
+                Ok((info, bytes)) => {
+                    app.update.pending_install = Some((info, bytes));
                     app.status_line = SharedString::from("正在安装更新，程序即将重启…");
                     cx.notify();
                     app.quit_app(cx);
