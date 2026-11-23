@@ -362,7 +362,7 @@ impl ComposeAddressField {
     }
 }
 
-/// WP-10-3 正文格式化工具条上的按钮（只在富文本 / Markdown 模式下出现）。
+/// WP-10-3 富文本模式的格式化工具条按钮。
 ///
 /// Windows 版正文是一个多行文本框，没有原版 GTK 富文本编辑器的选区命令，
 /// 所以这些按钮做的是「往正文里插入对应语法」——写的是 Markdown 标记，
@@ -751,6 +751,7 @@ pub(crate) struct HylkiApp {
     /// 与原版一致，切换格式会把正文转换成目标表示；当前格式随草稿一起
     /// 落盘（`body_format`），重新打开草稿时按原格式恢复。
     pub(crate) compose_format: ComposeFormat,
+    pub(crate) compose_preview: bool,
     /// WP-10-4 写信是否以「阅读器在上、写信器在下」的内联分屏呈现
     /// （对齐原版 `compose_inline` / `.reader-split`）。仅回复 / 转发且
     /// 阅读器里有可对照的邮件时成立。
@@ -1139,11 +1140,7 @@ impl HylkiApp {
             },
         )
         .detach();
-        let compose_body = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(10, 24)
-                .placeholder("在此输入多行中文正文，支持保存草稿、附件与持久化发件...")
-        });
+        let compose_body = cx.new(|cx| TextareaState::new(window, cx).placeholder("输入邮件正文"));
         // F-4：主题 / 正文变更同样重置 5 秒防抖自动保存定时器。
         cx.subscribe(&compose_subject, |this, _input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -1303,6 +1300,7 @@ impl HylkiApp {
                 compose_subject,
                 compose_body,
                 compose_format: ComposeFormat::default(),
+                compose_preview: false,
                 compose_split: false,
                 compose_split_height: COMPOSE_SPLIT_DEFAULT_HEIGHT,
                 compose_detached: false,
@@ -1531,6 +1529,7 @@ impl HylkiApp {
             compose_subject,
             compose_body,
             compose_format: ComposeFormat::default(),
+            compose_preview: false,
             compose_split: false,
             compose_split_height: COMPOSE_SPLIT_DEFAULT_HEIGHT,
             compose_detached: false,
@@ -3178,6 +3177,7 @@ impl HylkiApp {
             rfc_message_id: String::new(),
             sender: msg.sender.clone(),
             recipients: msg.recipients.clone(),
+            cc: String::new(),
             subject: msg.subject.clone(),
             date_ts: msg.date_ts,
             date_display: msg.date_display.clone(),
@@ -4207,7 +4207,7 @@ impl HylkiApp {
     ///
     /// 纯文本模式返回 `None`（只发 `text/plain`）；其余三种格式把正文转换到
     /// HTML，交给 SMTP 层组成 `multipart/alternative`，纯文本作为兜底。
-    fn compose_body_html(&self, cx: &Context<Self>) -> Option<String> {
+    pub(crate) fn compose_body_html(&self, cx: &Context<Self>) -> Option<String> {
         if self.compose_format == ComposeFormat::Plain {
             return None;
         }
@@ -4240,11 +4240,20 @@ impl HylkiApp {
         let body = self.compose_body.read(cx).value().to_string();
         let converted = hylki_mail_core::markup::convert(&body, from, to);
         self.compose_format = to;
+        self.compose_preview = false;
         self.compose_body
             .update(cx, |state, cx| state.replace_all(converted, window, cx));
         // `replace_all` 是静默写入（不触发 Change 事件），自动保存要手动续上。
         self.schedule_draft_autosave(cx);
         self.compose_body.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_compose_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.compose_preview = !self.compose_preview;
+        if !self.compose_preview {
+            self.compose_body.focus_handle(cx).focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -4646,6 +4655,7 @@ impl HylkiApp {
         });
         // 正文按模板记录里的格式打开，避免把 Markdown 源当成纯文本发出去。
         self.compose_format = ComposeFormat::from_str_lossy(&template.body_format);
+        self.compose_preview = false;
         self.compose_body.update(cx, |s, cx| {
             s.set_value(template.body_text.clone(), window, cx)
         });
@@ -4758,6 +4768,7 @@ impl HylkiApp {
     /// 若此时写信正弹在独立窗口里，先把窗口收回，避免同一份表单在两处渲染。
     fn begin_compose_session(&mut self, split: bool, cx: &mut Context<Self>) {
         self.compose_session_generation += 1;
+        self.compose_preview = false;
         if self.compose_detached {
             self.close_compose_window(cx);
         }
@@ -10623,11 +10634,11 @@ mod tests {
         assert_eq!(ComposeMarkup::NumberedList.wrap("甲\n乙"), "1. 甲\n2. 乙");
     }
 
-    /// HTML / 纯文本模式不提供语法工具条。
+    /// 源码与纯文本模式直接编辑正文，格式化工具只显示在富文本模式。
     #[test]
-    fn only_rich_and_markdown_offer_the_toolbar() {
+    fn only_rich_offers_the_toolbar() {
         assert!(ComposeFormat::Rich.has_format_toolbar());
-        assert!(ComposeFormat::Markdown.has_format_toolbar());
+        assert!(!ComposeFormat::Markdown.has_format_toolbar());
         assert!(!ComposeFormat::Html.has_format_toolbar());
         assert!(!ComposeFormat::Plain.has_format_toolbar());
     }
@@ -10957,6 +10968,7 @@ mod tests {
             subject: "Test".to_string(),
             sender: "a@test".to_string(),
             recipients: "b@test".to_string(),
+            cc: String::new(),
             date_display: "10:00".to_string(),
             date_ts: 0,
             unread,
@@ -10977,6 +10989,7 @@ mod tests {
             rfc_message_id: "<2@test>".to_string(),
             sender: "a@test".to_string(),
             recipients: "b@test".to_string(),
+            cc: String::new(),
             subject: "Test".to_string(),
             date_display: "10:00".to_string(),
             date_ts: 0,
@@ -11294,6 +11307,7 @@ mod tests {
             rfc_message_id: "<demo-7@hylki.example>".to_string(),
             sender: "林晓明 <xiaoming@example.com>".to_string(),
             recipients: "demo@hylki.example".to_string(),
+            cc: "陈思远 <siyuan@example.org>".to_string(),
             subject: "周报".to_string(),
             date_display: "11-21 09:30".to_string(),
             date_ts: 0,

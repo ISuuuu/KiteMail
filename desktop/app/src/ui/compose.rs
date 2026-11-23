@@ -10,17 +10,19 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::{h_flex, v_flex, Icon, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, SharedString, Styled,
+    div, px, Anchor, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
 
 use crate::app::{
     filter_contact_suggestions, ComposeAddressField, ComposeMarkup, HylkiApp, RecipientPill,
 };
 use crate::theme;
+use hylki_mail_core::imap_client::sanitize_html_for_display;
 use hylki_mail_core::markup::ComposeFormat;
 
 /// 信头行标签宽度。
@@ -404,29 +406,24 @@ fn format_icon(format: ComposeFormat) -> IconName {
     }
 }
 
-/// WP-10-3：正文区底部「格式切换 + 格式化工具条」。
-///
-/// 左侧是四档格式菜单（当前格式 + 一行说明），右侧是加粗 / 斜体 / 列表 /
-/// 引用 / 代码块 / 链接等语法插入按钮；HTML 与纯文本模式不显示工具条，
-/// 因为这两种模式下插入 Markdown 标记只会污染正文。
+/// 正文上方的格式化工具条，右端是格式切换入口。
 fn compose_format_bar(
     app: &HylkiApp,
-    entity: Entity<HylkiApp>,
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
     let current = app.compose_format;
     let accent = p.accent;
-    let muted_fg = p.text_muted;
+    let format_label = format!("正文格式：{}", current.label());
 
-    let ent_menu = entity.clone();
+    let ent_menu = cx.entity();
     let menu_button = Button::new("compose-format-menu")
         .ghost()
         .compact()
-        .text_size(px(12.0))
         .icon(format_icon(current))
-        .label(current.label())
-        .dropdown_menu(move |mut menu, _, _| {
+        .accessibility_label(format_label.clone())
+        .tooltip(format_label)
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
             for format in ComposeFormat::ALL {
                 let selected = format == current;
                 let ent_item = ent_menu.clone();
@@ -444,7 +441,8 @@ fn compose_format_bar(
             menu
         });
 
-    let toolbar: Vec<gpui_kit::AnyElement> = if current.has_format_toolbar() {
+    let toolbar: Vec<gpui_kit::AnyElement> = if current.has_format_toolbar() && !app.compose_preview
+    {
         ComposeMarkup::ALL
             .iter()
             .map(|kind| {
@@ -467,27 +465,70 @@ fn compose_format_bar(
     h_flex()
         .items_center()
         .justify_between()
+        .flex_shrink_0()
         .gap_2()
         .px_2()
         .py_1()
-        .border_t_1()
+        .border_b_1()
         .border_color(p.border)
         .child(
             h_flex()
                 .items_center()
-                .gap_2()
                 .min_w_0()
-                .child(menu_button)
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(SharedString::from(current.hint())),
-                ),
+                .flex_wrap()
+                .gap_0p5()
+                .children(toolbar),
         )
-        .child(h_flex().items_center().gap_0p5().children(toolbar))
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .when(current != ComposeFormat::Plain, |el| {
+                    el.child(
+                        Button::new("compose-preview")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Eye)
+                            .selected(app.compose_preview)
+                            .label(if app.compose_preview {
+                                "继续编辑"
+                            } else {
+                                "预览"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_compose_preview(window, cx);
+                            })),
+                    )
+                })
+                .child(menu_button),
+        )
+        .into_any_element()
+}
+
+fn compose_editor(app: &HylkiApp, cx: &Context<HylkiApp>) -> gpui_kit::AnyElement {
+    if app.compose_preview {
+        let html = app.compose_body_html(cx).unwrap_or_default();
+        let (html, _) = sanitize_html_for_display(&html, true);
+        return div()
+            .id("compose-preview-body")
+            .size_full()
+            .overflow_y_scroll()
+            .p_2()
+            .child(TextView::html("compose-preview-text", html).selectable(true))
+            .into_any_element();
+    }
+
+    Textarea::new(&app.compose_body)
+        .h_full()
+        .aria_label("邮件正文")
+        .when(
+            matches!(
+                app.compose_format,
+                ComposeFormat::Markdown | ComposeFormat::Html
+            ),
+            |editor| editor.font_family("Consolas"),
+        )
         .into_any_element()
 }
 
@@ -541,7 +582,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     v_flex()
         .flex_1()
         .min_w_0()
-        .h_full()
+        .min_h_0()
         .bg(p.canvas)
         .p_4()
         .gap_3()
@@ -880,8 +921,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         .when(!app.compose_attachments.is_empty(), |el| {
             el.child(h_flex().gap_2().flex_wrap().children(attachment_chips))
         })
-        // 正文编辑区（flex-1 撑满剩余高度）+ WP-10-3 底部格式 / 格式化工具条。
-        // WP-10-5：整块正文区同时是外部文件拖放入口（DropZones）。
+        // 正文编辑区填满工具条下方的空间，整块区域都支持拖放附件。
         .child(
             v_flex()
                 .flex_1()
@@ -893,14 +933,14 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
                     this.attach_dropped_files(paths.0.iter().cloned().collect(), cx);
                 }))
+                .child(compose_format_bar(app, &p, cx))
                 .child(
-                    div()
+                    v_flex()
                         .flex_1()
                         .min_h_0()
                         .p_2()
-                        .child(Textarea::new(&app.compose_body)),
-                )
-                .child(compose_format_bar(app, cx.entity(), &p, cx)),
+                        .child(compose_editor(app, cx)),
+                ),
         )
         .into_any_element()
 }

@@ -88,6 +88,10 @@ const BRAND_ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../../../data/brands/stalwart.png"),
     ),
 ];
+
+// GPUI Kit 给文本控件设置 `Input` 键盘上下文。匹配阶段就让出这些按键，
+// 文本控件才能收到字母和标点。
+const OUTSIDE_TEXT_INPUT: Option<&str> = Some("!Input");
 #[cfg(target_os = "windows")]
 pub(crate) const APP_ICON_PNG: &[u8] =
     include_bytes!("../../../data/icons/hicolor/256x256/apps/co.hyprlab.Hylki.png");
@@ -294,8 +298,8 @@ fn main() {
                 // Ctrl+Shift+K：命令面板预填 `>`，仅筛选操作命令（对齐原版）。
                 KeyBinding::new("ctrl-shift-k", OpenCommandPaletteActions, None),
                 KeyBinding::new("ctrl-f", FocusSearch, None),
-                // `/` 亦展开中栏搜索栏（输入框聚焦时按键被输入框消费，不会误触）。
-                KeyBinding::new("/", FocusSearch, None),
+                // `/` 亦展开中栏搜索栏（输入框聚焦时正常输入斜杠）。
+                KeyBinding::new("/", FocusSearch, OUTSIDE_TEXT_INPUT),
                 // F-1 阶段三组合键修正：Ctrl+R 是「回复」（原误绑刷新），刷新仅保留 F5。
                 KeyBinding::new("ctrl-r", ReplyCurrent, None),
                 KeyBinding::new("ctrl-shift-r", ReplyAllCurrent, None),
@@ -309,11 +313,11 @@ fn main() {
                 KeyBinding::new("ctrl-=", ZoomIn, None),
                 KeyBinding::new("ctrl--", ZoomOut, None),
                 KeyBinding::new("ctrl-0", ZoomReset, None),
-                KeyBinding::new("delete", DeleteSelectedMessage, None),
+                KeyBinding::new("delete", DeleteSelectedMessage, OUTSIDE_TEXT_INPUT),
                 // F-3：撤销最近一次移动 / 删除 / 归档（状态栏轻量撤销条的快捷键）。
-                KeyBinding::new("ctrl-z", UndoLastMove, None),
-                KeyBinding::new("down", SelectNextMessage, None),
-                KeyBinding::new("up", SelectPrevMessage, None),
+                KeyBinding::new("ctrl-z", UndoLastMove, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("down", SelectNextMessage, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("up", SelectPrevMessage, OUTSIDE_TEXT_INPUT),
                 KeyBinding::new("escape", CloseOverlay, None),
                 // 阶段二主菜单动作：显示/隐藏账号列表、全屏、快捷键帮助。
                 KeyBinding::new("ctrl-shift-a", ToggleAccountsList, None),
@@ -328,31 +332,30 @@ fn main() {
                 // 清除 shift 修饰），而部分布局/平台仍按 shift-/ 上报（原版
                 // 同样对两种写法都注册兜底）。
                 KeyBinding::new("f1", OpenShortcutsWindow, None),
-                KeyBinding::new("shift-/", OpenShortcutsWindow, None),
-                KeyBinding::new("?", OpenShortcutsWindow, None),
+                KeyBinding::new("shift-/", OpenShortcutsWindow, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("?", OpenShortcutsWindow, OUTSIDE_TEXT_INPUT),
                 // ---- F-1 阶段三：单键快捷键（偏好「启用单键快捷键」可整体关闭）----
-                // 输入框聚焦时按键先被输入框消费（守卫 no-op 不拦传播），与 `/` 同理安全。
                 // j / k 与 ↓ / ↑ 并存（↓↑ 绑定原动作不受偏好控制）。
-                KeyBinding::new("j", SingleKeyNextMessage, None),
-                KeyBinding::new("k", SingleKeyPrevMessage, None),
-                KeyBinding::new("r", SingleKeyReply, None),
+                KeyBinding::new("j", SingleKeyNextMessage, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("k", SingleKeyPrevMessage, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("r", SingleKeyReply, OUTSIDE_TEXT_INPUT),
                 // 回复全部：Windows 上 Shift+R 上报 {key:"r", shift:true}，"R" 解析后
                 // 归一化为同一目标键（parse 对单字符大写键自动加 shift），二者等价；
                 // 同时注册 "shift-r" 兜底部分布局 / 平台（与上方 `?` 双绑做法一致）。
-                KeyBinding::new("R", SingleKeyReplyAll, None),
-                KeyBinding::new("shift-r", SingleKeyReplyAll, None),
-                KeyBinding::new("f", SingleKeyForward, None),
-                KeyBinding::new("a", SingleKeyArchive, None),
-                KeyBinding::new("d", SingleKeyDelete, None),
-                KeyBinding::new("backspace", SingleKeyDelete, None),
+                KeyBinding::new("R", SingleKeyReplyAll, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("shift-r", SingleKeyReplyAll, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("f", SingleKeyForward, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("a", SingleKeyArchive, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("d", SingleKeyDelete, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("backspace", SingleKeyDelete, OUTSIDE_TEXT_INPUT),
                 // `!` 同 `?`：Windows 上 Shift+1 实际产生 `!` 键（shift 修饰被清除）。
-                KeyBinding::new("!", SingleKeyMarkSpam, None),
-                KeyBinding::new("s", SingleKeyToggleStar, None),
-                KeyBinding::new("m", SingleKeyToggleRead, None),
-                KeyBinding::new("c", SingleKeyCompose, None),
-                KeyBinding::new("u", SingleKeyBackToList, None),
-                KeyBinding::new("w", SingleKeyNextCard, None),
-                KeyBinding::new("b", SingleKeyPrevCard, None),
+                KeyBinding::new("!", SingleKeyMarkSpam, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("s", SingleKeyToggleStar, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("m", SingleKeyToggleRead, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("c", SingleKeyCompose, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("u", SingleKeyBackToList, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("w", SingleKeyNextCard, OUTSIDE_TEXT_INPUT),
+                KeyBinding::new("b", SingleKeyPrevCard, OUTSIDE_TEXT_INPUT),
             ]);
 
             let (win_w, win_h) = resolve_window_size(&prefs);
@@ -392,9 +395,36 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use gpui_kit::assets::IconName;
-    use gpui_kit::AssetSource;
+    use gpui_kit::{AssetSource, KeyBinding, KeyContext, Keymap, Keystroke};
 
-    use super::HylkiAssets;
+    use super::{
+        FocusSearch, HylkiAssets, SingleKeyArchive, SingleKeyDelete, SingleKeyForward,
+        SingleKeyToggleStar, OUTSIDE_TEXT_INPUT,
+    };
+
+    #[test]
+    fn typing_in_text_inputs_bypasses_mail_shortcuts() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("a", SingleKeyArchive, OUTSIDE_TEXT_INPUT),
+            KeyBinding::new("s", SingleKeyToggleStar, OUTSIDE_TEXT_INPUT),
+            KeyBinding::new("d", SingleKeyDelete, OUTSIDE_TEXT_INPUT),
+            KeyBinding::new("f", SingleKeyForward, OUTSIDE_TEXT_INPUT),
+            KeyBinding::new("/", FocusSearch, OUTSIDE_TEXT_INPUT),
+        ]);
+        let root = KeyContext::parse("Root").unwrap();
+        let input = KeyContext::parse("Input").unwrap();
+        for key in ["a", "s", "d", "f", "/"] {
+            let stroke = [Keystroke::parse(key).unwrap()];
+            assert_eq!(
+                keymap.bindings_for_input(&stroke, &[root.clone()]).0.len(),
+                1
+            );
+            let (bindings, pending) =
+                keymap.bindings_for_input(&stroke, &[root.clone(), input.clone()]);
+            assert!(bindings.is_empty());
+            assert!(!pending);
+        }
+    }
 
     #[test]
     fn all_assets_serves_ui_lucide_icons_and_wordmarks() {

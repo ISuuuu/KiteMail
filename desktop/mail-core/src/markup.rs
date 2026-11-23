@@ -40,7 +40,7 @@ impl ComposeFormat {
         match self {
             Self::Rich => "富文本",
             Self::Markdown => "Markdown",
-            Self::Html => "HTML",
+            Self::Html => "HTML 源码",
             Self::Plain => "纯文本",
         }
     }
@@ -57,10 +57,9 @@ impl ComposeFormat {
 
     /// 是否提供加粗 / 斜体 / 列表等语法插入按钮。
     ///
-    /// HTML 与纯文本模式不提供：前者要写标签、后者要保留原样，插入语法标记
-    /// 反而会污染正文（对齐原版仅富文本显示格式化工具条的行为）。
+    /// 对齐原版，源码与纯文本模式直接编辑正文。
     pub fn has_format_toolbar(self) -> bool {
-        matches!(self, Self::Rich | Self::Markdown)
+        self == Self::Rich
     }
 
     /// 存档 / 配置里使用的稳定标识。
@@ -95,13 +94,13 @@ pub fn convert(body: &str, from: ComposeFormat, to: ComposeFormat) -> String {
     let html = match from {
         ComposeFormat::Markdown => markdown_to_html(body),
         ComposeFormat::Plain => plain_to_html(body),
-        // 富文本模式下正文可能还是用户手打的纯文本（刚切换过来就输入），
-        // 用「像不像 HTML」兜底一次，避免把纯文本原样当成 HTML。
+        // 旧草稿和从其他模式切来的富文本可直接保存 HTML。
+        // 手输正文使用工具条插入的标记，并保留手动换行。
         ComposeFormat::Rich => {
             if looks_like_html(body) {
                 body.to_string()
             } else {
-                plain_to_html(body)
+                render_markdown(body, true)
             }
         }
         ComposeFormat::Html => body.to_string(),
@@ -138,6 +137,10 @@ const PLACEHOLDER: char = '\u{E000}';
 
 /// 把 Markdown 原文转成邮件可用的 HTML（块级 + 行内，CommonMark 常用子集）。
 pub fn markdown_to_html(md: &str) -> String {
+    render_markdown(md, false)
+}
+
+fn render_markdown(md: &str, hard_breaks: bool) -> String {
     let normalized = md.replace("\r\n", "\n");
     let lines: Vec<&str> = normalized.split('\n').collect();
     let mut out = String::new();
@@ -193,7 +196,7 @@ pub fn markdown_to_html(md: &str) -> String {
                 i += 1;
             }
             out.push_str("<blockquote style=\"margin:0 0 12px;padding-left:10px;border-left:3px solid #d4d4d8;color:#52525b\">");
-            out.push_str(markdown_to_html(inner.trim_end()).trim_end());
+            out.push_str(render_markdown(inner.trim_end(), hard_breaks).trim_end());
             out.push_str("</blockquote>\n");
             continue;
         }
@@ -259,10 +262,13 @@ pub fn markdown_to_html(md: &str) -> String {
             para.push_str(cur.trim_end());
             i += 1;
         }
-        out.push_str(&format!(
-            "<p style=\"margin:0 0 12px\">{}</p>\n",
-            inline(&para)
-        ));
+        let para = inline(&para);
+        let para = if hard_breaks {
+            para.replace('\n', "<br>")
+        } else {
+            para
+        };
+        out.push_str(&format!("<p style=\"margin:0 0 12px\">{para}</p>\n"));
     }
     out.trim_end().to_string()
 }
@@ -1211,6 +1217,22 @@ mod tests {
         assert_eq!(plain, "重点 内容");
         let same = convert(md, ComposeFormat::Markdown, ComposeFormat::Markdown);
         assert_eq!(same, md);
+    }
+
+    #[test]
+    fn rich_format_renders_toolbar_markup_and_preserves_line_breaks() {
+        let html = convert("第一行\n**重点**", ComposeFormat::Rich, ComposeFormat::Html);
+        assert!(html.contains("第一行<br><strong>重点</strong>"), "{html}");
+
+        let legacy = "<p><strong>旧草稿</strong></p>";
+        assert_eq!(
+            convert(legacy, ComposeFormat::Rich, ComposeFormat::Html),
+            legacy
+        );
+        assert_eq!(
+            convert("**原样**", ComposeFormat::Plain, ComposeFormat::Plain),
+            "**原样**"
+        );
     }
 
     #[test]
