@@ -66,6 +66,15 @@ impl HylkiPalette {
     }
 }
 
+/// 原生正文和 WebView2 共用的默认背景色与正文色。
+pub(crate) fn reader_body_colors(dark: bool) -> (Hsla, Hsla) {
+    if dark {
+        (rgb(0x202124).into(), rgb(0xe8eaed).into())
+    } else {
+        (white().into(), rgb(0x202124).into())
+    }
+}
+
 /// 星标琥珀金十六进制值（与亮暗主题无关，对齐 Linux 原版 `#e5a50a`）。
 pub(crate) const STAR_GOLD: u32 = 0xe5_a5_0a;
 

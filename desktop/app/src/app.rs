@@ -5835,13 +5835,16 @@ impl HylkiApp {
             }),
             ..Default::default()
         };
-        if let Ok((_handle, _entity)) = gpui_kit::open_window(options, cx, move |window, cx| {
-            window.set_window_title(&title);
-            cx.new(|cx| MessageWindow::new(detail, app_weak, prefs, window, cx))
-        }) {
-            #[cfg(target_os = "windows")]
-            crate::apply_window_icon();
-        }
+        // 独立窗口首帧会读取主窗口状态，等当前更新释放主窗口实体后再打开。
+        cx.defer(move |cx| {
+            if let Ok((_handle, _entity)) = gpui_kit::open_window(options, cx, move |window, cx| {
+                window.set_window_title(&title);
+                cx.new(|cx| MessageWindow::new(detail, app_weak, prefs, window, cx))
+            }) {
+                #[cfg(target_os = "windows")]
+                crate::apply_window_icon();
+            }
+        });
     }
 
     pub(crate) fn send_compose(&mut self, cx: &mut Context<Self>) {
@@ -9042,9 +9045,10 @@ impl Render for HylkiApp {
         #[cfg(windows)]
         if self.selected_message.is_none() && self.reader_webview_key.take().is_some() {
             if let Some(host) = self.reader_webview.clone() {
-                cx.defer_in(window, move |_, _, _| {
-                    host.set_visible(false);
-                    let _ = host.load(b"<!doctype html>".to_vec());
+                cx.defer_in(window, move |this, _, _| {
+                    if this.reader_webview_key.is_none() {
+                        let _ = host.load(b"<!doctype html>".to_vec());
+                    }
                 });
             }
         }

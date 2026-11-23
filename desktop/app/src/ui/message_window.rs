@@ -26,9 +26,10 @@ use hylki_mail_core::{format_message_datetime, MessageDetail};
 
 use crate::app::{split_sender, HylkiApp};
 use crate::theme;
-use crate::ui::{avatar, print_preview, window_controls};
-use crate::webview_host::{build_document, supports_document, WebViewHost};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use crate::ui::{avatar, print_preview, reader, window_controls};
+use crate::webview_host::{
+    build_document, supports_document, BodyView, DocumentAppearance, WebViewHost,
+};
 
 pub(crate) struct MessageWindow {
     detail: MessageDetail,
@@ -44,13 +45,13 @@ pub(crate) struct MessageWindow {
     text_states: HashMap<u32, (String, Entity<TextViewState>)>,
     print_preview: Option<print_preview::PrintPreviewState>,
     webview: Option<Rc<WebViewHost>>,
-    webview_appearance: (bool, u32, bool),
+    webview_appearance: Option<(DocumentAppearance, bool)>,
 }
 
 impl MessageWindow {
     fn poll_webview(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let mut previous = (false, false);
+            let mut previous = None;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(100))
@@ -60,21 +61,9 @@ impl MessageWindow {
                         let Some(host) = this.webview.as_ref() else {
                             return;
                         };
-                        let status = (host.ready(), host.failed());
+                        let status = Some(host.load_status());
                         if status != previous {
                             previous = status;
-                            cx.notify();
-                        }
-                        let app_dark = this
-                            .app_entity
-                            .upgrade()
-                            .is_some_and(|app| app.read(cx).dark_mode);
-                        let dark = match this.prefs.message_theme.as_str() {
-                            "light" => false,
-                            "dark" => true,
-                            _ => app_dark,
-                        };
-                        if dark != this.webview_appearance.0 {
                             cx.notify();
                         }
                         let links = host.take_links();
@@ -119,61 +108,17 @@ impl MessageWindow {
         )
         .detach();
 
-        let eligible_html = detail
-            .body_html
-            .as_deref()
-            .filter(|html| supports_document(html))
-            .map(str::to_owned);
-        let subject = detail.subject.clone();
-        let sender = detail.sender.clone();
-        let app_dark = app_entity
-            .upgrade()
-            .is_some_and(|app| app.read(cx).dark_mode);
-        let dark_mode = match prefs.message_theme.as_str() {
-            "light" => false,
-            "dark" => true,
-            _ => app_dark,
-        };
-        let zoom_percent = prefs.reader_zoom_percent;
-        let allow_remote = app_entity.upgrade().is_some_and(|app| {
+        cx.observe_global::<theme::HylkiThemeState>(|_, cx| cx.notify())
+            .detach();
+        if let Some(app) = app_entity.upgrade() {
             cx.observe(&app, |this, app, cx| {
-                if app.read(cx).remote_images_allowed(this.detail.id) != this.webview_appearance.2 {
+                if this.webview_appearance.is_some_and(|(_, allowed)| {
+                    app.read(cx).remote_images_allowed(this.detail.id) != allowed
+                }) {
                     cx.notify();
                 }
             })
             .detach();
-            app.read(cx).remote_images_allowed(detail.id)
-        });
-        if let Some(html) = eligible_html {
-            cx.defer_in(window, move |this, window, cx| {
-                if let Ok(handle) = window.window_handle() {
-                    if let RawWindowHandle::Win32(handle) = handle.as_raw() {
-                        let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
-                        if let Ok(host) = WebViewHost::create(hwnd, None) {
-                            let allow_remote = this.app_entity.upgrade().is_some_and(|app| {
-                                app.read(cx).remote_images_allowed(this.detail.id)
-                            });
-                            if host
-                                .load_with_remote(
-                                    build_document(
-                                        &html,
-                                        &subject,
-                                        &sender,
-                                        dark_mode,
-                                        zoom_percent,
-                                    ),
-                                    allow_remote,
-                                )
-                                .is_ok()
-                            {
-                                this.webview = Some(Rc::new(host));
-                                this.poll_webview(cx);
-                                cx.notify();
-                            }
-                        }
-                    }
-                }
-            });
         }
 
         Self {
@@ -190,7 +135,7 @@ impl MessageWindow {
             text_states: HashMap::new(),
             print_preview: None,
             webview: None,
-            webview_appearance: (dark_mode, zoom_percent, allow_remote),
+            webview_appearance: None,
         }
     }
 
@@ -380,36 +325,61 @@ impl Render for MessageWindow {
             )
         };
 
-        let text_state = self.ensure_text_state(d.id, &main_html, cx);
         let quote_expanded = self.expanded_quote_ids.contains(&d.id);
         let app_dark = self
             .app_entity
             .upgrade()
             .is_some_and(|app| app.read(cx).dark_mode);
-        let dark_mode = match self.prefs.message_theme.as_str() {
-            "light" => false,
-            "dark" => true,
-            _ => app_dark,
+        let forced_dark = match self.prefs.message_theme.as_str() {
+            "light" => Some(false),
+            "dark" => Some(true),
+            _ => None,
         };
-
-        let appearance = (dark_mode, self.prefs.reader_zoom_percent, allow_remote);
-        if self.webview_appearance != appearance {
-            self.webview_appearance = appearance;
-            if let (Some(host), Some(html)) = (self.webview.clone(), d.body_html.clone()) {
-                let document =
-                    build_document(&html, &d.subject, &d.sender, appearance.0, appearance.1);
-                cx.defer_in(window, move |_, _, _| {
-                    let _ = host.load_with_remote(document, appearance.2);
+        let dark = forced_dark.unwrap_or(app_dark);
+        let (background, foreground) = theme::reader_body_colors(dark);
+        let body_muted = foreground.opacity(0.75);
+        let appearance = DocumentAppearance {
+            dark,
+            zoom_percent: self.prefs.reader_zoom_percent,
+            background,
+            foreground,
+        };
+        let settings = Some((appearance, allow_remote));
+        let mut load_scheduled = false;
+        if self.webview_appearance != settings {
+            self.webview_appearance = settings;
+            if let Some(html) = d
+                .body_html
+                .as_deref()
+                .filter(|html| supports_document(html))
+            {
+                let document = build_document(html, &d.subject, &d.sender, appearance);
+                load_scheduled = true;
+                cx.defer_in(window, move |this, window, cx| {
+                    if this.webview_appearance != settings {
+                        return;
+                    }
+                    if let Some(host) = &this.webview {
+                        let _ = host.load_with_remote(document, allow_remote);
+                    } else if let Some(host) = WebViewHost::for_window(window, None) {
+                        let _ = host.load_with_remote(document, allow_remote);
+                        this.webview = Some(Rc::new(host));
+                        this.poll_webview(cx);
+                    }
+                    cx.notify();
                 });
             }
         }
-        let show_webview = self.webview.as_ref().is_some_and(|host| host.ready())
-            && !self.prefer_plain
-            && !self.find_open
-            && self.print_preview.is_none();
-        if let Some(host) = self.webview.clone() {
-            cx.defer_in(window, move |_, _, _| host.set_visible(show_webview));
+        let body_view = BodyView::for_document(
+            !self.prefer_plain && !self.find_open && self.print_preview.is_none(),
+            load_scheduled,
+            self.webview.as_deref(),
+        );
+        if let Some(host) = self.webview.clone().filter(|_| body_view != BodyView::Html) {
+            cx.defer_in(window, move |_, _, _| host.set_visible(false));
         }
+        let text_state =
+            (body_view == BodyView::Native).then(|| self.ensure_text_state(d.id, &main_html, cx));
         let win_controls = h_flex()
             .flex_shrink_0()
             .h_full()
@@ -655,8 +625,12 @@ impl Render for MessageWindow {
                     })))
             })
             // 邮件正文滚动区。
-            .when(show_webview, |root| {
+            .when(body_view == BodyView::Loading, |root| {
+                root.child(reader::body_loading(background, body_muted).flex_1().min_h_0())
+            })
+            .when(body_view == BodyView::Html, |root| {
                 let host = self.webview.as_ref().unwrap().clone();
+                let (version, _) = host.load_status();
                 root.child(
                     gpui_kit::canvas(
                         move |bounds, window, cx| {
@@ -669,7 +643,12 @@ impl Render for MessageWindow {
                                 bottom: ((bounds.origin.y + bounds.size.height).as_f32() * scale)
                                     .round() as i32,
                             };
-                            cx.defer(move |_| host.set_bounds(rect));
+                            cx.defer(move |_| {
+                                if host.load_status() == (version, BodyView::Html) {
+                                    host.set_bounds(rect);
+                                    host.set_visible(true);
+                                }
+                            });
                         },
                         |_, _, _, _| {},
                     )
@@ -678,12 +657,14 @@ impl Render for MessageWindow {
                     .w_full(),
                 )
             })
-            .when(!show_webview, |root| {
+            .when_some(text_state, |root, text_state| {
                 root.child(
                     v_flex()
                         .id("popout-scroll")
                         .flex_1()
                         .min_h_0()
+                        .bg(background)
+                        .text_color(foreground)
                         .overflow_y_scrollbar()
                         .p_6()
                         .gap_4()
@@ -698,7 +679,6 @@ impl Render for MessageWindow {
                                 .p_5()
                                 .gap_3()
                                 .rounded(px(12.0))
-                                .bg(p.surface_raised)
                                 .border_1()
                                 .border_color(border)
                                 .child(
@@ -721,7 +701,7 @@ impl Render for MessageWindow {
                                                     el.child(
                                                         div()
                                                             .text_xs()
-                                                            .text_color(muted_fg)
+                                                            .text_color(body_muted)
                                                             .truncate()
                                                             .child(SharedString::from(format!(
                                                                 "<{sender_email}>"
@@ -732,7 +712,7 @@ impl Render for MessageWindow {
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(muted_fg)
+                                                .text_color(body_muted)
                                                 .child(SharedString::from(formatted_date)),
                                         ),
                                 )
@@ -779,7 +759,7 @@ impl Render for MessageWindow {
                                                         .pl_3()
                                                         .border_l_2()
                                                         .border_color(p.accent.opacity(0.5))
-                                                        .text_color(muted_fg)
+                                                        .text_color(body_muted)
                                                         .text_size(px(13.0))
                                                         .child(
                                                             TextView::html(

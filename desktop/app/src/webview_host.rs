@@ -2,8 +2,10 @@
 #![allow(dead_code)]
 
 use gpui_kit::{
-    point, px, AsyncWindowContext, PlatformInput, ScrollDelta, ScrollEvent, TouchPhase,
+    point, px, AsyncWindowContext, Hsla, PlatformInput, Rgba, ScrollDelta, ScrollEvent, TouchPhase,
+    Window,
 };
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     cell::RefCell,
     os::windows::ffi::OsStrExt,
@@ -174,25 +176,31 @@ pub(crate) fn supports_document(html: &str) -> bool {
         && !lower.contains("mailto:")
 }
 
-pub(crate) fn build_body_document(html: &str, dark_mode: bool, zoom_percent: u32) -> Vec<u8> {
-    make_document(html, None, dark_mode, zoom_percent)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DocumentAppearance {
+    pub dark: bool,
+    pub zoom_percent: u32,
+    pub background: Hsla,
+    pub foreground: Hsla,
+}
+
+pub(crate) fn build_body_document(html: &str, appearance: DocumentAppearance) -> Vec<u8> {
+    make_document(html, None, appearance)
 }
 
 pub(crate) fn build_document(
     html: &str,
     subject: &str,
     sender: &str,
-    dark_mode: bool,
-    zoom_percent: u32,
+    appearance: DocumentAppearance,
 ) -> Vec<u8> {
-    make_document(html, Some((subject, sender)), dark_mode, zoom_percent)
+    make_document(html, Some((subject, sender)), appearance)
 }
 
 fn make_document(
     html: &str,
     header: Option<(&str, &str)>,
-    dark_mode: bool,
-    zoom_percent: u32,
+    appearance: DocumentAppearance,
 ) -> Vec<u8> {
     let escape = |value: &str| {
         value
@@ -201,20 +209,23 @@ fn make_document(
             .replace('<', "&lt;")
             .replace('>', "&gt;")
     };
-    let html = dark::pin_color_scheme(html, dark_mode);
-    let html = if dark_mode {
+    let html = dark::pin_color_scheme(html, appearance.dark);
+    let html = if appearance.dark {
         dark::adapt_colors_for_dark(&html)
     } else {
         html
     };
-    let (bg, fg, scheme) = if dark_mode {
-        ("#202124", "#e8eaed", "dark")
-    } else {
-        ("#fff", "#202124", "light")
+    let css_color = |color: Hsla| {
+        let rgb = Rgba::from(color);
+        let [r, g, b] = [rgb.r, rgb.g, rgb.b].map(|channel| (channel * 255.0).round() as u8);
+        format!("#{r:02x}{g:02x}{b:02x}")
     };
+    let bg = css_color(appearance.background);
+    let fg = css_color(appearance.foreground);
+    let scheme = if appearance.dark { "dark" } else { "light" };
     let style = format!(
-        "<style>:root{{color-scheme:{scheme};zoom:{}%}}body{{background:{bg};color:{fg}}}</style>",
-        zoom_percent.clamp(50, 250)
+        "<style>:root{{color-scheme:{scheme};zoom:{}%}}:where(body){{background-color:{bg};color:{fg}}}</style>",
+        appearance.zoom_percent.clamp(50, 250)
     );
     let lower = html.to_ascii_lowercase();
     let insertion = lower
@@ -233,7 +244,7 @@ fn make_document(
             )
         })
         .unwrap_or_default();
-    format!("<!doctype html><meta charset=utf-8><style>html,body{{height:100%;margin:0}}body{{display:flex;flex-direction:column;font:14px system-ui;background:{bg};color:{fg}}}header{{padding:24px 24px 12px}}h1{{font-size:20px;margin:0 0 12px}}iframe{{flex:1;width:100%;border:0;min-height:0}}</style>{header}<iframe sandbox=\"allow-same-origin allow-popups\" srcdoc=\"{escaped}\"></iframe>").into_bytes()
+    format!("<!doctype html><meta charset=utf-8><style>:root{{color-scheme:{scheme}}}html,body{{height:100%;margin:0}}body{{display:flex;flex-direction:column;font:14px system-ui;background:{bg};color:{fg}}}header{{padding:24px 24px 12px}}h1{{font-size:20px;margin:0 0 12px}}iframe{{flex:1;width:100%;border:0;min-height:0}}</style>{header}<iframe sandbox=\"allow-same-origin allow-popups\" srcdoc=\"{escaped}\"></iframe>").into_bytes()
 }
 
 #[derive(Default)]
@@ -328,11 +339,45 @@ fn create_controller(
     }
 }
 
-/// 创建不会阻塞或泵消息；异步完成后可通过 `ready` 检查。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BodyView {
+    #[default]
+    Native,
+    Loading,
+    Html,
+}
+
+impl BodyView {
+    pub(crate) fn for_document(
+        enabled: bool,
+        load_scheduled: bool,
+        host: Option<&WebViewHost>,
+    ) -> Self {
+        match (enabled, load_scheduled) {
+            (false, _) => Self::Native,
+            (true, true) => Self::Loading,
+            (true, false) => host.map_or(Self::Native, |host| host.load_status().1),
+        }
+    }
+}
+
+/// 创建不会阻塞或泵消息；异步完成后可通过 `load_status` 检查。
 pub(crate) struct WebViewHost(Rc<RefCell<State>>);
 
 impl WebViewHost {
-    pub(crate) fn create(
+    pub(crate) fn for_window(
+        window: &Window,
+        scroll_window: Option<AsyncWindowContext>,
+    ) -> Option<Self> {
+        let RawWindowHandle::Win32(handle) = HasWindowHandle::window_handle(window).ok()?.as_raw()
+        else {
+            return None;
+        };
+        let hwnd = HWND(handle.hwnd.get() as *mut _);
+        Self::create(hwnd, scroll_window).ok()
+    }
+
+    fn create(
         parent: HWND,
         scroll_window: Option<AsyncWindowContext>,
     ) -> windows::core::Result<Self> {
@@ -433,12 +478,16 @@ impl WebViewHost {
         Ok(Self(state))
     }
 
-    pub(crate) fn ready(&self) -> bool {
+    pub(crate) fn load_status(&self) -> (u64, BodyView) {
         let state = self.0.borrow();
-        state.controller.is_some() && state.loaded && !state.failed
-    }
-    pub(crate) fn failed(&self) -> bool {
-        self.0.borrow().failed
+        let view = if state.failed {
+            BodyView::Native
+        } else if state.loaded {
+            BodyView::Html
+        } else {
+            BodyView::Loading
+        };
+        (state.version, view)
     }
     pub(crate) fn take_links(&self) -> Vec<String> {
         let mut state = self.0.borrow_mut();
@@ -532,6 +581,7 @@ impl WebViewHost {
         allow_remote_images: bool,
         in_thread: bool,
     ) -> windows::core::Result<()> {
+        self.set_visible(false);
         let mut state = self.0.borrow_mut();
         state.document = document;
         state.allow_remote_images = false;
@@ -541,16 +591,22 @@ impl WebViewHost {
         state.navigation_id = None;
         let url = document_url(state.version);
         let controller = state.controller.clone();
+        if controller.is_some() {
+            state.failed = false;
+        }
         drop(state);
         if let Some(controller) = &controller {
-            unsafe {
-                let _ = controller.CoreWebView2()?.Stop();
+            if let Ok(view) = unsafe { controller.CoreWebView2() } {
+                let _ = unsafe { view.Stop() };
             }
         }
         self.0.borrow_mut().allow_remote_images = allow_remote_images;
         if let Some(controller) = controller {
-            unsafe {
-                navigate_to(&controller, &url)?;
+            if let Err(error) = unsafe { navigate_to(&controller, &url) } {
+                let mut state = self.0.borrow_mut();
+                state.navigation_id = None;
+                state.failed = true;
+                return Err(error);
             }
         }
         Ok(())
@@ -910,6 +966,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_scheduled_html_document_shows_loading_before_the_host_exists() {
+        assert_eq!(BodyView::for_document(true, true, None), BodyView::Loading);
+        assert_eq!(BodyView::for_document(true, false, None), BodyView::Native);
+        assert_eq!(BodyView::for_document(false, true, None), BodyView::Native);
+    }
+
+    #[test]
     fn thread_wheel_messages_require_a_finite_nonzero_delta() {
         assert_eq!(thread_wheel_delta("thread-wheel:42.5"), Some(42.5));
         assert_eq!(thread_wheel_delta("thread-wheel:-120"), Some(-120.0));
@@ -1066,12 +1129,18 @@ mod tests {
 
     #[test]
     fn document_preserves_markup_inside_an_escaped_sandboxed_frame() {
+        let (background, foreground) = crate::theme::reader_body_colors(false);
+        let light = DocumentAppearance {
+            dark: false,
+            zoom_percent: 100,
+            background,
+            foreground,
+        };
         let document = String::from_utf8(build_document(
             "<style>p{color:red}</style><p title=\"x\">A & B</p>",
             "<subject>",
             "sender & co",
-            false,
-            100,
+            light,
         ))
         .unwrap();
         assert!(document.contains("<iframe sandbox=\"allow-same-origin allow-popups\" srcdoc=\""));
@@ -1079,6 +1148,8 @@ mod tests {
         assert!(document.contains("title=&quot;x&quot;"));
         assert!(document.contains("&lt;subject&gt;"));
         assert!(document.contains("sender &amp; co"));
+        assert!(document.contains("background:#ffffff;color:#202124"));
+        assert!(document.contains(":where(body){background-color:#ffffff;color:#202124}"));
         assert!(supports_document(
             "<p><a href='https://example.com'>link</a></p>"
         ));
@@ -1089,10 +1160,27 @@ mod tests {
         assert!(!supports_document(
             "<a href='mailto:a@example.com'>mail</a>"
         ));
-        let dark = String::from_utf8(build_body_document("<!doctype html><html><head><style>p{color:#000}</style></head><body><p>x</p></body></html>", true, 150)).unwrap();
+        let (background, foreground) = crate::theme::reader_body_colors(true);
+        let dark = String::from_utf8(build_body_document(
+            "<!doctype html><html><head><style>p{color:#000}</style></head><body><p>x</p></body></html>",
+            DocumentAppearance {
+                dark: true,
+                zoom_percent: 150,
+                background,
+                foreground,
+            },
+        )).unwrap();
         assert!(dark.contains("color-scheme:dark;zoom:150%"));
+        assert!(dark.contains(":where(body){background-color:#202124;color:#e8eaed}"));
         assert!(dark.contains("&lt;!doctype html&gt;&lt;html&gt;&lt;head&gt;&lt;style&gt;"));
-        let clamped = String::from_utf8(build_body_document("<p>x</p>", false, 999)).unwrap();
+        let clamped = String::from_utf8(build_body_document(
+            "<p>x</p>",
+            DocumentAppearance {
+                zoom_percent: 999,
+                ..light
+            },
+        ))
+        .unwrap();
         assert!(clamped.contains("zoom:250%"));
     }
 }
