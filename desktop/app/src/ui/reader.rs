@@ -128,6 +128,7 @@ fn build_card_more_menu(
     cx: &mut Context<HylkiApp>,
 ) -> gpui_kit::AnyElement {
     let entity = cx.entity();
+    let popup_entity = entity.clone();
     let msg_id = card_detail.id;
     let account_id = card_detail.account_id;
     let uid = card_detail.uid;
@@ -276,6 +277,12 @@ fn build_card_more_menu(
                 );
             menu
         })
+        .on_open_change(move |open, _, cx| {
+            popup_entity.update(cx, |app, cx| {
+                app.reader_popup_open = *open;
+                cx.notify();
+            });
+        })
         .into_any_element()
 }
 
@@ -319,6 +326,8 @@ fn render_message_card(
     // F-7 该卡片是否处于「退订确认中」（全局待确认邮件 ID 匹配本卡片）。
     unsubscribe_confirming: bool,
     more_menu: gpui_kit::AnyElement,
+    show_webview: bool,
+    webview_in_thread: bool,
     p: &theme::HylkiPalette,
     app: &mut HylkiApp,
     cx: &mut Context<HylkiApp>,
@@ -486,7 +495,12 @@ fn render_message_card(
                 0,
             )
         };
-    let text_state: Entity<TextViewState> = app.ensure_reader_text_state(msg_id, &main_html, cx);
+    let text_state: Option<Entity<TextViewState>> = if show_webview {
+        app.reader_text_states.remove(&msg_id);
+        None
+    } else {
+        Some(app.ensure_reader_text_state(msg_id, &main_html, cx))
+    };
 
     let card_attachment_ids: Vec<u32> = attachments.iter().map(|a| a.id).collect();
     let attachment_rows: Vec<gpui_kit::AnyElement> = attachments
@@ -537,6 +551,9 @@ fn render_message_card(
         .collect();
 
     v_flex()
+        .when(show_webview && !webview_in_thread, |card| {
+            card.flex_1().min_h_0()
+        })
         .when(card_chrome, |card| {
             card.bg(p.surface_raised)
                 .rounded(px(12.0))
@@ -979,39 +996,80 @@ fn render_message_card(
                     ),
             )
         })
-        .child({
-            // B-5：亮 / 暗背景覆盖优先使用单封会话覆盖，其次使用「正文外观主题」全局偏好。
-            let effective_bg_pick = bg_pick.or(forced_theme_bg);
-            let (forced_bg, forced_fg) = match effective_bg_pick {
-                Some(false) => (Some(FORCE_LIGHT_BG), Some(FORCE_LIGHT_FG)),
-                Some(true) => (Some(FORCE_DARK_BG), Some(FORCE_DARK_FG)),
-                None => (None, None),
-            };
-            div()
-                .when(show_raw_source, |el| {
-                    el.p_3()
-                        .rounded(px(8.0))
-                        .bg(canvas)
-                        .border_1()
-                        .border_color(border)
-                        .text_size(px((12.0 * zoom_scale).max(10.0)))
-                })
-                .when(!show_raw_source, |el| el.text_size(px(body_font_px)))
-                .map(|el| match forced_bg {
-                    Some(bg) => el
-                        .bg(bg)
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(border)
-                        .p_2(),
-                    None => el,
-                })
-                .text_color(forced_fg.unwrap_or(if body_loaded { p.text } else { muted_fg }))
-                .child(TextView::new(&text_state).link_tooltip(|url, _, cx| {
-                    let url = url.clone();
-                    cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
-                        .into()
-                }))
+        .when(!show_webview, |card| {
+            card.child({
+                // B-5：亮 / 暗背景覆盖优先使用单封会话覆盖，其次使用「正文外观主题」全局偏好。
+                let effective_bg_pick = bg_pick.or(forced_theme_bg);
+                let (forced_bg, forced_fg) = match effective_bg_pick {
+                    Some(false) => (Some(FORCE_LIGHT_BG), Some(FORCE_LIGHT_FG)),
+                    Some(true) => (Some(FORCE_DARK_BG), Some(FORCE_DARK_FG)),
+                    None => (None, None),
+                };
+                div()
+                    .when(show_raw_source, |el| {
+                        el.p_3()
+                            .rounded(px(8.0))
+                            .bg(canvas)
+                            .border_1()
+                            .border_color(border)
+                            .text_size(px((12.0 * zoom_scale).max(10.0)))
+                    })
+                    .when(!show_raw_source, |el| el.text_size(px(body_font_px)))
+                    .map(|el| match forced_bg {
+                        Some(bg) => el
+                            .bg(bg)
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(border)
+                            .p_2(),
+                        None => el,
+                    })
+                    .text_color(forced_fg.unwrap_or(if body_loaded { p.text } else { muted_fg }))
+                    .child(TextView::new(text_state.as_ref().unwrap()).link_tooltip(
+                        |url, _, cx| {
+                            let url = url.clone();
+                            cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
+                                .into()
+                        },
+                    ))
+            })
+        })
+        .when(show_webview, |card| {
+            #[cfg(windows)]
+            {
+                let host = app.reader_webview.as_ref().unwrap().clone();
+                return card.child(
+                    gpui_kit::canvas(
+                        move |bounds, window, cx| {
+                            let scale = window.scale_factor();
+                            let rect = windows::Win32::Foundation::RECT {
+                                left: (bounds.origin.x.as_f32() * scale).round() as i32,
+                                top: (bounds.origin.y.as_f32() * scale).round() as i32,
+                                right: ((bounds.origin.x + bounds.size.width).as_f32() * scale)
+                                    .round() as i32,
+                                bottom: ((bounds.origin.y + bounds.size.height).as_f32() * scale)
+                                    .round() as i32,
+                            };
+                            let mask = window.content_mask().bounds;
+                            let clip = windows::Win32::Foundation::RECT {
+                                left: (mask.origin.x.as_f32() * scale).round() as i32,
+                                top: (mask.origin.y.as_f32() * scale).round() as i32,
+                                right: ((mask.origin.x + mask.size.width).as_f32() * scale).round()
+                                    as i32,
+                                bottom: ((mask.origin.y + mask.size.height).as_f32() * scale)
+                                    .round() as i32,
+                            };
+                            cx.defer(move |_| host.set_clipped_bounds(rect, clip));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .when(webview_in_thread, |el| el.h(px(500.0)))
+                    .when(!webview_in_thread, |el| el.flex_1().min_h_0())
+                    .w_full(),
+                );
+            }
+            #[cfg(not(windows))]
+            card
         })
         .when_some(quoted_part, |card, (q_html, lines)| {
             card.child(
@@ -1114,6 +1172,22 @@ fn render_message_card(
         .into_any_element()
 }
 
+#[cfg(windows)]
+fn webview_eligible(
+    html: Option<&str>,
+    body_pending: bool,
+    prefer_plain: bool,
+    raw_source: bool,
+    collapsed: bool,
+) -> bool {
+    html.is_some_and(|body| {
+        crate::webview_host::supports_document(body) && !body.to_ascii_lowercase().contains("cid:")
+    }) && !body_pending
+        && !prefer_plain
+        && !raw_source
+        && !collapsed
+}
+
 pub(crate) fn render(
     app: &mut HylkiApp,
     window: &Window,
@@ -1190,6 +1264,130 @@ pub(crate) fn render_with_pane_top(
     let thread_count = detail.thread_messages.len();
     // 占位详情：正文仍在远端加载中，显示加载提示而不是“加载完整正文”按钮。
     let body_pending = app.pending_body_message_id == Some(detail.id);
+
+    #[cfg(windows)]
+    let show_webview = {
+        use crate::webview_host::{build_body_document, WebViewHost};
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use std::hash::{Hash, Hasher};
+
+        let anchor = detail
+            .thread_messages
+            .iter()
+            .find(|message| message.id == detail.id);
+        let html = if thread_count > 1 {
+            anchor.and_then(|message| message.body_html.as_deref())
+        } else {
+            detail.body_html.as_deref()
+        };
+        let body_pending = body_pending
+            || (thread_count > 1 && !anchor.is_some_and(|message| message.body_loaded));
+        let block_remote = app.prefs.block_remote_images
+            && !app.allowed_remote_image_ids.contains(&detail.id)
+            && !app.prefs.is_remote_sender_allowed(&detail.sender);
+        let eligible = webview_eligible(
+            html,
+            body_pending,
+            prefer_plain,
+            app.raw_source_message_ids.contains(&detail.id),
+            app.collapsed_thread_cards.contains(&detail.id),
+        );
+        let unobscured = app.active_modal == crate::app::ActiveModal::None
+            && app.print_preview.is_none()
+            && !app.reader_find_open
+            && !app.compose_split
+            && !app.sidebar_peek_open
+            && app.drawer_image_preview.is_none();
+        let dark = app
+            .message_bg_picks
+            .get(&detail.id)
+            .copied()
+            .unwrap_or_else(|| match app.prefs.message_theme.as_str() {
+                "light" => false,
+                "dark" => true,
+                _ => app.dark_mode,
+            });
+        let key = html.filter(|_| eligible).map(|html| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            detail.id.hash(&mut hasher);
+            html.hash(&mut hasher);
+            detail.subject.hash(&mut hasher);
+            dark.hash(&mut hasher);
+            zoom_percent.hash(&mut hasher);
+            block_remote.hash(&mut hasher);
+            hasher.finish()
+        });
+        if key.is_none() && app.reader_webview_key.take().is_some() {
+            if let Some(host) = app.reader_webview.clone() {
+                cx.defer_in(window, move |_, _, _| {
+                    host.set_visible(false);
+                    let _ = host.load(b"<!doctype html>".to_vec());
+                });
+            }
+        }
+        let document_changed = key.is_some() && app.reader_webview_key != key;
+        if let Some(key) = key {
+            if document_changed {
+                let document = build_body_document(html.unwrap(), dark, zoom_percent);
+                app.reader_webview_key = Some(key);
+                if let Some(host) = app.reader_webview.clone() {
+                    cx.defer_in(window, move |_, _, _| {
+                        host.set_visible(false);
+                        let _ = host.load_with_remote(document, !block_remote);
+                    });
+                } else {
+                    let message_id = detail.id;
+                    cx.defer_in(window, move |this, window, cx| {
+                        if this.reader_webview_key != Some(key)
+                            || this.selected_message.as_ref().map(|message| message.id) != Some(message_id)
+                        { return; }
+                        if let Ok(handle) = HasWindowHandle::window_handle(window) {
+                            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                                let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
+                                if let Ok(host) = WebViewHost::create(hwnd) {
+                                    if host.load_with_remote(document, !block_remote).is_ok() {
+                                        this.reader_webview = Some(std::rc::Rc::new(host));
+                                        cx.spawn(async move |this, cx| {
+                                            let mut previous = (false, false, None);
+                                            loop {
+                                                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                                                if this.update(cx, |this, cx| {
+                                                    let Some(host) = this.reader_webview.clone() else { return; };
+                                                    let state = (host.ready(), host.failed(), this.reader_webview_key);
+                                                    if state != previous {
+                                                        previous = state;
+                                                        cx.notify();
+                                                    }
+                                                    for link in host.take_links() {
+                                                        if this.active_modal != crate::app::ActiveModal::None || this.reader_find_open || this.reader_popup_open { continue; }
+                                                        let link = if this.prefs.clean_links { hylki_mail_core::link_clean::clean_link(&link) } else { link };
+                                                        if crate::webview_host::allowed_external_url(&link) { this.open_link(&link, cx); }
+                                                    }
+                                                }).is_err() { break; }
+                                            }
+                                        }).detach();
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        let show = eligible
+            && unobscured
+            && !document_changed
+            && app.reader_webview_key == key
+            && app.reader_webview.as_ref().is_some_and(|host| host.ready());
+        if let Some(host) = app.reader_webview.clone() {
+            let visible = show && !app.reader_popup_open;
+            cx.defer_in(window, move |_, _, _| host.set_visible(visible));
+        }
+        show
+    };
+    #[cfg(not(windows))]
+    let show_webview = false;
 
     // 汇总当前会话全部附件 ID（用于顶部「保存全部附件」入口）。
     let all_thread_attachment_ids: Vec<u32> = if thread_count > 1 {
@@ -1324,6 +1522,8 @@ pub(crate) fn render_with_pane_top(
                     card_unsubscribe_one_click,
                     app.pending_unsubscribe == Some(tm.id),
                     menu,
+                    is_current && show_webview,
+                    true,
                     &p,
                     app,
                     cx,
@@ -1378,6 +1578,8 @@ pub(crate) fn render_with_pane_top(
             detail.unsubscribe_one_click,
             app.pending_unsubscribe == Some(detail.id),
             menu,
+            show_webview,
+            false,
             &p,
             app,
             cx,
@@ -1520,6 +1722,7 @@ pub(crate) fn render_with_pane_top(
                                 })
                                 .unwrap_or_default();
                             let move_entity = cx.entity();
+                            let popup_entity = cx.entity();
                             el.child(
                                 action_button("reader-archive", IconName::Archive, "归档")
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1569,6 +1772,12 @@ pub(crate) fn render_with_pane_top(
                                             );
                                         }
                                         menu
+                                    })
+                                    .on_open_change(move |open, _, cx| {
+                                        popup_entity.update(cx, |app, cx| {
+                                            app.reader_popup_open = *open;
+                                            cx.notify();
+                                        });
                                     }),
                             )
                             .child(
@@ -1655,6 +1864,7 @@ pub(crate) fn render_with_pane_top(
                             )
                         })
                         .when(narrow_topbar, |el| {
+                            let popup_entity = cx.entity();
                             let d_print = overflow_print_detail.clone();
                             let d_pop = overflow_popout_detail.clone();
                             el.child(
@@ -1727,6 +1937,12 @@ pub(crate) fn render_with_pane_top(
                                                     });
                                                 }),
                                         )
+                                    })
+                                    .on_open_change(move |open, _, cx| {
+                                        popup_entity.update(cx, |app, cx| {
+                                            app.reader_popup_open = *open;
+                                            cx.notify();
+                                        });
                                     }),
                             )
                         }),
@@ -1956,18 +2172,22 @@ pub(crate) fn render_with_pane_top(
                 ),
         )
         // 卡片式正文（外层滚动，内边距 12px 24px 24px；多封会话纵向叠放）。
-        .child(
-            v_flex()
+        .child({
+            let content = v_flex()
                 .id("reader-scroll")
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scrollbar()
                 .pt(px(12.0))
                 .px(px(24.0))
                 .pb(px(24.0))
                 .gap_3()
-                .children(cards),
-        )
+                .children(cards);
+            if show_webview && thread_count <= 1 {
+                content.into_any_element()
+            } else {
+                content.overflow_y_scrollbar().into_any_element()
+            }
+        })
         .when_some(drawer_element, |root, drawer| root.child(drawer))
         .into_any_element()
 }
@@ -1975,6 +2195,27 @@ pub(crate) fn render_with_pane_top(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn webview_requires_loaded_single_html_without_native_only_features() {
+        let html = Some("<p>Hello</p>");
+        assert!(webview_eligible(html, false, false, false, false));
+        assert!(!webview_eligible(None, false, false, false, false));
+        assert!(!webview_eligible(Some(""), false, false, false, false));
+
+        assert!(!webview_eligible(
+            Some("<img src=cid:example>"),
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!webview_eligible(html, true, false, false, false));
+        assert!(!webview_eligible(html, false, true, false, false));
+        assert!(!webview_eligible(html, false, false, true, false));
+        assert!(!webview_eligible(html, false, false, false, true));
+    }
 
     #[test]
     fn first_snippet_line_skips_blank_lines() {

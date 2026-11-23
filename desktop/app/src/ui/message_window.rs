@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -26,6 +27,8 @@ use hylki_mail_core::{format_message_datetime, MessageDetail};
 use crate::app::{split_sender, HylkiApp};
 use crate::theme;
 use crate::ui::{avatar, print_preview, window_controls};
+use crate::webview_host::{allowed_external_url, build_document, supports_document, WebViewHost};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 pub(crate) struct MessageWindow {
     detail: MessageDetail,
@@ -40,9 +43,78 @@ pub(crate) struct MessageWindow {
     find_total_matches: usize,
     text_states: HashMap<u32, (String, Entity<TextViewState>)>,
     print_preview: Option<print_preview::PrintPreviewState>,
+    webview: Option<Rc<WebViewHost>>,
+    webview_appearance: (bool, u32, bool),
 }
 
 impl MessageWindow {
+    fn poll_webview(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut previous = (false, false);
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        let Some(host) = this.webview.as_ref() else {
+                            return;
+                        };
+                        let status = (host.ready(), host.failed());
+                        if status != previous {
+                            previous = status;
+                            cx.notify();
+                        }
+                        let allowed = !this.prefs.block_remote_images
+                            || this.prefs.is_remote_sender_allowed(&this.detail.sender)
+                            || this.app_entity.upgrade().is_some_and(|app| {
+                                app.read(cx)
+                                    .allowed_remote_image_ids
+                                    .contains(&this.detail.id)
+                            });
+                        let app_dark = this
+                            .app_entity
+                            .upgrade()
+                            .is_some_and(|app| app.read(cx).dark_mode);
+                        let dark = match this.prefs.message_theme.as_str() {
+                            "light" => false,
+                            "dark" => true,
+                            _ => app_dark,
+                        };
+                        if allowed != this.webview_appearance.2 || dark != this.webview_appearance.0
+                        {
+                            cx.notify();
+                        }
+                        let links = host.take_links();
+                        if !this.prefer_plain && !this.find_open && this.print_preview.is_none() {
+                            for link in links {
+                                let link = if this.prefs.clean_links {
+                                    hylki_mail_core::link_clean::clean_link(&link)
+                                } else {
+                                    link
+                                };
+                                if !allowed_external_url(&link) {
+                                    continue;
+                                }
+                                if link.to_ascii_lowercase().starts_with("mailto:") {
+                                    cx.open_url(&link);
+                                } else {
+                                    let _ = this
+                                        .app_entity
+                                        .update(cx, |app, cx| app.open_link(&link, cx));
+                                }
+                            }
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn new(
         detail: MessageDetail,
         app_entity: WeakEntity<HylkiApp>,
@@ -67,6 +139,56 @@ impl MessageWindow {
         )
         .detach();
 
+        let eligible_html = detail
+            .body_html
+            .as_deref()
+            .filter(|html| supports_document(html))
+            .map(str::to_owned);
+        let subject = detail.subject.clone();
+        let sender = detail.sender.clone();
+        let app_dark = app_entity
+            .upgrade()
+            .is_some_and(|app| app.read(cx).dark_mode);
+        let dark_mode = match prefs.message_theme.as_str() {
+            "light" => false,
+            "dark" => true,
+            _ => app_dark,
+        };
+        let zoom_percent = prefs.reader_zoom_percent;
+        let allow_remote = !prefs.block_remote_images
+            || prefs.is_remote_sender_allowed(&detail.sender)
+            || app_entity
+                .upgrade()
+                .is_some_and(|app| app.read(cx).allowed_remote_image_ids.contains(&detail.id));
+        if let Some(html) = eligible_html {
+            cx.defer_in(window, move |this, window, cx| {
+                if let Ok(handle) = window.window_handle() {
+                    if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                        let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
+                        if let Ok(host) = WebViewHost::create(hwnd) {
+                            if host
+                                .load_with_remote(
+                                    build_document(
+                                        &html,
+                                        &subject,
+                                        &sender,
+                                        dark_mode,
+                                        zoom_percent,
+                                    ),
+                                    allow_remote,
+                                )
+                                .is_ok()
+                            {
+                                this.webview = Some(Rc::new(host));
+                                this.poll_webview(cx);
+                                cx.notify();
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         Self {
             detail,
             app_entity,
@@ -80,6 +202,8 @@ impl MessageWindow {
             find_total_matches: 0,
             text_states: HashMap::new(),
             print_preview: None,
+            webview: None,
+            webview_appearance: (dark_mode, zoom_percent, allow_remote),
         }
     }
 
@@ -206,7 +330,7 @@ pub(crate) fn find_case_insensitive_ranges(
 }
 
 impl Render for MessageWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = theme::current(cx);
         let (canvas, border, muted_fg) = (p.canvas, p.border, p.text_muted);
         let d = self.detail.clone();
@@ -263,6 +387,39 @@ impl Render for MessageWindow {
 
         let text_state = self.ensure_text_state(d.id, &main_html, cx);
         let quote_expanded = self.expanded_quote_ids.contains(&d.id);
+        let app_dark = self
+            .app_entity
+            .upgrade()
+            .is_some_and(|app| app.read(cx).dark_mode);
+        let dark_mode = match self.prefs.message_theme.as_str() {
+            "light" => false,
+            "dark" => true,
+            _ => app_dark,
+        };
+        let allow_remote = !self.prefs.block_remote_images
+            || self.prefs.is_remote_sender_allowed(&d.sender)
+            || self
+                .app_entity
+                .upgrade()
+                .is_some_and(|app| app.read(cx).allowed_remote_image_ids.contains(&d.id));
+        let appearance = (dark_mode, self.prefs.reader_zoom_percent, allow_remote);
+        if self.webview_appearance != appearance {
+            self.webview_appearance = appearance;
+            if let (Some(host), Some(html)) = (self.webview.clone(), d.body_html.clone()) {
+                let document =
+                    build_document(&html, &d.subject, &d.sender, appearance.0, appearance.1);
+                cx.defer_in(window, move |_, _, _| {
+                    let _ = host.load_with_remote(document, appearance.2);
+                });
+            }
+        }
+        let show_webview = self.webview.as_ref().is_some_and(|host| host.ready())
+            && !self.prefer_plain
+            && !self.find_open
+            && self.print_preview.is_none();
+        if let Some(host) = self.webview.clone() {
+            cx.defer_in(window, move |_, _, _| host.set_visible(show_webview));
+        }
         let win_controls = h_flex()
             .flex_shrink_0()
             .h_full()
@@ -497,114 +654,145 @@ impl Render for MessageWindow {
                 )
             })
             // 邮件正文滚动区。
-            .child(
-                v_flex()
-                    .id("popout-scroll")
+            .when(show_webview, |root| {
+                let host = self.webview.as_ref().unwrap().clone();
+                root.child(
+                    gpui_kit::canvas(
+                        move |bounds, window, cx| {
+                            let scale = window.scale_factor();
+                            let rect = windows::Win32::Foundation::RECT {
+                                left: (bounds.origin.x.as_f32() * scale).round() as i32,
+                                top: (bounds.origin.y.as_f32() * scale).round() as i32,
+                                right: ((bounds.origin.x + bounds.size.width).as_f32() * scale)
+                                    .round() as i32,
+                                bottom: ((bounds.origin.y + bounds.size.height).as_f32() * scale)
+                                    .round() as i32,
+                            };
+                            cx.defer(move |_| host.set_bounds(rect));
+                        },
+                        |_, _, _, _| {},
+                    )
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scrollbar()
-                    .p_6()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_size(px(20.0))
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child(SharedString::from(d.subject.clone())),
-                    )
-                    .child(
-                        v_flex()
-                            .p_5()
-                            .gap_3()
-                            .rounded(px(12.0))
-                            .bg(p.surface_raised)
-                            .border_1()
-                            .border_color(border)
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(avatar::avatar(&display_name, &sender_email, 34.0))
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                                    .truncate()
-                                                    .child(SharedString::from(display_name)),
-                                            )
-                                            .when(!sender_email.is_empty(), |el| {
-                                                el.child(
+                    .w_full(),
+                )
+            })
+            .when(!show_webview, |root| {
+                root.child(
+                    v_flex()
+                        .id("popout-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scrollbar()
+                        .p_6()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_size(px(20.0))
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .child(SharedString::from(d.subject.clone())),
+                        )
+                        .child(
+                            v_flex()
+                                .p_5()
+                                .gap_3()
+                                .rounded(px(12.0))
+                                .bg(p.surface_raised)
+                                .border_1()
+                                .border_color(border)
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(avatar::avatar(&display_name, &sender_email, 34.0))
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(
                                                     div()
-                                                        .text_xs()
-                                                        .text_color(muted_fg)
+                                                        .text_sm()
+                                                        .font_weight(gpui_kit::FontWeight::BOLD)
                                                         .truncate()
-                                                        .child(SharedString::from(format!(
-                                                            "<{sender_email}>"
-                                                        ))),
+                                                        .child(SharedString::from(display_name)),
+                                                )
+                                                .when(!sender_email.is_empty(), |el| {
+                                                    el.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(muted_fg)
+                                                            .truncate()
+                                                            .child(SharedString::from(format!(
+                                                                "<{sender_email}>"
+                                                            ))),
+                                                    )
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted_fg)
+                                                .child(SharedString::from(formatted_date)),
+                                        ),
+                                )
+                                .child(div().text_size(px(14.0)).child(
+                                    TextView::new(&text_state).link_tooltip(|url, _, cx| {
+                                        let url = url.clone();
+                                        cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
+                                            .into()
+                                    }),
+                                ))
+                                .when_some(quoted_opt, |card, (q_html, lines)| {
+                                    let msg_id = d.id;
+                                    card.child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(
+                                                Button::new("popout-quote-toggle")
+                                                    .outline()
+                                                    .compact()
+                                                    .label(SharedString::from(if quote_expanded {
+                                                        format!("▾ 隐藏引用内容 ({lines} 行)")
+                                                    } else {
+                                                        format!("⋯ 显示引用内容 ({lines} 行)")
+                                                    }))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            if !this
+                                                                .expanded_quote_ids
+                                                                .remove(&msg_id)
+                                                            {
+                                                                this.expanded_quote_ids
+                                                                    .insert(msg_id);
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .when(quote_expanded, |c| {
+                                                c.child(
+                                                    div()
+                                                        .pl_3()
+                                                        .border_l_2()
+                                                        .border_color(p.accent.opacity(0.5))
+                                                        .text_color(muted_fg)
+                                                        .text_size(px(13.0))
+                                                        .child(
+                                                            TextView::html(
+                                                                SharedString::from(format!(
+                                                                    "popout-quote-{msg_id}"
+                                                                )),
+                                                                q_html,
+                                                            )
+                                                            .selectable(true),
+                                                        ),
                                                 )
                                             }),
                                     )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted_fg)
-                                            .child(SharedString::from(formatted_date)),
-                                    ),
-                            )
-                            .child(div().text_size(px(14.0)).child(
-                                TextView::new(&text_state).link_tooltip(|url, _, cx| {
-                                    let url = url.clone();
-                                    cx.new(move |_| LinkPreviewTooltip { url: url.clone() })
-                                        .into()
                                 }),
-                            ))
-                            .when_some(quoted_opt, |card, (q_html, lines)| {
-                                let msg_id = d.id;
-                                card.child(
-                                    v_flex()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("popout-quote-toggle")
-                                                .outline()
-                                                .compact()
-                                                .label(SharedString::from(if quote_expanded {
-                                                    format!("▾ 隐藏引用内容 ({lines} 行)")
-                                                } else {
-                                                    format!("⋯ 显示引用内容 ({lines} 行)")
-                                                }))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if !this.expanded_quote_ids.remove(&msg_id) {
-                                                        this.expanded_quote_ids.insert(msg_id);
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .when(quote_expanded, |c| {
-                                            c.child(
-                                                div()
-                                                    .pl_3()
-                                                    .border_l_2()
-                                                    .border_color(p.accent.opacity(0.5))
-                                                    .text_color(muted_fg)
-                                                    .text_size(px(13.0))
-                                                    .child(
-                                                        TextView::html(
-                                                            SharedString::from(format!(
-                                                                "popout-quote-{msg_id}"
-                                                            )),
-                                                            q_html,
-                                                        )
-                                                        .selectable(true),
-                                                    ),
-                                            )
-                                        }),
-                                )
-                            }),
-                    ),
-            )
+                        ),
+                )
+            })
     }
 }
 

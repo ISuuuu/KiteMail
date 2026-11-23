@@ -887,6 +887,11 @@ pub(crate) struct HylkiApp {
     pub(crate) reader_find_active_match: usize,
     pub(crate) reader_find_total_matches: usize,
     pub(crate) reader_text_states: HashMap<u32, (String, Entity<TextViewState>)>,
+    #[cfg(windows)]
+    pub(crate) reader_webview: Option<std::rc::Rc<crate::webview_host::WebViewHost>>,
+    #[cfg(windows)]
+    pub(crate) reader_webview_key: Option<u64>,
+    pub(crate) reader_popup_open: bool,
     /// WP-09：打印预览浮层状态。
     pub(crate) print_preview: Option<PrintPreviewState>,
     /// B-2：列表行菜单挂起的后续动作（等对应正文加载完成后执行）。
@@ -1369,6 +1374,11 @@ impl HylkiApp {
                 reader_find_active_match: 0,
                 reader_find_total_matches: 0,
                 reader_text_states: HashMap::new(),
+                #[cfg(windows)]
+                reader_webview: None,
+                #[cfg(windows)]
+                reader_webview_key: None,
+                reader_popup_open: false,
                 print_preview: None,
                 pending_row_action: None,
                 pending_eml_export: None,
@@ -1589,6 +1599,11 @@ impl HylkiApp {
             reader_find_active_match: 0,
             reader_find_total_matches: 0,
             reader_text_states: HashMap::new(),
+            #[cfg(windows)]
+            reader_webview: None,
+            #[cfg(windows)]
+            reader_webview_key: None,
+            reader_popup_open: false,
             print_preview: None,
             pending_row_action: None,
             pending_eml_export: None,
@@ -5515,7 +5530,23 @@ impl HylkiApp {
         self.refresh_reader_find_highlights(cx);
     }
 
+    pub(crate) fn retain_current_reader_text_states(&mut self) {
+        let Some(detail) = self.selected_message.as_ref() else {
+            self.reader_text_states.clear();
+            return;
+        };
+        self.reader_text_states.retain(|id, _| {
+            !self.collapsed_thread_cards.contains(id)
+                && (*id == detail.id
+                    || detail
+                        .thread_messages
+                        .iter()
+                        .any(|message| message.id == *id))
+        });
+    }
+
     pub(crate) fn refresh_reader_find_highlights(&mut self, cx: &mut Context<Self>) {
+        self.retain_current_reader_text_states();
         let query = self.reader_find_query.trim().to_ascii_lowercase();
         if query.is_empty() {
             self.reader_find_total_matches = 0;
@@ -5586,6 +5617,12 @@ impl HylkiApp {
         let state = cx.new(|cx| TextViewState::html(html, cx).selectable(true));
         self.reader_text_states
             .insert(msg_id, (html.to_string(), state.clone()));
+        if self.reader_find_open && !self.reader_find_query.trim().is_empty() {
+            let entity = cx.entity();
+            cx.defer(move |cx| {
+                entity.update(cx, |this, cx| this.refresh_reader_find_highlights(cx))
+            });
+        }
         state
     }
 
@@ -8816,6 +8853,31 @@ impl Render for HylkiApp {
             let scale = config::clamp_ui_text_scale(self.prefs.ui_text_scale_percent);
             window.set_rem_size(px(16.0 * scale as f32 / 100.0));
             self.last_rem_scale = scale;
+        }
+        self.retain_current_reader_text_states();
+        #[cfg(windows)]
+        if self.selected_message.is_none() && self.reader_webview_key.take().is_some() {
+            if let Some(host) = self.reader_webview.clone() {
+                cx.defer_in(window, move |_, _, _| {
+                    host.set_visible(false);
+                    let _ = host.load(b"<!doctype html>".to_vec());
+                });
+            }
+        }
+        #[cfg(windows)]
+        if let Some(host) = self.reader_webview.clone() {
+            let visible = self.main_view == MainContentView::Mail
+                && self.selected_message.is_some()
+                && self.right_mode == RightPaneMode::Reader
+                && self.reader_position != ReaderPosition::Hidden
+                && self.active_modal == ActiveModal::None
+                && self.print_preview.is_none()
+                && !self.reader_find_open
+                && !self.compose_split
+                && !self.sidebar_peek_open;
+            if !visible {
+                cx.defer_in(window, move |_, _, _| host.set_visible(false));
+            }
         }
         // 避坑清单第 4 条：先把语义色 Copy 成局部变量再构建 UI。
         let p = theme::current(cx);

@@ -12,6 +12,8 @@ mod compose_schedule;
 mod theme;
 mod tray;
 mod ui;
+#[cfg(windows)]
+mod webview_host;
 
 use std::borrow::Cow;
 
