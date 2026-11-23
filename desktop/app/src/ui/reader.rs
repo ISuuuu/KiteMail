@@ -63,18 +63,13 @@ fn action_button(id: &'static str, icon: IconName, tooltip: &'static str) -> But
         .tooltip(tooltip)
 }
 
-/// 解析收件人列表，返回 `(计数胶囊文案, 收件人预览文本)`。
-fn recipient_summary(raw: &str) -> (String, String) {
-    let list: Vec<&str> = raw
-        .split(',')
+/// 收件人预览文本（去空白项后以逗号重排）。
+fn recipient_list(raw: &str) -> String {
+    raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .collect();
-    if list.is_empty() {
-        ("无收件人".to_string(), String::new())
-    } else {
-        (format!("{} 位收件人", list.len()), list.join(", "))
-    }
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// 提取折叠卡片用的单行正文摘要。
@@ -305,6 +300,8 @@ fn render_message_card(
     subject: &str,
     sender: &str,
     recipients: &str,
+    // 收件方网关写入的 `Authentication-Results` 头（无则不做真实性判定）。
+    auth_results: Option<&str>,
     date_display: &str,
     date_ts: i64,
     date_style: &str,
@@ -350,16 +347,18 @@ fn render_message_card(
     } else {
         sender_name
     };
-    let sender_check = hylki_mail_core::verify::check_sender_summary(sender, None);
-    let (badge_label, badge_color) = match sender_check.trust {
+    let sender_check = hylki_mail_core::verify::check_sender_summary(sender, auth_results);
+    // 「未验证」对用户不是可行动的结论（很多服务商干脆不写校验头），因此只在
+    // 有明确结论时显示徽标：已验证 / 疑似仿冒 / 校验失败。
+    let trust_badge = match sender_check.trust {
         hylki_mail_core::verify::SenderTrust::Pass => {
-            ("已验证", gpui_kit::hsla(0.38, 0.65, 0.36, 1.0))
+            Some(("已验证", gpui_kit::hsla(0.38, 0.65, 0.36, 1.0)))
         }
-        hylki_mail_core::verify::SenderTrust::Unverified => ("未验证", muted_fg),
         hylki_mail_core::verify::SenderTrust::Suspicious => {
-            ("疑似仿冒", gpui_kit::hsla(0.10, 0.85, 0.45, 1.0))
+            Some(("疑似仿冒", gpui_kit::hsla(0.10, 0.85, 0.45, 1.0)))
         }
-        hylki_mail_core::verify::SenderTrust::Fail => ("校验失败", p.danger),
+        hylki_mail_core::verify::SenderTrust::Fail => Some(("校验失败", p.danger)),
+        hylki_mail_core::verify::SenderTrust::Unverified => None,
     };
     let spoof_banner = if matches!(
         sender_check.trust,
@@ -449,7 +448,7 @@ fn render_message_card(
             .into_any_element();
     }
 
-    let (recipient_pill, recipient_list) = recipient_summary(recipients);
+    let recipient_list = recipient_list(recipients);
     let zoom_scale = (zoom_percent.clamp(50, 250) as f32) / 100.0;
     let body_font_px = 14.0 * zoom_scale;
     let forced_dark = bg_pick.or(forced_theme_bg);
@@ -618,32 +617,21 @@ fn render_message_card(
                                             )
                                         }),
                                 )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .bg(canvas)
-                                        .border_1()
-                                        .border_color(badge_color.opacity(0.45))
-                                        .text_color(badge_color)
-                                        .text_xs()
-                                        .child(SharedString::from(badge_label)),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .bg(canvas)
-                                        .border_1()
-                                        .border_color(border)
-                                        .text_color(muted_fg)
-                                        .text_xs()
-                                        .child(SharedString::from(recipient_pill)),
-                                )
+                                .when_some(trust_badge, |el, (label, color)| {
+                                    el.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .bg(canvas)
+                                            .border_1()
+                                            .border_color(color.opacity(0.45))
+                                            .text_color(color)
+                                            .text_xs()
+                                            .child(SharedString::from(label)),
+                                    )
+                                })
                                 .child(div().flex_1())
                                 .child(
                                     div()
@@ -1496,6 +1484,11 @@ pub(crate) fn render_with_pane_top(
                     thread_messages: Vec::new(),
                     unsubscribe_url: card_unsubscribe_url.map(str::to_string),
                     unsubscribe_one_click: card_unsubscribe_one_click,
+                    auth_results: if is_anchor {
+                        detail.auth_results.clone()
+                    } else {
+                        None
+                    },
                 };
                 let eml_exporting = app.pending_eml_export == Some(tm.id);
                 let menu = build_card_more_menu(
@@ -1512,6 +1505,11 @@ pub(crate) fn render_with_pane_top(
                     &card_subject,
                     &tm.sender,
                     &tm.recipients,
+                    if is_anchor {
+                        detail.auth_results.as_deref()
+                    } else {
+                        None
+                    },
                     &tm.date_display,
                     tm.date_ts,
                     &date_style,
@@ -1570,6 +1568,7 @@ pub(crate) fn render_with_pane_top(
             &detail.subject,
             &detail.sender,
             &detail.recipients,
+            detail.auth_results.as_deref(),
             &detail.date_display,
             detail.date_ts,
             &date_style,

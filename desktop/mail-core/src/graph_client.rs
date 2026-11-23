@@ -323,6 +323,7 @@ pub fn fetch_message_body(
     let unsubscribe_one_click = header_value("List-Unsubscribe-Post")
         .map(|v| crate::cache::is_one_click_post(&v))
         .unwrap_or(false);
+    let auth_results = header_value("Authentication-Results");
 
     Ok(FetchedMessageBody {
         body_text,
@@ -330,6 +331,7 @@ pub fn fetch_message_body(
         attachments,
         unsubscribe_url,
         unsubscribe_one_click,
+        auth_results,
     })
 }
 

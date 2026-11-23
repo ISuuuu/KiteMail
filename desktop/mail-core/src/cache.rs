@@ -490,6 +490,9 @@ impl CacheStore {
             "list_unsubscribe_post",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // 发件人真实性校验：收件方网关写入的 `Authentication-Results` 头原文
+        // （正文抓取时随头读出；旧库补列，历史数据视为无校验结论）。
+        self.ensure_column("messages", "auth_results", "TEXT NOT NULL DEFAULT ''")?;
         // WP-08：重要性、标签、回复/转发标记与稍后提醒时间戳。
         self.ensure_column("messages", "importance", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("messages", "tags", "TEXT NOT NULL DEFAULT ''")?;
@@ -2202,7 +2205,7 @@ impl CacheStore {
                 "
                 SELECT m.id, m.account_id, m.folder_id, m.uid, m.message_id, m.sender, m.recipients,
                        m.subject, m.date_ts, m.date_display, m.body_text, m.body_html, m.flagged, f.path,
-                       m.list_unsubscribe, m.list_unsubscribe_post
+                       m.list_unsubscribe, m.list_unsubscribe_post, m.auth_results
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE m.id = ?1
@@ -2212,6 +2215,7 @@ impl CacheStore {
                     let body: Option<String> = row.get(10)?;
                     let body_html: Option<String> = row.get(11)?;
                     let unsub: String = row.get(14)?;
+                    let auth_results: String = row.get(16)?;
                     Ok((
                         row.get::<_, u32>(0)?,
                         row.get::<_, u32>(1)?,
@@ -2229,6 +2233,7 @@ impl CacheStore {
                         row.get::<_, String>(13)?,
                         (!unsub.trim().is_empty()).then_some(unsub),
                         row.get::<_, i32>(15)? != 0,
+                        (!auth_results.trim().is_empty()).then_some(auth_results),
                     ))
                 },
             )
@@ -2252,6 +2257,7 @@ impl CacheStore {
             folder_path,
             unsubscribe_url,
             unsubscribe_one_click,
+            auth_results,
         )) = row
         else {
             return Ok(None);
@@ -2282,6 +2288,7 @@ impl CacheStore {
             thread_messages,
             unsubscribe_url,
             unsubscribe_one_click,
+            auth_results,
         };
         Ok(Some((detail, uid, body_loaded)))
     }
@@ -2687,7 +2694,15 @@ impl CacheStore {
         body_text: &str,
         attachments: &[CachedAttachmentInput],
     ) -> Result<(), String> {
-        self.store_message_body_with_html(message_id, body_text, None, attachments, None, false)
+        self.store_message_body_with_html(
+            message_id,
+            body_text,
+            None,
+            attachments,
+            None,
+            false,
+            None,
+        )
     }
 
     /// Save fetched message plain text, optional HTML body, attachments, and the
@@ -2700,6 +2715,7 @@ impl CacheStore {
         attachments: &[CachedAttachmentInput],
         unsubscribe_url: Option<&str>,
         unsubscribe_one_click: bool,
+        auth_results: Option<&str>,
     ) -> Result<(), String> {
         let tx = self
             .conn
@@ -2714,7 +2730,8 @@ impl CacheStore {
                 index_text = NULL,
                 has_attachment = CASE WHEN ?3 > 0 THEN 1 ELSE has_attachment END,
                 list_unsubscribe = ?5,
-                list_unsubscribe_post = ?6
+                list_unsubscribe_post = ?6,
+                auth_results = ?7
             WHERE id = ?4
             ",
             params![
@@ -2724,6 +2741,7 @@ impl CacheStore {
                 message_id,
                 unsubscribe_url.unwrap_or_default(),
                 unsubscribe_one_click as i64,
+                auth_results.unwrap_or_default(),
             ],
         )
         .map_err(|e| format!("保存邮件正文失败: {e}"))?;
@@ -7423,6 +7441,7 @@ mod tests {
                 &[],
                 Some("https://lists.example.com/unsub"),
                 true,
+                None,
             )
             .unwrap();
         let (detail, _, _) = store.get_message_detail(msg_id).unwrap().unwrap();

@@ -1200,6 +1200,7 @@ async fn handle_request(
                         &fetched.attachments,
                         fetched.unsubscribe_url.as_deref(),
                         fetched.unsubscribe_one_click,
+                        fetched.auth_results.as_deref(),
                     ) {
                         let _ = evt_tx.send(WorkerEvent::Error {
                             account_id: Some(account_id),

@@ -650,6 +650,14 @@ pub async fn fetch_message_body(
     )
     .map(crate::cache::is_one_click_post)
     .unwrap_or(false);
+    // 发件人真实性校验：收件方网关写入的 SPF / DKIM / DMARC 结论，只读取不验证。
+    let auth_results = raw_header_value(
+        parsed
+            .header_raw("Authentication-Results")
+            .unwrap_or_default(),
+    )
+    .map(str::to_string)
+    .filter(|v| !v.is_empty());
 
     Ok(FetchedMessageBody {
         body_text,
@@ -657,6 +665,7 @@ pub async fn fetch_message_body(
         attachments,
         unsubscribe_url,
         unsubscribe_one_click,
+        auth_results,
     })
 }
 

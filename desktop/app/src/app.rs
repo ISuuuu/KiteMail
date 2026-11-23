@@ -1889,10 +1889,14 @@ impl HylkiApp {
                     // B-2：行菜单挂起的动作（回复 / 复制正文 / 查看原文）在正文就绪后执行。
                     if let Some((msg_id, action)) = pending {
                         if msg_id == detail.id {
+                            // 同样运行在 `HylkiApp::update` 内部，需延后一 tick 再更新自身实体。
                             let entity = cx.entity();
-                            let _ = self.window_handle.update(cx, |_, window, cx| {
-                                entity.update(cx, |app, cx| {
-                                    app.finish_pending_row_action(&detail, window, cx);
+                            let handle = self.window_handle;
+                            cx.defer(move |cx| {
+                                let _ = handle.update(cx, |_, window, cx| {
+                                    entity.update(cx, |app, cx| {
+                                        app.finish_pending_row_action(&detail, window, cx);
+                                    });
                                 });
                             });
                         } else {
@@ -2636,12 +2640,17 @@ impl HylkiApp {
                 if let Some(ref tray) = self.tray {
                     tray.show_main_window();
                 }
+                // 本方法运行在 `HylkiApp::update` 内部（托盘轮询任务），此处再
+                // `entity.update` 会对同一实体重复租借并 panic，故延后到下一 tick。
+                let handle = self.window_handle;
                 let entity = cx.entity();
-                let _ = self.window_handle.update(cx, |_, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.active_modal = ActiveModal::None;
-                        this.main_view = MainContentView::Mail;
-                        this.start_new_compose(window, cx);
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.active_modal = ActiveModal::None;
+                            this.main_view = MainContentView::Mail;
+                            this.start_new_compose(window, cx);
+                        });
                     });
                 });
             }
@@ -3179,6 +3188,7 @@ impl HylkiApp {
             thread_messages: Vec::new(),
             unsubscribe_url: None,
             unsubscribe_one_click: false,
+            auth_results: None,
         });
     }
 
@@ -10983,6 +10993,7 @@ mod tests {
             ],
             unsubscribe_url: None,
             unsubscribe_one_click: false,
+            auth_results: None,
         };
 
         let folded_all = compute_default_collapsed_cards(&detail, true, "all_but_newest");
@@ -11293,6 +11304,7 @@ mod tests {
             thread_messages: Vec::new(),
             unsubscribe_url: None,
             unsubscribe_one_click: false,
+            auth_results: None,
         };
         let bytes = compose_demo_eml(&detail);
         let text = String::from_utf8(bytes).unwrap();

@@ -1037,6 +1037,7 @@ impl DemoStore {
             thread_messages,
             unsubscribe_url,
             unsubscribe_one_click,
+            auth_results: None,
         })
     }
 }

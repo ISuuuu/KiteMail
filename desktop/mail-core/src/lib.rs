@@ -180,6 +180,11 @@ pub struct MessageDetail {
     /// （RFC 8058），此时可静默 POST 而无需打开浏览器。
     #[serde(default)]
     pub unsubscribe_one_click: bool,
+    /// 发件人真实性校验：收件方网关写入的 `Authentication-Results` 头原文
+    /// （SPF / DKIM / DMARC 结论由收件服务器判定，本机只解析）。随正文抓取读出；
+    /// 空表示缓存中没有该头（旧数据或服务商未写），UI 不显示验证徽标。
+    #[serde(default)]
+    pub auth_results: Option<String>,
 }
 
 /// 一次完整正文抓取（IMAP `RFC822` / Graph 消息）解析出的载荷；
@@ -191,6 +196,8 @@ pub struct FetchedMessageBody {
     pub attachments: Vec<CachedAttachmentInput>,
     pub unsubscribe_url: Option<String>,
     pub unsubscribe_one_click: bool,
+    /// `Authentication-Results` 头原文（收件方网关写入的校验结论）。
+    pub auth_results: Option<String>,
 }
 
 /// 用户手动维护的联系人（`user_contacts` 表行）；`id == 0` 表示待插入的新联系人。
