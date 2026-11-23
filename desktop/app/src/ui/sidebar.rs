@@ -1765,6 +1765,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let current_view = app.current_view;
     // 统一视图行选中态由 `current_view` 决定（演示模式同样映射）。
     let is_unified_selected = current_view == CurrentView::UnifiedInbox;
+    let is_unread_selected = current_view == CurrentView::Unread;
     let is_starred_selected = current_view == CurrentView::Starred;
     let is_sent_selected = current_view == CurrentView::Sent;
     let is_drafts_selected = current_view == CurrentView::Drafts;
@@ -2004,7 +2005,24 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         },
                     ))
                 })
-                // 迭代 2：已加星标 / 已发送 / 归档接入 mail-core 统一视图查询。
+                // 迭代 2：未读 / 已加星标 / 已发送 / 归档接入 mail-core 统一视图查询。
+                .when(app.prefs.unified_show_unread, |el| {
+                    el.child(unified_row_with_subrows(
+                        app,
+                        &p,
+                        cx,
+                        "nav-unread",
+                        IconName::Mail,
+                        "未读",
+                        None,
+                        is_unread_selected,
+                        multi_account,
+                        false,
+                        &[],
+                        |this, cx| this.select_unified_view(CurrentView::Unread, cx),
+                        |menu, _, _| menu,
+                    ))
+                })
                 .when(app.prefs.unified_show_starred, |el| {
                     el.child(unified_row_with_subrows(
                         app,

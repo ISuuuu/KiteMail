@@ -340,6 +340,7 @@ pub struct OutboxItem {
 /// Unified cross-account views backed by dedicated cache queries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnifiedView {
+    Unread,
     Starred,
     Sent,
     Archive,

@@ -404,6 +404,8 @@ pub struct AppPreferences {
     #[serde(default = "default_true")]
     pub unified_show_inbox: bool,
     #[serde(default = "default_true")]
+    pub unified_show_unread: bool,
+    #[serde(default = "default_true")]
     pub unified_show_starred: bool,
     #[serde(default = "default_true")]
     pub unified_show_sent: bool,
@@ -646,7 +648,7 @@ pub struct AppPreferences {
     #[serde(default = "default_true")]
     pub unified_show_snoozed: bool,
     /// 侧边栏显示「筛选文件夹」分区。
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub sidebar_show_filtered: bool,
     /// 侧边栏显示「智能文件夹」分区。
     #[serde(default = "default_true")]
@@ -1110,6 +1112,7 @@ impl Default for AppPreferences {
             remember_sidebar_collapsed: true,
             sidebar_collapsed: false,
             unified_show_inbox: true,
+            unified_show_unread: true,
             unified_show_starred: true,
             unified_show_sent: true,
             unified_show_drafts: true,
@@ -1191,7 +1194,7 @@ impl Default for AppPreferences {
             unified_show_junk: true,
             unified_show_trash: true,
             unified_show_snoozed: true,
-            sidebar_show_filtered: true,
+            sidebar_show_filtered: false,
             sidebar_show_smart: true,
             sidebar_show_tags: true,
             list_layout: default_list_layout_key(),

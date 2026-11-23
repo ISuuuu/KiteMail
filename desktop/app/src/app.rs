@@ -132,6 +132,7 @@ pub(crate) enum RightPaneMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CurrentView {
     UnifiedInbox,
+    Unread,
     Starred,
     Sent,
     Drafts,
@@ -146,6 +147,7 @@ impl CurrentView {
     /// 对应的 mail-core 统一视图查询；`UnifiedInbox`/`Drafts` 走独立链路。
     pub(crate) fn unified(self) -> Option<UnifiedView> {
         match self {
+            Self::Unread => Some(UnifiedView::Unread),
             Self::Starred => Some(UnifiedView::Starred),
             Self::Sent => Some(UnifiedView::Sent),
             Self::Archive => Some(UnifiedView::Archive),
@@ -1641,6 +1643,7 @@ impl HylkiApp {
     fn current_view_from_last(last: Option<&str>) -> Option<CurrentView> {
         match last? {
             "unified" => Some(CurrentView::UnifiedInbox),
+            "unread" => Some(CurrentView::Unread),
             "starred" => Some(CurrentView::Starred),
             "sent" => Some(CurrentView::Sent),
             "drafts" => Some(CurrentView::Drafts),
@@ -1795,7 +1798,8 @@ impl HylkiApp {
                             !self.demo_mode && page.folder_id == UNIFIED_INBOX_FOLDER_ID
                         }
                         CurrentView::AccountFolder => page.folder_id == self.selected_folder_id,
-                        CurrentView::Starred
+                        CurrentView::Unread
+                        | CurrentView::Starred
                         | CurrentView::Sent
                         | CurrentView::Drafts
                         | CurrentView::Archive
@@ -2444,6 +2448,13 @@ impl HylkiApp {
                 )
             } else {
                 match self.current_view {
+                    CurrentView::Unread => self.demo_store.list_unread_page_with_options(
+                        &self.search_query,
+                        self.quick_filters,
+                        self.list_sort,
+                        0,
+                        limit,
+                    ),
                     CurrentView::Starred => self.demo_store.list_starred_page_with_options(
                         &self.search_query,
                         self.quick_filters,
@@ -2459,7 +2470,8 @@ impl HylkiApp {
                             CurrentView::Sent => DEMO_SENT_ID,
                             CurrentView::Drafts => DEMO_DRAFTS_ID,
                             CurrentView::Archive => DEMO_ARCHIVE_ID,
-                            CurrentView::Starred
+                            CurrentView::Unread
+                            | CurrentView::Starred
                             | CurrentView::Junk
                             | CurrentView::Trash
                             | CurrentView::Snoozed => DEMO_INBOX_ID,
@@ -2513,7 +2525,8 @@ impl HylkiApp {
                         limit,
                     });
                 }
-                CurrentView::Starred
+                CurrentView::Unread
+                | CurrentView::Starred
                 | CurrentView::Sent
                 | CurrentView::Archive
                 | CurrentView::Junk
@@ -2689,6 +2702,7 @@ impl HylkiApp {
             // 演示模式下统一视图映射到对应的演示文件夹。
             self.selected_folder_id = match view {
                 CurrentView::UnifiedInbox
+                | CurrentView::Unread
                 | CurrentView::Starred
                 | CurrentView::Junk
                 | CurrentView::Trash
@@ -3687,6 +3701,7 @@ impl HylkiApp {
                 .find(|f| f.id == self.selected_folder_id)
                 .is_some_and(|f| is_sent_folder(&f.name, &f.path)),
             CurrentView::UnifiedInbox
+            | CurrentView::Unread
             | CurrentView::Starred
             | CurrentView::Archive
             | CurrentView::Junk
@@ -6187,7 +6202,8 @@ impl HylkiApp {
                 .flatten()
                 .find(|f| f.id == self.selected_folder_id)
                 .is_some_and(|f| f.has_more_remote),
-            CurrentView::Starred
+            CurrentView::Unread
+            | CurrentView::Starred
             | CurrentView::Sent
             | CurrentView::Drafts
             | CurrentView::Archive
@@ -8207,6 +8223,10 @@ impl HylkiApp {
         match self.current_view {
             CurrentView::UnifiedInbox => {
                 self.prefs.last_view = Some("unified".to_string());
+                self.prefs.last_folder = None;
+            }
+            CurrentView::Unread => {
+                self.prefs.last_view = Some("unread".to_string());
                 self.prefs.last_folder = None;
             }
             CurrentView::Starred => {
@@ -10474,6 +10494,10 @@ mod tests {
         assert_eq!(
             HylkiApp::current_view_from_last(Some("unified")),
             Some(CurrentView::UnifiedInbox)
+        );
+        assert_eq!(
+            HylkiApp::current_view_from_last(Some("unread")),
+            Some(CurrentView::Unread)
         );
         assert_eq!(
             HylkiApp::current_view_from_last(Some("starred")),

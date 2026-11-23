@@ -1547,6 +1547,31 @@ impl CacheStore {
         )
     }
 
+    /// Query a page of unread messages restricted to `allowed_account_ids` (excluding Trash/Junk).
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_unread_messages_for_accounts(
+        &self,
+        allowed_account_ids: &[u32],
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        let predicate =
+            format!("m.unread = 1 AND NOT ({TRASH_FOLDER_MATCH} OR {JUNK_FOLDER_MATCH})");
+        self.list_role_messages_with_options_for_accounts(
+            &predicate,
+            "未读邮件",
+            Some(allowed_account_ids),
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
     /// Query a page of starred messages restricted to `allowed_account_ids`.
     #[allow(clippy::too_many_arguments)]
     pub fn list_starred_messages_for_accounts(
@@ -5472,6 +5497,68 @@ mod tests {
         let search = cache.list_sent_messages("发出", 0, 10).unwrap();
         assert_eq!(search.total, 1);
         assert_eq!(search.items[0].subject, "发出的邮件");
+    }
+
+    #[test]
+    fn unread_view_lists_unread_and_excludes_trash_and_junk() {
+        let mut cache = CacheStore::open_in_memory().expect("open memory db");
+        let f1 = cache
+            .sync_folders(
+                1,
+                &[
+                    folder("收件箱", "INBOX"),
+                    folder("已删除", "Trash"),
+                    folder("垃圾邮件", "Junk"),
+                ],
+            )
+            .unwrap();
+        let inbox = f1.iter().find(|f| f.path == "INBOX").unwrap().id;
+        let trash = f1.iter().find(|f| f.path == "Trash").unwrap().id;
+        let junk = f1.iter().find(|f| f.path == "Junk").unwrap().id;
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                10,
+                &[
+                    header_with(1, "未读邮件", "a@x.com", "", false, true, 100),
+                    header_with(2, "已读邮件", "b@x.com", "", false, false, 90),
+                ],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                trash,
+                10,
+                &[header_with(3, "已删未读", "c@x.com", "", false, true, 95)],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                1,
+                junk,
+                10,
+                &[header_with(4, "垃圾未读", "d@x.com", "", false, true, 96)],
+                None,
+            )
+            .unwrap();
+
+        let page = cache
+            .list_unread_messages_for_accounts(
+                &[1],
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                20,
+            )
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].subject, "未读邮件");
     }
 
     #[test]

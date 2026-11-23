@@ -1708,6 +1708,17 @@ fn render_sidebar(
                     is_hit(win, "pref-unified-inbox"),
                     p,
                 ),
+                prefs_switch_row(
+                    &app_entity,
+                    "pref-unified-unread",
+                    "显示「未读」",
+                    None,
+                    prefs.unified_show_unread,
+                    false,
+                    is_hit(win, "pref-unified-unread"),
+                    |p, v| p.unified_show_unread = v,
+                    p,
+                ),
                 setting_row(
                     "pref-unified-starred",
                     "显示「已加星标」",

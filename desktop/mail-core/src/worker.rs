@@ -2185,6 +2185,9 @@ async fn handle_request(
             let effective = merge_filter_options(filter, quick_filters);
             let allowed = unified_account_ids(data_dir);
             let result = match view {
+                UnifiedView::Unread => cache.list_unread_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
                 UnifiedView::Starred => cache.list_starred_messages_for_accounts(
                     &allowed, &query, effective, sort, offset, limit,
                 ),

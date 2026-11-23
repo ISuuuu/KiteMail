@@ -405,6 +405,48 @@ impl DemoStore {
         }
     }
 
+    /// Return a page of unread demo messages with structured query, quick filters, and sort.
+    pub fn list_unread_page_with_options(
+        &self,
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> MailPage {
+        let parsed = SearchQuery::parse(query);
+        let today_start = start_of_today_ts();
+        let mut filtered: Vec<MessageSummary> = self
+            .inbox_messages
+            .iter()
+            .chain(self.sent_messages.iter())
+            .chain(self.archive_messages.iter())
+            .filter(|m| m.unread && Self::matches_quick_filters(m, quick_filters, today_start))
+            .filter(|m| {
+                parsed.is_empty()
+                    || parsed.matches_summary(
+                        m,
+                        self.folder_name_for(m.folder_id),
+                        "demo@hylki.example",
+                        None,
+                    )
+            })
+            .cloned()
+            .collect();
+
+        Self::sort_summaries(&mut filtered, sort);
+
+        let total = filtered.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        MailPage {
+            folder_id: 0,
+            offset: start,
+            total,
+            items: filtered[start..end].to_vec(),
+        }
+    }
+
     /// Return a page of starred demo messages across all demo folders.
     pub fn list_starred_page(
         &self,
