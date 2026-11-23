@@ -128,7 +128,7 @@ fn document_headers(allow_remote_images: bool) -> String {
     } else {
         "data:"
     };
-    format!("Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: unsafe-url\r\nContent-Security-Policy: default-src 'none'; img-src {image_sources}; style-src 'unsafe-inline'; frame-src 'self'; base-uri 'none'; form-action 'none'\r\n")
+    format!("Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; img-src {image_sources}; style-src 'unsafe-inline'; frame-src 'self'; base-uri 'none'; form-action 'none'\r\n")
 }
 
 fn allow_remote_request(
@@ -139,7 +139,7 @@ fn allow_remote_request(
     version: u64,
 ) -> bool {
     context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE
-        && referer == document_url(version)
+        && (referer.is_empty() || referer == document_url(version))
         && allowed_mail_image_url(url, allowed)
 }
 
@@ -918,6 +918,11 @@ unsafe fn configure(
                 );
             let allow_remote_images = current && state.allow_remote_images;
             if allow_external {
+                if let Some(request) = &request {
+                    if let Ok(headers) = unsafe { request.Headers() } {
+                        let _ = unsafe { headers.RemoveHeader(w!("Referer")) };
+                    }
+                }
                 return Ok(());
             }
             let stream =
@@ -1051,6 +1056,8 @@ mod tests {
         assert!(!allowed_external_url("file:///C:/test"));
         assert!(!allowed_external_url("https://user:pass@example.com"));
         assert!(!allowed_external_url("javascript:alert(1)"));
+        assert!(document_headers(false).contains("Referrer-Policy: no-referrer"));
+        assert!(document_headers(true).contains("Referrer-Policy: no-referrer"));
         assert!(document_headers(false).contains("img-src data:;"));
         assert!(document_headers(true).contains("img-src data: http: https:;"));
         assert!(document_headers(true).contains("default-src 'none'"));
@@ -1076,10 +1083,17 @@ mod tests {
             &document_url(3),
             4
         ));
-        assert!(!allow_remote_request(
+        assert!(allow_remote_request(
             "https://example.com/a.png",
             image,
             true,
+            "",
+            4
+        ));
+        assert!(!allow_remote_request(
+            "https://example.com/a.png",
+            image,
+            false,
             "",
             4
         ));
