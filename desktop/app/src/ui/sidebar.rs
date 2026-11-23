@@ -20,6 +20,7 @@ use std::collections::HashSet;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{
     ContextMenu, ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem,
 };
@@ -38,7 +39,9 @@ use hylki_mail_core::config::{
 };
 use hylki_mail_core::{FolderSummary, MailRequest, OutboxItem, OutboxStatus};
 
-use crate::app::{CurrentView, HylkiApp, MainContentView, ReaderPosition, SidebarDrag};
+use crate::app::{
+    CurrentView, FolderActionPrompt, HylkiApp, MainContentView, ReaderPosition, SidebarDrag,
+};
 use crate::theme;
 use crate::ui::avatar;
 
@@ -346,6 +349,12 @@ pub(crate) struct SidebarUiState {
     unified_expanded: HashSet<&'static str>,
     /// 收藏分区是否折叠（默认展开）。
     favorites_collapsed: bool,
+    /// 筛选文件夹分区是否折叠（默认展开）。
+    filtered_collapsed: bool,
+    /// 智能文件夹分区是否折叠（默认展开）。
+    smart_collapsed: bool,
+    /// 标签分区是否折叠（默认展开）。
+    tags_collapsed: bool,
     /// 折叠的「文件夹」自定义分组（账号 id；默认展开）。
     folders_group_collapsed: HashSet<u32>,
     /// 折叠的自定义文件夹树节点（账号 id, IMAP 路径；默认展开）。
@@ -759,6 +768,354 @@ fn favorites_section(
         })
 }
 
+/// 筛选文件夹分区（WP-07 Filtered Folders）：快捷筛选入口（未读 / 带附件 / 已加星标）。
+fn filtered_section(
+    app: &HylkiApp,
+    p: &theme::HylkiPalette,
+    ui: &SidebarUiState,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::Div {
+    let collapsed = ui.filtered_collapsed;
+    let soft = p.accent_soft();
+    let text = p.text;
+    let muted = p.text_muted;
+    let accent = p.accent;
+    let items: [(&'static str, IconName, &'static str, &'static str); 3] = [
+        ("filt-unread", IconName::Mail, "未读邮件", "is:unread"),
+        (
+            "filt-attachment",
+            IconName::Paperclip,
+            "带附件",
+            "has:attachment",
+        ),
+        ("filt-starred", IconName::Star, "已加星标", "is:starred"),
+    ];
+    let current_q = app.search_query.trim();
+    v_flex()
+        .pb_1()
+        .gap_0p5()
+        .child(
+            h_flex()
+                .id("filtered-section-header")
+                .h(px(30.0))
+                .px_2()
+                .gap_2()
+                .items_center()
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(soft))
+                .on_click(cx.listener(|_, _, _, cx| {
+                    mutate_sidebar_ui_state(cx, |s| s.filtered_collapsed = !s.filtered_collapsed);
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(IconName::Search)
+                        .with_size(px(14.0))
+                        .text_color(muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(text)
+                        .child("筛选文件夹"),
+                )
+                .child(
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .with_size(px(14.0))
+                    .text_color(muted),
+                ),
+        )
+        .when(!collapsed, |col| {
+            col.children(items.into_iter().map(|(id, icon, label, query)| {
+                let selected = current_q.eq_ignore_ascii_case(query);
+                h_flex()
+                    .id(id)
+                    .h(px(NAV_ROW_HEIGHT))
+                    .pl(px(24.0))
+                    .pr_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(soft))
+                    .when(selected, |r| r.bg(soft))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.apply_sidebar_query_shortcut(query.to_string(), window, cx);
+                    }))
+                    .child(Icon::new(icon).with_size(px(14.0)).text_color(if selected {
+                        accent
+                    } else {
+                        muted
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .truncate()
+                            .text_color(if selected { accent } else { text })
+                            .child(label),
+                    )
+            }))
+        })
+}
+
+/// 智能文件夹分区（WP-07 Smart Folders）：基于保存的搜索表达式一键过滤。
+fn smart_folders_section(
+    app: &HylkiApp,
+    p: &theme::HylkiPalette,
+    ui: &SidebarUiState,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::Div {
+    let collapsed = ui.smart_collapsed;
+    let soft = p.accent_soft();
+    let text = p.text;
+    let muted = p.text_muted;
+    let accent = p.accent;
+    let current_q = app.search_query.trim();
+    v_flex()
+        .pb_1()
+        .gap_0p5()
+        .child(
+            h_flex()
+                .id("smart-section-header")
+                .h(px(30.0))
+                .px_2()
+                .gap_2()
+                .items_center()
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(soft))
+                .on_click(cx.listener(|_, _, _, cx| {
+                    mutate_sidebar_ui_state(cx, |s| s.smart_collapsed = !s.smart_collapsed);
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(IconName::Folder)
+                        .with_size(px(14.0))
+                        .text_color(muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(text)
+                        .child("智能文件夹"),
+                )
+                .child(
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .with_size(px(14.0))
+                    .text_color(muted),
+                ),
+        )
+        .when(!collapsed, |col| {
+            col.children(app.prefs.smart_folders.iter().enumerate().map(|(idx, sf)| {
+                let query = sf.query.clone();
+                let name = sf.name.clone();
+                let selected = !query.trim().is_empty() && current_q == query.trim();
+                h_flex()
+                    .id(("smart-folder", idx))
+                    .h(px(NAV_ROW_HEIGHT))
+                    .pl(px(24.0))
+                    .pr_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(soft))
+                    .when(selected, |r| r.bg(soft))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.apply_sidebar_query_shortcut(query.clone(), window, cx);
+                    }))
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .with_size(px(14.0))
+                            .text_color(if selected { accent } else { muted }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .truncate()
+                            .text_color(if selected { accent } else { text })
+                            .child(SharedString::from(name)),
+                    )
+            }))
+        })
+}
+
+/// 标签分区（WP-07 Tags）：彩色圆点 + 标签名，点击按 `tag:"..."` 过滤。
+fn tags_section(
+    app: &HylkiApp,
+    p: &theme::HylkiPalette,
+    ui: &SidebarUiState,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::Div {
+    let collapsed = ui.tags_collapsed;
+    let soft = p.accent_soft();
+    let text = p.text;
+    let muted = p.text_muted;
+    let accent = p.accent;
+    let current_q = app.search_query.trim();
+    v_flex()
+        .pb_1()
+        .gap_0p5()
+        .child(
+            h_flex()
+                .id("tags-section-header")
+                .h(px(30.0))
+                .px_2()
+                .gap_2()
+                .items_center()
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(soft))
+                .on_click(cx.listener(|_, _, _, cx| {
+                    mutate_sidebar_ui_state(cx, |s| s.tags_collapsed = !s.tags_collapsed);
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(IconName::Tag)
+                        .with_size(px(14.0))
+                        .text_color(muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(text)
+                        .child("标签"),
+                )
+                .child(
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .with_size(px(14.0))
+                    .text_color(muted),
+                ),
+        )
+        .when(!collapsed, |col| {
+            col.children(app.available_tags.iter().map(|tag| {
+                let query = if tag.name.contains(' ') {
+                    format!("tag:\"{}\"", tag.name)
+                } else {
+                    format!("tag:{}", tag.name)
+                };
+                let selected = current_q.eq_ignore_ascii_case(&query);
+                let dot = avatar::parse_hex_color(&tag.color).unwrap_or(accent);
+                let name = tag.name.clone();
+                h_flex()
+                    .id(("sidebar-tag", tag.id))
+                    .h(px(NAV_ROW_HEIGHT))
+                    .pl(px(24.0))
+                    .pr_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(soft))
+                    .when(selected, |r| r.bg(soft))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.apply_sidebar_query_shortcut(query.clone(), window, cx);
+                    }))
+                    .child(div().rounded_full().size(px(8.0)).flex_shrink_0().bg(dot))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .truncate()
+                            .text_color(if selected { accent } else { text })
+                            .child(SharedString::from(name)),
+                    )
+            }))
+        })
+}
+
+/// WP-07 侧边栏文件夹右键操作内联确认条（新建子文件夹 / 重命名 / 删除确认）。
+fn folder_action_prompt_bar(
+    app: &HylkiApp,
+    action: &FolderActionPrompt,
+    p: &theme::HylkiPalette,
+    cx: &mut Context<HylkiApp>,
+) -> gpui_kit::Div {
+    let (title, needs_input, is_danger) = match action {
+        FolderActionPrompt::CreateSubfolder { parent_path, .. } => (
+            if parent_path.is_empty() {
+                "新建文件夹".to_string()
+            } else {
+                format!("在「{parent_path}」下新建")
+            },
+            true,
+            false,
+        ),
+        FolderActionPrompt::RenameFolder { current_name, .. } => {
+            (format!("重命名「{current_name}」"), true, false)
+        }
+        FolderActionPrompt::DeleteFolder { folder_name, .. } => {
+            (format!("确认删除「{folder_name}」？"), false, true)
+        }
+    };
+    v_flex()
+        .mx_2()
+        .my_1()
+        .p_2()
+        .gap_1p5()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if is_danger { p.danger } else { p.border })
+        .bg(p.surface_raised)
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(if is_danger { p.danger } else { p.text })
+                .truncate()
+                .child(SharedString::from(title)),
+        )
+        .when(needs_input, |el| {
+            el.child(Input::new(&app.folder_action_input))
+        })
+        .child(
+            h_flex()
+                .justify_end()
+                .gap_1()
+                .child(
+                    Button::new("folder-action-cancel")
+                        .ghost()
+                        .compact()
+                        .label("取消")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_folder_action(cx);
+                        })),
+                )
+                .child(
+                    Button::new("folder-action-confirm")
+                        .primary()
+                        .compact()
+                        .label(if is_danger { "删除" } else { "确定" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_folder_action(cx);
+                        })),
+                ),
+        )
+}
+
 /// 自定义文件夹树节点的折叠箭头（独立点击目标；行本体负责选中）。
 fn tree_chevron(
     acc_id: u32,
@@ -945,13 +1302,59 @@ fn folder_context_menu(
             }),
         );
     if is_custom {
-        // 后端 IMAP CREATE / RENAME / DELETE 尚未接入 mail-core 请求通道
-        // （WP-03 并行实施期间冻结 worker.rs），先以禁用项占位，见交接报告。
+        let delimiter = if folder_path.contains('.') && !folder_path.contains('/') {
+            '.'
+        } else {
+            '/'
+        };
         menu = menu
             .separator()
-            .item(PopupMenuItem::new("新建子文件夹…").disabled(true))
-            .item(PopupMenuItem::new("重命名…").disabled(true))
-            .item(PopupMenuItem::new("删除…").disabled(true))
+            .item(
+                PopupMenuItem::new("新建子文件夹…")
+                    .disabled(is_graph)
+                    .on_click({
+                        let e = app_entity.clone();
+                        let path = folder_path.clone();
+                        move |_, window, cx| {
+                            e.update(cx, |this, cx| {
+                                this.begin_create_subfolder(
+                                    acc_id,
+                                    path.clone(),
+                                    delimiter,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                    }),
+            )
+            .item(PopupMenuItem::new("重命名…").disabled(is_graph).on_click({
+                let e = app_entity.clone();
+                let path = folder_path.clone();
+                let name = folder_name.clone();
+                move |_, window, cx| {
+                    e.update(cx, |this, cx| {
+                        this.begin_rename_folder(
+                            acc_id,
+                            folder_id,
+                            path.clone(),
+                            name.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            }))
+            .item(PopupMenuItem::new("删除…").disabled(is_graph).on_click({
+                let e = app_entity.clone();
+                let path = folder_path.clone();
+                let name = folder_name.clone();
+                move |_, _, cx| {
+                    e.update(cx, |this, cx| {
+                        this.begin_delete_folder(acc_id, folder_id, path.clone(), name.clone(), cx);
+                    });
+                }
+            }))
             .item(PopupMenuItem::new("隐藏文件夹").on_click({
                 let e = app_entity.clone();
                 let path = folder_path.clone();
@@ -1366,6 +1769,9 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let is_sent_selected = current_view == CurrentView::Sent;
     let is_drafts_selected = current_view == CurrentView::Drafts;
     let is_archive_selected = current_view == CurrentView::Archive;
+    let is_junk_selected = current_view == CurrentView::Junk;
+    let is_trash_selected = current_view == CurrentView::Trash;
+    let is_snoozed_selected = current_view == CurrentView::Snoozed;
     // 草稿计数：真实账号取本地草稿数，演示模式取演示草稿箱邮件总数。
     let drafts_count = if demo_mode {
         app.demo_store
@@ -1405,6 +1811,8 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let sent_subrows = subrow_targets(FolderRole::Sent);
     let drafts_subrows = subrow_targets(FolderRole::Drafts);
     let archive_subrows = subrow_targets(FolderRole::Archive);
+    let junk_subrows = subrow_targets(FolderRole::Junk);
+    let trash_subrows = subrow_targets(FolderRole::Trash);
     // WP-07 Favorites 分区：收藏文件夹（按账号 + 路径解析到当前文件夹列表，
     // 解析不到的条目跳过）。
     let favorites: Vec<(AccountConfig, FolderSummary)> = app
@@ -1670,6 +2078,59 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         |menu, _, _| menu,
                     ))
                 })
+                .when(app.prefs.unified_show_junk, |el| {
+                    let expanded = multi_account && ui.unified_expanded.contains("nav-junk");
+                    el.child(unified_row_with_subrows(
+                        app,
+                        &p,
+                        cx,
+                        "nav-junk",
+                        IconName::TriangleAlert,
+                        "垃圾邮件",
+                        None,
+                        is_junk_selected,
+                        multi_account,
+                        expanded,
+                        &junk_subrows,
+                        |this, cx| this.select_unified_view(CurrentView::Junk, cx),
+                        |menu, _, _| menu,
+                    ))
+                })
+                .when(app.prefs.unified_show_trash, |el| {
+                    let expanded = multi_account && ui.unified_expanded.contains("nav-trash");
+                    el.child(unified_row_with_subrows(
+                        app,
+                        &p,
+                        cx,
+                        "nav-trash",
+                        IconName::Trash,
+                        "已删除",
+                        None,
+                        is_trash_selected,
+                        multi_account,
+                        expanded,
+                        &trash_subrows,
+                        |this, cx| this.select_unified_view(CurrentView::Trash, cx),
+                        |menu, _, _| menu,
+                    ))
+                })
+                .when(app.prefs.unified_show_snoozed, |el| {
+                    el.child(unified_row_with_subrows(
+                        app,
+                        &p,
+                        cx,
+                        "nav-snoozed",
+                        IconName::AlarmClock,
+                        "稍后处理",
+                        None,
+                        is_snoozed_selected,
+                        multi_account,
+                        false,
+                        &[],
+                        |this, cx| this.select_unified_view(CurrentView::Snoozed, cx),
+                        |menu, _, _| menu,
+                    ))
+                })
                 .when(!outbox_items.is_empty(), |el| {
                     el.child(
                         nav_row(
@@ -1745,37 +2206,57 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     }))
                 }),
         )
-        // 账号区段：细分隔线 + 可滚动区（WP-07 收藏分区 + 账号分组树）。
-        // Ctrl+Shift+A / 主菜单「显示 / 隐藏账号列表」（show_accounts，对齐
-        // 原版 Show Accounts）只隐藏账号分组；收藏分区非空时保持可见
-        //（对齐原版 Favorites 独立于 Show Accounts 的行为）。
-        .when(app.show_accounts || !favorites.is_empty(), |el| {
-            el.child(div().mx_2().my_1().h(px(1.0)).bg(border)).child(
-                v_flex()
-                    .id("sidebar-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scrollbar()
-                    .px_2()
-                    .py_1()
-                    .gap_0p5()
-                    .when(!favorites.is_empty(), |el| {
-                        el.child(favorites_section(app, &favorites, &p, &ui, cx))
-                    })
-                    .when(app.show_accounts, |el| {
-                        el.when(app.accounts.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .pt_1()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child("尚未配置邮箱，请在右侧添加账号。"),
-                            )
-                        })
-                        .children(account_sections)
-                    }),
-            )
+        .when_some(app.folder_action.as_ref(), |el, action| {
+            el.child(folder_action_prompt_bar(app, action, &p, cx))
         })
+        // 账号区段：细分隔线 + 可滚动区（WP-07 收藏 / 筛选 / 智能文件夹 / 标签 / 账号分组树）。
+        // Ctrl+Shift+A / 主菜单「显示 / 隐藏账号列表」（show_accounts，对齐
+        // 原版 Show Accounts）只隐藏账号分组；其余分区有内容时保持可见。
+        .when(
+            app.show_accounts
+                || !favorites.is_empty()
+                || app.prefs.sidebar_show_filtered
+                || (app.prefs.sidebar_show_smart && !app.prefs.smart_folders.is_empty())
+                || (app.prefs.sidebar_show_tags && !app.available_tags.is_empty()),
+            |el| {
+                el.child(div().mx_2().my_1().h(px(1.0)).bg(border)).child(
+                    v_flex()
+                        .id("sidebar-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scrollbar()
+                        .px_2()
+                        .py_1()
+                        .gap_0p5()
+                        .when(!favorites.is_empty(), |el| {
+                            el.child(favorites_section(app, &favorites, &p, &ui, cx))
+                        })
+                        .when(app.prefs.sidebar_show_filtered, |el| {
+                            el.child(filtered_section(app, &p, &ui, cx))
+                        })
+                        .when(
+                            app.prefs.sidebar_show_smart && !app.prefs.smart_folders.is_empty(),
+                            |el| el.child(smart_folders_section(app, &p, &ui, cx)),
+                        )
+                        .when(
+                            app.prefs.sidebar_show_tags && !app.available_tags.is_empty(),
+                            |el| el.child(tags_section(app, &p, &ui, cx)),
+                        )
+                        .when(app.show_accounts, |el| {
+                            el.when(app.accounts.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .pt_1()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child("尚未配置邮箱，请在右侧添加账号。"),
+                                )
+                            })
+                            .children(account_sections)
+                        }),
+                )
+            },
+        )
         // 底部固定区：联系人 / 附件入口。
         .when(
             app.prefs.sidebar_show_contacts || app.prefs.sidebar_show_attachments,

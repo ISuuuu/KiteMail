@@ -136,6 +136,9 @@ pub(crate) enum CurrentView {
     Sent,
     Drafts,
     Archive,
+    Junk,
+    Trash,
+    Snoozed,
     AccountFolder,
 }
 
@@ -146,6 +149,9 @@ impl CurrentView {
             Self::Starred => Some(UnifiedView::Starred),
             Self::Sent => Some(UnifiedView::Sent),
             Self::Archive => Some(UnifiedView::Archive),
+            Self::Junk => Some(UnifiedView::Junk),
+            Self::Trash => Some(UnifiedView::Trash),
+            Self::Snoozed => Some(UnifiedView::Snoozed),
             Self::UnifiedInbox | Self::Drafts | Self::AccountFolder => None,
         }
     }
@@ -154,6 +160,28 @@ impl CurrentView {
     pub(crate) fn is_unified(self) -> bool {
         !matches!(self, Self::AccountFolder)
     }
+}
+
+/// WP-07 侧边栏文件夹右键操作弹窗状态（新建子文件夹 / 重命名 / 删除确认）。
+#[derive(Clone, Debug)]
+pub(crate) enum FolderActionPrompt {
+    CreateSubfolder {
+        account_id: u32,
+        parent_path: String,
+        delimiter: char,
+    },
+    RenameFolder {
+        account_id: u32,
+        folder_id: u32,
+        old_path: String,
+        current_name: String,
+    },
+    DeleteFolder {
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+        folder_name: String,
+    },
 }
 
 /// L-6：阅读器位置（对齐原版 config::ReadingPane #475）：列表右侧 / 列表下方 / 关闭。
@@ -767,6 +795,11 @@ pub(crate) struct HylkiApp {
     pub(crate) compose_autosaved_at: Option<SharedString>,
     /// 已知联系人本地缓存（供写信收件人自动补全）。
     pub(crate) known_contacts: Vec<KnownContact>,
+    /// WP-07 侧边栏 Tags 分区展示的自定义标签列表（从 SQLite `tags` 表加载）。
+    pub(crate) available_tags: Vec<hylki_mail_core::cache::TagItem>,
+    /// WP-07 侧边栏文件夹右键「新建子文件夹 / 重命名 / 删除」内联确认条。
+    pub(crate) folder_action: Option<FolderActionPrompt>,
+    pub(crate) folder_action_input: Entity<InputState>,
     /// 撤销发送（5 秒缓冲）状态。
     pub(crate) pending_send: Option<PendingSend>,
     quitting: bool,
@@ -1284,6 +1317,10 @@ impl HylkiApp {
                 compose_autosaved_new: false,
                 compose_autosaved_at: None,
                 known_contacts: demo_contacts,
+                available_tags: Vec::new(),
+                folder_action: None,
+                folder_action_input: cx
+                    .new(|cx| InputState::new(window, cx).placeholder("输入文件夹名称…")),
                 pending_send: None,
                 quitting: false,
                 quit_preparing: false,
@@ -1500,6 +1537,10 @@ impl HylkiApp {
             compose_autosaved_new: false,
             compose_autosaved_at: None,
             known_contacts: Vec::new(),
+            available_tags: Vec::new(),
+            folder_action: None,
+            folder_action_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("输入文件夹名称…")),
             pending_send: None,
             quitting: false,
             quit_preparing: false,
@@ -1604,6 +1645,9 @@ impl HylkiApp {
             "sent" => Some(CurrentView::Sent),
             "drafts" => Some(CurrentView::Drafts),
             "archive" => Some(CurrentView::Archive),
+            "junk" => Some(CurrentView::Junk),
+            "trash" => Some(CurrentView::Trash),
+            "snoozed" => Some(CurrentView::Snoozed),
             _ => None,
         }
     }
@@ -1754,7 +1798,10 @@ impl HylkiApp {
                         CurrentView::Starred
                         | CurrentView::Sent
                         | CurrentView::Drafts
-                        | CurrentView::Archive => false,
+                        | CurrentView::Archive
+                        | CurrentView::Junk
+                        | CurrentView::Trash
+                        | CurrentView::Snoozed => false,
                     };
                     if page_matches {
                         self.merge_loaded_page(page, cx);
@@ -2151,6 +2198,9 @@ impl HylkiApp {
                         self.merge_loaded_page(page, cx);
                     }
                 }
+                WorkerEvent::TagsLoaded { tags } => {
+                    self.available_tags = tags;
+                }
                 WorkerEvent::CachedAttachmentsLoaded { items } => {
                     self.gallery_items = items.clone();
                     if let Some(ref g) = self.gallery {
@@ -2409,7 +2459,10 @@ impl HylkiApp {
                             CurrentView::Sent => DEMO_SENT_ID,
                             CurrentView::Drafts => DEMO_DRAFTS_ID,
                             CurrentView::Archive => DEMO_ARCHIVE_ID,
-                            CurrentView::Starred => DEMO_INBOX_ID,
+                            CurrentView::Starred
+                            | CurrentView::Junk
+                            | CurrentView::Trash
+                            | CurrentView::Snoozed => DEMO_INBOX_ID,
                         };
                         self.demo_store.list_messages_page_with_options(
                             folder_id,
@@ -2460,8 +2513,12 @@ impl HylkiApp {
                         limit,
                     });
                 }
-                CurrentView::Starred | CurrentView::Sent | CurrentView::Archive => {
-                    // unified() 在这三个视图下恒为 Some。
+                CurrentView::Starred
+                | CurrentView::Sent
+                | CurrentView::Archive
+                | CurrentView::Junk
+                | CurrentView::Trash
+                | CurrentView::Snoozed => {
                     if let Some(view) = self.current_view.unified() {
                         w.send(MailRequest::LoadUnifiedView {
                             view,
@@ -2631,7 +2688,11 @@ impl HylkiApp {
         if self.demo_mode {
             // 演示模式下统一视图映射到对应的演示文件夹。
             self.selected_folder_id = match view {
-                CurrentView::UnifiedInbox | CurrentView::Starred => DEMO_INBOX_ID,
+                CurrentView::UnifiedInbox
+                | CurrentView::Starred
+                | CurrentView::Junk
+                | CurrentView::Trash
+                | CurrentView::Snoozed => DEMO_INBOX_ID,
                 CurrentView::Sent => DEMO_SENT_ID,
                 CurrentView::Drafts => DEMO_DRAFTS_ID,
                 CurrentView::Archive => DEMO_ARCHIVE_ID,
@@ -2640,6 +2701,155 @@ impl HylkiApp {
         }
         self.remember_last_location(None);
         self.reload_current_page(cx);
+        cx.notify();
+    }
+
+    /// WP-07 侧边栏快捷入口（筛选文件夹 / 智能文件夹 / 标签）：
+    /// 写入搜索词并切到全部文件夹搜索，立即刷新列表。
+    pub(crate) fn apply_sidebar_query_shortcut(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_sidebar_peek();
+        self.main_view = MainContentView::Mail;
+        self.right_mode = RightPaneMode::Reader;
+        self.current_view = CurrentView::UnifiedInbox;
+        self.search_scope = SearchScope::AllFolders;
+        self.search_query = query.clone();
+        self.search_input
+            .update(cx, |s, cx| s.set_value(query, window, cx));
+        self.reset_list_pagination();
+        self.selected_message = None;
+        self.reload_current_page(cx);
+        cx.notify();
+    }
+
+    /// WP-07 侧边栏右键「新建子文件夹…」。
+    pub(crate) fn begin_create_subfolder(
+        &mut self,
+        account_id: u32,
+        parent_path: String,
+        delimiter: char,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.folder_action = Some(FolderActionPrompt::CreateSubfolder {
+            account_id,
+            parent_path,
+            delimiter,
+        });
+        self.folder_action_input.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// WP-07 侧边栏右键「重命名…」。
+    pub(crate) fn begin_rename_folder(
+        &mut self,
+        account_id: u32,
+        folder_id: u32,
+        old_path: String,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.folder_action = Some(FolderActionPrompt::RenameFolder {
+            account_id,
+            folder_id,
+            old_path,
+            current_name: current_name.clone(),
+        });
+        self.folder_action_input.update(cx, |s, cx| {
+            s.set_value(current_name, window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// WP-07 侧边栏右键「删除…」。
+    pub(crate) fn begin_delete_folder(
+        &mut self,
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+        folder_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.folder_action = Some(FolderActionPrompt::DeleteFolder {
+            account_id,
+            folder_id,
+            folder_path,
+            folder_name,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_folder_action(&mut self, cx: &mut Context<Self>) {
+        self.folder_action = None;
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_folder_action(&mut self, cx: &mut Context<Self>) {
+        let Some(action) = self.folder_action.take() else {
+            return;
+        };
+        let input_val = self.folder_action_input.read(cx).value().trim().to_string();
+        if let Some(ref w) = self.worker {
+            match action {
+                FolderActionPrompt::CreateSubfolder {
+                    account_id,
+                    parent_path,
+                    delimiter,
+                } => {
+                    if !input_val.is_empty() {
+                        let folder_path = if parent_path.is_empty() {
+                            input_val
+                        } else {
+                            format!("{parent_path}{delimiter}{input_val}")
+                        };
+                        w.send(MailRequest::CreateFolder {
+                            account_id,
+                            folder_path,
+                        });
+                    }
+                }
+                FolderActionPrompt::RenameFolder {
+                    account_id,
+                    folder_id,
+                    old_path,
+                    ..
+                } => {
+                    if !input_val.is_empty() {
+                        let new_path = match old_path.rfind(['/', '.']) {
+                            Some(pos) => format!("{}{}", &old_path[..=pos], input_val),
+                            None => input_val,
+                        };
+                        w.send(MailRequest::RenameFolder {
+                            account_id,
+                            folder_id,
+                            old_path,
+                            new_path,
+                        });
+                    }
+                }
+                FolderActionPrompt::DeleteFolder {
+                    account_id,
+                    folder_id,
+                    folder_path,
+                    ..
+                } => {
+                    w.send(MailRequest::DeleteFolder {
+                        account_id,
+                        folder_id,
+                        folder_path,
+                    });
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -3476,7 +3686,12 @@ impl HylkiApp {
                 .flatten()
                 .find(|f| f.id == self.selected_folder_id)
                 .is_some_and(|f| is_sent_folder(&f.name, &f.path)),
-            CurrentView::UnifiedInbox | CurrentView::Starred | CurrentView::Archive => false,
+            CurrentView::UnifiedInbox
+            | CurrentView::Starred
+            | CurrentView::Archive
+            | CurrentView::Junk
+            | CurrentView::Trash
+            | CurrentView::Snoozed => false,
         }
     }
 
@@ -5975,7 +6190,10 @@ impl HylkiApp {
             CurrentView::Starred
             | CurrentView::Sent
             | CurrentView::Drafts
-            | CurrentView::Archive => false,
+            | CurrentView::Archive
+            | CurrentView::Junk
+            | CurrentView::Trash
+            | CurrentView::Snoozed => false,
         }
     }
 
@@ -8005,6 +8223,18 @@ impl HylkiApp {
             }
             CurrentView::Archive => {
                 self.prefs.last_view = Some("archive".to_string());
+                self.prefs.last_folder = None;
+            }
+            CurrentView::Junk => {
+                self.prefs.last_view = Some("junk".to_string());
+                self.prefs.last_folder = None;
+            }
+            CurrentView::Trash => {
+                self.prefs.last_view = Some("trash".to_string());
+                self.prefs.last_folder = None;
+            }
+            CurrentView::Snoozed => {
+                self.prefs.last_view = Some("snoozed".to_string());
                 self.prefs.last_folder = None;
             }
             CurrentView::AccountFolder => {

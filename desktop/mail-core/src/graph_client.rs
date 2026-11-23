@@ -469,6 +469,7 @@ pub fn send_message(
     to_addr: &str,
     cc_addrs: &str,
     bcc_addrs: &str,
+    reply_to: Option<&str>,
     subject: &str,
     body_text: &str,
     // WP-10-3：按正文格式预先算好的 HTML；`Some` 时以 `contentType: Html` 发送。
@@ -527,6 +528,12 @@ pub fn send_message(
     let bcc_recipients = graph_recipient_array(bcc_addrs);
     if !bcc_recipients.is_empty() {
         message_obj["bccRecipients"] = serde_json::Value::Array(bcc_recipients);
+    }
+    if let Some(rt) = reply_to {
+        let reply_to_recipients = graph_recipient_array(rt);
+        if !reply_to_recipients.is_empty() {
+            message_obj["replyTo"] = serde_json::Value::Array(reply_to_recipients);
+        }
     }
 
     let payload = serde_json::json!({

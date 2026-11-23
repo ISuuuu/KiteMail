@@ -697,6 +697,38 @@ impl CacheStore {
         self.list_folders(account_id)
     }
 
+    /// WP-07: Rename a cached folder's path and display name after IMAP `RENAME`.
+    pub fn rename_folder_entry(
+        &mut self,
+        account_id: u32,
+        folder_id: u32,
+        new_path: &str,
+        new_name: &str,
+    ) -> Result<Vec<FolderSummary>, String> {
+        self.conn
+            .execute(
+                "UPDATE folders SET path = ?1, name = ?2 WHERE id = ?3 AND account_id = ?4",
+                params![new_path, new_name, folder_id, account_id],
+            )
+            .map_err(|e| format!("更新文件夹名称失败: {e}"))?;
+        self.list_folders(account_id)
+    }
+
+    /// WP-07: Remove a cached folder (and cascade-delete its cached messages) after IMAP `DELETE`.
+    pub fn delete_folder_entry(
+        &mut self,
+        account_id: u32,
+        folder_id: u32,
+    ) -> Result<Vec<FolderSummary>, String> {
+        self.conn
+            .execute(
+                "DELETE FROM folders WHERE id = ?1 AND account_id = ?2",
+                params![folder_id, account_id],
+            )
+            .map_err(|e| format!("删除本地文件夹缓存失败: {e}"))?;
+        self.list_folders(account_id)
+    }
+
     /// List cached folders for `account_id`.
     pub fn list_folders(&self, account_id: u32) -> Result<Vec<FolderSummary>, String> {
         let mut stmt = self
@@ -1256,6 +1288,13 @@ impl CacheStore {
             args.push(pat.clone().into());
             args.push(pat.into());
         }
+        for val in &parsed.tags {
+            clauses.push(
+                "(',' || REPLACE(LOWER(COALESCE(m.tags, '')), ', ', ',') || ',') LIKE ?"
+                    .to_string(),
+            );
+            args.push(format!("%,{val},%").into());
+        }
         for term in &parsed.terms {
             if let Some(fts_q) = Self::fts5_term(term) {
                 clauses.push(
@@ -1663,6 +1702,75 @@ impl CacheStore {
         self.list_role_messages_with_options_for_accounts(
             ARCHIVE_FOLDER_MATCH,
             "归档",
+            Some(allowed_account_ids),
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
+    /// Query a page of junk/spam messages restricted to `allowed_account_ids`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_junk_messages_for_accounts(
+        &self,
+        allowed_account_ids: &[u32],
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options_for_accounts(
+            JUNK_FOLDER_MATCH,
+            "垃圾邮件",
+            Some(allowed_account_ids),
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
+    /// Query a page of trash/deleted messages restricted to `allowed_account_ids`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_trash_messages_for_accounts(
+        &self,
+        allowed_account_ids: &[u32],
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options_for_accounts(
+            TRASH_FOLDER_MATCH,
+            "已删除",
+            Some(allowed_account_ids),
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        )
+    }
+
+    /// Query a page of snoozed messages (`snoozed_until_ts > 0`) restricted to `allowed_account_ids`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_snoozed_messages_for_accounts(
+        &self,
+        allowed_account_ids: &[u32],
+        query: &str,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MailPage, String> {
+        self.list_role_messages_with_options_for_accounts(
+            "m.snoozed_until_ts > 0",
+            "稍后处理",
             Some(allowed_account_ids),
             query,
             quick_filters,

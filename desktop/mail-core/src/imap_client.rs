@@ -809,6 +809,52 @@ pub async fn empty_folder(
     Ok(())
 }
 
+/// Create a new mailbox `folder_path` on the IMAP server (`CREATE`).
+pub async fn create_folder(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .create(folder_path)
+        .await
+        .map_err(|e| format!("创建文件夹 {folder_path} 失败: {e}"))?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+/// Rename an existing mailbox from `old_path` to `new_path` on the IMAP server (`RENAME`).
+pub async fn rename_folder(
+    account: &AccountConfig,
+    password: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .rename(old_path, new_path)
+        .await
+        .map_err(|e| format!("重命名文件夹 {old_path} -> {new_path} 失败: {e}"))?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+/// Delete a mailbox `folder_path` on the IMAP server (`DELETE`).
+pub async fn delete_folder(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+) -> Result<(), String> {
+    let mut session = connect_imap(account, password).await?;
+    session
+        .delete(folder_path)
+        .await
+        .map_err(|e| format!("删除文件夹 {folder_path} 失败: {e}"))?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
 /// Move a message to another mailbox via `UID MOVE` (RFC 6851).
 pub async fn move_message(
     account: &AccountConfig,

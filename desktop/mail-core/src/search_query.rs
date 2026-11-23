@@ -32,6 +32,8 @@ pub struct SearchQuery {
     pub unread: Option<bool>,
     /// `is:starred`.
     pub starred: bool,
+    /// `tag:<val>` — must match one of the message's tags.
+    pub tags: Vec<String>,
 }
 
 /// Split raw query text into tokens, keeping quoted stretches intact (with quotes removed)
@@ -79,6 +81,7 @@ impl SearchQuery {
                 Some(("to" | "cc" | "bcc", v)) => q.to.push(clean(v)),
                 Some(("subject", v)) => q.subject.push(clean(v)),
                 Some(("in" | "folder", v)) => q.folder.push(clean(v)),
+                Some(("tag", v)) => q.tags.push(clean(v)),
                 Some(("has", "attachment" | "attachments")) => q.attachment = true,
                 Some(("is", "unread")) => q.unread = Some(true),
                 Some(("is", "read")) => q.unread = Some(false),
@@ -95,6 +98,7 @@ impl SearchQuery {
         q.to.retain(|v| !v.is_empty());
         q.subject.retain(|v| !v.is_empty());
         q.folder.retain(|v| !v.is_empty());
+        q.tags.retain(|v| !v.is_empty());
         q
     }
 
@@ -161,6 +165,13 @@ impl SearchQuery {
             .folder
             .iter()
             .all(|v| folder_name_l.contains(v.as_str()) || folder_path_l.contains(v.as_str()))
+        {
+            return false;
+        }
+        if !self
+            .tags
+            .iter()
+            .all(|v| msg.tags.iter().any(|t| t.to_lowercase() == *v))
         {
             return false;
         }

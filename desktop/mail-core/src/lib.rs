@@ -343,6 +343,9 @@ pub enum UnifiedView {
     Starred,
     Sent,
     Archive,
+    Junk,
+    Trash,
+    Snoozed,
 }
 
 /// Server/cache-side single-choice filter (kept for backward compatibility).
@@ -848,6 +851,26 @@ pub enum MailRequest {
         target_account_id: u32,
         target_folder_path: String,
     },
+    /// WP-07: Load all custom tags from SQLite for the sidebar Tags section.
+    ListTags,
+    /// WP-07: Create a new IMAP folder (or subfolder) on the server and refresh folders.
+    CreateFolder {
+        account_id: u32,
+        folder_path: String,
+    },
+    /// WP-07: Rename a custom IMAP folder on the server and update local cache.
+    RenameFolder {
+        account_id: u32,
+        folder_id: u32,
+        old_path: String,
+        new_path: String,
+    },
+    /// WP-07: Delete a custom IMAP folder on the server and remove it from local cache.
+    DeleteFolder {
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+    },
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.
@@ -1027,6 +1050,10 @@ pub enum WorkerEvent {
         message_id: u32,
         target_account_id: u32,
         target_folder_path: String,
+    },
+    /// WP-07: Custom tags loaded for the sidebar Tags section.
+    TagsLoaded {
+        tags: Vec<cache::TagItem>,
     },
     /// F-4 草稿落库完成（含新增分配的本地 ID；写信页据此绑定 `compose_draft_id`
     /// 并在自动保存后显示「草稿已自动保存 HH:MM」）。

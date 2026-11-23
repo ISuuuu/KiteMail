@@ -983,6 +983,9 @@ async fn handle_request(
             if let Ok(drafts) = cache.list_drafts() {
                 let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
             }
+            if let Ok(tags) = cache.list_tags() {
+                let _ = evt_tx.send(WorkerEvent::TagsLoaded { tags });
+            }
             let page_size = pref_page_size(data_dir);
             let allowed = unified_account_ids(data_dir);
             if let Ok(page) = cache.list_unified_inbox_for_accounts(
@@ -1015,6 +1018,9 @@ async fn handle_request(
             }
             if let Ok(drafts) = cache.list_drafts() {
                 let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
+            }
+            if let Ok(tags) = cache.list_tags() {
+                let _ = evt_tx.send(WorkerEvent::TagsLoaded { tags });
             }
             let page_size = pref_page_size(data_dir);
             let allowed = unified_account_ids(data_dir);
@@ -2003,6 +2009,9 @@ async fn handle_request(
             if let Ok(drafts) = cache.list_drafts() {
                 let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
             }
+            if let Ok(tags) = cache.list_tags() {
+                let _ = evt_tx.send(WorkerEvent::TagsLoaded { tags });
+            }
         }
 
         // WP-10-5 写信模板：保存 / 删除都回推整份列表，UI 无需自行合并。
@@ -2183,6 +2192,15 @@ async fn handle_request(
                     &allowed, &query, effective, sort, offset, limit,
                 ),
                 UnifiedView::Archive => cache.list_archived_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Junk => cache.list_junk_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Trash => cache.list_trash_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Snoozed => cache.list_snoozed_messages_for_accounts(
                     &allowed, &query, effective, sort, offset, limit,
                 ),
             };
@@ -2423,6 +2441,192 @@ async fn handle_request(
                 });
             }
         },
+
+        MailRequest::ListTags => match cache.list_tags() {
+            Ok(tags) => {
+                let _ = evt_tx.send(WorkerEvent::TagsLoaded { tags });
+            }
+            Err(e) => {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: e,
+                });
+            }
+        },
+
+        MailRequest::CreateFolder {
+            account_id,
+            folder_path,
+        } => {
+            let trimmed = folder_path.trim().to_string();
+            if trimmed.is_empty() {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: "文件夹名称不能为空".to_string(),
+                });
+                return;
+            }
+            let account = match load_account_config(data_dir, account_id) {
+                Ok(acc) => acc,
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                    return;
+                }
+            };
+            if account.auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: "Microsoft Graph 账号暂不支持远端新建文件夹".to_string(),
+                });
+                return;
+            }
+            let res = match secrets::load_account_secrets(account_id) {
+                Ok(sec) => imap_client::create_folder(&account, &sec.imap_password, &trimmed).await,
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => {
+                    if let Ok(sec) = secrets::load_account_secrets(account_id) {
+                        if let Ok(remote) =
+                            imap_client::fetch_folders(&account, &sec.imap_password).await
+                        {
+                            if let Ok(folders) = cache.sync_folders(account_id, &remote) {
+                                let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                                    account_id,
+                                    folders,
+                                });
+                            }
+                        }
+                    }
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: Some(account_id),
+                        text: format!("已创建文件夹「{trimmed}」"),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        MailRequest::RenameFolder {
+            account_id,
+            folder_id,
+            old_path,
+            new_path,
+        } => {
+            let trimmed = new_path.trim().to_string();
+            if trimmed.is_empty() || trimmed == old_path {
+                return;
+            }
+            let account = match load_account_config(data_dir, account_id) {
+                Ok(acc) => acc,
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                    return;
+                }
+            };
+            if account.auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: "Microsoft Graph 账号暂不支持远端重命名文件夹".to_string(),
+                });
+                return;
+            }
+            let res = match secrets::load_account_secrets(account_id) {
+                Ok(sec) => {
+                    imap_client::rename_folder(&account, &sec.imap_password, &old_path, &trimmed)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => {
+                    let leaf_name = trimmed
+                        .rsplit(['/', '.'])
+                        .next()
+                        .unwrap_or(&trimmed)
+                        .to_string();
+                    if let Ok(folders) =
+                        cache.rename_folder_entry(account_id, folder_id, &trimmed, &leaf_name)
+                    {
+                        let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                            account_id,
+                            folders,
+                        });
+                    }
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: Some(account_id),
+                        text: format!("已将文件夹重命名为「{leaf_name}」"),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                }
+            }
+        }
+
+        MailRequest::DeleteFolder {
+            account_id,
+            folder_id,
+            folder_path,
+        } => {
+            let account = match load_account_config(data_dir, account_id) {
+                Ok(acc) => acc,
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                    return;
+                }
+            };
+            if account.auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message: "Microsoft Graph 账号暂不支持远端删除文件夹".to_string(),
+                });
+                return;
+            }
+            let res = match secrets::load_account_secrets(account_id) {
+                Ok(sec) => {
+                    imap_client::delete_folder(&account, &sec.imap_password, &folder_path).await
+                }
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => {
+                    if let Ok(folders) = cache.delete_folder_entry(account_id, folder_id) {
+                        let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                            account_id,
+                            folders,
+                        });
+                    }
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: Some(account_id),
+                        text: format!("已删除文件夹「{folder_path}」"),
+                    });
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: e,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -3673,6 +3877,7 @@ async fn deliver_outbox_item(
                 let to_addr = item.to_addr.clone();
                 let cc_addrs = item.cc_addr.clone();
                 let bcc_addrs = item.bcc_addr.clone();
+                let reply_to = item.reply_to.clone();
                 let subject = item.subject.clone();
                 let body = item.body_text.clone();
                 let body_html = item.body_html.clone();
@@ -3683,6 +3888,7 @@ async fn deliver_outbox_item(
                         &to_addr,
                         &cc_addrs,
                         &bcc_addrs,
+                        (!reply_to.trim().is_empty()).then_some(reply_to.as_str()),
                         &subject,
                         &body,
                         body_html.as_deref(),
