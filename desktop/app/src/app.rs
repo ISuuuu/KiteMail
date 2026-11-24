@@ -9030,6 +9030,7 @@ impl HylkiApp {
             let _ = hylki_mail_core::secrets::migrate_legacy_secret_to_email(acc.id, &acc.email);
         }
         config::save_accounts_in(&data_dir, &merged)?;
+        config::register_known_data_dir(&data_dir);
         self.accounts = merged;
         if !self
             .accounts

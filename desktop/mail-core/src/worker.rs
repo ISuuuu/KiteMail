@@ -25,9 +25,17 @@ type SharedAsyncCache = Arc<std::sync::Mutex<Option<CacheStore>>>;
 struct SharedTokenCache {
     cache: Arc<tokio::sync::Mutex<TokenCache>>,
     refresh_locks: Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::Mutex<()>>>>>,
+    data_dir: Option<PathBuf>,
 }
 
 impl SharedTokenCache {
+    fn for_data_dir(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            ..Self::default()
+        }
+    }
+
     async fn insert(&self, account_id: u32, token: String, expires_at: Instant) {
         let mut guard = self.cache.lock().await;
         guard.insert(account_id, (token, expires_at));
@@ -72,23 +80,130 @@ impl SharedTokenCache {
             return Ok(tok);
         }
 
-        let refresh_token = secrets::load_oauth_refresh_token_for(account.id, &account.email)?;
-        let client_id = account.oauth_client_id.clone();
-        let refreshed = tokio::task::spawn_blocking(move || {
-            oauth::refresh_microsoft_token(&client_id, &refresh_token)
-        })
-        .await
-        .map_err(|e| format!("刷新令牌任务异常: {e}"))??;
-
-        if let Some(new_rt) = refreshed.refresh_token {
-            let _ = secrets::save_oauth_refresh_token_for(account.id, &account.email, new_rt);
-        }
+        let refreshed =
+            refresh_microsoft_oauth_token_with_sync(self.data_dir.as_deref(), account, false)
+                .await?;
         let expires_at =
             Instant::now() + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
         self.insert(account.id, refreshed.access_token.clone(), expires_at)
             .await;
         Ok(refreshed.access_token)
     }
+}
+
+fn select_oauth_refresh_token_to_persist(
+    returned: Option<&str>,
+    recovered_from_legacy: Option<&str>,
+) -> Option<String> {
+    returned
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            recovered_from_legacy
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
+async fn run_single_microsoft_refresh(
+    client_id: &str,
+    refresh_token: &str,
+    imap_scope: bool,
+) -> Result<oauth::RefreshedTokens, String> {
+    let cid = client_id.to_string();
+    let rt = refresh_token.to_string();
+    tokio::task::spawn_blocking(move || {
+        if imap_scope {
+            oauth::refresh_microsoft_imap_token(&cid, &rt)
+        } else {
+            oauth::refresh_microsoft_token(&cid, &rt)
+        }
+    })
+    .await
+    .map_err(|e| format!("刷新令牌任务异常: {e}"))?
+}
+
+async fn try_legacy_oauth_fallback(
+    account: &AccountConfig,
+    imap_scope: bool,
+    legacy_ids: &[u32],
+    already_tried: &str,
+    first_err: String,
+) -> Result<(oauth::RefreshedTokens, Option<String>), String> {
+    for candidate in secrets::load_distinct_legacy_oauth_refresh_tokens(legacy_ids, already_tried) {
+        if let Ok(refreshed) =
+            run_single_microsoft_refresh(&account.oauth_client_id, &candidate, imap_scope).await
+        {
+            return Ok((refreshed, Some(candidate)));
+        }
+    }
+    Err(first_err)
+}
+
+async fn refresh_microsoft_oauth_token_with_sync(
+    data_dir: Option<&Path>,
+    account: &AccountConfig,
+    imap_scope: bool,
+) -> Result<oauth::RefreshedTokens, String> {
+    let resolve_legacy_ids = || {
+        data_dir
+            .map(|d| config::non_conflicting_legacy_ids_for_email(d, &account.email))
+            .unwrap_or_else(|| vec![account.id])
+    };
+    let primary_res = secrets::load_oauth_refresh_token_for(account.id, &account.email);
+    let (refreshed, recovered_from_legacy) = match primary_res {
+        Ok(primary_rt) => {
+            match run_single_microsoft_refresh(&account.oauth_client_id, &primary_rt, imap_scope)
+                .await
+            {
+                Ok(refreshed) => (refreshed, None),
+                Err(first_err) => {
+                    let ids = resolve_legacy_ids();
+                    try_legacy_oauth_fallback(account, imap_scope, &ids, &primary_rt, first_err)
+                        .await?
+                }
+            }
+        }
+        Err(load_err) => {
+            let ids = resolve_legacy_ids();
+            try_legacy_oauth_fallback(account, imap_scope, &ids, "", load_err).await?
+        }
+    };
+
+    if let Some(rt_to_persist) = select_oauth_refresh_token_to_persist(
+        refreshed.refresh_token.as_deref(),
+        recovered_from_legacy.as_deref(),
+    ) {
+        let ids = resolve_legacy_ids();
+        let _ = secrets::save_oauth_refresh_token_and_sync_legacy(
+            account.id,
+            &account.email,
+            &ids,
+            rt_to_persist,
+        );
+    }
+
+    Ok(refreshed)
+}
+
+fn legacy_ids_for_oauth_save(data_dir: &Path, account_id: u32, email: &str) -> Vec<u32> {
+    let mut ids = config::non_conflicting_legacy_ids_for_email(data_dir, email);
+    let has_local_conflict = config::load_accounts_in(data_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|a| {
+            a.id == account_id
+                && !a.email.trim().is_empty()
+                && !a.email.trim().eq_ignore_ascii_case(email.trim())
+        });
+    let has_peer_conflict =
+        config::collect_peer_secret_usage(data_dir, account_id, email).legacy_id_in_use_by_peer;
+    if !has_local_conflict && !has_peer_conflict && !ids.contains(&account_id) {
+        ids.push(account_id);
+    }
+    ids
 }
 
 fn open_existing_or_create_cache(data_dir: &Path) -> Result<CacheStore, String> {
@@ -299,8 +414,9 @@ async fn worker_loop(
             return;
         }
     };
+    config::register_known_data_dir(&data_dir);
     let mut cache_opt = Some(initial_cache);
-    let tokens = SharedTokenCache::default();
+    let tokens = SharedTokenCache::for_data_dir(data_dir.clone());
     let async_cache: SharedAsyncCache = Arc::new(std::sync::Mutex::new(
         open_existing_or_create_cache(&data_dir).ok(),
     ));
@@ -560,6 +676,7 @@ async fn handle_change_mail_data_dir(
                     message: format!("保存导入的关联账号配置失败: {err}"),
                 });
             } else {
+                config::register_known_data_dir(data_dir);
                 imported_count = added;
                 for acc in &merged {
                     if !prev_ids.contains(&acc.id) {
@@ -872,6 +989,7 @@ fn wake_due_snoozed_messages(cache: &mut CacheStore, evt_tx: &EventSender) {
 /// unread/total check so push-like responsiveness works immediately without re-login.
 fn spawn_account_idle_watcher(
     watchers: &mut IdleWatchers,
+    data_dir: PathBuf,
     account: AccountConfig,
     req_tx: mpsc::Sender<MailRequest>,
 ) {
@@ -880,7 +998,7 @@ fn spawn_account_idle_watcher(
     }
     let account_id = account.id;
     let handle = tokio::spawn(async move {
-        run_account_push_watcher(account, req_tx).await;
+        run_account_push_watcher(data_dir, account, req_tx).await;
     });
     watchers.insert(account_id, handle);
 }
@@ -959,13 +1077,22 @@ fn refresh_account_watcher(
         .map(|p| p.push_enabled)
         .unwrap_or(true);
     if account.enabled && account.effective_push(global_push) {
-        spawn_account_idle_watcher(watchers, account.clone(), req_tx.clone());
+        spawn_account_idle_watcher(
+            watchers,
+            data_dir.to_path_buf(),
+            account.clone(),
+            req_tx.clone(),
+        );
     } else {
         stop_account_idle_watcher(watchers, account.id);
     }
 }
 
-async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<MailRequest>) {
+async fn run_account_push_watcher(
+    data_dir: PathBuf,
+    account: AccountConfig,
+    req_tx: mpsc::Sender<MailRequest>,
+) {
     // Brief initial delay so startup sync finishes first without competing for connections.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -1001,39 +1128,41 @@ async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<M
                 //    so we can use genuine IMAP IDLE push on outlook.office365.com:993.
                 let imap_token = match cached_imap_token.as_ref() {
                     Some((tok, exp)) if Instant::now() < *exp => Some(tok.clone()),
-                    _ => {
-                        let Ok(rt) =
-                            secrets::load_oauth_refresh_token_for(account.id, &account.email)
-                        else {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            continue;
-                        };
-                        let cid = account.oauth_client_id.clone();
-                        let refreshed = tokio::task::spawn_blocking(move || {
-                            oauth::refresh_microsoft_imap_token(&cid, &rt)
-                        })
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok());
-
-                        if let Some(refreshed) = refreshed {
-                            if let Some(new_rt) = refreshed.refresh_token {
-                                let _ = secrets::save_oauth_refresh_token_for(
-                                    account.id,
-                                    &account.email,
-                                    new_rt,
-                                );
-                            }
+                    _ => match refresh_microsoft_oauth_token_with_sync(
+                        Some(&data_dir),
+                        &account,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(refreshed) => {
                             let exp = Instant::now()
                                 + Duration::from_secs(
                                     refreshed.expires_in_secs.saturating_sub(120),
                                 );
                             cached_imap_token = Some((refreshed.access_token.clone(), exp));
                             Some(refreshed.access_token)
-                        } else {
+                        }
+                        Err(_) => {
+                            let legacy_ids = config::non_conflicting_legacy_ids_for_email(
+                                &data_dir,
+                                &account.email,
+                            );
+                            let missing_rt =
+                                secrets::load_oauth_refresh_token_for(account.id, &account.email)
+                                    .is_err()
+                                    && secrets::load_distinct_legacy_oauth_refresh_tokens(
+                                        &legacy_ids,
+                                        "",
+                                    )
+                                    .is_empty();
+                            if missing_rt {
+                                tokio::time::sleep(Duration::from_secs(60)).await;
+                                continue;
+                            }
                             None
                         }
-                    }
+                    },
                 };
 
                 if let Some(token) = imap_token {
@@ -1059,7 +1188,7 @@ async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<M
                 // 2. Fallback when an older refresh token has not yet been re-authorized with
                 //    IMAP.AccessAsUser.All (or tenant blocks IMAP): lightweight 20-second Graph
                 //    inbox unread/total pulse check; only triggers full sync when counts change.
-                run_graph_fast_poll_fallback(&account, &req_tx).await;
+                run_graph_fast_poll_fallback(&data_dir, &account, &req_tx).await;
             }
         }
 
@@ -1068,7 +1197,11 @@ async fn run_account_push_watcher(account: AccountConfig, req_tx: mpsc::Sender<M
     }
 }
 
-async fn run_graph_fast_poll_fallback(account: &AccountConfig, req_tx: &mpsc::Sender<MailRequest>) {
+async fn run_graph_fast_poll_fallback(
+    data_dir: &Path,
+    account: &AccountConfig,
+    req_tx: &mpsc::Sender<MailRequest>,
+) {
     let mut cached_graph_token: Option<(String, Instant)> = None;
     let mut last_inbox_sig: Option<(u32, usize)> = None;
 
@@ -1079,21 +1212,11 @@ async fn run_graph_fast_poll_fallback(account: &AccountConfig, req_tx: &mpsc::Se
         let token = match cached_graph_token.as_ref() {
             Some((tok, exp)) if Instant::now() < *exp => tok.clone(),
             _ => {
-                let Ok(rt) = secrets::load_oauth_refresh_token_for(account.id, &account.email)
+                let Ok(refreshed) =
+                    refresh_microsoft_oauth_token_with_sync(Some(data_dir), account, false).await
                 else {
                     return;
                 };
-                let cid = account.oauth_client_id.clone();
-                let Ok(Ok(refreshed)) =
-                    tokio::task::spawn_blocking(move || oauth::refresh_microsoft_token(&cid, &rt))
-                        .await
-                else {
-                    return;
-                };
-                if let Some(new_rt) = refreshed.refresh_token {
-                    let _ =
-                        secrets::save_oauth_refresh_token_for(account.id, &account.email, new_rt);
-                }
                 let exp = Instant::now()
                     + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
                 cached_graph_token = Some((refreshed.access_token.clone(), exp));
@@ -1297,6 +1420,7 @@ async fn handle_request(
                 });
                 return;
             }
+            config::register_known_data_dir(data_dir);
             if let Ok(all_accounts) = config::load_accounts_in(data_dir) {
                 let _ = cache.sync_account_registry(&all_accounts);
                 cache.set_own_emails(all_accounts.iter().map(|a| a.email.clone()).collect());
@@ -1390,9 +1514,12 @@ async fn handle_request(
             // 编辑已有账号重新授权：只把新令牌写入 Keyring 与内存令牌缓存，
             // 账号配置、缓存与同步完全不动，由 UI 保留编辑表单并提示成功。
             if editing_account_id.is_some() {
-                if let Err(e) = secrets::save_oauth_refresh_token_for(
+                config::register_known_data_dir(data_dir);
+                let legacy_ids = legacy_ids_for_oauth_save(data_dir, account_id, &result.email);
+                if let Err(e) = secrets::save_oauth_refresh_token_and_sync_legacy(
                     account_id,
                     &result.email,
+                    &legacy_ids,
                     result.refresh_token,
                 ) {
                     let _ = evt_tx.send(WorkerEvent::Error {
@@ -1461,9 +1588,11 @@ async fn handle_request(
                 storage_dir: prev.and_then(|p| p.storage_dir.clone()),
             };
 
-            if let Err(e) = secrets::save_oauth_refresh_token_for(
+            let legacy_ids = legacy_ids_for_oauth_save(data_dir, account_id, &account.email);
+            if let Err(e) = secrets::save_oauth_refresh_token_and_sync_legacy(
                 account_id,
                 &account.email,
+                &legacy_ids,
                 result.refresh_token,
             ) {
                 let _ = evt_tx.send(WorkerEvent::Error {
@@ -1479,6 +1608,7 @@ async fn handle_request(
                 });
                 return;
             }
+            config::register_known_data_dir(data_dir);
             if let Ok(all_accounts) = config::load_accounts_in(data_dir) {
                 let _ = cache.sync_account_registry(&all_accounts);
                 cache.set_own_emails(all_accounts.iter().map(|a| a.email.clone()).collect());
@@ -1522,15 +1652,13 @@ async fn handle_request(
                 .and_then(|accounts| accounts.into_iter().find(|a| a.id == account_id))
                 .map(|a| a.email)
                 .unwrap_or_default();
-            let installed_dir = dirs::data_local_dir().map(|d| d.join("Hylki"));
-            if !should_preserve_shared_secrets_on_delete_against(
-                crate::update::is_portable(),
-                installed_dir.as_deref(),
-                data_dir,
+            let usage = config::collect_peer_secret_usage(data_dir, account_id, &deleted_email);
+            let _ = secrets::delete_account_secrets_selective(
+                account_id,
                 &deleted_email,
-            ) {
-                let _ = secrets::delete_account_secrets_for(account_id, &deleted_email);
-            }
+                !usage.email_in_use_elsewhere,
+                !usage.legacy_id_in_use_by_peer,
+            );
             let _ = config::delete_account_in(data_dir, account_id);
             let _ = cache.delete_account_data(account_id);
             let _ = evt_tx.send(WorkerEvent::AccountDeleted { account_id });
@@ -3134,7 +3262,12 @@ async fn handle_request(
                 for acc in accounts {
                     if acc.enabled && acc.effective_push(enabled) {
                         if !watchers.contains_key(&acc.id) {
-                            spawn_account_idle_watcher(watchers, acc, req_tx.clone());
+                            spawn_account_idle_watcher(
+                                watchers,
+                                data_dir.to_path_buf(),
+                                acc,
+                                req_tx.clone(),
+                            );
                         }
                     } else {
                         stop_account_idle_watcher(watchers, acc.id);
@@ -5135,27 +5268,6 @@ fn load_account_config(data_dir: &PathBuf, account_id: u32) -> Result<AccountCon
         .ok_or_else(|| format!("找不到账号 ID {account_id}"))
 }
 
-/// 在便携模式下删除账号前，检查本机标准安装版配置目录是否仍在使用同一邮箱；
-/// 若仍在使用则保留共享凭据库中的该账号凭据，防止误删安装版登录状态。
-fn should_preserve_shared_secrets_on_delete_against(
-    is_portable: bool,
-    installed_dir: Option<&Path>,
-    data_dir: &Path,
-    email: &str,
-) -> bool {
-    let trimmed = email.trim();
-    if !is_portable || trimmed.is_empty() {
-        return false;
-    }
-    installed_dir.is_some_and(|dir| {
-        config::normalized_path_key(dir) != config::normalized_path_key(data_dir)
-            && config::load_accounts_in(dir)
-                .unwrap_or_default()
-                .iter()
-                .any(|a| a.email.eq_ignore_ascii_case(trimmed))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5169,53 +5281,28 @@ mod tests {
     }
 
     #[test]
-    fn portable_delete_preserves_shared_secrets_when_installed_still_uses_email() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "hylki-delete-guard-{}-{unique}",
-            std::process::id()
-        ));
-        let installed_dir = base.join("installed");
-        let portable_dir = base.join("portable");
-        std::fs::create_dir_all(&installed_dir).unwrap();
-        std::fs::create_dir_all(&portable_dir).unwrap();
-        config::save_accounts_in(&installed_dir, &[account(1, "Alice@Outlook.com")]).unwrap();
-
-        assert!(should_preserve_shared_secrets_on_delete_against(
-            true,
-            Some(&installed_dir),
-            &portable_dir,
-            "alice@outlook.com",
-        ));
-        assert!(!should_preserve_shared_secrets_on_delete_against(
-            true,
-            Some(&installed_dir),
-            &portable_dir,
-            "other@example.com",
-        ));
-        assert!(!should_preserve_shared_secrets_on_delete_against(
-            false,
-            Some(&installed_dir),
-            &portable_dir,
-            "alice@outlook.com",
-        ));
-        assert!(!should_preserve_shared_secrets_on_delete_against(
-            true,
-            Some(&installed_dir),
-            &installed_dir,
-            "alice@outlook.com",
-        ));
-        assert!(!should_preserve_shared_secrets_on_delete_against(
-            true,
-            Some(&installed_dir),
-            &portable_dir,
-            "   ",
-        ));
-
-        let _ = std::fs::remove_dir_all(&base);
+    fn select_oauth_refresh_token_to_persist_covers_rotation_and_legacy_recovery() {
+        assert_eq!(
+            select_oauth_refresh_token_to_persist(Some("rt_new"), None),
+            Some("rt_new".to_string())
+        );
+        assert_eq!(select_oauth_refresh_token_to_persist(None, None), None);
+        assert_eq!(
+            select_oauth_refresh_token_to_persist(Some("   "), None),
+            None
+        );
+        assert_eq!(
+            select_oauth_refresh_token_to_persist(Some("rt_new"), Some("rt_legacy")),
+            Some("rt_new".to_string())
+        );
+        assert_eq!(
+            select_oauth_refresh_token_to_persist(None, Some("rt_legacy")),
+            Some("rt_legacy".to_string())
+        );
+        assert_eq!(
+            select_oauth_refresh_token_to_persist(Some(""), Some("  rt_legacy  ")),
+            Some("rt_legacy".to_string())
+        );
     }
 
     #[test]

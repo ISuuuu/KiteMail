@@ -2394,6 +2394,222 @@ pub fn next_account_id(accounts: &[AccountConfig]) -> u32 {
     accounts.iter().map(|a| a.id).max().unwrap_or(0) + 1
 }
 
+const KNOWN_INSTANCES_FILE: &str = "known_instances.toml";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct KnownInstancesFile {
+    data_dirs: Vec<String>,
+}
+
+/// 同机其他配置目录中对目标账号邮箱及旧版数字 ID 凭据的占用情况。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PeerSecretUsage {
+    pub email_in_use_elsewhere: bool,
+    pub legacy_id_in_use_by_peer: bool,
+}
+
+pub(crate) fn has_env_data_dir_override() -> bool {
+    std::env::var_os("HYLKI_DATA_DIR").is_some_and(|v| !v.is_empty())
+}
+
+fn default_installed_registry_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("Hylki"))
+}
+
+fn read_known_instances_raw(registry_dir: &Path) -> Vec<String> {
+    let path = registry_dir.join(KNOWN_INSTANCES_FILE);
+    if !path.exists() {
+        return Vec::new();
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str::<KnownInstancesFile>(&s).ok())
+        .map(|f| f.data_dirs)
+        .unwrap_or_default()
+}
+
+/// 在指定注册目录（通常为 `%LOCALAPPDATA%\Hylki`）中登记当前活跃配置目录，并自动清理已不存在的旧目录。
+pub(crate) fn register_known_data_dir_in(
+    registry_dir: &Path,
+    data_dir: &Path,
+) -> Result<(), String> {
+    let raw_dirs = read_known_instances_raw(registry_dir);
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped = Vec::new();
+
+    for raw in &raw_dirs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(trimmed);
+        if !candidate.exists() {
+            continue;
+        }
+        let key = normalized_path_key(candidate);
+        if seen.insert(key) {
+            deduped.push(trimmed.to_string());
+        }
+    }
+
+    let current_str = data_dir.to_string_lossy().trim().to_string();
+    if !current_str.is_empty() {
+        let key = normalized_path_key(data_dir);
+        if seen.insert(key) {
+            deduped.push(current_str);
+        }
+    }
+
+    let reg_file = registry_dir.join(KNOWN_INSTANCES_FILE);
+    if reg_file.exists() && deduped == raw_dirs {
+        return Ok(());
+    }
+
+    let text = toml::to_string_pretty(&KnownInstancesFile { data_dirs: deduped })
+        .map_err(|e| format!("序列化实例注册表失败: {e}"))?;
+    atomic_write_file(registry_dir, &reg_file, &text, "实例注册表")
+}
+
+/// 在运行时将当前生效的 `data_dir` 登记到同机共享实例注册表（单测与 `HYLKI_DATA_DIR` 隔离模式跳过）。
+pub fn register_known_data_dir(data_dir: &Path) {
+    if cfg!(test) || has_env_data_dir_override() {
+        return;
+    }
+    if let Some(reg_dir) = default_installed_registry_dir() {
+        let _ = register_known_data_dir_in(&reg_dir, data_dir);
+    }
+}
+
+/// 汇总同机所有已知有效配置目录（含当前目录、默认安装目录与注册表内现存目录），按规范路径键去重。
+pub(crate) fn list_known_data_dirs_in(
+    registry_dir: &Path,
+    current_data_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    let mut push_if_new = |dir: PathBuf| {
+        if dir.as_os_str().is_empty() {
+            return;
+        }
+        let key = normalized_path_key(&dir);
+        if seen.insert(key) {
+            out.push(dir);
+        }
+    };
+
+    push_if_new(current_data_dir.to_path_buf());
+    if registry_dir.exists() {
+        push_if_new(registry_dir.to_path_buf());
+    }
+    for raw in read_known_instances_raw(registry_dir) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(trimmed);
+        if path.exists() {
+            push_if_new(path);
+        }
+    }
+    out
+}
+
+/// 统计删除 `(account_id, email)` 时，本目录其他账号及同机其他实例对其邮箱键与旧版 ID 键的占用状态。
+pub(crate) fn collect_peer_secret_usage_in(
+    registry_dir: &Path,
+    current_data_dir: &Path,
+    account_id: u32,
+    email: &str,
+) -> PeerSecretUsage {
+    let trimmed_email = email.trim();
+    let current_key = normalized_path_key(current_data_dir);
+    let mut usage = PeerSecretUsage::default();
+
+    for dir in list_known_data_dirs_in(registry_dir, current_data_dir) {
+        let accounts = load_accounts_in(&dir).unwrap_or_default();
+        if normalized_path_key(&dir) == current_key {
+            if !trimmed_email.is_empty()
+                && accounts
+                    .iter()
+                    .any(|a| a.id != account_id && a.email.eq_ignore_ascii_case(trimmed_email))
+            {
+                usage.email_in_use_elsewhere = true;
+            }
+            continue;
+        }
+        if !trimmed_email.is_empty()
+            && accounts
+                .iter()
+                .any(|a| a.email.eq_ignore_ascii_case(trimmed_email))
+        {
+            usage.email_in_use_elsewhere = true;
+        }
+        if accounts.iter().any(|a| a.id == account_id) {
+            usage.legacy_id_in_use_by_peer = true;
+        }
+    }
+    usage
+}
+
+/// 运行时检查删除账号前是否仍需保留共享邮箱键或旧版 ID 键。
+pub(crate) fn collect_peer_secret_usage(
+    current_data_dir: &Path,
+    account_id: u32,
+    email: &str,
+) -> PeerSecretUsage {
+    if !cfg!(test) && !has_env_data_dir_override() {
+        if let Some(reg_dir) = default_installed_registry_dir() {
+            return collect_peer_secret_usage_in(&reg_dir, current_data_dir, account_id, email);
+        }
+    }
+    collect_peer_secret_usage_in(current_data_dir, current_data_dir, account_id, email)
+}
+
+/// 收集同机所有已知配置目录中使用 `email` 且不与其他邮箱冲突的旧版 `account_id` 列表。
+pub(crate) fn non_conflicting_legacy_ids_for_email_in(
+    registry_dir: &Path,
+    current_data_dir: &Path,
+    email: &str,
+) -> Vec<u32> {
+    let trimmed = email.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut owned = std::collections::BTreeSet::new();
+    let mut conflicting = std::collections::HashSet::new();
+
+    for dir in list_known_data_dirs_in(registry_dir, current_data_dir) {
+        for acc in load_accounts_in(&dir).unwrap_or_default() {
+            let acc_email = acc.email.trim();
+            if acc_email.eq_ignore_ascii_case(trimmed) {
+                owned.insert(acc.id);
+            } else if !acc_email.is_empty() {
+                conflicting.insert(acc.id);
+            }
+        }
+    }
+
+    owned
+        .into_iter()
+        .filter(|id| !conflicting.contains(id))
+        .collect()
+}
+
+/// 运行时收集当前及同机关联目录中属于 `email` 的无冲突旧版 `account_id` 列表。
+pub(crate) fn non_conflicting_legacy_ids_for_email(
+    current_data_dir: &Path,
+    email: &str,
+) -> Vec<u32> {
+    if !cfg!(test) && !has_env_data_dir_override() {
+        if let Some(reg_dir) = default_installed_registry_dir() {
+            return non_conflicting_legacy_ids_for_email_in(&reg_dir, current_data_dir, email);
+        }
+    }
+    non_conflicting_legacy_ids_for_email_in(current_data_dir, current_data_dir, email)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3354,6 +3570,120 @@ smtp_separate_credentials = false
         assert_eq!(summary.per_account.len(), 1);
         assert_eq!(summary.per_account[0].stats.total_bytes, 1024);
         assert!(summary.config_stats.total_bytes < 1024);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn known_instances_registry_dedupes_prunes_and_guards_bidirectional_secrets() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "hylki-known-instances-{}-{unique}",
+            std::process::id()
+        ));
+        let installed = base.join("installed");
+        let portable_a = base.join("portable_a");
+        let portable_b = base.join("portable_b");
+        let stale = base.join("deleted_portable");
+        fs::create_dir_all(&installed).unwrap();
+        fs::create_dir_all(&portable_a).unwrap();
+        fs::create_dir_all(&portable_b).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+
+        let make_acc = |id: u32, email: &str| AccountConfig {
+            id,
+            email: email.to_string(),
+            ..Default::default()
+        };
+
+        // 1. 注册并去重，且无变化时不重写（或保持内容一致），不存在目录会被自动清理。
+        register_known_data_dir_in(&installed, &stale).unwrap();
+        register_known_data_dir_in(&installed, &portable_a).unwrap();
+        register_known_data_dir_in(&installed, &portable_a).unwrap();
+        register_known_data_dir_in(&installed, &portable_b).unwrap();
+        fs::remove_dir_all(&stale).unwrap();
+        register_known_data_dir_in(&installed, &portable_a).unwrap();
+
+        let dirs = list_known_data_dirs_in(&installed, &installed);
+        assert_eq!(dirs.len(), 3);
+        let raw_after = read_known_instances_raw(&installed);
+        assert_eq!(raw_after.len(), 2);
+
+        // 2. 配置账号：
+        // - installed: id=1 (alice), id=2 (shared_id_diff_email)
+        // - portable_a: id=3 (alice), id=2 (bob) -> id=2 与 installed 邮箱冲突
+        // - portable_b: id=4 (alice)
+        save_accounts_in(
+            &installed,
+            &[
+                make_acc(1, "Alice@Outlook.com"),
+                make_acc(2, "InstalledOnly@Example.com"),
+            ],
+        )
+        .unwrap();
+        save_accounts_in(
+            &portable_a,
+            &[
+                make_acc(3, "alice@outlook.com"),
+                make_acc(2, "bob@test.com"),
+            ],
+        )
+        .unwrap();
+        save_accounts_in(&portable_b, &[make_acc(4, "ALICE@OUTLOOK.COM")]).unwrap();
+
+        // 安装版删除 alice(1) -> portable_a/portable_b 仍用 alice
+        assert_eq!(
+            collect_peer_secret_usage_in(&installed, &installed, 1, "alice@outlook.com"),
+            PeerSecretUsage {
+                email_in_use_elsewhere: true,
+                legacy_id_in_use_by_peer: false,
+            }
+        );
+
+        // 便携版 B 删除 alice(4) -> installed/portable_a 仍用 alice
+        assert_eq!(
+            collect_peer_secret_usage_in(&installed, &portable_b, 4, "alice@outlook.com"),
+            PeerSecretUsage {
+                email_in_use_elsewhere: true,
+                legacy_id_in_use_by_peer: false,
+            }
+        );
+
+        // 安装版删除 InstalledOnly(2) -> 邮箱无人共用，但 portable_a 也使用了 account_id=2
+        assert_eq!(
+            collect_peer_secret_usage_in(&installed, &installed, 2, "InstalledOnly@Example.com"),
+            PeerSecretUsage {
+                email_in_use_elsewhere: false,
+                legacy_id_in_use_by_peer: true,
+            }
+        );
+
+        // 只在 installed(1) 与 portable_a(3)、portable_b(4) 中存在且无冲突的 alice 旧版 ID
+        assert_eq!(
+            non_conflicting_legacy_ids_for_email_in(&installed, &portable_a, "alice@outlook.com"),
+            vec![1, 3, 4]
+        );
+        // id=2 同时被两个不同邮箱使用，因此 InstalledOnly 和 bob 的无冲突旧 ID 列表都必须排除 id=2
+        assert!(non_conflicting_legacy_ids_for_email_in(
+            &installed,
+            &installed,
+            "InstalledOnly@Example.com"
+        )
+        .is_empty());
+
+        // 若从 portable_a 与 portable_b 移除 alice 后再删 installed(1)，应彻底可删
+        save_accounts_in(&portable_a, &[make_acc(2, "bob@test.com")]).unwrap();
+        save_accounts_in(&portable_b, &[]).unwrap();
+        assert_eq!(
+            collect_peer_secret_usage_in(&installed, &installed, 1, "alice@outlook.com"),
+            PeerSecretUsage {
+                email_in_use_elsewhere: false,
+                legacy_id_in_use_by_peer: false,
+            }
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

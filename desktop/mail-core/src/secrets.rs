@@ -244,26 +244,89 @@ pub fn load_account_secrets_for(account_id: u32, email: &str) -> Result<AccountS
     })
 }
 
-/// 删除指定账号关联的旧版 `account-{id}-*` 及邮箱键 `email-{lower_email}-*` 凭据。
-pub fn delete_account_secrets_for(account_id: u32, email: &str) -> Result<(), String> {
+/// 选择性删除账号关联的凭据项：可分别控制是否删除邮箱键 `email-{lower_email}-*` 与旧版 `account-{id}-*`。
+pub fn delete_account_secrets_selective(
+    account_id: u32,
+    email: &str,
+    delete_email_keys: bool,
+    delete_legacy_id_keys: bool,
+) -> Result<(), String> {
+    let mut keys = Vec::new();
+    if delete_legacy_id_keys {
+        keys.push(imap_entry_name(account_id));
+        keys.push(smtp_entry_name(account_id));
+        keys.push(oauth_refresh_entry_name(account_id));
+    }
+    if delete_email_keys {
+        if let Some(k) = email_imap_entry_name(email) {
+            keys.push(k);
+        }
+        if let Some(k) = email_smtp_entry_name(email) {
+            keys.push(k);
+        }
+        if let Some(k) = email_oauth_refresh_entry_name(email) {
+            keys.push(k);
+        }
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
     let service_name = current_service_name();
-    let mut keys = vec![
-        imap_entry_name(account_id),
-        smtp_entry_name(account_id),
-        oauth_refresh_entry_name(account_id),
-    ];
-    if let Some(k) = email_imap_entry_name(email) {
-        keys.push(k);
-    }
-    if let Some(k) = email_smtp_entry_name(email) {
-        keys.push(k);
-    }
-    if let Some(k) = email_oauth_refresh_entry_name(email) {
-        keys.push(k);
-    }
     run_on_keyring_thread(move || {
         for key in &keys {
             delete_entry(&service_name, key);
+        }
+        Ok(())
+    })
+}
+
+/// 删除指定账号关联的旧版 `account-{id}-*` 及邮箱键 `email-{lower_email}-*` 凭据。
+pub fn delete_account_secrets_for(account_id: u32, email: &str) -> Result<(), String> {
+    delete_account_secrets_selective(account_id, email, true, true)
+}
+
+/// 保存 OAuth2 刷新令牌到主键（优先邮箱键），并静默同步所有“已存在且与主键不同”的旧版 `account-{id}-oauth-refresh` 键。
+pub fn save_oauth_refresh_token_and_sync_legacy(
+    account_id: u32,
+    email: &str,
+    legacy_ids_to_sync: &[u32],
+    refresh_token: String,
+) -> Result<(), String> {
+    let service_name = current_service_name();
+    let primary_key = email_oauth_refresh_entry_name(email)
+        .unwrap_or_else(|| oauth_refresh_entry_name(account_id));
+    let mut seen = std::collections::HashSet::new();
+    let mut legacy_keys = Vec::new();
+    for &lid in legacy_ids_to_sync {
+        if !seen.insert(lid) {
+            continue;
+        }
+        let lkey = oauth_refresh_entry_name(lid);
+        if lkey != primary_key {
+            legacy_keys.push(lkey);
+        }
+    }
+
+    run_on_keyring_thread(move || {
+        write_entry(
+            &service_name,
+            &primary_key,
+            &refresh_token,
+            "OAuth",
+            "保存 OAuth 刷新令牌失败",
+        )?;
+        for lkey in &legacy_keys {
+            if let Ok(Some(_)) =
+                read_entry_optional(&service_name, lkey, "OAuth", "读取旧版 OAuth 刷新令牌失败")
+            {
+                let _ = write_entry(
+                    &service_name,
+                    lkey,
+                    &refresh_token,
+                    "OAuth",
+                    "同步旧版 OAuth 刷新令牌失败",
+                );
+            }
         }
         Ok(())
     })
@@ -275,18 +338,43 @@ pub fn save_oauth_refresh_token_for(
     email: &str,
     refresh_token: String,
 ) -> Result<(), String> {
+    save_oauth_refresh_token_and_sync_legacy(account_id, email, &[], refresh_token)
+}
+
+/// 依次读取给定无冲突 `legacy_ids` 对应的旧版 `account-{id}-oauth-refresh`，跳过空值及与 `already_tried` 相同或重复的令牌。
+pub fn load_distinct_legacy_oauth_refresh_tokens(
+    legacy_ids: &[u32],
+    already_tried: &str,
+) -> Vec<String> {
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut keys = Vec::new();
+    for &lid in legacy_ids {
+        if seen_ids.insert(lid) {
+            keys.push(oauth_refresh_entry_name(lid));
+        }
+    }
+    if keys.is_empty() {
+        return Vec::new();
+    }
+
     let service_name = current_service_name();
-    let key = email_oauth_refresh_entry_name(email)
-        .unwrap_or_else(|| oauth_refresh_entry_name(account_id));
+    let tried = already_tried.to_string();
     run_on_keyring_thread(move || {
-        write_entry(
-            &service_name,
-            &key,
-            &refresh_token,
-            "OAuth",
-            "保存 OAuth 刷新令牌失败",
-        )
+        let mut seen_tokens = std::collections::HashSet::new();
+        seen_tokens.insert(tried);
+        let mut out = Vec::new();
+        for key in &keys {
+            if let Ok(Some(val)) =
+                read_entry_optional(&service_name, key, "OAuth", "读取旧版 OAuth 刷新令牌失败")
+            {
+                if !val.is_empty() && seen_tokens.insert(val.clone()) {
+                    out.push(val);
+                }
+            }
+        }
+        Ok(out)
     })
+    .unwrap_or_default()
 }
 
 /// 按邮箱地址优先读取 OAuth2 刷新令牌；若新邮箱键尚不存在，则回退读取旧版 `account-{id}-oauth-refresh` 并懒镜像到邮箱键。
