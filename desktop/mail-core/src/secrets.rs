@@ -3,10 +3,36 @@
 //! All keyring operations run serially on a dedicated background thread so a
 //! save followed immediately by a read or delete is never reordered.
 
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::OnceLock;
 
-const SERVICE_NAME: &str = "co.hyprlab.Hylki.Windows";
+use sha2::{Digest, Sha256};
+
+const DEFAULT_SERVICE_NAME: &str = "co.hyprlab.Hylki.Windows";
+
+/// 根据配置目录和便携隔离标志推导 Windows 凭据管理器命名空间。
+/// 安装版保持 `co.hyprlab.Hylki.Windows` 不变，便携版/自定义 `HYLKI_DATA_DIR` 附加目录指纹以免互相覆盖。
+pub fn resolve_service_name_for(data_dir: &Path, isolated: bool) -> String {
+    if !isolated {
+        return DEFAULT_SERVICE_NAME.to_string();
+    }
+    let resolved = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let raw = resolved.to_string_lossy();
+    let trimmed = raw
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&raw)
+        .to_ascii_lowercase();
+    let digest = Sha256::digest(trimmed.as_bytes());
+    let hex12: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{DEFAULT_SERVICE_NAME}.Portable.{hex12}")
+}
+
+fn current_service_name() -> String {
+    let has_env_override = std::env::var_os("HYLKI_DATA_DIR").is_some_and(|v| !v.is_empty());
+    let isolated = has_env_override || crate::update::is_portable();
+    resolve_service_name_for(&crate::config::data_dir(), isolated)
+}
 
 type KeyringJob = Box<dyn FnOnce() + Send>;
 
@@ -65,14 +91,15 @@ pub struct AccountSecrets {
 
 /// Save IMAP (and optional separate SMTP) credentials in Windows Credential Manager.
 pub fn save_account_secrets(account_id: u32, secrets: AccountSecrets) -> Result<(), String> {
+    let service_name = current_service_name();
     run_on_keyring_thread(move || {
-        let imap_entry = keyring::Entry::new(SERVICE_NAME, &imap_entry_name(account_id))
+        let imap_entry = keyring::Entry::new(&service_name, &imap_entry_name(account_id))
             .map_err(|e| format!("初始化 IMAP 凭据项失败: {e}"))?;
         imap_entry
             .set_password(&secrets.imap_password)
             .map_err(|e| format!("保存 IMAP 授权码失败: {e}"))?;
 
-        let smtp_entry = keyring::Entry::new(SERVICE_NAME, &smtp_entry_name(account_id))
+        let smtp_entry = keyring::Entry::new(&service_name, &smtp_entry_name(account_id))
             .map_err(|e| format!("初始化 SMTP 凭据项失败: {e}"))?;
         match secrets.smtp_password {
             Some(pwd) if !pwd.is_empty() => smtp_entry
@@ -88,14 +115,15 @@ pub fn save_account_secrets(account_id: u32, secrets: AccountSecrets) -> Result<
 
 /// Load IMAP (and optional separate SMTP) credentials from Windows Credential Manager.
 pub fn load_account_secrets(account_id: u32) -> Result<AccountSecrets, String> {
+    let service_name = current_service_name();
     run_on_keyring_thread(move || {
-        let imap_entry = keyring::Entry::new(SERVICE_NAME, &imap_entry_name(account_id))
+        let imap_entry = keyring::Entry::new(&service_name, &imap_entry_name(account_id))
             .map_err(|e| format!("初始化 IMAP 凭据项失败: {e}"))?;
         let imap_password = imap_entry
             .get_password()
             .map_err(|e| format!("读取 IMAP 授权码失败: {e}"))?;
 
-        let smtp_entry = keyring::Entry::new(SERVICE_NAME, &smtp_entry_name(account_id))
+        let smtp_entry = keyring::Entry::new(&service_name, &smtp_entry_name(account_id))
             .map_err(|e| format!("初始化 SMTP 凭据项失败: {e}"))?;
         let smtp_password = match smtp_entry.get_password() {
             Ok(pwd) => Some(pwd),
@@ -112,13 +140,14 @@ pub fn load_account_secrets(account_id: u32) -> Result<AccountSecrets, String> {
 
 /// Remove saved credentials for `account_id` from Windows Credential Manager.
 pub fn delete_account_secrets(account_id: u32) -> Result<(), String> {
+    let service_name = current_service_name();
     run_on_keyring_thread(move || {
         for key in [
             imap_entry_name(account_id),
             smtp_entry_name(account_id),
             oauth_refresh_entry_name(account_id),
         ] {
-            if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, &key) {
+            if let Ok(entry) = keyring::Entry::new(&service_name, &key) {
                 let _ = entry.delete_credential();
             }
         }
@@ -128,8 +157,9 @@ pub fn delete_account_secrets(account_id: u32) -> Result<(), String> {
 
 /// Save an OAuth2 refresh token in Windows Credential Manager.
 pub fn save_oauth_refresh_token(account_id: u32, refresh_token: String) -> Result<(), String> {
+    let service_name = current_service_name();
     run_on_keyring_thread(move || {
-        let entry = keyring::Entry::new(SERVICE_NAME, &oauth_refresh_entry_name(account_id))
+        let entry = keyring::Entry::new(&service_name, &oauth_refresh_entry_name(account_id))
             .map_err(|e| format!("初始化 OAuth 凭据项失败: {e}"))?;
         entry
             .set_password(&refresh_token)
@@ -140,11 +170,39 @@ pub fn save_oauth_refresh_token(account_id: u32, refresh_token: String) -> Resul
 
 /// Load an OAuth2 refresh token from Windows Credential Manager.
 pub fn load_oauth_refresh_token(account_id: u32) -> Result<String, String> {
+    let service_name = current_service_name();
     run_on_keyring_thread(move || {
-        let entry = keyring::Entry::new(SERVICE_NAME, &oauth_refresh_entry_name(account_id))
+        let entry = keyring::Entry::new(&service_name, &oauth_refresh_entry_name(account_id))
             .map_err(|e| format!("初始化 OAuth 凭据项失败: {e}"))?;
         entry
             .get_password()
             .map_err(|e| format!("读取 OAuth 刷新令牌失败（请重新执行 OAuth2 登录）: {e}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn service_name_keeps_installed_default_and_isolates_portable_dirs() {
+        let installed =
+            resolve_service_name_for(Path::new(r"C:\Users\Alice\AppData\Local\Hylki"), false);
+        assert_eq!(installed, "co.hyprlab.Hylki.Windows");
+
+        let dir_a = PathBuf::from(r"D:\PortableApps\HylkiA\data");
+        let dir_b = PathBuf::from(r"E:\USB\HylkiB\data");
+        let svc_a1 = resolve_service_name_for(&dir_a, true);
+        let svc_a2 = resolve_service_name_for(&dir_a, true);
+        let svc_b = resolve_service_name_for(&dir_b, true);
+
+        assert!(svc_a1.starts_with("co.hyprlab.Hylki.Windows.Portable."));
+        assert_eq!(
+            svc_a1.len(),
+            "co.hyprlab.Hylki.Windows.Portable.".len() + 12
+        );
+        assert_eq!(svc_a1, svc_a2);
+        assert_ne!(svc_a1, svc_b);
+    }
 }

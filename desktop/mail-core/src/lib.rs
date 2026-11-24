@@ -901,6 +901,12 @@ pub enum MailRequest {
         folder_id: u32,
         folder_path: String,
     },
+    /// 切换邮件数据存储目录（复用目标目录已有邮件或迁移当前邮件）。
+    ChangeMailDataDir {
+        /// `None` 表示恢复默认目录（`<app_data_dir>\mail`）。
+        target_dir: Option<std::path::PathBuf>,
+        mode: cache::MailDirSwitchMode,
+    },
 }
 
 /// Events emitted from the mail worker back to the GPUI frontend.
@@ -1122,6 +1128,12 @@ pub enum WorkerEvent {
         fetched_count: usize,
         body_only: bool,
         has_more_remote: bool,
+    },
+    /// 邮件存储目录切换结果（成功或失败）。
+    MailDataDirChanged {
+        ok: bool,
+        mail_data_dir: std::path::PathBuf,
+        message: String,
     },
     Status {
         account_id: Option<u32>,

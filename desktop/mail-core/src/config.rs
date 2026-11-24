@@ -154,6 +154,9 @@ pub struct AccountConfig {
     /// WP-06：账号级隐藏文件夹路径列表。
     #[serde(default)]
     pub hidden_folders: Vec<String>,
+    /// 自定义的账号本地邮件目录名（位于 `mail_data_dir` 下；`None` 时按 `email` 自动归一化推导）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_dir: Option<String>,
 }
 
 impl AccountConfig {
@@ -210,6 +213,7 @@ impl Default for AccountConfig {
             auto_empty_trash_days: 0,
             auto_empty_junk_days: 0,
             hidden_folders: Vec::new(),
+            storage_dir: None,
         }
     }
 }
@@ -1717,18 +1721,54 @@ impl NotificationButtons {
 }
 
 /// 本地数据目录占用统计：总字节数与文件数（纯 Rust 目录遍历，实时计算）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorageStats {
     pub total_bytes: u64,
     pub file_count: u64,
 }
 
+/// 单个账号在邮件存储目录中的空间占用统计。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountStorageStat {
+    pub account_id: u32,
+    pub email: String,
+    pub dir_name: String,
+    pub stats: StorageStats,
+}
+
+/// 程序配置目录与独立邮件存储目录的组合空间统计摘要。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppStorageSummary {
+    pub app_data_dir: PathBuf,
+    pub mail_data_dir: PathBuf,
+    pub is_portable: bool,
+    pub is_custom_mail_dir: bool,
+    pub config_stats: StorageStats,
+    pub mail_stats: StorageStats,
+    pub per_account: Vec<AccountStorageStat>,
+}
+
+/// 独立邮件存储配置（存于 `<app_data_dir>\storage.toml`）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// 自定义邮件数据根目录；`None` 或空串表示使用默认的 `<app_data_dir>\mail`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail_data_dir: Option<String>,
+}
+
 /// 统计 `dir` 及其子目录的磁盘占用（跳过无法访问的条目）。`dir` 不存在时为零值。
 pub fn storage_stats_in(dir: &Path) -> StorageStats {
+    storage_stats_excluding_in(dir, None)
+}
+
+fn storage_stats_excluding_in(dir: &Path, skip_dir: Option<&Path>) -> StorageStats {
     let mut stats = StorageStats {
         total_bytes: 0,
         file_count: 0,
     };
+    let canonical_skip =
+        skip_dir.and_then(|p| fs::canonicalize(p).ok().or_else(|| Some(p.to_path_buf())));
     let Ok(entries) = fs::read_dir(dir) else {
         return stats;
     };
@@ -1738,6 +1778,12 @@ pub fn storage_stats_in(dir: &Path) -> StorageStats {
             let path = entry.path();
             match entry.file_type() {
                 Ok(ft) if ft.is_dir() => {
+                    if let Some(ref skip) = canonical_skip {
+                        let cmp_path = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                        if &cmp_path == skip {
+                            continue;
+                        }
+                    }
                     if let Ok(sub) = fs::read_dir(&path) {
                         stack.push(sub);
                     }
@@ -1804,11 +1850,324 @@ fn atomic_write_file(dir: &Path, target: &Path, content: &str, kind: &str) -> Re
     Ok(())
 }
 
-/// Return the Hylki Windows local data directory (`%LOCALAPPDATA%\Hylki`).
-pub fn data_dir() -> PathBuf {
-    dirs::data_local_dir()
+/// 解析程序配置与全局数据根目录：
+/// `HYLKI_DATA_DIR` > 便携版（`<exe_dir>\data`）> 安装版（`%LOCALAPPDATA%\Hylki`）。
+pub fn resolve_data_dir(
+    env_override: Option<&str>,
+    is_portable: bool,
+    exe_dir: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> PathBuf {
+    if let Some(raw) = env_override.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(raw);
+    }
+    if is_portable {
+        if let Some(dir) = exe_dir {
+            return dir.join("data");
+        }
+    }
+    local_app_data
+        .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Hylki")
+}
+
+/// 返回当前运行时生效的 Hylki 本地配置与全局数据库根目录。
+/// 安装版为 `%LOCALAPPDATA%\Hylki`；便携版（同级存在 `portable.flag`）为 `<exe_dir>\data`。
+pub fn data_dir() -> PathBuf {
+    let env_override = std::env::var("HYLKI_DATA_DIR").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let local_app_data = dirs::data_local_dir();
+    resolve_data_dir(
+        env_override.as_deref(),
+        crate::update::is_portable(),
+        exe_dir.as_deref(),
+        local_app_data.as_deref(),
+    )
+}
+
+/// 返回 `dir/storage.toml` 的路径。
+pub fn storage_config_file_in(dir: &Path) -> PathBuf {
+    dir.join("storage.toml")
+}
+
+/// 从 `dir` 加载邮件存储路径配置；文件缺失时返回默认值。
+pub fn load_storage_config_in(dir: &Path) -> Result<StorageConfig, String> {
+    let path = storage_config_file_in(dir);
+    if !path.exists() {
+        return Ok(StorageConfig::default());
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("读取存储路径配置失败 ({}): {e}", path.display()))?;
+    toml::from_str(&text).map_err(|e| format!("解析存储路径配置失败 ({}): {e}", path.display()))
+}
+
+/// 将独立邮件存储路径配置原子写入 `dir/storage.toml`。
+pub fn save_storage_config_in(dir: &Path, cfg: &StorageConfig) -> Result<(), String> {
+    let normalized = StorageConfig {
+        mail_data_dir: cfg
+            .mail_data_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
+    let path = storage_config_file_in(dir);
+    let text =
+        toml::to_string_pretty(&normalized).map_err(|e| format!("序列化存储路径配置失败: {e}"))?;
+    atomic_write_file(dir, &path, &text, "存储路径配置")
+}
+
+/// 返回配置目录对应的默认独立邮件存储路径（`<app_data_dir>\mail`）。
+pub fn default_mail_data_dir_in(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("mail")
+}
+
+/// 解析当前生效的独立邮件存储目录；若 `storage.toml` 配置了相对路径则相对于 `app_data_dir` 解析。
+pub fn resolve_mail_data_dir_in(app_data_dir: &Path) -> PathBuf {
+    if let Ok(cfg) = load_storage_config_in(app_data_dir) {
+        if let Some(raw) = cfg
+            .mail_data_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let path = PathBuf::from(raw);
+            return if path.is_absolute() {
+                path
+            } else {
+                app_data_dir.join(path)
+            };
+        }
+    }
+    default_mail_data_dir_in(app_data_dir)
+}
+
+/// 判断目录名是否为单一合法的普通子目录名（防路径穿越及 Windows 保留设备名）。
+pub fn is_valid_single_dir_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('\0')
+        || trimmed.ends_with('.')
+        || trimmed.ends_with(' ')
+    {
+        return false;
+    }
+    let mut comps = Path::new(trimmed).components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return false,
+    }
+    !is_windows_reserved_name(trimmed)
+}
+
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    matches!(
+        stem.as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
+}
+
+/// 将邮箱地址归一化为安全可读的 Windows 账号目录名（如 `user@outlook.com`）。
+pub fn normalize_email_storage_dir(email: &str) -> String {
+    let cleaned: String = email
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() || c.is_whitespace() => '_',
+            other => other,
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c| c == '.' || c == ' ');
+    let mut safe = if trimmed.is_empty() {
+        "account".to_string()
+    } else if trimmed.chars().count() > 120 {
+        trimmed
+            .chars()
+            .take(120)
+            .collect::<String>()
+            .trim_end_matches(|c| c == '.' || c == ' ')
+            .to_string()
+    } else {
+        trimmed.to_string()
+    };
+    if safe.is_empty() {
+        safe = "account".to_string();
+    }
+    if is_windows_reserved_name(&safe) {
+        safe = format!("_{safe}");
+    }
+    safe
+}
+
+/// 为指定账号确定不冲突的邮件存储子目录名：优先采用显式且合法的 `account.storage_dir`，
+/// 否则按 `email` 归一化；若同一客户端配置了多个同邮箱账号则追加 `_2`、`_3`。
+pub fn resolve_account_storage_dir(
+    account: &AccountConfig,
+    all_accounts: &[AccountConfig],
+) -> String {
+    if let Some(ref custom) = account.storage_dir {
+        let trimmed = custom.trim();
+        if is_valid_single_dir_name(trimmed) {
+            return trimmed.to_string();
+        }
+    }
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for acc in all_accounts {
+        if let Some(ref custom) = acc.storage_dir {
+            let trimmed = custom.trim();
+            if is_valid_single_dir_name(trimmed) {
+                used.insert(trimmed.to_ascii_lowercase());
+            }
+        }
+    }
+    for acc in all_accounts {
+        let dir_name = if let Some(ref custom) = acc.storage_dir {
+            let trimmed = custom.trim();
+            if is_valid_single_dir_name(trimmed) {
+                trimmed.to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        let resolved = if !dir_name.is_empty() {
+            dir_name
+        } else {
+            let base = normalize_email_storage_dir(&acc.email);
+            let mut candidate = base.clone();
+            let mut seq = 2u32;
+            while used.contains(&candidate.to_ascii_lowercase()) {
+                candidate = format!("{base}_{seq}");
+                seq = seq.saturating_add(1);
+            }
+            used.insert(candidate.to_ascii_lowercase());
+            candidate
+        };
+        if acc.id == account.id {
+            return resolved;
+        }
+    }
+    normalize_email_storage_dir(&account.email)
+}
+
+/// 拼接并校验账号独立邮件目录（`<mail_data_dir>\<storage_dir>`）。
+pub fn account_mail_dir_in(mail_data_dir: &Path, storage_dir: &str) -> Result<PathBuf, String> {
+    let trimmed = storage_dir.trim();
+    if !is_valid_single_dir_name(trimmed) {
+        return Err(format!("非法的账号存储目录名: {storage_dir}"));
+    }
+    Ok(mail_data_dir.join(trimmed))
+}
+
+/// 返回全局元数据 SQLite 库路径（`<app_data_dir>\global.db`）。
+pub fn global_db_in(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("global.db")
+}
+
+/// 把路径规整为可用于等价/包含判断的规范键（解析已有祖先符号链接并去掉 Windows `\\?\` 前缀）。
+pub(crate) fn normalized_path_key(path: &Path) -> String {
+    let resolved = if path.exists() {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        // 目标末级目录尚未创建时，向上回溯到最近存在的祖先以消除大小写/盘符/符号链接差异。
+        let mut cursor = Some(path);
+        let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+        let mut base = None;
+        while let Some(cur) = cursor {
+            if cur.exists() {
+                if let Ok(canon) = fs::canonicalize(cur) {
+                    base = Some(canon);
+                    break;
+                }
+            }
+            if let Some(name) = cur.file_name() {
+                suffix.push(name.to_os_string());
+                cursor = cur.parent();
+            } else {
+                break;
+            }
+        }
+        if let Some(mut rebuilt) = base {
+            for comp in suffix.into_iter().rev() {
+                rebuilt.push(comp);
+            }
+            rebuilt
+        } else {
+            path.to_path_buf()
+        }
+    };
+    let s = resolved.to_string_lossy();
+    let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    stripped
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// 计算程序配置目录与独立邮件存储目录的分项磁盘占用摘要。
+pub fn app_storage_summary_in(app_data_dir: &Path) -> AppStorageSummary {
+    let default_mail_dir = default_mail_data_dir_in(app_data_dir);
+    let mail_data_dir = resolve_mail_data_dir_in(app_data_dir);
+    let is_custom_mail_dir =
+        normalized_path_key(&mail_data_dir) != normalized_path_key(&default_mail_dir);
+    let config_stats = storage_stats_excluding_in(app_data_dir, Some(&mail_data_dir));
+    let mail_stats = storage_stats_in(&mail_data_dir);
+    let accounts = load_accounts_in(app_data_dir).unwrap_or_default();
+    let per_account = accounts
+        .iter()
+        .map(|acc| {
+            let dir_name = resolve_account_storage_dir(acc, &accounts);
+            let stats = storage_stats_in(&mail_data_dir.join(&dir_name));
+            AccountStorageStat {
+                account_id: acc.id,
+                email: acc.email.clone(),
+                dir_name,
+                stats,
+            }
+        })
+        .collect();
+    AppStorageSummary {
+        app_data_dir: app_data_dir.to_path_buf(),
+        mail_data_dir,
+        is_portable: crate::update::is_portable(),
+        is_custom_mail_dir,
+        config_stats,
+        mail_stats,
+        per_account,
+    }
 }
 
 /// Return the directory storing imported custom account avatars under `dir`.
@@ -2896,5 +3255,106 @@ smtp_separate_credentials = false
         let legacy: AppPreferences = toml::from_str("").unwrap();
         assert_eq!(legacy.cloud_auto_upload_threshold_mb, 25);
         assert_eq!(legacy.mcp_socket_path, r"\\.\pipe\hylki-mcp");
+    }
+
+    #[test]
+    fn resolve_data_dir_handles_env_portable_and_installed_modes() {
+        let exe_dir = Path::new(r"D:\Tools\HylkiPortable");
+        let local_app_data = Path::new(r"C:\Users\Alice\AppData\Local");
+
+        assert_eq!(
+            resolve_data_dir(
+                Some(r"E:\CustomData"),
+                true,
+                Some(exe_dir),
+                Some(local_app_data),
+            ),
+            PathBuf::from(r"E:\CustomData")
+        );
+        assert_eq!(
+            resolve_data_dir(Some("   "), true, Some(exe_dir), Some(local_app_data)),
+            PathBuf::from(r"D:\Tools\HylkiPortable\data")
+        );
+        assert_eq!(
+            resolve_data_dir(None, false, Some(exe_dir), Some(local_app_data)),
+            PathBuf::from(r"C:\Users\Alice\AppData\Local\Hylki")
+        );
+    }
+
+    #[test]
+    fn storage_config_and_account_dir_normalization_work() {
+        let base = std::env::temp_dir().join(format!("hylki-storage-cfg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+
+        // 缺失 storage.toml 时默认使用 `<app_data_dir>/mail`。
+        assert_eq!(resolve_mail_data_dir_in(&base), base.join("mail"));
+
+        // 相对路径相对 app_data_dir 解析。
+        save_storage_config_in(
+            &base,
+            &StorageConfig {
+                mail_data_dir: Some("custom-mail".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(resolve_mail_data_dir_in(&base), base.join("custom-mail"));
+
+        // 绝对路径原样生效，空值回退默认。
+        let custom_abs = base.join("external_mail_root");
+        save_storage_config_in(
+            &base,
+            &StorageConfig {
+                mail_data_dir: Some(custom_abs.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        assert_eq!(resolve_mail_data_dir_in(&base), custom_abs);
+
+        save_storage_config_in(
+            &base,
+            &StorageConfig {
+                mail_data_dir: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(resolve_mail_data_dir_in(&base), base.join("mail"));
+
+        // 账号目录名规范化与防冲突测试。
+        assert_eq!(
+            normalize_email_storage_dir("  User.Name@Outlook.COM "),
+            "user.name@outlook.com"
+        );
+        assert_eq!(normalize_email_storage_dir("a:b/c*d"), "a_b_c_d");
+        assert_eq!(normalize_email_storage_dir("CON"), "_con");
+        assert!(!is_valid_single_dir_name("../escape"));
+        assert!(!is_valid_single_dir_name("a/b"));
+        assert!(!is_valid_single_dir_name("aux"));
+        assert!(is_valid_single_dir_name("zjlkim@outlook.com"));
+
+        let mut a1 = AccountConfig::default();
+        a1.id = 1;
+        a1.email = "dup@example.com".to_string();
+        let mut a2 = AccountConfig::default();
+        a2.id = 2;
+        a2.email = "DUP@example.com".to_string();
+        let all = vec![a1.clone(), a2.clone()];
+        assert_eq!(resolve_account_storage_dir(&a1, &all), "dup@example.com");
+        assert_eq!(resolve_account_storage_dir(&a2, &all), "dup@example.com_2");
+
+        // 组合空间统计在默认嵌套目录下不应重复计算 mail 子目录。
+        let acc_dir = resolve_mail_data_dir_in(&base).join("dup@example.com");
+        fs::create_dir_all(&acc_dir).unwrap();
+        fs::write(global_db_in(&base), [0u8; 400]).unwrap();
+        fs::write(acc_dir.join("mail.db"), [0u8; 1024]).unwrap();
+        save_accounts_in(&base, &[a1.clone()]).unwrap();
+
+        let summary = app_storage_summary_in(&base);
+        assert!(!summary.is_custom_mail_dir);
+        assert_eq!(summary.mail_stats.total_bytes, 1024);
+        assert_eq!(summary.per_account.len(), 1);
+        assert_eq!(summary.per_account[0].stats.total_bytes, 1024);
+        assert!(summary.config_stats.total_bytes < 1024);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

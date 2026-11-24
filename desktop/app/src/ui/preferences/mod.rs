@@ -18,7 +18,7 @@ use gpui_kit::{
     ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window,
     WindowControlArea,
 };
-use hylki_mail_core::cache::TagItem;
+use hylki_mail_core::cache::{self, MailDirInspection, MailDirSwitchMode, TagItem};
 use hylki_mail_core::config::{
     self, AccountConfig, AppPreferences, FilterField, FilterMatch, SettingsBackupBundle,
     DEFAULT_ATTACHMENT_KEYWORDS,
@@ -243,8 +243,12 @@ pub(crate) struct SettingsWindow {
     pub(crate) attachment_keywords_input: Entity<InputState>,
     pub(crate) compose_inputs_feedback: Option<SharedString>,
     pub(crate) confirm_clear_cache: bool,
-    /// WP-05：系统页本地缓存占用统计（进入系统页时计算一次，清除缓存后失效）。
-    pub(crate) storage_stats: Option<config::StorageStats>,
+    /// 系统页双目录及分项磁盘占用摘要（进入系统页时计算一次，清除缓存或切换目录后失效）。
+    pub(crate) storage_summary: Option<config::AppStorageSummary>,
+    /// 待二次确认的邮件存储目录切换 `(target_dir_override, target_inspection)`。
+    pub(crate) pending_mail_dir_switch: Option<(Option<std::path::PathBuf>, MailDirInspection)>,
+    /// 后台正在执行邮件存储目录切换或迁移。
+    pub(crate) mail_dir_switching: bool,
     pub(crate) pending_backup_import: Option<(std::path::PathBuf, SettingsBackupBundle)>,
     pub(crate) backup_feedback: Option<(bool, SharedString)>,
     // ---- WP-06：8 个新增分页控件状态 ----
@@ -456,7 +460,9 @@ impl SettingsWindow {
             attachment_keywords_input,
             compose_inputs_feedback: None,
             confirm_clear_cache: false,
-            storage_stats: None,
+            storage_summary: None,
+            pending_mail_dir_switch: None,
+            mail_dir_switching: false,
             pending_backup_import: None,
             backup_feedback: None,
             pgp_name_input,
@@ -637,7 +643,10 @@ impl SettingsWindow {
                 self.narrow_show_content = true;
                 self.confirm_clear_cache = false;
                 // 系统页存储占用统计在每次进入时重新计算。
-                self.storage_stats = None;
+                self.storage_summary = None;
+                if !self.mail_dir_switching {
+                    self.pending_mail_dir_switch = None;
+                }
                 self.sender_feedback = None;
                 self.compose_inputs_feedback = None;
                 cx.notify();
@@ -780,6 +789,9 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) {
         self.active_tab = item.tab;
+        if item.tab == PrefTab::System {
+            self.storage_summary = None;
+        }
         self.narrow_show_content = true;
         self.highlighted_row_id = Some(item.row_id);
         // 切换 Tab 后请求滚动：下一次渲染把锚点挂到高亮行，记录行位置后滚进视口。
@@ -858,7 +870,7 @@ impl SettingsWindow {
     /// 只保留域名以免泄露隐私）。保存到用户选择的位置。
     pub(crate) fn export_diagnostics_log(&mut self, cx: &mut Context<Self>) {
         let app = self.app.read(cx);
-        let stats = config::storage_stats_in(&config::data_dir());
+        let summary = config::app_storage_summary_in(&config::data_dir());
         let mut domains = 0usize;
         for acc in &app.accounts {
             if let Some((_, domain)) = acc.email.rsplit_once('@') {
@@ -867,29 +879,43 @@ impl SettingsWindow {
                 }
             }
         }
+        let run_mode = if app.demo_mode {
+            "演示模式（内存模拟）"
+        } else if summary.is_portable {
+            "便携版（EXE 同级 data 配置 + 分库存储）"
+        } else {
+            "安装版（LocalAppData 配置 + 分库存储）"
+        };
+        let mail_dir_kind = if summary.is_custom_mail_dir {
+            "自定义"
+        } else {
+            "默认"
+        };
         let report = format!(
             "Hylki Windows 诊断信息\n=======================\n\
              版本: v{}\n\
              运行模式: {}\n\
              操作系统: {} {}\n\
-             数据目录: {}\n\
-             本地数据占用: {}（{} 个文件）\n\
+             程序配置目录: {}\n\
+             邮件存储目录 ({}): {}\n\
+             配置与全局索引占用: {}（{} 个文件）\n\
+             邮件与附件占用: {}（{} 个文件）\n\
              已配置账号: {} 个（{} 个含邮箱域名）\n\
              偏好设置: 主题={} 明暗={:?} 列表布局={} 字号缩放={}%\n\
              自动同步: {} 分钟 推送={} 计费省流={}\n\
              黑名单发件人: {} 条\n\
              导出时间: {}\n",
             crate::app::app_version(),
-            if app.demo_mode {
-                "演示模式（内存模拟）"
-            } else {
-                "标准模式（SQLite + TOML）"
-            },
+            run_mode,
             std::env::consts::OS,
             std::env::consts::ARCH,
-            config::data_dir().display(),
-            config::format_bytes(stats.total_bytes),
-            stats.file_count,
+            summary.app_data_dir.display(),
+            mail_dir_kind,
+            summary.mail_data_dir.display(),
+            config::format_bytes(summary.config_stats.total_bytes),
+            summary.config_stats.file_count,
+            config::format_bytes(summary.mail_stats.total_bytes),
+            summary.mail_stats.file_count,
             app.accounts.len(),
             domains,
             app.prefs.theme_id,
@@ -999,6 +1025,123 @@ impl SettingsWindow {
             });
         });
         self.compose_inputs_feedback = Some(SharedString::from("已恢复默认附件检测关键词"));
+        cx.notify();
+    }
+
+    pub(crate) fn open_dir_in_explorer(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if let Err(e) = std::fs::create_dir_all(path) {
+            self.backup_feedback = Some((
+                false,
+                SharedString::from(format!("无法访问或创建目录 ({}): {e}", path.display())),
+            ));
+            cx.notify();
+            return;
+        }
+        #[cfg(windows)]
+        let res = std::process::Command::new("explorer.exe").arg(path).spawn();
+        #[cfg(not(windows))]
+        let res = std::process::Command::new("xdg-open").arg(path).spawn();
+        if let Err(e) = res {
+            self.backup_feedback = Some((
+                false,
+                SharedString::from(format!("打开文件管理器失败 ({}): {e}", path.display())),
+            ));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn pick_mail_data_dir(&mut self, cx: &mut Context<Self>) {
+        if self.file_dialog_open || self.mail_dir_switching {
+            return;
+        }
+        self.file_dialog_open = true;
+        cx.spawn(async move |this, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_title("选择邮件存储目录")
+                        .pick_folder()
+                })
+                .await;
+            let _ = this.update(cx, |this, _| this.file_dialog_open = false);
+            let Some(picked) = picked else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                let app_dir = config::data_dir();
+                let current_dir = config::resolve_mail_data_dir_in(&app_dir);
+                if let Err(err) = cache::validate_target_mail_dir(&current_dir, &picked) {
+                    this.pending_mail_dir_switch = None;
+                    this.backup_feedback = Some((false, SharedString::from(err)));
+                    cx.notify();
+                    return;
+                }
+                let accounts = this.app.read(cx).accounts.clone();
+                let inspection = cache::inspect_mail_data_dir(&picked, &accounts);
+                this.backup_feedback = None;
+                this.pending_mail_dir_switch = Some((Some(picked), inspection));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn request_reset_mail_data_dir(&mut self, cx: &mut Context<Self>) {
+        if self.mail_dir_switching {
+            return;
+        }
+        let app_dir = config::data_dir();
+        let current_dir = config::resolve_mail_data_dir_in(&app_dir);
+        let default_dir = config::default_mail_data_dir_in(&app_dir);
+        if let Err(err) = cache::validate_target_mail_dir(&current_dir, &default_dir) {
+            self.pending_mail_dir_switch = None;
+            self.backup_feedback = Some((false, SharedString::from(err)));
+            cx.notify();
+            return;
+        }
+        let accounts = self.app.read(cx).accounts.clone();
+        let inspection = cache::inspect_mail_data_dir(&default_dir, &accounts);
+        self.backup_feedback = None;
+        self.pending_mail_dir_switch = Some((None, inspection));
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_mail_dir_switch(
+        &mut self,
+        mode: MailDirSwitchMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mail_dir_switching {
+            return;
+        }
+        let Some((target_opt, _inspection)) = self.pending_mail_dir_switch.take() else {
+            return;
+        };
+        self.mail_dir_switching = true;
+        self.backup_feedback = None;
+        self.app.update(cx, |app, cx| {
+            app.change_mail_data_dir(target_opt, mode, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_mail_dir_switch(&mut self, cx: &mut Context<Self>) {
+        self.pending_mail_dir_switch = None;
+        cx.notify();
+    }
+
+    pub(crate) fn on_mail_data_dir_changed(
+        &mut self,
+        ok: bool,
+        _dir: &std::path::Path,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.mail_dir_switching = false;
+        self.pending_mail_dir_switch = None;
+        self.storage_summary = None;
+        self.backup_feedback = Some((ok, SharedString::from(message.to_string())));
         cx.notify();
     }
 
@@ -1609,6 +1752,9 @@ impl Render for SettingsWindow {
                 accounts::render_list_page(self, app_entity, &p, cx)
             }
         } else {
+            if self.active_tab == PrefTab::System && self.storage_summary.is_none() {
+                self.storage_summary = Some(config::app_storage_summary_in(&config::data_dir()));
+            }
             let app_entity = self.app.clone();
             pages::render_tab(self, app_entity, &p, window, cx)
         };

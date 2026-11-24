@@ -28,7 +28,9 @@ use gpui_kit::{
     StyledImage, Subscription, TitlebarOptions, Window, WindowAppearance, WindowBounds,
     WindowOptions,
 };
-use hylki_mail_core::cache::{sanitize_filename, CachedAttachment, KnownContact};
+use hylki_mail_core::cache::{
+    sanitize_filename, CachedAttachment, KnownContact, MailDirSwitchMode,
+};
 use hylki_mail_core::config::{self, AccountConfig, AppPreferences, SettingsBackupBundle};
 use hylki_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_SENT_ID,
@@ -2550,6 +2552,39 @@ impl HylkiApp {
                 } => {
                     self.stripping_attachment_ids.remove(&attachment_id);
                     self.status_line = SharedString::from(format!("剥离附件失败：{message}"));
+                }
+                WorkerEvent::MailDataDirChanged {
+                    ok,
+                    mail_data_dir,
+                    message,
+                } => {
+                    if let Some(ref w) = self.worker {
+                        w.reset_read_cache();
+                    }
+                    if ok {
+                        self.folders_by_account.clear();
+                        self.outbox_by_account.clear();
+                        self.selected_message = None;
+                        self.selected_message_is_placeholder = false;
+                        self.selected_message_ids.clear();
+                        self.attachment_thumb_cache.clear();
+                        self.attachment_thumb_requested.clear();
+                        self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
+                        self.current_view = CurrentView::UnifiedInbox;
+                        self.current_page = MailPage {
+                            folder_id: UNIFIED_INBOX_FOLDER_ID,
+                            offset: 0,
+                            total: 0,
+                            items: Vec::new(),
+                        };
+                        folders_updated = true;
+                    }
+                    self.status_line = SharedString::from(message.clone());
+                    let msg_for_win = message;
+                    let dir_for_win = mail_data_dir;
+                    self.with_settings_window(cx, move |win, _, cx| {
+                        win.on_mail_data_dir_changed(ok, &dir_for_win, &msg_for_win, cx);
+                    });
                 }
             }
         }
@@ -8872,6 +8907,23 @@ impl HylkiApp {
         if let Some(ref w) = self.worker {
             self.status_line = SharedString::from("正在清理正文缓存...");
             w.send(MailRequest::ClearBodyCaches);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn change_mail_data_dir(
+        &mut self,
+        target_dir: Option<std::path::PathBuf>,
+        mode: MailDirSwitchMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            w.reset_read_cache();
+            self.status_line = SharedString::from("正在切换邮件存储目录...");
+            w.send(MailRequest::ChangeMailDataDir { target_dir, mode });
         }
         cx.notify();
     }

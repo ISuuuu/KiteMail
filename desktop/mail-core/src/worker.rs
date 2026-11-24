@@ -91,13 +91,13 @@ impl SharedTokenCache {
     }
 }
 
-fn open_existing_or_create_cache(db_path: &Path) -> Result<CacheStore, String> {
-    if db_path.exists() {
-        if let Ok(c) = CacheStore::open_existing(db_path) {
+fn open_existing_or_create_cache(data_dir: &Path) -> Result<CacheStore, String> {
+    if config::global_db_in(data_dir).exists() {
+        if let Ok(c) = CacheStore::open_for_data_dir_existing(data_dir) {
             return Ok(c);
         }
     }
-    CacheStore::open(db_path)
+    CacheStore::open_for_data_dir(data_dir)
 }
 
 fn with_shared_cache<T>(
@@ -107,9 +107,7 @@ fn with_shared_cache<T>(
 ) -> Result<T, String> {
     let mut guard = shared.lock().map_err(|_| "异步缓存锁已损坏".to_string())?;
     if guard.is_none() {
-        *guard = Some(open_existing_or_create_cache(&config::cache_db_in(
-            data_dir,
-        ))?);
+        *guard = Some(open_existing_or_create_cache(data_dir)?);
     }
     let cache = guard
         .as_mut()
@@ -217,6 +215,13 @@ impl MailWorkerHandle {
         })
     }
 
+    /// Release the UI thread's read-only SQLite connections (e.g. before switching mail directory).
+    pub fn reset_read_cache(&self) {
+        if let Ok(mut guard) = self.read_cache.lock() {
+            *guard = None;
+        }
+    }
+
     /// Read already-cached message details directly on the UI thread via a read-only
     /// SQLite connection, bypassing the worker channel completely.
     pub fn try_load_cached_message(
@@ -228,11 +233,10 @@ impl MailWorkerHandle {
             return Ok(None);
         };
         if guard.is_none() {
-            let db_path = config::cache_db_in(&self.data_dir);
-            if !db_path.exists() {
+            if !config::global_db_in(&self.data_dir).exists() {
                 return Ok(None);
             }
-            match CacheStore::open_read_only(&db_path) {
+            match CacheStore::open_for_data_dir_read_only(&self.data_dir) {
                 Ok(store) => *guard = Some(store),
                 Err(_) => return Ok(None),
             }
@@ -254,7 +258,7 @@ impl MailWorkerHandle {
     /// 使下次启动立即续发（对齐 Linux 主线程直接落盘的退出语义）。即使 worker
     /// 正在执行耗时的同步或超时重连也不会阻塞关窗。
     pub fn prepare_quit_now(&self) -> Result<(), String> {
-        let mut cache = CacheStore::open(&config::cache_db_in(&self.data_dir))?;
+        let mut cache = open_existing_or_create_cache(&self.data_dir)?;
         cache.expire_queued_outbox()
     }
 
@@ -285,8 +289,7 @@ async fn worker_loop(
     req_rx: mpsc::Receiver<MailRequest>,
     evt_tx: EventSender,
 ) {
-    let db_path = config::cache_db_in(&data_dir);
-    let mut cache = match CacheStore::open(&db_path) {
+    let initial_cache = match CacheStore::open_for_data_dir(&data_dir) {
         Ok(c) => c,
         Err(e) => {
             let _ = evt_tx.send(WorkerEvent::Error {
@@ -296,19 +299,15 @@ async fn worker_loop(
             return;
         }
     };
+    let mut cache_opt = Some(initial_cache);
     let tokens = SharedTokenCache::default();
     let async_cache: SharedAsyncCache = Arc::new(std::sync::Mutex::new(
-        open_existing_or_create_cache(&db_path).ok(),
+        open_existing_or_create_cache(&data_dir).ok(),
     ));
     let in_flight_bodies: Arc<std::sync::Mutex<HashSet<u32>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
     let mut watchers: IdleWatchers = HashMap::new();
-    let background = BackgroundTasks::new(
-        data_dir.clone(),
-        db_path.clone(),
-        tokens.clone(),
-        evt_tx.clone(),
-    );
+    let background = BackgroundTasks::new(data_dir.clone(), tokens.clone(), evt_tx.clone());
 
     if let Ok(prefs) = config::load_preferences_in(&data_dir) {
         if prefs.keep_downloads_days > 0 {
@@ -325,22 +324,31 @@ async fn worker_loop(
     }
 
     if let Ok(accounts) = config::load_accounts_in(&data_dir) {
-        cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
-        for acc in &accounts {
-            refresh_account_watcher(&mut watchers, &data_dir, acc, &req_tx);
+        if let Some(cache) = cache_opt.as_mut() {
+            let _ = cache.sync_account_registry(&accounts);
+            cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
+            for acc in &accounts {
+                refresh_account_watcher(&mut watchers, &data_dir, acc, &req_tx);
+            }
+            deliver_due_outbox(&data_dir, cache, &tokens, &accounts, &evt_tx).await;
         }
-        deliver_due_outbox(&data_dir, &mut cache, &tokens, &accounts, &evt_tx).await;
     }
-    wake_due_snoozed_messages(&mut cache, &evt_tx);
+    if let Some(cache) = cache_opt.as_mut() {
+        wake_due_snoozed_messages(cache, &evt_tx);
+    }
 
     // 主循环不再无限阻塞等请求：按「下一条定时记录的到期时刻」限时等待（clamp 到
     // [`OUTBOX_TICK_MIN`]..[`OUTBOX_TICK_MAX`]，即最长 30s），醒来先投递已到期的
     // 定时件。这样「明天早上 8 点发」不依赖用户任何操作也能按时发出；同时间隔上限
     // 30s 也顺带承担了稍后提醒（snooze）的巡检粒度。
     loop {
+        let wait = cache_opt
+            .as_ref()
+            .map(next_outbox_wait)
+            .unwrap_or(OUTBOX_TICK_MAX);
         // 请求通道是标准库 mpsc（阻塞式），这里用 `recv_timeout` 替代直接
         // `recv`：worker 独占自己的 runtime 线程，限时阻塞不影响 IDLE 推送。
-        let req = match req_rx.recv_timeout(next_outbox_wait(&cache)) {
+        let req = match req_rx.recv_timeout(wait) {
             Ok(req) => Some(req),
             // 没有新请求：落到下面做一次到期巡检。
             Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -350,20 +358,43 @@ async fn worker_loop(
 
         // 定时发送投递：内部先查有无到期记录，没有就立刻返回（不读盘），
         // 所以每次唤醒都调用也不影响交互请求的响应速度。
-        deliver_due_outbox_tick(&data_dir, &mut cache, &tokens, &evt_tx).await;
+        if let Some(cache) = cache_opt.as_mut() {
+            deliver_due_outbox_tick(&data_dir, cache, &tokens, &evt_tx).await;
+        }
 
         let Some(req) = req else {
             // 空闲唤醒才巡检稍后提醒，避免在交互请求路径上多加一次查库。
-            wake_due_snoozed_messages(&mut cache, &evt_tx);
+            if let Some(cache) = cache_opt.as_mut() {
+                wake_due_snoozed_messages(cache, &evt_tx);
+            }
             continue;
         };
         if matches!(req, MailRequest::PrepareQuit) {
-            let result = cache.expire_queued_outbox();
+            let result = match cache_opt.as_mut() {
+                Some(cache) => cache.expire_queued_outbox(),
+                None => Ok(()),
+            };
             let prepared = result.is_ok();
             let _ = evt_tx.send(WorkerEvent::QuitPrepared { result });
             if prepared {
                 break;
             }
+            continue;
+        }
+        if let MailRequest::ChangeMailDataDir { target_dir, mode } = req {
+            handle_change_mail_data_dir(
+                &data_dir,
+                &mut cache_opt,
+                &tokens,
+                &async_cache,
+                &background,
+                &mut watchers,
+                &req_tx,
+                target_dir,
+                mode,
+                &evt_tx,
+            )
+            .await;
             continue;
         }
         // 后台任务（历史索引 / 账号与文件夹同步）改派到独立任务执行，不占用
@@ -372,9 +403,12 @@ async fn worker_loop(
         if background.dispatch_if_background(&req) {
             continue;
         }
+        let Some(cache) = cache_opt.as_mut() else {
+            continue;
+        };
         handle_request(
             &data_dir,
-            &mut cache,
+            cache,
             &tokens,
             &async_cache,
             &in_flight_bodies,
@@ -388,6 +422,179 @@ async fn worker_loop(
 
     for (_, handle) in watchers.drain() {
         handle.abort();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_change_mail_data_dir(
+    data_dir: &PathBuf,
+    cache_opt: &mut Option<CacheStore>,
+    tokens: &SharedTokenCache,
+    async_cache: &SharedAsyncCache,
+    background: &BackgroundTasks,
+    watchers: &mut IdleWatchers,
+    req_tx: &mpsc::Sender<MailRequest>,
+    target_dir: Option<PathBuf>,
+    mode: crate::cache::MailDirSwitchMode,
+    evt_tx: &EventSender,
+) {
+    let current_dir = config::resolve_mail_data_dir_in(data_dir);
+    let default_dir = config::default_mail_data_dir_in(data_dir);
+    let new_dir = target_dir.clone().unwrap_or_else(|| default_dir.clone());
+
+    // 1. 停止所有推送监测并等待在途后台任务关闭 SQLite 句柄，避免 Windows 共享违例。
+    for (_, handle) in watchers.drain() {
+        handle.abort();
+    }
+    background.drain_and_close_cache().await;
+    if let Ok(mut guard) = async_cache.lock() {
+        if let Some(ref mut c) = *guard {
+            c.checkpoint_and_close_all();
+        }
+        *guard = None;
+    }
+    if let Some(mut old_cache) = cache_opt.take() {
+        old_cache.checkpoint_and_close_all();
+    }
+
+    let prev_cfg = config::load_storage_config_in(data_dir).unwrap_or_default();
+    let is_default_target = target_dir.is_none()
+        || config::normalized_path_key(&new_dir) == config::normalized_path_key(&default_dir);
+
+    let data_dir_cl = data_dir.clone();
+    let current_dir_cl = current_dir.clone();
+    let new_dir_cl = new_dir.clone();
+    let fs_res = tokio::task::spawn_blocking(move || -> Result<(usize, u64), String> {
+        crate::cache::validate_target_mail_dir(&current_dir_cl, &new_dir_cl)?;
+        let stats = if matches!(mode, crate::cache::MailDirSwitchMode::MigrateCurrent) {
+            crate::cache::copy_mail_dir_contents(&current_dir_cl, &new_dir_cl)?
+        } else {
+            (0, 0)
+        };
+        config::save_storage_config_in(
+            &data_dir_cl,
+            &config::StorageConfig {
+                mail_data_dir: if is_default_target {
+                    None
+                } else {
+                    Some(new_dir_cl.to_string_lossy().into_owned())
+                },
+            },
+        )?;
+        Ok(stats)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("邮件目录切换线程异常: {e}")));
+
+    let (copied_files, copied_bytes) = match fs_res {
+        Ok(stats) => stats,
+        Err(err) => {
+            // 恢复原存储配置和数据库连接。
+            let _ = config::save_storage_config_in(data_dir, &prev_cfg);
+            if let Ok(restored) = CacheStore::open_for_data_dir(data_dir) {
+                *cache_opt = Some(restored);
+            }
+            if let Ok(accounts) = config::load_accounts_in(data_dir) {
+                for acc in &accounts {
+                    refresh_account_watcher(watchers, data_dir, acc, req_tx);
+                }
+            }
+            let _ = evt_tx.send(WorkerEvent::MailDataDirChanged {
+                ok: false,
+                mail_data_dir: current_dir,
+                message: err,
+            });
+            return;
+        }
+    };
+
+    let reopened = match CacheStore::open_for_data_dir(data_dir) {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = config::save_storage_config_in(data_dir, &prev_cfg);
+            if let Ok(restored) = CacheStore::open_for_data_dir(data_dir) {
+                *cache_opt = Some(restored);
+            }
+            if let Ok(accounts) = config::load_accounts_in(data_dir) {
+                for acc in &accounts {
+                    refresh_account_watcher(watchers, data_dir, acc, req_tx);
+                }
+            }
+            let _ = evt_tx.send(WorkerEvent::MailDataDirChanged {
+                ok: false,
+                mail_data_dir: current_dir,
+                message: format!("打开新邮件存储目录失败，已回滚原目录: {err}"),
+            });
+            return;
+        }
+    };
+
+    *cache_opt = Some(reopened);
+    let _ = tokens;
+    let Some(cache) = cache_opt.as_mut() else {
+        return;
+    };
+
+    // 先发送切换成功事件以清空前端旧目录视图，再推送新目录回填事件。
+    let msg = match mode {
+        crate::cache::MailDirSwitchMode::ReuseExisting => {
+            format!("已切换并挂载邮件存储目录：{}", new_dir.display())
+        }
+        crate::cache::MailDirSwitchMode::MigrateCurrent => {
+            if copied_files > 0 {
+                format!(
+                    "已将邮件数据迁移至：{}（复制 {} 个文件，共 {}）",
+                    new_dir.display(),
+                    copied_files,
+                    config::format_bytes(copied_bytes)
+                )
+            } else {
+                format!("已将邮件存储目录切换至：{}", new_dir.display())
+            }
+        }
+    };
+    let _ = evt_tx.send(WorkerEvent::MailDataDirChanged {
+        ok: true,
+        mail_data_dir: new_dir,
+        message: msg,
+    });
+
+    if let Ok(accounts) = config::load_accounts_in(data_dir) {
+        let _ = cache.sync_account_registry(&accounts);
+        cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
+        for acc in &accounts {
+            refresh_account_watcher(watchers, data_dir, acc, req_tx);
+            if let Ok(folders) = cache.list_folders(acc.id) {
+                let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                    account_id: acc.id,
+                    folders,
+                });
+            }
+            if let Ok(items) = cache.list_outbox(acc.id) {
+                let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                    account_id: acc.id,
+                    items,
+                });
+            }
+        }
+    }
+    if let Ok(drafts) = cache.list_drafts() {
+        let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
+    }
+    if let Ok(tags) = cache.list_tags() {
+        let _ = evt_tx.send(WorkerEvent::TagsLoaded { tags });
+    }
+    let page_size = pref_page_size(data_dir);
+    let allowed = unified_account_ids(data_dir);
+    if let Ok(page) = cache.list_unified_inbox_for_accounts(
+        &allowed,
+        "",
+        QuickFilterSet::default(),
+        MessageSort::DateNewest,
+        0,
+        page_size,
+    ) {
+        let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
     }
 }
 
@@ -428,12 +635,11 @@ impl BackgroundJob {
         tokens: &SharedTokenCache,
         backfill: Arc<tokio::sync::Mutex<BackfillIndexState>>,
         bg_cache: &Arc<tokio::sync::Mutex<Option<CacheStore>>>,
-        db_path: &PathBuf,
         evt_tx: &EventSender,
     ) {
         let mut cache_guard = bg_cache.lock().await;
         if cache_guard.is_none() {
-            match open_existing_or_create_cache(db_path) {
+            match open_existing_or_create_cache(data_dir) {
                 Ok(c) => *cache_guard = Some(c),
                 Err(e) => {
                     let _ = evt_tx.send(WorkerEvent::Error {
@@ -459,6 +665,7 @@ impl BackgroundJob {
         };
         // 独立连接也要设置本机账号邮箱，保证「发给我」类筛选与主连接口径一致。
         let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
+        let _ = cache.sync_account_registry(&accounts);
         cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
         match self {
             Self::Backfill => {
@@ -520,26 +727,28 @@ struct BackgroundTasks {
     tokens: SharedTokenCache,
     cache: Arc<tokio::sync::Mutex<Option<CacheStore>>>,
     data_dir: PathBuf,
-    db_path: PathBuf,
     evt_tx: EventSender,
 }
 
 impl BackgroundTasks {
-    fn new(
-        data_dir: PathBuf,
-        db_path: PathBuf,
-        tokens: SharedTokenCache,
-        evt_tx: EventSender,
-    ) -> Self {
+    fn new(data_dir: PathBuf, tokens: SharedTokenCache, evt_tx: EventSender) -> Self {
         Self {
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
             backfill: Arc::new(tokio::sync::Mutex::new(BackfillIndexState::default())),
             tokens,
             cache: Arc::new(tokio::sync::Mutex::new(None)),
             data_dir,
-            db_path,
             evt_tx,
         }
+    }
+
+    async fn drain_and_close_cache(&self) {
+        let _permit = self.gate.acquire().await;
+        let mut guard = self.cache.lock().await;
+        if let Some(ref mut c) = *guard {
+            c.checkpoint_and_close_all();
+        }
+        *guard = None;
     }
 
     /// 后台请求在此改派到独立任务并返回 true（调用方跳过交互队列）。
@@ -552,13 +761,12 @@ impl BackgroundTasks {
         let tokens = self.tokens.clone();
         let bg_cache = Arc::clone(&self.cache);
         let data_dir = self.data_dir.clone();
-        let db_path = self.db_path.clone();
         let evt_tx = self.evt_tx.clone();
         tokio::spawn(async move {
             let Ok(_permit) = gate.acquire_owned().await else {
                 return;
             };
-            job.run(&data_dir, &tokens, backfill, &bg_cache, &db_path, &evt_tx)
+            job.run(&data_dir, &tokens, backfill, &bg_cache, &evt_tx)
                 .await;
         });
         true
@@ -1002,6 +1210,10 @@ async fn handle_request(
                 });
                 return;
             }
+            if let Ok(all_accounts) = config::load_accounts_in(data_dir) {
+                let _ = cache.sync_account_registry(&all_accounts);
+                cache.set_own_emails(all_accounts.iter().map(|a| a.email.clone()).collect());
+            }
             let account_id = config.id;
             let account_enabled = config.enabled;
             refresh_account_watcher(watchers, data_dir, &config, req_tx);
@@ -1156,6 +1368,7 @@ async fn handle_request(
                 auto_empty_trash_days: prev.map(|p| p.auto_empty_trash_days).unwrap_or(0),
                 auto_empty_junk_days: prev.map(|p| p.auto_empty_junk_days).unwrap_or(0),
                 hidden_folders: prev.map(|p| p.hidden_folders.clone()).unwrap_or_default(),
+                storage_dir: prev.and_then(|p| p.storage_dir.clone()),
             };
 
             if let Err(e) = secrets::save_oauth_refresh_token(account_id, result.refresh_token) {
@@ -1171,6 +1384,10 @@ async fn handle_request(
                     message: e,
                 });
                 return;
+            }
+            if let Ok(all_accounts) = config::load_accounts_in(data_dir) {
+                let _ = cache.sync_account_registry(&all_accounts);
+                cache.set_own_emails(all_accounts.iter().map(|a| a.email.clone()).collect());
             }
 
             let expires_at =
@@ -3163,6 +3380,9 @@ async fn handle_request(
                 }
             }
         }
+        MailRequest::ChangeMailDataDir { .. } => {
+            unreachable!("邮件存储目录切换由 worker_loop 主循环处理")
+        }
     }
 }
 
@@ -4809,8 +5029,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("hylki-quit-{}-{unique}", std::process::id()));
-        let db_path = config::cache_db_in(&dir);
-        let mut cache = CacheStore::open(&db_path).unwrap();
+        let mut cache = CacheStore::open_for_data_dir(&dir).unwrap();
         let id = cache
             .enqueue_outbox(
                 1,
@@ -4847,11 +5066,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let cache = CacheStore::open(&db_path).unwrap();
+        let cache = CacheStore::open_for_data_dir_existing(&dir).unwrap();
         assert_eq!(cache.list_due_queued_ids(None, 1).unwrap(), vec![(1, id)]);
         drop(cache);
-        std::fs::remove_file(&db_path).unwrap();
-        std::fs::remove_dir(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

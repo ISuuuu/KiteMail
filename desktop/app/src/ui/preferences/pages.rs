@@ -11,6 +11,7 @@ use gpui_kit::{
     div, px, AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElement,
     ParentElement, ScrollAnchor, SharedString, StatefulInteractiveElement, Styled, Window,
 };
+use hylki_mail_core::cache::MailDirSwitchMode;
 use hylki_mail_core::config::{
     self, ListColumn, NotificationButton, NotificationButtons, ToolbarItem, ToolbarSide,
     DEFAULT_ATTACHMENT_KEYWORDS, UI_TEXT_SCALE_STEPS,
@@ -3087,15 +3088,36 @@ fn render_system(
 ) -> AnyElement {
     let demo_mode = app_entity.read(cx).demo_mode;
     let prefs = app_entity.read(cx).prefs.clone();
-    let data_dir_str = config::data_dir().display().to_string();
-    let stats = win
-        .storage_stats
-        .unwrap_or_else(|| config::storage_stats_in(&config::data_dir()));
-    let storage_text = format!(
-        "{}（{} 个文件）",
-        config::format_bytes(stats.total_bytes),
-        stats.file_count
+    let summary = win
+        .storage_summary
+        .clone()
+        .unwrap_or_else(|| config::app_storage_summary_in(&config::data_dir()));
+    let app_dir_path = summary.app_data_dir.clone();
+    let app_dir_str = app_dir_path.display().to_string();
+    let mail_dir_path = summary.mail_data_dir.clone();
+    let mail_dir_desc = format!(
+        "{} · {}",
+        if summary.is_custom_mail_dir {
+            "自定义目录"
+        } else {
+            "默认位置"
+        },
+        mail_dir_path.display()
     );
+    let storage_text = format!(
+        "配置与全局索引 {}（{} 文件）· 邮件与附件 {}（{} 文件）",
+        config::format_bytes(summary.config_stats.total_bytes),
+        summary.config_stats.file_count,
+        config::format_bytes(summary.mail_stats.total_bytes),
+        summary.mail_stats.file_count
+    );
+    let run_mode_text = if demo_mode {
+        "演示模式（内存模拟）"
+    } else if summary.is_portable {
+        "便携版（EXE 同级 data 配置 + 分账号分库存储）"
+    } else {
+        "安装版（LocalAppData 配置 + 分账号分库存储）"
+    };
     let autostart_on = crate::autostart::is_autostart_enabled();
     let app_clear = app_entity.clone();
     let app_close = app_entity.clone();
@@ -3118,7 +3140,7 @@ fn render_system(
                     .label("确认清除")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.confirm_clear_cache = false;
-                        this.storage_stats = None;
+                        this.storage_summary = None;
                         app_clear.update(cx, |app, cx| {
                             app.clear_body_caches(cx);
                         });
@@ -3322,16 +3344,68 @@ fn render_system(
             ],
             p,
         ))
-        .child(setting_group(
-            "本地数据与缓存维护",
-            None,
-            CARD_MAX_WIDTH,
-            vec![
-                info_row(
+        .child({
+            let mut storage_rows = vec![
+                setting_row(
                     "pref-data-dir",
-                    "配置与缓存根目录",
-                    data_dir_str,
+                    "程序配置目录",
+                    Some(&app_dir_str),
+                    Button::new("btn-open-app-dir")
+                        .outline()
+                        .compact()
+                        .label("打开目录")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_dir_in_explorer(&app_dir_path, cx);
+                        }))
+                        .into_any_element(),
+                    false,
                     is_hit(win, "pref-data-dir"),
+                    p,
+                ),
+                setting_row(
+                    "pref-mail-data-dir",
+                    "邮件存储目录",
+                    Some(&mail_dir_desc),
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            Button::new("btn-pick-mail-dir")
+                                .outline()
+                                .compact()
+                                .disabled(demo_mode || win.mail_dir_switching)
+                                .label(if win.mail_dir_switching {
+                                    "切换中..."
+                                } else {
+                                    "更改目录"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pick_mail_data_dir(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("btn-open-mail-dir")
+                                .outline()
+                                .compact()
+                                .label("打开目录")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_dir_in_explorer(&mail_dir_path, cx);
+                                })),
+                        )
+                        .when(summary.is_custom_mail_dir, |el| {
+                            el.child(
+                                Button::new("btn-reset-mail-dir")
+                                    .outline()
+                                    .compact()
+                                    .disabled(demo_mode || win.mail_dir_switching)
+                                    .label("恢复默认")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.request_reset_mail_data_dir(cx);
+                                    })),
+                            )
+                        })
+                        .into_any_element(),
+                    demo_mode || win.mail_dir_switching,
+                    is_hit(win, "pref-mail-data-dir"),
                     p,
                 ),
                 info_row(
@@ -3341,6 +3415,22 @@ fn render_system(
                     is_hit(win, "pref-storage-stats"),
                     p,
                 ),
+            ];
+            for acc_stat in &summary.per_account {
+                storage_rows.push(info_row(
+                    SharedString::from(format!("pref-acc-storage-{}", acc_stat.account_id)),
+                    format!("  · {}", acc_stat.email),
+                    format!(
+                        "文件夹 {} · {}（{} 个文件）",
+                        acc_stat.dir_name,
+                        config::format_bytes(acc_stat.stats.total_bytes),
+                        acc_stat.stats.file_count
+                    ),
+                    false,
+                    p,
+                ));
+            }
+            storage_rows.extend([
                 setting_row(
                     "pref-keep-downloads",
                     "已下载邮件保留时长",
@@ -3365,17 +3455,7 @@ fn render_system(
                     is_hit(win, "pref-keep-downloads"),
                     p,
                 ),
-                info_row(
-                    "pref-run-mode",
-                    "运行模式",
-                    if demo_mode {
-                        "演示模式（内存模拟）"
-                    } else {
-                        "标准模式（SQLite + TOML）"
-                    },
-                    false,
-                    p,
-                ),
+                info_row("pref-run-mode", "运行模式", run_mode_text, false, p),
                 setting_row(
                     "pref-clear-body-cache",
                     "清除本地邮件正文缓存",
@@ -3402,9 +3482,164 @@ fn render_system(
                     is_hit(win, "pref-export-log"),
                     p,
                 ),
-            ],
-            p,
-        ))
+            ]);
+            setting_group("本地数据与缓存维护", None, CARD_MAX_WIDTH, storage_rows, p)
+        })
+        .when_some(
+            win.pending_mail_dir_switch.as_ref(),
+            |el, (target_opt, inspection)| {
+                let mut rows = vec![info_row(
+                    "mail-switch-target",
+                    if target_opt.is_some() {
+                        "目标存储路径"
+                    } else {
+                        "恢复为默认路径"
+                    },
+                    inspection.target_dir.display().to_string(),
+                    false,
+                    p,
+                )];
+
+                let has_existing = !inspection.existing_accounts.is_empty();
+                let desc = if has_existing {
+                    format!(
+                        "目标目录中已存在 {} 个账号的邮件库（共 {}）。请选择复用已有数据或将当前邮件迁移过去：",
+                        inspection.existing_accounts.len(),
+                        config::format_bytes(inspection.total_bytes)
+                    )
+                } else {
+                    "目标目录中暂无现成 Hylki 账号邮件库。可选择迁移当前全部邮件，或直接启用新目录并重新同步：".to_string()
+                };
+
+                if has_existing {
+                    for (idx, item) in inspection.existing_accounts.iter().enumerate() {
+                        let value = if let Some(ref email) = item.matched_email {
+                            format!(
+                                "匹配当前账号 {} · {}",
+                                email,
+                                config::format_bytes(item.total_bytes)
+                            )
+                        } else {
+                            format!("发现已有 mail.db · {}", config::format_bytes(item.total_bytes))
+                        };
+                        rows.push(info_row(
+                            SharedString::from(format!("mail-switch-acc-{idx}")),
+                            format!("文件夹 {}", item.dir_name),
+                            value,
+                            false,
+                            p,
+                        ));
+                    }
+                } else {
+                    rows.push(info_row(
+                        "mail-switch-empty",
+                        "目录状态",
+                        if inspection.has_any_entries {
+                            "目录非空，未检测到 Hylki 账号子目录"
+                        } else {
+                            "空目录（就绪）"
+                        },
+                        false,
+                        p,
+                    ));
+                }
+
+                let actions = if has_existing {
+                    h_flex()
+                        .px_4()
+                        .py_3()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("mail-switch-cancel")
+                                .outline()
+                                .compact()
+                                .label("取消")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_mail_dir_switch(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("mail-switch-migrate")
+                                .outline()
+                                .compact()
+                                .disabled(win.mail_dir_switching)
+                                .label("迁移当前邮件到此目录")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_mail_dir_switch(
+                                        MailDirSwitchMode::MigrateCurrent,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("mail-switch-reuse")
+                                .primary()
+                                .compact()
+                                .disabled(win.mail_dir_switching)
+                                .label("直接使用已有邮件数据（复用）")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_mail_dir_switch(
+                                        MailDirSwitchMode::ReuseExisting,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .px_4()
+                        .py_3()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("mail-switch-cancel")
+                                .outline()
+                                .compact()
+                                .label("取消")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_mail_dir_switch(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("mail-switch-reuse")
+                                .outline()
+                                .compact()
+                                .disabled(win.mail_dir_switching)
+                                .label("直接使用该目录（不迁移）")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_mail_dir_switch(
+                                        MailDirSwitchMode::ReuseExisting,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("mail-switch-migrate")
+                                .primary()
+                                .compact()
+                                .disabled(win.mail_dir_switching)
+                                .label("确认迁移当前邮件到此目录")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_mail_dir_switch(
+                                        MailDirSwitchMode::MigrateCurrent,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .into_any_element()
+                };
+                rows.push(actions);
+
+                el.child(setting_group(
+                    "确认切换邮件存储目录",
+                    Some(desc.as_str()),
+                    CARD_MAX_WIDTH,
+                    rows,
+                    p,
+                ))
+            },
+        )
         .child(setting_group(
             "软件更新",
             None,

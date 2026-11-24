@@ -449,9 +449,16 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     PrefSearchItem {
         tab: PrefTab::System,
         row_id: "pref-data-dir",
-        title: "本地数据与缓存目录",
-        subtitle: "查看 preferences.toml、accounts.toml 与 SQLite 缓存路径",
-        keywords: "system cache data directory path sqlite 系统 缓存 目录 路径",
+        title: "程序配置目录",
+        subtitle: "查看 preferences.toml、accounts.toml、storage.toml 与 global.db 路径",
+        keywords: "system config data directory path portable sqlite global 系统 配置 目录 路径 便携",
+    },
+    PrefSearchItem {
+        tab: PrefTab::System,
+        row_id: "pref-mail-data-dir",
+        title: "邮件存储目录",
+        subtitle: "查看或更换各账号 mail.db / content.db 与附件的独立存储目录",
+        keywords: "mail data directory storage path migrate reuse portable 邮件 存储 独立 目录 路径 迁移 复用 便携",
     },
     PrefSearchItem {
         tab: PrefTab::System,

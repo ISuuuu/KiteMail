@@ -513,9 +513,7 @@ impl WebViewHost {
                 Ok(())
             },
         ));
-        let data_dir = std::env::var_os("LOCALAPPDATA")
-            .map(std::path::PathBuf::from)
-            .map(|path| path.join("Hylki").join("WebView2"));
+        let data_dir = Some(hylki_mail_core::config::data_dir().join("WebView2"));
         let data_dir: Vec<u16> = data_dir
             .as_deref()
             .map(|path| path.as_os_str().encode_wide().chain(Some(0)).collect())

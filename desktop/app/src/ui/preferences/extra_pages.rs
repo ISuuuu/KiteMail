@@ -974,7 +974,7 @@ pub(crate) fn render_contacts_sources(
 // ===========================================================================
 
 fn load_tags_from_db() -> Result<Vec<TagItem>, String> {
-    let store = CacheStore::open(&config::cache_db_in(&config::data_dir()))?;
+    let store = CacheStore::open_for_data_dir(&config::data_dir())?;
     store.list_tags()
 }
 
@@ -1077,15 +1077,11 @@ pub(crate) fn render_tags(
                                     .icon(IconName::Trash)
                                     .tooltip("删除标签")
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        match CacheStore::open(&config::cache_db_in(
-                                            &config::data_dir(),
-                                        ))
-                                        .and_then(
-                                            |mut s| {
+                                        match CacheStore::open_for_data_dir(&config::data_dir())
+                                            .and_then(|mut s| {
                                                 s.delete_tag(tag_id)?;
                                                 s.list_tags()
-                                            },
-                                        ) {
+                                            }) {
                                             Ok(list) => {
                                                 this.cached_tags = list;
                                                 if this.editing_tag_id == Some(tag_id) {
@@ -1222,11 +1218,8 @@ pub(crate) fn render_tags(
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         let name =
                                             this.tag_name_input.read(cx).value().trim().to_string();
-                                        match CacheStore::open(&config::cache_db_in(
-                                            &config::data_dir(),
-                                        ))
-                                        .and_then(
-                                            |mut store| {
+                                        match CacheStore::open_for_data_dir(&config::data_dir())
+                                            .and_then(|mut store| {
                                                 store.upsert_tag(
                                                     this.editing_tag_id,
                                                     &name,
@@ -1234,8 +1227,7 @@ pub(crate) fn render_tags(
                                                     this.tag_shortcut,
                                                 )?;
                                                 store.list_tags()
-                                            },
-                                        ) {
+                                            }) {
                                             Ok(list) => {
                                                 this.cached_tags = list;
                                                 this.tags_loaded = true;
@@ -1680,7 +1672,7 @@ pub(crate) fn render_filters(
                         let app = app_run.read(cx);
                         (app.prefs.filter_rules.clone(), app.accounts.clone())
                     };
-                    match CacheStore::open(&config::cache_db_in(&config::data_dir()))
+                    match CacheStore::open_for_data_dir(&config::data_dir())
                         .and_then(|mut store| store.apply_filter_rules(&rules, &accs))
                     {
                         Ok(count) => {

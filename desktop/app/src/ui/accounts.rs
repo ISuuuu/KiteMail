@@ -1161,6 +1161,7 @@ impl AccountFormState {
                 auto_empty_trash_days: self.auto_empty_trash_days,
                 auto_empty_junk_days: self.auto_empty_junk_days,
                 hidden_folders: self.hidden_folders.clone(),
+                storage_dir: base.storage_dir,
             };
             return (cfg, String::new(), None);
         }
@@ -1229,6 +1230,7 @@ impl AccountFormState {
             auto_empty_trash_days: self.auto_empty_trash_days,
             auto_empty_junk_days: self.auto_empty_junk_days,
             hidden_folders: self.hidden_folders.clone(),
+            storage_dir: existing_acc.and_then(|a| a.storage_dir.clone()),
         };
         let imap_pwd = self.imap_pass.read(cx).value().to_string();
         let smtp_pwd = if self.smtp_separate {
