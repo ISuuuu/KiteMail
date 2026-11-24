@@ -14,10 +14,10 @@ use std::{
 };
 use webview2_com::{
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    DOMContentLoadedEventHandler, Microsoft::Web::WebView2::Win32::*,
-    NavigationCompletedEventHandler, NavigationStartingEventHandler,
-    NewWindowRequestedEventHandler, ProcessFailedEventHandler, WebMessageReceivedEventHandler,
-    WebResourceRequestedEventHandler,
+    DOMContentLoadedEventHandler, LaunchingExternalUriSchemeEventHandler,
+    Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
+    WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
 };
 use windows::{
     core::{w, Interface},
@@ -169,13 +169,23 @@ fn clipped_rects(content: RECT, viewport: RECT) -> Option<(RECT, RECT)> {
 }
 
 pub(crate) fn supports_document(html: &str) -> bool {
-    let lower = html.to_ascii_lowercase();
     !html.trim().is_empty()
-        && !lower.contains("<blockquote")
-        && !lower.contains("gmail_quote")
-        && !lower.contains("divrplyfwdmsg")
-        && !lower.contains("appendonsend")
-        && !lower.contains("mailto:")
+}
+
+fn find_html_tag(lower: &str, tag: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(tag).map(|i| from + i) {
+        let next = lower
+            .as_bytes()
+            .get(at + tag.len())
+            .copied()
+            .unwrap_or(b'>');
+        if next == b'>' || next == b'/' || next.is_ascii_whitespace() {
+            return Some(at);
+        }
+        from = at + tag.len();
+    }
+    None
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,12 +221,12 @@ fn make_document(
             .replace('<', "&lt;")
             .replace('>', "&gt;")
     };
-    let html = dark::pin_color_scheme(html, appearance.dark);
     let html = if appearance.dark {
-        dark::adapt_colors_for_dark(&html)
+        dark::adapt_colors_for_dark(html)
     } else {
-        html
+        html.to_string()
     };
+    let html = dark::pin_color_scheme(&html, appearance.dark);
     let css_color = |color: Hsla| {
         let rgb = Rgba::from(color);
         let [r, g, b] = [rgb.r, rgb.g, rgb.b].map(|channel| (channel * 255.0).round() as u8);
@@ -230,8 +240,7 @@ fn make_document(
         appearance.zoom_percent.clamp(50, 250)
     );
     let lower = html.to_ascii_lowercase();
-    let insertion = lower
-        .find("<head")
+    let insertion = find_html_tag(&lower, "<head")
         .or_else(|| lower.find("<!doctype"))
         .and_then(|start| lower[start..].find('>').map(|end| start + end + 1))
         .unwrap_or(0);
@@ -260,7 +269,7 @@ struct State {
     loaded: bool,
     links: Vec<(u64, String)>,
     scroll_window: Option<AsyncWindowContext>,
-    scroll_script_version: u64,
+    bridge_script_version: u64,
     notifier: Option<futures_mpsc::Sender<()>>,
     in_thread: bool,
     bounds: RECT,
@@ -277,6 +286,37 @@ impl State {
             let _ = tx.try_send(());
         }
     }
+}
+
+fn open_link_message(message: &str) -> Option<&str> {
+    let url = message.strip_prefix("open-link:")?;
+    let parsed = parse_external_url(url)?;
+    (parsed.scheme() == "mailto").then_some(url)
+}
+
+fn record_external_link(state: &mut State, url: &str) -> bool {
+    if state.closed || !state.loaded || !allowed_external_url(url) {
+        return false;
+    }
+    let version = state.version;
+    if !state
+        .links
+        .last()
+        .is_some_and(|(v, last)| *v == version && last == url)
+    {
+        state.links.push((version, url.to_string()));
+        state.notify_ui();
+    }
+    true
+}
+
+fn record_script_link(state: &Rc<RefCell<State>>, source: &str, url: &str) -> bool {
+    let mut inner = state.borrow_mut();
+    if !allow_main_navigation(source, inner.version) {
+        return false;
+    }
+    let is_mailto = parse_external_url(url).is_some_and(|parsed| parsed.scheme() == "mailto");
+    is_mailto && record_external_link(&mut inner, url)
 }
 
 fn apply_dom_content_loaded(state: &mut State, navigation_id: u64) -> bool {
@@ -301,27 +341,24 @@ fn apply_navigation_completed(state: &mut State, navigation_id: u64, success: bo
     }
 }
 
-fn maybe_install_thread_scroll(state: &Rc<RefCell<State>>, view: Option<&ICoreWebView2>) {
-    let should_install = {
+fn maybe_install_bridge_script(state: &Rc<RefCell<State>>, view: Option<&ICoreWebView2>) {
+    let forward_wheel = {
         let mut inner = state.borrow_mut();
         let version = inner.version;
-        if inner.loaded
-            && inner.in_thread
-            && inner.scroll_window.is_some()
-            && inner.scroll_script_version != version
-        {
-            inner.scroll_script_version = version;
-            true
+        if inner.loaded && inner.bridge_script_version != version {
+            inner.bridge_script_version = version;
+            Some(inner.in_thread && inner.scroll_window.is_some())
         } else {
-            false
+            None
         }
     };
-    if let Some(view) = view.filter(|_| should_install) {
+    if let (Some(view), Some(forward_wheel)) = (view, forward_wheel) {
         // Run the trusted listener in the wrapper. The mail frame stays scriptless.
-        let script: Vec<u16> = include_str!("thread_scroll.js")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
+        let script = format!(
+            "window.__hylkiForwardWheel = {forward_wheel};\n{}",
+            include_str!("thread_scroll.js")
+        );
+        let script: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
         unsafe {
             let _ = view.ExecuteScript(
                 windows::core::PCWSTR(script.as_ptr()),
@@ -835,7 +872,7 @@ unsafe fn configure(
                 }
                 let matched = apply_dom_content_loaded(&mut state.borrow_mut(), id);
                 if matched {
-                    maybe_install_thread_scroll(&state, view.as_ref());
+                    maybe_install_bridge_script(&state, view.as_ref());
                 }
             }
             Ok(())
@@ -854,32 +891,31 @@ unsafe fn configure(
             let matched =
                 apply_navigation_completed(&mut state.borrow_mut(), id, success.as_bool());
             if matched {
-                maybe_install_thread_scroll(&state, view.as_ref());
+                maybe_install_bridge_script(&state, view.as_ref());
             }
         }
         Ok(())
     }));
     view.add_NavigationCompleted(&complete, &mut token)?;
-    if state
-        .upgrade()
-        .is_some_and(|state| state.borrow().scroll_window.is_some())
-    {
-        let scroll_state = state.clone();
-        let wheel = WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
-            if let (Some(state), Some(args)) = (scroll_state.upgrade(), args) {
-                let mut message = windows::core::PWSTR::null();
-                if unsafe { args.TryGetWebMessageAsString(&mut message) }.is_ok() {
-                    if let Some(delta) = thread_wheel_delta(&webview2_com::take_pwstr(message)) {
-                        let mut source = windows::core::PWSTR::null();
-                        unsafe { args.Source(&mut source)? };
-                        forward_thread_wheel(state, webview2_com::take_pwstr(source), delta)?;
-                    }
+    let message_state = state.clone();
+    let web_message = WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+        if let (Some(state), Some(args)) = (message_state.upgrade(), args) {
+            let mut message = windows::core::PWSTR::null();
+            if unsafe { args.TryGetWebMessageAsString(&mut message) }.is_ok() {
+                let message = webview2_com::take_pwstr(message);
+                let mut source = windows::core::PWSTR::null();
+                unsafe { args.Source(&mut source)? };
+                let source = webview2_com::take_pwstr(source);
+                if let Some(delta) = thread_wheel_delta(&message) {
+                    forward_thread_wheel(state, source, delta)?;
+                } else if let Some(url) = open_link_message(&message) {
+                    record_script_link(&state, &source, url);
                 }
             }
-            Ok(())
-        }));
-        view.add_WebMessageReceived(&wheel, &mut token)?;
-    }
+        }
+        Ok(())
+    }));
+    view.add_WebMessageReceived(&web_message, &mut token)?;
     let failure_state = state.clone();
     let failure = ProcessFailedEventHandler::create(Box::new(move |_, _| {
         if let Some(state) = failure_state.upgrade() {
@@ -905,18 +941,7 @@ unsafe fn configure(
             }
             if initiated.as_bool() && allowed_external_url(&url) {
                 if let Some(state) = frame_state.upgrade() {
-                    let mut state = state.borrow_mut();
-                    if state.loaded {
-                        let version = state.version;
-                        if !state
-                            .links
-                            .last()
-                            .is_some_and(|(v, last)| *v == version && *last == url)
-                        {
-                            state.links.push((version, url.clone()));
-                            state.notify_ui();
-                        }
-                    }
+                    record_external_link(&mut state.borrow_mut(), &url);
                 }
             }
             unsafe {
@@ -938,18 +963,7 @@ unsafe fn configure(
             let url = webview2_com::take_pwstr(uri);
             if initiated.as_bool() && allowed_external_url(&url) {
                 if let Some(state) = new_window_state.upgrade() {
-                    let mut state = state.borrow_mut();
-                    if state.loaded {
-                        let version = state.version;
-                        if !state
-                            .links
-                            .last()
-                            .is_some_and(|(v, last)| *v == version && *last == url)
-                        {
-                            state.links.push((version, url));
-                            state.notify_ui();
-                        }
-                    }
+                    record_external_link(&mut state.borrow_mut(), &url);
                 }
             }
             unsafe {
@@ -959,6 +973,30 @@ unsafe fn configure(
         Ok(())
     }));
     view.add_NewWindowRequested(&new_window, &mut token)?;
+    if let Ok(view18) = view.cast::<ICoreWebView2_18>() {
+        let external_state = state.clone();
+        let external = LaunchingExternalUriSchemeEventHandler::create(Box::new(move |_, args| {
+            if let Some(args) = args {
+                unsafe {
+                    args.SetCancel(true)?;
+                }
+                let mut initiated = windows::core::BOOL::default();
+                let mut uri = windows::core::PWSTR::null();
+                unsafe {
+                    args.IsUserInitiated(&mut initiated)?;
+                    args.Uri(&mut uri)?;
+                }
+                let url = webview2_com::take_pwstr(uri);
+                if initiated.as_bool() && allowed_external_url(&url) {
+                    if let Some(state) = external_state.upgrade() {
+                        record_external_link(&mut state.borrow_mut(), &url);
+                    }
+                }
+            }
+            Ok(())
+        }));
+        let _ = view18.add_LaunchingExternalUriScheme(&external, &mut token);
+    }
     let env = env.clone();
     let resource = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
         if let (Some(state), Some(args)) = (state.upgrade(), args) {
@@ -1252,10 +1290,11 @@ mod tests {
         assert!(supports_document(
             "<a target='_blank' href='https://example.com'>link</a>"
         ));
-        assert!(!supports_document("<blockquote>quote</blockquote>"));
-        assert!(!supports_document(
-            "<a href='mailto:a@example.com'>mail</a>"
-        ));
+        assert!(supports_document("<blockquote>quote</blockquote>"));
+        assert!(supports_document("<div class='gmail_quote'>quote</div>"));
+        assert!(supports_document("<a href='mailto:a@example.com'>mail</a>"));
+        assert!(!supports_document(""));
+        assert!(!supports_document("   \n\t "));
         let (background, foreground) = crate::theme::reader_body_colors(true);
         let dark = String::from_utf8(build_body_document(
             "<!doctype html><html><head><style>p{color:#000}</style></head><body><p>x</p></body></html>",
@@ -1278,6 +1317,132 @@ mod tests {
         ))
         .unwrap();
         assert!(clamped.contains("zoom:250%"));
+    }
+
+    #[test]
+    fn make_document_does_not_insert_style_inside_header_element() {
+        let (background, foreground) = crate::theme::reader_body_colors(false);
+        let light = DocumentAppearance {
+            dark: false,
+            zoom_percent: 100,
+            background,
+            foreground,
+        };
+        let document = String::from_utf8(build_body_document(
+            "<header><h1>Title</h1></header><p>Body</p>",
+            light,
+        ))
+        .unwrap();
+        assert!(document.contains("srcdoc=\"&lt;style&gt;:root{color-scheme:light;zoom:100%}"));
+        assert!(document
+            .contains("&lt;/style&gt;&lt;header&gt;&lt;h1&gt;Title&lt;/h1&gt;&lt;/header&gt;"));
+    }
+
+    #[test]
+    fn script_mailto_links_validate_source_state_scheme_and_dedup() {
+        assert_eq!(
+            open_link_message("open-link:mailto:team@makenotion.com"),
+            Some("mailto:team@makenotion.com")
+        );
+        assert_eq!(
+            open_link_message("open-link:MAILTO:user@example.com?subject=hi"),
+            Some("MAILTO:user@example.com?subject=hi")
+        );
+        for invalid in [
+            "thread-wheel:10",
+            "open-link:",
+            "open-link:mailto:",
+            "open-link:mailto:?subject=only",
+            "open-link:https://example.com",
+            "open-link:file:///C:/test",
+            "open-link:javascript:alert(1)",
+        ] {
+            assert_eq!(open_link_message(invalid), None);
+        }
+
+        let (tx, mut rx) = futures_mpsc::channel::<()>(8);
+        let state = Rc::new(RefCell::new(State::default()));
+        {
+            let mut inner = state.borrow_mut();
+            inner.version = 5;
+            inner.loaded = true;
+            inner.notifier = Some(tx);
+        }
+
+        // Valid mailto from current document version queues link and wakes UI.
+        assert!(record_script_link(
+            &state,
+            &document_url(5),
+            "mailto:team@makenotion.com"
+        ));
+        assert_eq!(rx.try_recv().ok(), Some(()));
+
+        // Adjacent duplicate in the same version is deduplicated.
+        assert!(record_script_link(
+            &state,
+            &document_url(5),
+            "mailto:team@makenotion.com"
+        ));
+        assert!(rx.try_recv().is_err());
+
+        // Uppercase MAILTO is accepted.
+        assert!(record_script_link(
+            &state,
+            &document_url(5),
+            "MAILTO:other@example.com"
+        ));
+        assert_eq!(rx.try_recv().ok(), Some(()));
+
+        // Stale/wrong source, non-mailto schemes, unloaded or closed states are rejected.
+        assert!(!record_script_link(
+            &state,
+            &document_url(4),
+            "mailto:x@example.com"
+        ));
+        assert!(!record_script_link(
+            &state,
+            "https://example.com/",
+            "mailto:x@example.com"
+        ));
+        assert!(!record_script_link(
+            &state,
+            &document_url(5),
+            "https://example.com/"
+        ));
+        assert!(!record_script_link(
+            &state,
+            &document_url(5),
+            "file:///C:/test"
+        ));
+        assert!(!record_script_link(
+            &state,
+            &document_url(5),
+            "javascript:alert(1)"
+        ));
+        assert!(!record_script_link(&state, &document_url(5), "mailto:"));
+
+        state.borrow_mut().loaded = false;
+        assert!(!record_script_link(
+            &state,
+            &document_url(5),
+            "mailto:unloaded@example.com"
+        ));
+        state.borrow_mut().loaded = true;
+        state.borrow_mut().closed = true;
+        assert!(!record_script_link(
+            &state,
+            &document_url(5),
+            "mailto:closed@example.com"
+        ));
+
+        let links = WebViewHost(state).take_links();
+        assert_eq!(
+            links,
+            vec![
+                "mailto:team@makenotion.com".to_string(),
+                "MAILTO:other@example.com".to_string()
+            ]
+        );
     }
 
     #[test]

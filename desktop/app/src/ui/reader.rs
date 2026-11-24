@@ -506,8 +506,12 @@ fn render_message_card(
                     block_remote_images,
                     clean_links,
                 );
-                let split = split_quoted_html(&sanitized);
-                (split.main, split.quoted, blocked)
+                if body_view == BodyView::Native {
+                    let split = split_quoted_html(&sanitized);
+                    (split.main, split.quoted, blocked)
+                } else {
+                    (String::new(), None, blocked)
+                }
             } else {
                 let split = split_quoted_plain(body_text);
                 (
@@ -1160,9 +1164,8 @@ fn webview_eligible(
     raw_source: bool,
     collapsed: bool,
 ) -> bool {
-    html.is_some_and(|body| {
-        crate::webview_host::supports_document(body) && !body.to_ascii_lowercase().contains("cid:")
-    }) && !body_pending
+    html.is_some_and(crate::webview_host::supports_document)
+        && !body_pending
         && !prefer_plain
         && !raw_source
         && !collapsed
@@ -2169,16 +2172,38 @@ mod tests {
     fn webview_requires_loaded_html_without_native_only_features() {
         let html = Some("<p>Hello</p>");
         assert!(webview_eligible(html, false, false, false, false));
-        assert!(!webview_eligible(None, false, false, false, false));
-        assert!(!webview_eligible(Some(""), false, false, false, false));
-
-        assert!(!webview_eligible(
+        assert!(webview_eligible(
+            Some(r#"<p><a href="mailto:team@makenotion.com">Email</a></p>"#),
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(webview_eligible(
+            Some("<blockquote>quote</blockquote>"),
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(webview_eligible(
+            Some(r#"<div class="gmail_quote">quote</div>"#),
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(webview_eligible(
             Some("<img src=cid:example>"),
             false,
             false,
             false,
             false
         ));
+        assert!(!webview_eligible(None, false, false, false, false));
+        assert!(!webview_eligible(Some(""), false, false, false, false));
+        assert!(!webview_eligible(Some("   "), false, false, false, false));
+
         assert!(!webview_eligible(html, true, false, false, false));
         assert!(!webview_eligible(html, false, true, false, false));
         assert!(!webview_eligible(html, false, false, true, false));
