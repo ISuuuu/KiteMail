@@ -1,6 +1,6 @@
 //! Microsoft Graph REST mail client (folders, messages, attachments, flags, sendMail).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -40,6 +40,152 @@ fn uid_from_remote_id(remote_id: &str) -> u32 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GraphWellKnownRole {
+    Inbox,
+    Sent,
+    Drafts,
+    Trash,
+    Junk,
+    Archive,
+}
+
+impl GraphWellKnownRole {
+    const ALL: [(&'static str, Self); 6] = [
+        ("inbox", Self::Inbox),
+        ("sentitems", Self::Sent),
+        ("drafts", Self::Drafts),
+        ("deleteditems", Self::Trash),
+        ("junkemail", Self::Junk),
+        ("archive", Self::Archive),
+    ];
+
+    fn friendly_name(self) -> &'static str {
+        match self {
+            Self::Inbox => "收件箱",
+            Self::Sent => "已发送",
+            Self::Drafts => "草稿箱",
+            Self::Trash => "已删除",
+            Self::Junk => "垃圾邮件",
+            Self::Archive => "归档",
+        }
+    }
+
+    fn from_display_name(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "inbox" | "收件箱" => Some(Self::Inbox),
+            "sent items" | "sent" | "已发送邮件" | "已发送" => Some(Self::Sent),
+            "drafts" | "草稿" => Some(Self::Drafts),
+            "deleted items" | "trash" | "已删除邮件" => Some(Self::Trash),
+            "junk email" | "spam" | "垃圾邮件" => Some(Self::Junk),
+            "archive" | "存档" => Some(Self::Archive),
+            _ => None,
+        }
+    }
+}
+
+/// 查询 Graph 系统保留角色文件夹 ID（`inbox` / `sentitems` / `drafts` / `deleteditems` /
+/// `junkemail` / `archive`），用于在列表存在同名自定义文件夹（如第三方客户端建的 `Trash`）时
+/// 准确识别系统文件夹，避免冒充标准角色。单项 404 或网络失败静默跳过。
+fn fetch_well_known_roles(access_token: &str) -> HashMap<String, GraphWellKnownRole> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let auth = format!("Bearer {access_token}");
+    let mut roles = HashMap::new();
+    // 分两批每批最多 3 并发，低于 Exchange Online 单邮箱 4 并发上限，避免触发 429 限流。
+    for chunk in GraphWellKnownRole::ALL.chunks(3) {
+        let batch: Vec<(String, GraphWellKnownRole)> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|&(wk, role)| {
+                    let agent = &agent;
+                    let auth = &auth;
+                    s.spawn(move || {
+                        let url = format!("{GRAPH_BASE}/mailFolders/{wk}?$select=id");
+                        let resp = agent.get(&url).set("Authorization", auth).call().ok()?;
+                        let json: serde_json::Value = resp.into_json().ok()?;
+                        let id = json["id"].as_str()?.trim();
+                        if id.is_empty() {
+                            return None;
+                        }
+                        Some((id.to_string(), role))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok().flatten())
+                .collect()
+        });
+        for (id, role) in batch {
+            roles.insert(id, role);
+        }
+    }
+    roles
+}
+
+fn resolve_graph_folder_name(
+    id: &str,
+    raw_name: &str,
+    well_known_by_id: &HashMap<String, GraphWellKnownRole>,
+    present_roles: &HashSet<GraphWellKnownRole>,
+) -> (String, bool) {
+    if let Some(&role) = well_known_by_id.get(id) {
+        return (
+            role.friendly_name().to_string(),
+            role == GraphWellKnownRole::Inbox,
+        );
+    }
+    if let Some(candidate) = GraphWellKnownRole::from_display_name(raw_name) {
+        // 该角色没有实际存在的系统保留文件夹时，回退按名称映射以保持旧行为兼容；
+        // 已有真正系统文件夹时保留原始名称，防止非系统文件夹冒充标准角色。
+        if !present_roles.contains(&candidate) {
+            return (
+                candidate.friendly_name().to_string(),
+                candidate == GraphWellKnownRole::Inbox,
+            );
+        }
+    }
+    (raw_name.to_string(), false)
+}
+
+fn parse_graph_folders_json(
+    json: &serde_json::Value,
+    well_known_by_id: &HashMap<String, GraphWellKnownRole>,
+) -> Vec<(RemoteFolder, bool)> {
+    let Some(arr) = json["value"].as_array() else {
+        return Vec::new();
+    };
+    let present_roles: HashSet<GraphWellKnownRole> = arr
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .filter_map(|id| well_known_by_id.get(id).copied())
+        .collect();
+
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(id) = item["id"].as_str() else {
+            continue;
+        };
+        let raw_name = item["displayName"].as_str().unwrap_or("Folder");
+        let (friendly, is_inbox) =
+            resolve_graph_folder_name(id, raw_name, well_known_by_id, &present_roles);
+        let unread = item["unreadItemCount"].as_u64().unwrap_or(0) as u32;
+        let total = item["totalItemCount"].as_u64().unwrap_or(0) as usize;
+        out.push((
+            RemoteFolder {
+                name: friendly,
+                path: id.to_string(),
+                unread_count: unread,
+                total_count: total,
+            },
+            is_inbox,
+        ));
+    }
+    out
+}
+
 /// Fetch mail folders via Microsoft Graph.
 pub fn fetch_folders(access_token: &str) -> Result<Vec<(RemoteFolder, bool)>, String> {
     let url = format!(
@@ -54,40 +200,24 @@ pub fn fetch_folders(access_token: &str) -> Result<Vec<(RemoteFolder, bool)>, St
         .into_json()
         .map_err(|e| format!("解析 Graph 文件夹响应失败: {e}"))?;
 
-    let mut out = Vec::new();
-    if let Some(arr) = json["value"].as_array() {
-        for item in arr {
-            let Some(id) = item["id"].as_str() else {
-                continue;
-            };
-            let raw_name = item["displayName"].as_str().unwrap_or("Folder");
-            let (friendly, is_inbox) = map_graph_folder_name(raw_name);
-            let unread = item["unreadItemCount"].as_u64().unwrap_or(0) as u32;
-            let total = item["totalItemCount"].as_u64().unwrap_or(0) as usize;
-            out.push((
-                RemoteFolder {
-                    name: friendly,
-                    path: id.to_string(),
-                    unread_count: unread,
-                    total_count: total,
-                },
-                is_inbox,
-            ));
-        }
-    }
-    Ok(out)
+    let well_known = fetch_well_known_roles(access_token);
+    Ok(parse_graph_folders_json(&json, &well_known))
 }
 
-fn map_graph_folder_name(raw: &str) -> (String, bool) {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "inbox" | "收件箱" => ("收件箱".to_string(), true),
-        "sent items" | "sent" | "已发送邮件" | "已发送" => ("已发送".to_string(), false),
-        "drafts" | "草稿" => ("草稿箱".to_string(), false),
-        "deleted items" | "trash" | "已删除邮件" => ("已删除".to_string(), false),
-        "junk email" | "spam" | "垃圾邮件" => ("垃圾邮件".to_string(), false),
-        "archive" | "存档" => ("归档".to_string(), false),
-        _ => (raw.to_string(), false),
-    }
+/// Fetch inbox unread/total counts via a single lightweight Graph well-known query.
+pub(crate) fn fetch_inbox_counts(access_token: &str) -> Result<(u32, usize), String> {
+    let url = format!("{GRAPH_BASE}/mailFolders/inbox?$select=unreadItemCount,totalItemCount");
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .call()
+        .map_err(format_graph_error)?;
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("解析 Graph 收件箱计数失败: {e}"))?;
+    let unread = json["unreadItemCount"].as_u64().unwrap_or(0) as u32;
+    let total = json["totalItemCount"].as_u64().unwrap_or(0) as usize;
+    Ok((unread, total))
 }
 
 /// Fetch recent message headers from a Graph folder.
@@ -761,5 +891,119 @@ mod tests {
         // 无 @ 的片段跳过；全无效时为空（send_message 据此报收件人为空）。
         assert!(graph_recipient_array("notaaddress").is_empty());
         assert!(graph_recipient_array("   ").is_empty());
+    }
+
+    #[test]
+    fn custom_trash_or_role_namesakes_keep_original_name_when_well_known_exists() {
+        let json = serde_json::json!({
+            "value": [
+                { "id": "custom_trash", "displayName": "Trash", "unreadItemCount": 0, "totalItemCount": 5 },
+                { "id": "custom_deleted", "displayName": "Deleted Items", "unreadItemCount": 0, "totalItemCount": 1 },
+                { "id": "custom_sent", "displayName": "Sent", "unreadItemCount": 0, "totalItemCount": 2 },
+                { "id": "custom_drafts", "displayName": "Drafts", "unreadItemCount": 0, "totalItemCount": 3 },
+                { "id": "custom_spam", "displayName": "Spam", "unreadItemCount": 0, "totalItemCount": 4 },
+                { "id": "custom_archive", "displayName": "Archive", "unreadItemCount": 0, "totalItemCount": 6 },
+                { "id": "sys_inbox", "displayName": "收件箱", "unreadItemCount": 10, "totalItemCount": 2444 },
+                { "id": "sys_deleted", "displayName": "已删除邮件", "unreadItemCount": 0, "totalItemCount": 4 },
+                { "id": "sys_sent", "displayName": "已发送邮件", "unreadItemCount": 0, "totalItemCount": 55 },
+                { "id": "sys_drafts", "displayName": "草稿", "unreadItemCount": 0, "totalItemCount": 2 },
+                { "id": "sys_junk", "displayName": "垃圾邮件", "unreadItemCount": 0, "totalItemCount": 19 },
+                { "id": "sys_archive", "displayName": "存档", "unreadItemCount": 0, "totalItemCount": 0 }
+            ]
+        });
+        let well_known = HashMap::from([
+            ("sys_inbox".to_string(), GraphWellKnownRole::Inbox),
+            ("sys_deleted".to_string(), GraphWellKnownRole::Trash),
+            ("sys_sent".to_string(), GraphWellKnownRole::Sent),
+            ("sys_drafts".to_string(), GraphWellKnownRole::Drafts),
+            ("sys_junk".to_string(), GraphWellKnownRole::Junk),
+            ("sys_archive".to_string(), GraphWellKnownRole::Archive),
+        ]);
+
+        let parsed = parse_graph_folders_json(&json, &well_known);
+        let by_id: HashMap<&str, (&str, bool, usize)> = parsed
+            .iter()
+            .map(|(f, is_inbox)| (f.path.as_str(), (f.name.as_str(), *is_inbox, f.total_count)))
+            .collect();
+
+        assert_eq!(by_id["sys_inbox"], ("收件箱", true, 2444));
+        assert_eq!(by_id["sys_deleted"], ("已删除", false, 4));
+        assert_eq!(by_id["sys_sent"], ("已发送", false, 55));
+        assert_eq!(by_id["sys_drafts"], ("草稿箱", false, 2));
+        assert_eq!(by_id["sys_junk"], ("垃圾邮件", false, 19));
+        assert_eq!(by_id["sys_archive"], ("归档", false, 0));
+
+        assert_eq!(by_id["custom_trash"], ("Trash", false, 5));
+        assert_eq!(by_id["custom_deleted"], ("Deleted Items", false, 1));
+        assert_eq!(by_id["custom_sent"], ("Sent", false, 2));
+        assert_eq!(by_id["custom_drafts"], ("Drafts", false, 3));
+        assert_eq!(by_id["custom_spam"], ("Spam", false, 4));
+        assert_eq!(by_id["custom_archive"], ("Archive", false, 6));
+    }
+
+    #[test]
+    fn well_known_ids_map_non_english_and_non_chinese_system_folders() {
+        let json = serde_json::json!({
+            "value": [
+                { "id": "de_inbox", "displayName": "Posteingang", "unreadItemCount": 3, "totalItemCount": 10 },
+                { "id": "de_trash", "displayName": "Gelöschte Elemente", "unreadItemCount": 1, "totalItemCount": 2 }
+            ]
+        });
+        let well_known = HashMap::from([
+            ("de_inbox".to_string(), GraphWellKnownRole::Inbox),
+            ("de_trash".to_string(), GraphWellKnownRole::Trash),
+        ]);
+
+        let parsed = parse_graph_folders_json(&json, &well_known);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0.name, "收件箱");
+        assert!(parsed[0].1);
+        assert_eq!(parsed[1].0.name, "已删除");
+        assert!(!parsed[1].1);
+    }
+
+    #[test]
+    fn missing_well_known_role_falls_back_to_display_name_mapping() {
+        let json = serde_json::json!({
+            "value": [
+                { "id": "f1", "displayName": "Inbox", "unreadItemCount": 1, "totalItemCount": 5 },
+                { "id": "f2", "displayName": "已删除邮件", "unreadItemCount": 0, "totalItemCount": 2 },
+                { "id": "f3", "displayName": "Archive", "unreadItemCount": 0, "totalItemCount": 3 }
+            ]
+        });
+
+        let parsed = parse_graph_folders_json(&json, &HashMap::new());
+        assert_eq!(parsed[0].0.name, "收件箱");
+        assert!(parsed[0].1);
+        assert_eq!(parsed[1].0.name, "已删除");
+        assert!(!parsed[1].1);
+        assert_eq!(parsed[2].0.name, "归档");
+        assert!(!parsed[2].1);
+
+        // well_known_by_id 中即使有 id 但不在返回的 value 列表中，也不抑制回退映射。
+        let partial_wk =
+            HashMap::from([("absent_archive".to_string(), GraphWellKnownRole::Archive)]);
+        let parsed_partial = parse_graph_folders_json(&json, &partial_wk);
+        assert_eq!(parsed_partial[2].0.name, "归档");
+    }
+
+    #[test]
+    fn parse_graph_folders_handles_missing_fields_and_empty_value() {
+        let empty = serde_json::json!({});
+        assert!(parse_graph_folders_json(&empty, &HashMap::new()).is_empty());
+
+        let edge = serde_json::json!({
+            "value": [
+                { "displayName": "NoIdFolder", "unreadItemCount": 1, "totalItemCount": 1 },
+                { "id": "only_id", "unreadItemCount": 2, "totalItemCount": 7 }
+            ]
+        });
+        let parsed = parse_graph_folders_json(&edge, &HashMap::new());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.path, "only_id");
+        assert_eq!(parsed[0].0.name, "Folder");
+        assert_eq!(parsed[0].0.unread_count, 2);
+        assert_eq!(parsed[0].0.total_count, 7);
+        assert!(!parsed[0].1);
     }
 }

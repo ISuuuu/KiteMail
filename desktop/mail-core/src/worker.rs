@@ -1225,28 +1225,22 @@ async fn run_graph_fast_poll_fallback(
         };
 
         let tok_for_call = token.clone();
-        let Ok(Ok(folders)) =
-            tokio::task::spawn_blocking(move || graph_client::fetch_folders(&tok_for_call)).await
+        let Ok(Ok(sig)) =
+            tokio::task::spawn_blocking(move || graph_client::fetch_inbox_counts(&tok_for_call))
+                .await
         else {
             cached_graph_token = None;
             continue;
         };
 
-        if let Some((inbox, _)) = folders
-            .iter()
-            .find(|(_, is_inbox)| *is_inbox)
-            .or_else(|| folders.first())
-        {
-            let sig = (inbox.unread_count, inbox.total_count);
-            if let Some(prev) = last_inbox_sig {
-                if sig != prev {
-                    let _ = req_tx.send(MailRequest::SyncAccount {
-                        account_id: account.id,
-                    });
-                }
+        if let Some(prev) = last_inbox_sig {
+            if sig != prev {
+                let _ = req_tx.send(MailRequest::SyncAccount {
+                    account_id: account.id,
+                });
             }
-            last_inbox_sig = Some(sig);
         }
+        last_inbox_sig = Some(sig);
     }
 }
 
