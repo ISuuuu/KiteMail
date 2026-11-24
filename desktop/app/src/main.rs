@@ -11,6 +11,7 @@
 mod app;
 mod autostart;
 mod compose_schedule;
+mod single_instance;
 mod theme;
 mod tray;
 mod ui;
@@ -275,6 +276,12 @@ impl gpui_kit::http_client::HttpClient for HylkiHttpClient {
 }
 
 fn main() {
+    // 单实例：已有 Hylki 在运行时把它的窗口还原到前台（含隐藏到托盘的情况），
+    // 本进程直接退出，不再启动第二个实例。守卫持有到进程结束。
+    let Some(_instance_guard) = single_instance::acquire_or_activate() else {
+        return;
+    };
+
     let demo_mode = std::env::args().any(|arg| arg == "--demo");
 
     // 注册 Hylki 欢迎页 Logo 与完整 Lucide 图标资源。
