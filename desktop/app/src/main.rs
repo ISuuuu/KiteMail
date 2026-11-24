@@ -6,6 +6,8 @@
 //! `app.rs`，主题系统在 `theme.rs`，三栏与全局视图在 `ui/`（sidebar /
 //! message_list / reader / gallery / contacts / preferences / command_palette）。
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod autostart;
 mod compose_schedule;

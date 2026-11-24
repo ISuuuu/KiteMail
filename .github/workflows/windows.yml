@@ -58,15 +58,18 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             desktop/target/
-          key: ${{ runner.os }}-desktop-cargo-${{ hashFiles('desktop/Cargo.lock') }}
+          key: ${{ runner.os }}-desktop-cargo-check-v2-${{ hashFiles('desktop/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-desktop-cargo-
+            ${{ runner.os }}-desktop-cargo-check-v2-
 
       - name: Check formatting
         run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
 
       - name: Check workspace
         run: cargo check --manifest-path desktop/Cargo.toml --workspace --target x86_64-pc-windows-msvc --locked
+
+      - name: Verify release binary target
+        run: cargo check --manifest-path desktop/Cargo.toml -p hylki-windows --bin hylki-windows --target x86_64-pc-windows-msvc --locked
 
       - name: Run unit tests
         run: cargo test --manifest-path desktop/Cargo.toml --workspace --target x86_64-pc-windows-msvc --locked
@@ -98,9 +101,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             desktop/target/
-          key: ${{ runner.os }}-desktop-cargo-${{ hashFiles('desktop/Cargo.lock') }}
+          key: ${{ runner.os }}-desktop-cargo-release-v2-${{ hashFiles('desktop/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-desktop-cargo-
+            ${{ runner.os }}-desktop-cargo-release-v2-
 
       - name: Resolve version
         id: version
@@ -127,10 +130,16 @@ jobs:
           $nsis | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Build release binary
+        shell: pwsh
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
           HYLKI_VERSION: ${{ steps.version.outputs.version }}
-        run: cargo build --manifest-path desktop/Cargo.toml -p hylki-windows --release --target x86_64-pc-windows-msvc --locked
+        run: |
+          $exe = 'desktop/target/x86_64-pc-windows-msvc/release/hylki-windows.exe'
+          Remove-Item -Force -ErrorAction SilentlyContinue $exe
+          cargo build --manifest-path desktop/Cargo.toml -p hylki-windows --bin hylki-windows --release --target x86_64-pc-windows-msvc --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $exe)) { throw "Expected release binary was not produced: $exe" }
 
       - name: Build NSIS installer
         shell: pwsh
@@ -203,10 +212,9 @@ jobs:
             dist/latest.json
           if-no-files-found: error
 
-      # The release page is written by hand (docs/RELEASING.md), so this only
-      # adds the assets: to the release if it exists, otherwise to a draft that
-      # carries the notes tools/release-notes.sh would have produced.
-      - name: Attach artifacts to the release
+      # Publish the GitHub release directly when a version tag is pushed
+      # (beta tags are marked as prerelease so they never replace `latest`).
+      - name: Publish release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.check.outputs.checkout_sha == github.sha
         shell: bash
         env:
@@ -216,12 +224,13 @@ jobs:
           tag="$GITHUB_REF_NAME"
           version="${tag#v}"
           assets=(dist/Hylki_*_x64-setup.exe dist/Hylki_v*_portable.zip dist/latest.json)
+          prerelease=()
+          if [[ "$version" == *-beta.* ]]; then prerelease+=(--prerelease); fi
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${assets[@]}" --clobber
+            gh release edit "$tag" --draft=false "${prerelease[@]}"
             exit 0
           fi
           notes=$(mktemp)
           tools/release-notes.sh "$version" >"$notes" 2>/dev/null || printf 'Hylki %s\n' "$version" >"$notes"
-          prerelease=()
-          if [[ "$version" == *-beta.* ]]; then prerelease+=(--prerelease); fi
-          gh release create "$tag" --draft "${prerelease[@]}" --title "Hylki $version" --notes-file "$notes" "${assets[@]}"
+          gh release create "$tag" "${prerelease[@]}" --title "Hylki $version" --notes-file "$notes" "${assets[@]}"
