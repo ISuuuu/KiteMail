@@ -3681,3 +3681,131 @@ fn validate_and_copy_mail_dir_handles_overlaps_and_filtered_copy() {
     let _ = std::fs::remove_dir_all(&dst);
     let _ = std::fs::remove_dir_all(&app_dir);
 }
+
+#[test]
+fn copy_mail_dir_contents_removes_stale_target_wal_and_shm_before_overwrite() {
+    let cur = temp_cache_dir("mail-wal-cur");
+    let dst = temp_cache_dir("mail-wal-dst");
+    let app_dir = temp_cache_dir("mail-wal-app");
+
+    config::save_storage_config_in(
+        &app_dir,
+        &config::StorageConfig {
+            mail_data_dir: Some(cur.to_string_lossy().into_owned()),
+        },
+    )
+    .unwrap();
+
+    let mut cache = CacheStore::open_for_data_dir(&app_dir).unwrap();
+    let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+    cache
+        .commit_folder_headers(
+            1,
+            folders[0].id,
+            1,
+            &[sample_header(1, "覆盖迁移后的新邮件")],
+            None,
+        )
+        .unwrap();
+    cache.checkpoint_and_close_all();
+    drop(cache);
+
+    let dst_acc = dst.join("account_1");
+    std::fs::create_dir_all(&dst_acc).unwrap();
+    std::fs::write(dst_acc.join("mail.db"), b"stale-db").unwrap();
+    std::fs::write(dst_acc.join("mail.db-wal"), b"stale-wal").unwrap();
+    std::fs::write(dst_acc.join("mail.db-shm"), b"stale-shm").unwrap();
+    std::fs::write(dst_acc.join("content.db-wal"), b"stale-cwal").unwrap();
+
+    let (files, bytes) = copy_mail_dir_contents(&cur, &dst).unwrap();
+    assert!(files >= 1 && bytes > 0);
+    assert!(!dst_acc.join("mail.db-wal").exists());
+    assert!(!dst_acc.join("mail.db-shm").exists());
+
+    config::save_storage_config_in(
+        &app_dir,
+        &config::StorageConfig {
+            mail_data_dir: Some(dst.to_string_lossy().into_owned()),
+        },
+    )
+    .unwrap();
+    let reopened = CacheStore::open_for_data_dir(&app_dir).unwrap();
+    let page = reopened.list_unified_inbox("", 0, 10).unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].subject, "覆盖迁移后的新邮件");
+
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&cur);
+    let _ = std::fs::remove_dir_all(&dst);
+    let _ = std::fs::remove_dir_all(&app_dir);
+}
+
+#[test]
+fn inspect_with_app_dir_discovers_external_accounts_and_current_mail_data() {
+    let base = temp_cache_dir("mail-inspect-import");
+    let installed_app = base.join("installed");
+    let installed_mail = installed_app.join("mail");
+    let portable_app = base.join("portable");
+    let portable_mail = portable_app.join("mail");
+
+    let mut acc1 = AccountConfig::default();
+    acc1.id = 1;
+    acc1.email = "alice@example.com".to_string();
+    let mut acc2 = AccountConfig::default();
+    acc2.id = 2;
+    acc2.email = "bob@example.com".to_string();
+    config::save_accounts_in(&installed_app, &[acc1.clone(), acc2.clone()]).unwrap();
+
+    // 在安装版邮件目录为 acc1 创建本地库，acc2 仅存在配置中尚未缓存。
+    let mut inst_cache = CacheStore::open_for_data_dir(&installed_app).unwrap();
+    let f = inst_cache
+        .sync_folders(1, &[folder("收件箱", "INBOX")])
+        .unwrap();
+    inst_cache
+        .commit_folder_headers(1, f[0].id, 1, &[sample_header(1, "离线邮件")], None)
+        .unwrap();
+    inst_cache.checkpoint_and_close_all();
+    drop(inst_cache);
+
+    std::fs::create_dir_all(&portable_mail).unwrap();
+    assert!(dir_has_account_mail_data(&installed_mail));
+    assert!(!dir_has_account_mail_data(&portable_mail));
+
+    // 便携版尚无任何账号与本地邮件：应探测出 2 个可导入账号，且 current_has_mail_data 为 false。
+    let insp = inspect_mail_data_dir_with_app_dir(&portable_app, &installed_mail, &[]);
+    assert!(!insp.current_has_mail_data);
+    assert_eq!(
+        insp.importable_config_dir.as_deref(),
+        Some(installed_app.as_path())
+    );
+    assert_eq!(insp.importable_accounts.len(), 2);
+    assert_eq!(
+        insp.importable_accounts[0].storage_dir.as_deref(),
+        Some("alice@example.com")
+    );
+    assert_eq!(insp.importable_accounts[1].storage_dir, None);
+
+    // 若便携版已配置 alice@example.com（忽略大小写），仅剩余 bob@example.com 可导入。
+    let mut existing = AccountConfig::default();
+    existing.id = 5;
+    existing.email = "Alice@Example.COM".to_string();
+    let insp_partial =
+        inspect_mail_data_dir_with_app_dir(&portable_app, &installed_mail, &[existing.clone()]);
+    assert_eq!(insp_partial.importable_accounts.len(), 1);
+    assert_eq!(insp_partial.importable_accounts[0].email, "bob@example.com");
+
+    // 同配置目录内部不得自导入。
+    let insp_self = inspect_mail_data_dir_with_app_dir(&installed_app, &installed_mail, &[]);
+    assert!(insp_self.current_has_mail_data);
+    assert!(insp_self.importable_accounts.is_empty());
+
+    // merge_imported_accounts 跳过已存在邮箱并分配新 ID。
+    let (merged, added) = merge_imported_accounts(&[existing], &insp.importable_accounts);
+    assert_eq!(added, 1);
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].id, 5);
+    assert_eq!(merged[1].id, 6);
+    assert_eq!(merged[1].email, "bob@example.com");
+
+    let _ = std::fs::remove_dir_all(&base);
+}

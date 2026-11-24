@@ -1280,7 +1280,8 @@ pub(crate) fn render_with_pane_top(
             && !app.reader_find_open
             && !app.compose_split
             && !app.sidebar_peek_open
-            && app.drawer_image_preview.is_none();
+            && app.drawer_image_preview.is_none()
+            && !app.mail_dir_switching;
         let forced_dark = app
             .message_bg_picks
             .get(&detail.id)

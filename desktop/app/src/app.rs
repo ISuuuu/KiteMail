@@ -19,7 +19,7 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{resize_handle, HandleEdge};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::{RangeHighlight, TextViewState};
-use gpui_kit::component::{h_flex, v_flex, Disableable, Icon};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     actions, black, div, img, point, px, size, AnyWindowHandle, AppContext, Axis, Bounds,
@@ -996,6 +996,9 @@ pub(crate) struct HylkiApp {
     settings_window: Option<(AnyWindowHandle, Entity<SettingsWindow>)>,
     /// 独立设置窗口异步打开防重入标记。
     settings_window_opening: bool,
+    /// 邮件存储目录正在切换或迁移中（主窗口展示加载遮罩并禁止旧库只读访问）。
+    pub(crate) mail_dir_switching: bool,
+    mail_dir_switching_label: SharedString,
     /// 进入专注模式并临时强制简化阅读视图前保存的原视图开关，退出专注时恢复。
     focus_saved_prefer_plain: Option<bool>,
     /// 选中邮件已读标记代际（用于 2 秒延迟标已读防抖）。
@@ -1477,6 +1480,8 @@ impl HylkiApp {
                 active_modal: ActiveModal::None,
                 settings_window: None,
                 settings_window_opening: false,
+                mail_dir_switching: false,
+                mail_dir_switching_label: SharedString::default(),
                 focus_saved_prefer_plain,
                 read_mark_generation: 0,
                 last_rem_scale: initial_rem_scale,
@@ -1726,6 +1731,8 @@ impl HylkiApp {
             active_modal: ActiveModal::None,
             settings_window: None,
             settings_window_opening: false,
+            mail_dir_switching: false,
+            mail_dir_switching_label: SharedString::default(),
             focus_saved_prefer_plain,
             read_mark_generation: 0,
             last_rem_scale: initial_rem_scale,
@@ -1865,6 +1872,25 @@ impl HylkiApp {
                 }
                 WorkerEvent::AccountsUpdated { accounts } => {
                     self.accounts = accounts;
+                    if !self
+                        .accounts
+                        .iter()
+                        .any(|a| a.id == self.compose_account_id && a.enabled)
+                    {
+                        if let Some(first) = self
+                            .accounts
+                            .iter()
+                            .find(|a| a.enabled)
+                            .or_else(|| self.accounts.first())
+                        {
+                            self.compose_account_id = first.id;
+                        }
+                    }
+                    if self.accounts.is_empty() {
+                        self.right_mode = RightPaneMode::Welcome;
+                    } else if self.right_mode == RightPaneMode::Welcome {
+                        self.right_mode = RightPaneMode::Reader;
+                    }
                     // 任务一：停用账号不再静默切换写信账号。写信界面检测到当前所选
                     // 账号停用时显示提示，由用户明确选择可用账号后才能发送。
                     if self.current_view == CurrentView::AccountFolder {
@@ -2558,19 +2584,34 @@ impl HylkiApp {
                     mail_data_dir,
                     message,
                 } => {
+                    self.mail_dir_switching = false;
                     if let Some(ref w) = self.worker {
                         w.reset_read_cache();
                     }
                     if ok {
                         self.folders_by_account.clear();
                         self.outbox_by_account.clear();
+                        self.last_unread_by_account.clear();
                         self.selected_message = None;
                         self.selected_message_is_placeholder = false;
                         self.selected_message_ids.clear();
+                        self.pending_body_message_id = None;
+                        self.pending_popout_message_ids.clear();
+                        self.pending_row_action = None;
                         self.attachment_thumb_cache.clear();
                         self.attachment_thumb_requested.clear();
+                        self.expanded_threads.clear();
+                        self.thread_children_cache.clear();
+                        self.collapsed_day_groups.clear();
+                        self.gallery_items.clear();
+                        self.backfill.on_scope_refresh();
+                        #[cfg(windows)]
+                        {
+                            self.reader_webview_key = None;
+                        }
                         self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                         self.current_view = CurrentView::UnifiedInbox;
+                        self.reset_list_pagination();
                         self.current_page = MailPage {
                             folder_id: UNIFIED_INBOX_FOLDER_ID,
                             offset: 0,
@@ -2578,6 +2619,27 @@ impl HylkiApp {
                             items: Vec::new(),
                         };
                         folders_updated = true;
+                        match self.main_view {
+                            MainContentView::Gallery => {
+                                self.request_gallery_items(cx);
+                            }
+                            MainContentView::Contacts => {
+                                if let Some(ref w) = self.worker {
+                                    w.send(MailRequest::ListKnownContacts {
+                                        query: self.contacts_query.clone(),
+                                        offset: 0,
+                                        limit: 500,
+                                    });
+                                }
+                            }
+                            MainContentView::Mail => {}
+                        }
+                        if !self.search_query.trim().is_empty()
+                            || self.quick_filters != QuickFilterSet::default()
+                            || self.list_sort != MessageSort::DateNewest
+                        {
+                            self.reload_current_page(cx);
+                        }
                     }
                     self.status_line = SharedString::from(message.clone());
                     let msg_for_win = message;
@@ -3169,7 +3231,7 @@ impl HylkiApp {
     }
 
     fn try_load_cached_detail(&self, message_id: u32) -> Option<(MessageDetail, bool)> {
-        if self.demo_mode {
+        if self.demo_mode || self.mail_dir_switching {
             return None;
         }
         self.worker.as_ref().and_then(|w| {
@@ -8915,17 +8977,90 @@ impl HylkiApp {
         &mut self,
         target_dir: Option<std::path::PathBuf>,
         mode: MailDirSwitchMode,
+        import_accounts: Vec<AccountConfig>,
         cx: &mut Context<Self>,
     ) {
         if self.demo_mode {
             return;
         }
+        let Some(ref w) = self.worker else {
+            let current_dir = config::resolve_mail_data_dir_in(&config::data_dir());
+            self.with_settings_window(cx, move |win, _, cx| {
+                win.on_mail_data_dir_changed(
+                    false,
+                    &current_dir,
+                    "邮件后台服务未就绪，无法切换目录",
+                    cx,
+                );
+            });
+            return;
+        };
+        let label = match mode {
+            MailDirSwitchMode::MigrateCurrent => "正在迁移邮件数据并重新加载...",
+            MailDirSwitchMode::ReuseExisting => "正在切换邮件存储目录并重新加载...",
+        };
+        self.mail_dir_switching = true;
+        self.mail_dir_switching_label = SharedString::from(label);
+        self.status_line = self.mail_dir_switching_label.clone();
+        w.reset_read_cache();
+        w.send(MailRequest::ChangeMailDataDir {
+            target_dir,
+            mode,
+            import_accounts,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn import_discovered_accounts(
+        &mut self,
+        import_accounts: Vec<AccountConfig>,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        if self.demo_mode {
+            return Ok(0);
+        }
+        let data_dir = config::data_dir();
+        let existing = config::load_accounts_in(&data_dir)?;
+        let (merged, added) =
+            hylki_mail_core::cache::merge_imported_accounts(&existing, &import_accounts);
+        if added == 0 {
+            return Ok(0);
+        }
+        config::save_accounts_in(&data_dir, &merged)?;
+        self.accounts = merged;
+        if !self
+            .accounts
+            .iter()
+            .any(|a| a.id == self.compose_account_id && a.enabled)
+        {
+            if let Some(first) = self
+                .accounts
+                .iter()
+                .find(|a| a.enabled)
+                .or_else(|| self.accounts.first())
+            {
+                self.compose_account_id = first.id;
+            }
+        }
+        if !self.accounts.is_empty() && self.right_mode == RightPaneMode::Welcome {
+            self.right_mode = RightPaneMode::Reader;
+        }
+        self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
+        self.current_view = CurrentView::UnifiedInbox;
+        self.reset_list_pagination();
+        self.backfill.on_scope_refresh();
         if let Some(ref w) = self.worker {
             w.reset_read_cache();
-            self.status_line = SharedString::from("正在切换邮件存储目录...");
-            w.send(MailRequest::ChangeMailDataDir { target_dir, mode });
+            w.send(MailRequest::SetPushEnabled {
+                enabled: self.prefs.push_enabled,
+            });
+            w.send(MailRequest::LoadAllCached);
         }
+        self.status_line = SharedString::from(format!(
+            "已导入 {added} 个关联账号配置，正在加载本地邮件..."
+        ));
         cx.notify();
+        Ok(added)
     }
 
     pub(crate) fn apply_imported_backup(
@@ -8952,7 +9087,13 @@ impl HylkiApp {
                     self.compose_account_id = first.id;
                 }
             }
+            if self.accounts.is_empty() {
+                self.right_mode = RightPaneMode::Welcome;
+            } else if self.right_mode == RightPaneMode::Welcome {
+                self.right_mode = RightPaneMode::Reader;
+            }
             if let Some(ref w) = self.worker {
+                w.reset_read_cache();
                 w.send(MailRequest::SetPushEnabled {
                     enabled: self.prefs.push_enabled,
                 });
@@ -9882,7 +10023,8 @@ impl Render for HylkiApp {
                 && !self.compose_split
                 && !self.sidebar_peek_open
                 && self.drawer_image_preview.is_none()
-                && !self.reader_popup_open;
+                && !self.reader_popup_open
+                && !self.mail_dir_switching;
             if !visible {
                 cx.defer_in(window, move |_, _, _| host.set_visible(false));
             }
@@ -10751,6 +10893,61 @@ impl Render for HylkiApp {
                                     .child("正在加载图片预览...")
                                     .into_any_element()
                             }),
+                    ),
+            );
+        }
+        if self.mail_dir_switching {
+            let label = if self.mail_dir_switching_label.is_empty() {
+                SharedString::from("正在切换邮件存储目录并重新加载...")
+            } else {
+                self.mail_dir_switching_label.clone()
+            };
+            root = root.child(
+                div()
+                    .id("mail-dir-switching-overlay")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(black().opacity(0.45))
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        h_flex().size_full().items_center().justify_center().child(
+                            v_flex()
+                                .w(px(380.0))
+                                .bg(p.surface)
+                                .rounded(px(12.0))
+                                .border_1()
+                                .border_color(border)
+                                .shadow_xl()
+                                .p_6()
+                                .gap_2()
+                                .items_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    Icon::new(IconName::RefreshCw)
+                                        .with_size(px(28.0))
+                                        .text_color(p.accent),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(p.text)
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .child("正在关闭旧数据库连接并重新加载邮件数据，请稍候…"),
+                                ),
+                        ),
                     ),
             );
         }

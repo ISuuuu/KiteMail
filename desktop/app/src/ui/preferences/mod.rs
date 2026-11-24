@@ -11,12 +11,12 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::{h_flex, v_flex, Icon, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, AnyElement, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window,
-    WindowControlArea,
+    black, div, px, AnyElement, AppContext, Context, Entity, FontWeight, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Window, WindowControlArea,
 };
 use hylki_mail_core::cache::{self, MailDirInspection, MailDirSwitchMode, TagItem};
 use hylki_mail_core::config::{
@@ -249,6 +249,12 @@ pub(crate) struct SettingsWindow {
     pub(crate) pending_mail_dir_switch: Option<(Option<std::path::PathBuf>, MailDirInspection)>,
     /// 后台正在执行邮件存储目录切换或迁移。
     pub(crate) mail_dir_switching: bool,
+    /// 正在执行的目录切换模式与目标路径（用于在确认弹窗内平滑切为进行中态）。
+    pub(crate) mail_dir_switch_active: Option<(MailDirSwitchMode, std::path::PathBuf)>,
+    /// 邮件存储目录校验/切换结果提示（就地展示在「邮件存储目录」行紧下方）。
+    pub(crate) mail_dir_feedback: Option<(bool, SharedString)>,
+    /// 当前生效邮件目录关联的外部配置中可一键导入的未配置账号。
+    pub(crate) current_mail_dir_importable: Vec<AccountConfig>,
     pub(crate) pending_backup_import: Option<(std::path::PathBuf, SettingsBackupBundle)>,
     pub(crate) backup_feedback: Option<(bool, SharedString)>,
     // ---- WP-06：8 个新增分页控件状态 ----
@@ -321,7 +327,9 @@ impl SettingsWindow {
         window.on_window_should_close(cx, move |_, cx| {
             weak_self
                 .update(cx, |this, cx| {
-                    if this.is_account_editor_dirty(cx) {
+                    if this.mail_dir_switching {
+                        false
+                    } else if this.is_account_editor_dirty(cx) {
                         this.pending_leave_action = Some(EditorLeaveAction::CloseWindow);
                         this.confirm_remove_in_editor = false;
                         cx.notify();
@@ -463,6 +471,9 @@ impl SettingsWindow {
             storage_summary: None,
             pending_mail_dir_switch: None,
             mail_dir_switching: false,
+            mail_dir_switch_active: None,
+            mail_dir_feedback: None,
+            current_mail_dir_importable: Vec::new(),
             pending_backup_import: None,
             backup_feedback: None,
             pgp_name_input,
@@ -646,6 +657,8 @@ impl SettingsWindow {
                 self.storage_summary = None;
                 if !self.mail_dir_switching {
                     self.pending_mail_dir_switch = None;
+                    self.mail_dir_feedback = None;
+                    self.current_mail_dir_importable.clear();
                 }
                 self.sender_feedback = None;
                 self.compose_inputs_feedback = None;
@@ -1073,13 +1086,14 @@ impl SettingsWindow {
                 let current_dir = config::resolve_mail_data_dir_in(&app_dir);
                 if let Err(err) = cache::validate_target_mail_dir(&current_dir, &picked) {
                     this.pending_mail_dir_switch = None;
-                    this.backup_feedback = Some((false, SharedString::from(err)));
+                    this.mail_dir_feedback = Some((false, SharedString::from(err)));
                     cx.notify();
                     return;
                 }
                 let accounts = this.app.read(cx).accounts.clone();
-                let inspection = cache::inspect_mail_data_dir(&picked, &accounts);
-                this.backup_feedback = None;
+                let inspection =
+                    cache::inspect_mail_data_dir_with_app_dir(&app_dir, &picked, &accounts);
+                this.mail_dir_feedback = None;
                 this.pending_mail_dir_switch = Some((Some(picked), inspection));
                 cx.notify();
             });
@@ -1096,13 +1110,14 @@ impl SettingsWindow {
         let default_dir = config::default_mail_data_dir_in(&app_dir);
         if let Err(err) = cache::validate_target_mail_dir(&current_dir, &default_dir) {
             self.pending_mail_dir_switch = None;
-            self.backup_feedback = Some((false, SharedString::from(err)));
+            self.mail_dir_feedback = Some((false, SharedString::from(err)));
             cx.notify();
             return;
         }
         let accounts = self.app.read(cx).accounts.clone();
-        let inspection = cache::inspect_mail_data_dir(&default_dir, &accounts);
-        self.backup_feedback = None;
+        let inspection =
+            cache::inspect_mail_data_dir_with_app_dir(&app_dir, &default_dir, &accounts);
+        self.mail_dir_feedback = None;
         self.pending_mail_dir_switch = Some((None, inspection));
         cx.notify();
     }
@@ -1110,23 +1125,66 @@ impl SettingsWindow {
     pub(crate) fn confirm_mail_dir_switch(
         &mut self,
         mode: MailDirSwitchMode,
+        import_discovered: bool,
         cx: &mut Context<Self>,
     ) {
         if self.mail_dir_switching {
             return;
         }
-        let Some((target_opt, _inspection)) = self.pending_mail_dir_switch.take() else {
+        let Some((target_opt, inspection)) = self.pending_mail_dir_switch.take() else {
             return;
         };
+        let import_accounts = if import_discovered {
+            inspection.importable_accounts
+        } else {
+            Vec::new()
+        };
+        self.mail_dir_switch_active = Some((mode, inspection.target_dir));
         self.mail_dir_switching = true;
-        self.backup_feedback = None;
+        self.mail_dir_feedback = None;
         self.app.update(cx, |app, cx| {
-            app.change_mail_data_dir(target_opt, mode, cx);
+            app.change_mail_data_dir(target_opt, mode, import_accounts, cx);
         });
         cx.notify();
     }
 
+    pub(crate) fn import_current_mail_dir_accounts(&mut self, cx: &mut Context<Self>) {
+        if self.mail_dir_switching || self.current_mail_dir_importable.is_empty() {
+            return;
+        }
+        let to_import = self.current_mail_dir_importable.clone();
+        let mut res = Ok(0usize);
+        self.app.update(cx, |app, cx| {
+            res = app.import_discovered_accounts(to_import, cx);
+        });
+        match res {
+            Ok(added) if added > 0 => {
+                self.storage_summary = None;
+                self.current_mail_dir_importable.clear();
+                self.mail_dir_feedback = Some((
+                    true,
+                    SharedString::from(format!(
+                        "已导入 {added} 个关联账号配置并加载本地邮件；收发新邮件前请在「邮箱账号」补填密码或重新授权"
+                    )),
+                ));
+            }
+            Ok(_) => {
+                self.storage_summary = None;
+                self.current_mail_dir_importable.clear();
+                self.mail_dir_feedback =
+                    Some((true, SharedString::from("关联账号已存在于当前配置中")));
+            }
+            Err(err) => {
+                self.mail_dir_feedback = Some((false, SharedString::from(err)));
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn cancel_mail_dir_switch(&mut self, cx: &mut Context<Self>) {
+        if self.mail_dir_switching {
+            return;
+        }
         self.pending_mail_dir_switch = None;
         cx.notify();
     }
@@ -1140,8 +1198,10 @@ impl SettingsWindow {
     ) {
         self.mail_dir_switching = false;
         self.pending_mail_dir_switch = None;
+        self.mail_dir_switch_active = None;
         self.storage_summary = None;
-        self.backup_feedback = Some((ok, SharedString::from(message.to_string())));
+        self.current_mail_dir_importable.clear();
+        self.mail_dir_feedback = Some((ok, SharedString::from(message.to_string())));
         cx.notify();
     }
 
@@ -1272,7 +1332,524 @@ impl SettingsWindow {
     }
 
     fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mail_dir_switching {
+            return;
+        }
         self.request_leave_editor(EditorLeaveAction::CloseWindow, window, cx);
+    }
+
+    fn render_mail_dir_modal(
+        &self,
+        p: &HylkiPalette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.mail_dir_switching {
+            let (mode, target_dir) = self.mail_dir_switch_active.clone().unwrap_or_else(|| {
+                (
+                    MailDirSwitchMode::ReuseExisting,
+                    config::resolve_mail_data_dir_in(&config::data_dir()),
+                )
+            });
+            let title = match mode {
+                MailDirSwitchMode::MigrateCurrent => "正在迁移邮件存储目录...",
+                MailDirSwitchMode::ReuseExisting => "正在切换邮件存储目录...",
+            };
+            return Some(
+                div()
+                    .id("mail-dir-switch-modal")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(black().opacity(0.45))
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        h_flex()
+                            .size_full()
+                            .items_center()
+                            .justify_center()
+                            .p_6()
+                            .child(
+                                v_flex()
+                                    .w(px(520.0))
+                                    .max_w(px(520.0))
+                                    .bg(p.surface)
+                                    .rounded(px(12.0))
+                                    .border_1()
+                                    .border_color(p.border)
+                                    .shadow_xl()
+                                    .p_5()
+                                    .gap_4()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2p5()
+                                            .child(
+                                                Icon::new(IconName::RefreshCw)
+                                                    .with_size(px(18.0))
+                                                    .text_color(p.accent),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(p.text)
+                                                    .child(title),
+                                            ),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .rounded(px(8.0))
+                                            .bg(p.canvas)
+                                            .border_1()
+                                            .border_color(p.border)
+                                            .px_3()
+                                            .py_2p5()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(p.text_muted)
+                                                    .child("目标存储目录"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(p.text)
+                                                    .child(target_dir.display().to_string()),
+                                            ),
+                                    )
+                                    .child(div().text_xs().text_color(p.text_muted).child(
+                                        "正在关闭旧连接、处理本地邮件库并重载主窗口，请勿关闭窗口…",
+                                    )),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let (ref target_opt, ref inspection) = self.pending_mail_dir_switch.as_ref()?;
+        let current_dir = config::resolve_mail_data_dir_in(&config::data_dir());
+        let has_existing = !inspection.existing_accounts.is_empty();
+        let has_importable = !inspection.importable_accounts.is_empty();
+        let importable_count = inspection.importable_accounts.len();
+        let find_importable_email = |dir_name: &str| -> Option<String> {
+            inspection
+                .importable_accounts
+                .iter()
+                .find(|acc| {
+                    config::resolve_account_storage_dir(acc, &inspection.importable_accounts)
+                        .eq_ignore_ascii_case(dir_name)
+                        || format!("account_{}", acc.id).eq_ignore_ascii_case(dir_name)
+                })
+                .map(|acc| acc.email.clone())
+        };
+        let has_unmatched_existing = inspection.existing_accounts.iter().any(|item| {
+            item.matched_email.is_none() && find_importable_email(&item.dir_name).is_none()
+        });
+        let title = if target_opt.is_some() {
+            "确认切换邮件存储目录"
+        } else {
+            "确认恢复默认邮件存储目录"
+        };
+        let desc = if has_existing && has_importable {
+            format!(
+                "目标目录中已检测到 {} 个账号的邮件库（共 {}），并在关联配置目录发现 {} 个当前尚未导入的账号配置。导入后主窗体可立即浏览离线邮件（收发新邮件前需在「邮箱账号」补填密码或重新授权）：",
+                inspection.existing_accounts.len(),
+                config::format_bytes(inspection.total_bytes),
+                importable_count
+            )
+        } else if has_importable {
+            format!(
+                "在目标目录关联配置中发现 {} 个当前尚未导入的账号配置。选择「切换并导入」可在切换目录的同时恢复账号配置：",
+                importable_count
+            )
+        } else if has_existing {
+            if has_unmatched_existing {
+                format!(
+                    "目标目录中已检测到 {} 个账号的邮件库（共 {}），但当前客户端未配置对应邮箱账号。需先在「邮箱账号」添加或通过「备份与恢复」导入同邮箱账号后，邮件才会在主窗体显示：",
+                    inspection.existing_accounts.len(),
+                    config::format_bytes(inspection.total_bytes)
+                )
+            } else {
+                format!(
+                    "目标目录中已检测到 {} 个账号的邮件库（共 {}）。请选择复用已有邮件数据，或将当前邮件迁移到此目录：",
+                    inspection.existing_accounts.len(),
+                    config::format_bytes(inspection.total_bytes)
+                )
+            }
+        } else if inspection.current_has_mail_data {
+            if inspection.has_any_entries {
+                "目标目录非空，未检测到现成 Hylki 账号邮件库。可选择迁移当前全部邮件，或直接启用该目录并从服务器重新同步：".to_string()
+            } else {
+                "目标目录为空（就绪）。可选择迁移当前全部邮件，或直接启用该目录并从服务器重新同步："
+                    .to_string()
+            }
+        } else if inspection.has_any_entries {
+            "目标目录非空且无现成 Hylki 账号邮件库，当前邮件目录也暂无本地缓存邮件。切换后后续新邮件与缓存将保存到目标目录：".to_string()
+        } else {
+            "目标目录为空（就绪），当前邮件目录也暂无本地缓存邮件。切换后后续新邮件与缓存将保存到目标目录：".to_string()
+        };
+
+        let mut card = v_flex()
+            .w(px(560.0))
+            .max_w(px(560.0))
+            .bg(p.surface)
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(p.border)
+            .shadow_xl()
+            .p_5()
+            .gap_4()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text)
+                            .child(title),
+                    )
+                    .child(
+                        Button::new("mail-dir-modal-close")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Close)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_mail_dir_switch(cx);
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .rounded(px(8.0))
+                    .bg(p.canvas)
+                    .border_1()
+                    .border_color(p.border)
+                    .p_3()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(div().text_xs().text_color(p.text_muted).child("当前目录"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.text)
+                                    .child(current_dir.display().to_string()),
+                            ),
+                    )
+                    .child(div().w_full().h(px(1.0)).bg(p.border))
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(div().text_xs().text_color(p.text_muted).child("目标目录"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.text)
+                                    .child(inspection.target_dir.display().to_string()),
+                            ),
+                    ),
+            )
+            .child(div().text_xs().text_color(p.text_muted).child(desc));
+
+        if has_existing {
+            let mut acc_list = v_flex()
+                .id("mail-dir-modal-accounts")
+                .rounded(px(8.0))
+                .bg(p.surface_raised)
+                .border_1()
+                .border_color(p.border)
+                .px_3()
+                .py_2()
+                .gap_1p5()
+                .max_h(px(180.0))
+                .overflow_y_scrollbar();
+            for item in &inspection.existing_accounts {
+                let right_text = if let Some(ref email) = item.matched_email {
+                    format!(
+                        "匹配当前账号 {} · {}",
+                        email,
+                        config::format_bytes(item.total_bytes)
+                    )
+                } else if let Some(email) = find_importable_email(&item.dir_name) {
+                    format!(
+                        "可导入关联账号 {} · {}",
+                        email,
+                        config::format_bytes(item.total_bytes)
+                    )
+                } else {
+                    format!(
+                        "未关联本地账号 · {}",
+                        config::format_bytes(item.total_bytes)
+                    )
+                };
+                acc_list = acc_list.child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.text)
+                                .child(format!("文件夹 {}", item.dir_name)),
+                        )
+                        .child(div().text_xs().text_color(p.text_muted).child(right_text)),
+                );
+            }
+            card = card.child(acc_list);
+        } else if has_importable {
+            let mut acc_list = v_flex()
+                .id("mail-dir-modal-importable")
+                .rounded(px(8.0))
+                .bg(p.surface_raised)
+                .border_1()
+                .border_color(p.border)
+                .px_3()
+                .py_2()
+                .gap_1p5()
+                .max_h(px(160.0))
+                .overflow_y_scrollbar();
+            for acc in &inspection.importable_accounts {
+                acc_list = acc_list.child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.text)
+                                .child(acc.email.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(p.text_muted)
+                                .child("关联配置目录中待导入"),
+                        ),
+                );
+            }
+            card = card.child(acc_list);
+        }
+
+        let actions = if has_importable {
+            h_flex()
+                .flex_wrap()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("mail-switch-cancel")
+                        .outline()
+                        .compact()
+                        .label("取消")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_mail_dir_switch(cx);
+                        })),
+                )
+                .when(inspection.current_has_mail_data, |el| {
+                    el.child(
+                        Button::new("mail-switch-migrate")
+                            .outline()
+                            .compact()
+                            .disabled(self.mail_dir_switching)
+                            .label("迁移当前邮件")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_mail_dir_switch(
+                                    MailDirSwitchMode::MigrateCurrent,
+                                    false,
+                                    cx,
+                                );
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("mail-switch-reuse-only")
+                        .outline()
+                        .compact()
+                        .disabled(self.mail_dir_switching)
+                        .label("仅切换目录")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_mail_dir_switch(
+                                MailDirSwitchMode::ReuseExisting,
+                                false,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new("mail-switch-reuse-import")
+                        .primary()
+                        .compact()
+                        .disabled(self.mail_dir_switching)
+                        .label(format!("切换并导入 {importable_count} 个账号"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_mail_dir_switch(
+                                MailDirSwitchMode::ReuseExisting,
+                                true,
+                                cx,
+                            );
+                        })),
+                )
+        } else if has_existing {
+            h_flex()
+                .flex_wrap()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("mail-switch-cancel")
+                        .outline()
+                        .compact()
+                        .label("取消")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_mail_dir_switch(cx);
+                        })),
+                )
+                .when(inspection.current_has_mail_data, |el| {
+                    el.child(
+                        Button::new("mail-switch-migrate")
+                            .outline()
+                            .compact()
+                            .disabled(self.mail_dir_switching)
+                            .label("迁移当前邮件到此目录")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_mail_dir_switch(
+                                    MailDirSwitchMode::MigrateCurrent,
+                                    false,
+                                    cx,
+                                );
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("mail-switch-reuse")
+                        .primary()
+                        .compact()
+                        .disabled(self.mail_dir_switching)
+                        .label("直接使用已有邮件数据（复用）")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_mail_dir_switch(
+                                MailDirSwitchMode::ReuseExisting,
+                                false,
+                                cx,
+                            );
+                        })),
+                )
+        } else if inspection.current_has_mail_data {
+            h_flex()
+                .flex_wrap()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("mail-switch-cancel")
+                        .outline()
+                        .compact()
+                        .label("取消")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_mail_dir_switch(cx);
+                        })),
+                )
+                .child(
+                    Button::new("mail-switch-reuse")
+                        .outline()
+                        .compact()
+                        .disabled(self.mail_dir_switching)
+                        .label("直接使用该目录（不迁移）")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_mail_dir_switch(
+                                MailDirSwitchMode::ReuseExisting,
+                                false,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new("mail-switch-migrate")
+                        .primary()
+                        .compact()
+                        .disabled(self.mail_dir_switching)
+                        .label("确认迁移当前邮件到此目录")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_mail_dir_switch(
+                                MailDirSwitchMode::MigrateCurrent,
+                                false,
+                                cx,
+                            );
+                        })),
+                )
+        } else {
+            h_flex()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("mail-switch-cancel")
+                        .outline()
+                        .compact()
+                        .label("取消")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel_mail_dir_switch(cx);
+                        })),
+                )
+                .child(
+                    Button::new("mail-switch-reuse")
+                        .primary()
+                        .compact()
+                        .disabled(self.mail_dir_switching)
+                        .label("确认切换到该目录")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_mail_dir_switch(
+                                MailDirSwitchMode::ReuseExisting,
+                                false,
+                                cx,
+                            );
+                        })),
+                )
+        };
+        card = card.child(actions);
+
+        Some(
+            div()
+                .id("mail-dir-switch-modal")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(black().opacity(0.45))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.cancel_mail_dir_switch(cx);
+                    }),
+                )
+                .child(
+                    h_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .p_6()
+                        .child(card),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_sidebar(
@@ -1753,13 +2330,25 @@ impl Render for SettingsWindow {
             }
         } else {
             if self.active_tab == PrefTab::System && self.storage_summary.is_none() {
-                self.storage_summary = Some(config::app_storage_summary_in(&config::data_dir()));
+                let app_dir = config::data_dir();
+                let summary = config::app_storage_summary_in(&app_dir);
+                let accounts = self.app.read(cx).accounts.clone();
+                let inspection = cache::inspect_mail_data_dir_with_app_dir(
+                    &app_dir,
+                    &summary.mail_data_dir,
+                    &accounts,
+                );
+                self.current_mail_dir_importable = inspection.importable_accounts;
+                self.storage_summary = Some(summary);
             }
             let app_entity = self.app.clone();
             pages::render_tab(self, app_entity, &p, window, cx)
         };
 
+        let mail_dir_modal = self.render_mail_dir_modal(&p, cx);
+
         h_flex()
+            .relative()
             .size_full()
             .bg(p.canvas)
             .text_color(p.text)
@@ -1770,7 +2359,11 @@ impl Render for SettingsWindow {
                 this.close_window(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
-                if this.search_open {
+                if this.mail_dir_switching {
+                    return;
+                } else if this.pending_mail_dir_switch.is_some() {
+                    this.cancel_mail_dir_switch(cx);
+                } else if this.search_open {
                     this.close_search(window, cx);
                 } else if this.confirm_remove_in_editor {
                     this.confirm_remove_in_editor = false;
@@ -1814,6 +2407,7 @@ impl Render for SettingsWindow {
                         .child(content_area),
                 )
             })
+            .when_some(mail_dir_modal, |el, modal| el.child(modal))
     }
 }
 

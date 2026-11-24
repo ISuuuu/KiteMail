@@ -381,7 +381,12 @@ async fn worker_loop(
             }
             continue;
         }
-        if let MailRequest::ChangeMailDataDir { target_dir, mode } = req {
+        if let MailRequest::ChangeMailDataDir {
+            target_dir,
+            mode,
+            import_accounts,
+        } = req
+        {
             handle_change_mail_data_dir(
                 &data_dir,
                 &mut cache_opt,
@@ -392,6 +397,7 @@ async fn worker_loop(
                 &req_tx,
                 target_dir,
                 mode,
+                import_accounts,
                 &evt_tx,
             )
             .await;
@@ -436,6 +442,7 @@ async fn handle_change_mail_data_dir(
     req_tx: &mpsc::Sender<MailRequest>,
     target_dir: Option<PathBuf>,
     mode: crate::cache::MailDirSwitchMode,
+    import_accounts: Vec<AccountConfig>,
     evt_tx: &EventSender,
 ) {
     let current_dir = config::resolve_mail_data_dir_in(data_dir);
@@ -443,10 +450,11 @@ async fn handle_change_mail_data_dir(
     let new_dir = target_dir.clone().unwrap_or_else(|| default_dir.clone());
 
     // 1. 停止所有推送监测并等待在途后台任务关闭 SQLite 句柄，避免 Windows 共享违例。
+    // 保持持有后台任务信号量许可，直到新目录打开或回滚完毕再释放，防止排队中的同步/索引重开旧库。
     for (_, handle) in watchers.drain() {
         handle.abort();
     }
-    background.drain_and_close_cache().await;
+    let _bg_permit = background.drain_and_close_cache().await;
     if let Ok(mut guard) = async_cache.lock() {
         if let Some(ref mut c) = *guard {
             c.checkpoint_and_close_all();
@@ -530,13 +538,37 @@ async fn handle_change_mail_data_dir(
     };
 
     *cache_opt = Some(reopened);
+    *background.backfill.lock().await = BackfillIndexState::default();
     let _ = tokens;
     let Some(cache) = cache_opt.as_mut() else {
         return;
     };
 
+    let mut imported_count = 0usize;
+    let mut imported_ids = HashSet::new();
+    if !import_accounts.is_empty() {
+        let existing = config::load_accounts_in(data_dir).unwrap_or_default();
+        let prev_ids: HashSet<u32> = existing.iter().map(|a| a.id).collect();
+        let (merged, added) = crate::cache::merge_imported_accounts(&existing, &import_accounts);
+        if added > 0 {
+            if let Err(err) = config::save_accounts_in(data_dir, &merged) {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: format!("保存导入的关联账号配置失败: {err}"),
+                });
+            } else {
+                imported_count = added;
+                for acc in &merged {
+                    if !prev_ids.contains(&acc.id) {
+                        imported_ids.insert(acc.id);
+                    }
+                }
+            }
+        }
+    }
+
     // 先发送切换成功事件以清空前端旧目录视图，再推送新目录回填事件。
-    let msg = match mode {
+    let mut msg = match mode {
         crate::cache::MailDirSwitchMode::ReuseExisting => {
             format!("已切换并挂载邮件存储目录：{}", new_dir.display())
         }
@@ -553,22 +585,47 @@ async fn handle_change_mail_data_dir(
             }
         }
     };
+    if imported_count > 0 {
+        msg.push_str(&format!(
+            "（已同时导入 {imported_count} 个账号配置，可直接浏览离线邮件；收发新邮件前请在「邮箱账号」补填密码或重新授权）"
+        ));
+    }
     let _ = evt_tx.send(WorkerEvent::MailDataDirChanged {
         ok: true,
         mail_data_dir: new_dir,
         message: msg,
     });
 
+    let mut needs_sync = false;
     if let Ok(accounts) = config::load_accounts_in(data_dir) {
+        if imported_count > 0 {
+            let _ = evt_tx.send(WorkerEvent::AccountsUpdated {
+                accounts: accounts.clone(),
+            });
+        }
         let _ = cache.sync_account_registry(&accounts);
         cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
         for acc in &accounts {
             refresh_account_watcher(watchers, data_dir, acc, req_tx);
-            if let Ok(folders) = cache.list_folders(acc.id) {
-                let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
-                    account_id: acc.id,
-                    folders,
-                });
+            match cache.list_folders(acc.id) {
+                Ok(folders) => {
+                    if acc.enabled && !imported_ids.contains(&acc.id) && folders.is_empty() {
+                        needs_sync = true;
+                    }
+                    let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                        account_id: acc.id,
+                        folders,
+                    });
+                }
+                Err(err) => {
+                    if acc.enabled && !imported_ids.contains(&acc.id) {
+                        needs_sync = true;
+                    }
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(acc.id),
+                        message: err,
+                    });
+                }
             }
             if let Ok(items) = cache.list_outbox(acc.id) {
                 let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
@@ -586,7 +643,7 @@ async fn handle_change_mail_data_dir(
     }
     let page_size = pref_page_size(data_dir);
     let allowed = unified_account_ids(data_dir);
-    if let Ok(page) = cache.list_unified_inbox_for_accounts(
+    match cache.list_unified_inbox_for_accounts(
         &allowed,
         "",
         QuickFilterSet::default(),
@@ -594,7 +651,24 @@ async fn handle_change_mail_data_dir(
         0,
         page_size,
     ) {
-        let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+        Ok(page) => {
+            let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+        }
+        Err(err) => {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: None,
+                message: err,
+            });
+        }
+    }
+
+    drop(_bg_permit);
+    if needs_sync {
+        let _ = evt_tx.send(WorkerEvent::Status {
+            account_id: None,
+            text: "已切换存储目录，正在从服务器同步邮件...".to_string(),
+        });
+        let _ = req_tx.send(MailRequest::SyncAllAccounts);
     }
 }
 
@@ -742,13 +816,14 @@ impl BackgroundTasks {
         }
     }
 
-    async fn drain_and_close_cache(&self) {
-        let _permit = self.gate.acquire().await;
+    async fn drain_and_close_cache(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        let permit = self.gate.acquire().await.ok();
         let mut guard = self.cache.lock().await;
         if let Some(ref mut c) = *guard {
             c.checkpoint_and_close_all();
         }
         *guard = None;
+        permit
     }
 
     /// 后台请求在此改派到独立任务并返回 true（调用方跳过交互队列）。
@@ -1449,6 +1524,8 @@ async fn handle_request(
 
         MailRequest::LoadAllCached => {
             let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
+            let _ = cache.sync_account_registry(&accounts);
+            cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
             for acc in &accounts {
                 if let Ok(folders) = cache.list_folders(acc.id) {
                     let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
@@ -5250,5 +5327,336 @@ mod tests {
             tokens.remove(1).await;
             assert_eq!(tokens.cached_valid_token(1).await, None);
         });
+    }
+
+    #[test]
+    fn change_mail_data_dir_migrates_and_triggers_sync_on_empty_reuse() {
+        use crate::cache::{CachedHeaderInput, MailDirSwitchMode, RemoteFolder};
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "hylki-worker-dir-switch-{}-{unique}",
+            std::process::id()
+        ));
+        let app_dir = base.join("app");
+        let migrated_dir = base.join("migrated-mail");
+        let empty_dir = base.join("empty-mail");
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        let mut acc = account(99_001, "switch-test@example.invalid");
+        acc.imap_host = String::new();
+        acc.enabled = true;
+        acc.in_unified = true;
+        config::save_accounts_in(&app_dir, &[acc.clone()]).unwrap();
+
+        let mut cache = CacheStore::open_for_data_dir(&app_dir).unwrap();
+        let folders = cache
+            .sync_folders(
+                acc.id,
+                &[RemoteFolder {
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 1,
+                    total_count: 1,
+                }],
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                acc.id,
+                folders[0].id,
+                1,
+                &[CachedHeaderInput {
+                    uid: 1,
+                    message_id: "<switch-msg-1@example.invalid>".to_string(),
+                    in_reply_to: String::new(),
+                    references_header: String::new(),
+                    sender: "Alice <alice@example.invalid>".to_string(),
+                    recipients: acc.email.clone(),
+                    cc: String::new(),
+                    subject: "目录切换验证邮件".to_string(),
+                    preview: "正文摘要".to_string(),
+                    date_ts: 1_700_000_001,
+                    date_display: "12:00".to_string(),
+                    unread: true,
+                    flagged: false,
+                    has_attachment: false,
+                }],
+                None,
+            )
+            .unwrap();
+        cache.checkpoint_and_close_all();
+        drop(cache);
+
+        let worker = MailWorkerHandle::spawn(app_dir.clone()).unwrap();
+
+        // 1) 迁移模式：切换到 migrated_dir，应收到切换成功 + 文件夹 + 邮件页回填，且 storage.toml 更新。
+        worker
+            .send_checked(MailRequest::ChangeMailDataDir {
+                target_dir: Some(migrated_dir.clone()),
+                mode: MailDirSwitchMode::MigrateCurrent,
+                import_accounts: Vec::new(),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got_dir_changed = false;
+        let mut got_folders = false;
+        let mut got_page = false;
+        while !(got_dir_changed && got_folders && got_page) {
+            assert!(Instant::now() < deadline, "等待 MigrateCurrent 回填超时");
+            for evt in worker.drain_events() {
+                match evt {
+                    WorkerEvent::MailDataDirChanged {
+                        ok: true,
+                        mail_data_dir,
+                        ..
+                    } if mail_data_dir == migrated_dir => {
+                        got_dir_changed = true;
+                    }
+                    WorkerEvent::FoldersLoaded {
+                        account_id,
+                        folders,
+                    } if account_id == acc.id => {
+                        assert_eq!(folders.len(), 1);
+                        assert_eq!(folders[0].path, "INBOX");
+                        got_folders = true;
+                    }
+                    WorkerEvent::MessagesPageLoaded(page) => {
+                        assert_eq!(page.total, 1);
+                        assert_eq!(page.items[0].subject, "目录切换验证邮件");
+                        got_page = true;
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(
+            config::resolve_mail_data_dir_in(&app_dir),
+            migrated_dir,
+            "storage.toml 应已更新为 migrated_dir"
+        );
+
+        // 2) 空目录复用模式：切换到 empty_dir，应返回空文件夹/空列表并自动触发同步状态通知。
+        worker
+            .send_checked(MailRequest::ChangeMailDataDir {
+                target_dir: Some(empty_dir.clone()),
+                mode: MailDirSwitchMode::ReuseExisting,
+                import_accounts: Vec::new(),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut empty_dir_changed = false;
+        let mut empty_folders = false;
+        let mut empty_page = false;
+        let mut sync_triggered_status = false;
+        while !(empty_dir_changed && empty_folders && empty_page && sync_triggered_status) {
+            assert!(
+                Instant::now() < deadline,
+                "等待空目录 ReuseExisting 回填超时"
+            );
+            for evt in worker.drain_events() {
+                match evt {
+                    WorkerEvent::MailDataDirChanged {
+                        ok: true,
+                        mail_data_dir,
+                        ..
+                    } if mail_data_dir == empty_dir => {
+                        empty_dir_changed = true;
+                    }
+                    WorkerEvent::FoldersLoaded {
+                        account_id,
+                        folders,
+                    } if account_id == acc.id => {
+                        assert!(folders.is_empty());
+                        empty_folders = true;
+                    }
+                    WorkerEvent::MessagesPageLoaded(page) => {
+                        assert_eq!(page.total, 0);
+                        assert!(page.items.is_empty());
+                        empty_page = true;
+                    }
+                    WorkerEvent::Status { text, .. }
+                        if text == "已切换存储目录，正在从服务器同步邮件..." =>
+                    {
+                        sync_triggered_status = true;
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // 先优雅停掉 worker 释放文件句柄后再清理临时目录。
+        worker.send_checked(MailRequest::PrepareQuit).unwrap();
+        let quit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut prepared = false;
+            for evt in worker.drain_events() {
+                if matches!(evt, WorkerEvent::QuitPrepared { result: Ok(()) }) {
+                    prepared = true;
+                }
+            }
+            if prepared || worker.send_checked(MailRequest::LoadAllCached).is_err() {
+                break;
+            }
+            assert!(Instant::now() < quit_deadline, "worker 未按预期停止");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn change_mail_data_dir_imports_discovered_accounts_and_loads_offline_mail() {
+        use crate::cache::{
+            inspect_mail_data_dir_with_app_dir, CachedHeaderInput, MailDirSwitchMode, RemoteFolder,
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "hylki-worker-import-switch-{}-{unique}",
+            std::process::id()
+        ));
+        let installed_app = base.join("installed");
+        let installed_mail = installed_app.join("mail");
+        let portable_app = base.join("portable");
+        std::fs::create_dir_all(&installed_app).unwrap();
+        std::fs::create_dir_all(&portable_app).unwrap();
+
+        let mut src_acc = account(3, "offline-user@example.invalid");
+        src_acc.imap_host = String::new();
+        src_acc.enabled = true;
+        src_acc.in_unified = true;
+        config::save_accounts_in(&installed_app, &[src_acc.clone()]).unwrap();
+
+        let mut inst_cache = CacheStore::open_for_data_dir(&installed_app).unwrap();
+        let folders = inst_cache
+            .sync_folders(
+                src_acc.id,
+                &[RemoteFolder {
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 1,
+                    total_count: 1,
+                }],
+            )
+            .unwrap();
+        inst_cache
+            .commit_folder_headers(
+                src_acc.id,
+                folders[0].id,
+                1,
+                &[CachedHeaderInput {
+                    uid: 10,
+                    message_id: "<offline-10@example.invalid>".to_string(),
+                    in_reply_to: String::new(),
+                    references_header: String::new(),
+                    sender: "Sender <sender@example.invalid>".to_string(),
+                    recipients: src_acc.email.clone(),
+                    cc: String::new(),
+                    subject: "关联导入的离线邮件".to_string(),
+                    preview: "离线摘要".to_string(),
+                    date_ts: 1_700_000_010,
+                    date_display: "13:00".to_string(),
+                    unread: true,
+                    flagged: false,
+                    has_attachment: false,
+                }],
+                None,
+            )
+            .unwrap();
+        inst_cache.checkpoint_and_close_all();
+        drop(inst_cache);
+
+        let inspection = inspect_mail_data_dir_with_app_dir(&portable_app, &installed_mail, &[]);
+        assert_eq!(inspection.importable_accounts.len(), 1);
+
+        let worker = MailWorkerHandle::spawn(portable_app.clone()).unwrap();
+        worker
+            .send_checked(MailRequest::ChangeMailDataDir {
+                target_dir: Some(installed_mail.clone()),
+                mode: MailDirSwitchMode::ReuseExisting,
+                import_accounts: inspection.importable_accounts,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got_dir_changed = false;
+        let mut got_accounts = false;
+        let mut got_folders = false;
+        let mut got_page = false;
+        let mut got_unexpected_sync_status = false;
+        while !(got_dir_changed && got_accounts && got_folders && got_page) {
+            assert!(Instant::now() < deadline, "等待关联导入目录切换回填超时");
+            for evt in worker.drain_events() {
+                match evt {
+                    WorkerEvent::MailDataDirChanged {
+                        ok: true,
+                        mail_data_dir,
+                        ..
+                    } if mail_data_dir == installed_mail => {
+                        got_dir_changed = true;
+                    }
+                    WorkerEvent::AccountsUpdated { accounts } => {
+                        assert_eq!(accounts.len(), 1);
+                        assert_eq!(accounts[0].email, "offline-user@example.invalid");
+                        got_accounts = true;
+                    }
+                    WorkerEvent::FoldersLoaded { folders, .. } => {
+                        assert_eq!(folders.len(), 1);
+                        assert_eq!(folders[0].path, "INBOX");
+                        got_folders = true;
+                    }
+                    WorkerEvent::MessagesPageLoaded(page) => {
+                        assert_eq!(page.total, 1);
+                        assert_eq!(page.items[0].subject, "关联导入的离线邮件");
+                        got_page = true;
+                    }
+                    WorkerEvent::Status { text, .. }
+                        if text == "已切换存储目录，正在从服务器同步邮件..." =>
+                    {
+                        got_unexpected_sync_status = true;
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            !got_unexpected_sync_status,
+            "已有离线邮件或刚导入账号不应误触发 SyncAllAccounts"
+        );
+        assert_eq!(
+            config::load_accounts_in(&portable_app).unwrap().len(),
+            1,
+            "accounts.toml 应已落盘导入账号"
+        );
+
+        worker.send_checked(MailRequest::PrepareQuit).unwrap();
+        let quit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut prepared = false;
+            for evt in worker.drain_events() {
+                if matches!(evt, WorkerEvent::QuitPrepared { result: Ok(()) }) {
+                    prepared = true;
+                }
+            }
+            if prepared || worker.send_checked(MailRequest::LoadAllCached).is_err() {
+                break;
+            }
+            assert!(Instant::now() < quit_deadline, "worker 未按预期停止");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

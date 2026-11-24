@@ -35,10 +35,51 @@ pub struct MailDirInspection {
     pub existing_accounts: Vec<DiscoveredAccountDir>,
     pub total_bytes: u64,
     pub has_any_entries: bool,
+    /// Whether the currently active `mail_data_dir` has any `<account>\mail.db` data.
+    pub current_has_mail_data: bool,
+    /// Accounts discovered in an external config directory associated with `target_dir`
+    /// (e.g. `<target_dir>\..\accounts.toml`) that are not yet configured locally.
+    pub importable_accounts: Vec<AccountConfig>,
+    /// External config directory where `importable_accounts` were discovered, if any.
+    pub importable_config_dir: Option<PathBuf>,
+}
+
+/// Return whether `dir` contains at least one account folder with `mail.db`.
+pub fn dir_has_account_mail_data(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir())
+            && AccountDb::mail_db_path_in(&entry.path()).is_file()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Inspect a candidate `mail_data_dir` for existing `<account>\mail.db` folders.
 pub fn inspect_mail_data_dir(target_dir: &Path, accounts: &[AccountConfig]) -> MailDirInspection {
+    inspect_mail_data_dir_inner(None, target_dir, accounts)
+}
+
+/// Inspect a candidate `mail_data_dir` with full context of `app_data_dir`:
+/// checks whether the current mail directory has data, and discovers any unconfigured
+/// accounts from an external config directory associated with `target_dir`.
+pub fn inspect_mail_data_dir_with_app_dir(
+    app_data_dir: &Path,
+    target_dir: &Path,
+    accounts: &[AccountConfig],
+) -> MailDirInspection {
+    inspect_mail_data_dir_inner(Some(app_data_dir), target_dir, accounts)
+}
+
+fn inspect_mail_data_dir_inner(
+    app_data_dir: Option<&Path>,
+    target_dir: &Path,
+    accounts: &[AccountConfig],
+) -> MailDirInspection {
     let mut existing_accounts = Vec::new();
     let mut total_bytes = 0u64;
     let mut has_any_entries = false;
@@ -72,12 +113,105 @@ pub fn inspect_mail_data_dir(target_dir: &Path, accounts: &[AccountConfig]) -> M
     }
     existing_accounts.sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
 
+    let current_has_mail_data = app_data_dir
+        .map(|dir| dir_has_account_mail_data(&config::resolve_mail_data_dir_in(dir)))
+        .unwrap_or(false);
+    let (importable_config_dir, importable_accounts) =
+        discover_importable_accounts(app_data_dir, target_dir, accounts);
+
     MailDirInspection {
         target_dir: target_dir.to_path_buf(),
         existing_accounts,
         total_bytes,
         has_any_entries,
+        current_has_mail_data,
+        importable_accounts,
+        importable_config_dir,
     }
+}
+
+fn discover_importable_accounts(
+    current_app_dir: Option<&Path>,
+    target_dir: &Path,
+    current_accounts: &[AccountConfig],
+) -> (Option<PathBuf>, Vec<AccountConfig>) {
+    let Some(parent) = target_dir.parent() else {
+        return (None, Vec::new());
+    };
+    if !config::accounts_file_in(parent).is_file() {
+        return (None, Vec::new());
+    }
+    if let Some(cur_app) = current_app_dir {
+        if config::normalized_path_key(cur_app) == config::normalized_path_key(parent) {
+            return (None, Vec::new());
+        }
+    }
+    let target_key = config::normalized_path_key(target_dir);
+    let parent_mail_key = config::normalized_path_key(&config::resolve_mail_data_dir_in(parent));
+    let parent_default_key = config::normalized_path_key(&config::default_mail_data_dir_in(parent));
+    if target_key != parent_mail_key && target_key != parent_default_key {
+        return (None, Vec::new());
+    }
+
+    let Ok(source_accounts) = config::load_accounts_in(parent) else {
+        return (None, Vec::new());
+    };
+    let mut importable = Vec::new();
+    for acc in &source_accounts {
+        let email = acc.email.trim();
+        if email.is_empty()
+            || current_accounts
+                .iter()
+                .any(|cur| cur.email.trim().eq_ignore_ascii_case(email))
+            || importable
+                .iter()
+                .any(|seen: &AccountConfig| seen.email.trim().eq_ignore_ascii_case(email))
+        {
+            continue;
+        }
+        let mut cloned = acc.clone();
+        cloned.avatar = None;
+        let resolved = config::resolve_account_storage_dir(&cloned, &source_accounts);
+        let legacy_slot_dir = format!("account_{}", cloned.id);
+        if AccountDb::mail_db_path_in(&target_dir.join(&resolved)).is_file() {
+            cloned.storage_dir = Some(resolved);
+        } else if AccountDb::mail_db_path_in(&target_dir.join(&legacy_slot_dir)).is_file() {
+            cloned.storage_dir = Some(legacy_slot_dir);
+        }
+        importable.push(cloned);
+    }
+
+    if importable.is_empty() {
+        (None, Vec::new())
+    } else {
+        (Some(parent.to_path_buf()), importable)
+    }
+}
+
+/// Merge `imported` accounts into `existing`, skipping empty or already-present emails
+/// (case-insensitive) and assigning fresh unique account IDs.
+pub fn merge_imported_accounts(
+    existing: &[AccountConfig],
+    imported: &[AccountConfig],
+) -> (Vec<AccountConfig>, usize) {
+    let mut merged = existing.to_vec();
+    let mut added = 0usize;
+    for acc in imported {
+        let email = acc.email.trim();
+        if email.is_empty()
+            || merged
+                .iter()
+                .any(|cur| cur.email.trim().eq_ignore_ascii_case(email))
+        {
+            continue;
+        }
+        let mut next = acc.clone();
+        next.id = config::next_account_id(&merged);
+        next.avatar = None;
+        merged.push(next);
+        added += 1;
+    }
+    (merged, added)
 }
 
 /// Validate switching `mail_data_dir` from `current_dir` to `target_dir`:
@@ -168,6 +302,10 @@ fn copy_dir_recursive_filtered(src: &Path, dst: &Path) -> Result<(usize, u64), S
                 || name_str.ends_with(".tmp")
             {
                 continue;
+            }
+            if name_str.ends_with(".db") {
+                let _ = fs::remove_file(dst.join(format!("{name_str}-wal")));
+                let _ = fs::remove_file(dst.join(format!("{name_str}-shm")));
             }
             let expected_len = fs::metadata(&src_path)
                 .map_err(|e| format!("读取源文件元信息失败 ({}): {e}", src_path.display()))?

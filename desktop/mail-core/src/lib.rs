@@ -907,6 +907,8 @@ pub enum MailRequest {
         /// `None` 表示恢复默认目录（`<app_data_dir>\mail`）。
         target_dir: Option<std::path::PathBuf>,
         mode: cache::MailDirSwitchMode,
+        /// 随目录切换一并导入的关联账号配置（来自目标目录上级配置库）。
+        import_accounts: Vec<config::AccountConfig>,
     },
 }
 

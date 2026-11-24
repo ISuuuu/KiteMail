@@ -29,8 +29,9 @@ use merge::{
     parallel_account_disk_query,
 };
 pub use migrate::{
-    copy_mail_dir_contents, inspect_mail_data_dir, validate_target_mail_dir, DiscoveredAccountDir,
-    MailDirInspection, MailDirSwitchMode,
+    copy_mail_dir_contents, dir_has_account_mail_data, inspect_mail_data_dir,
+    inspect_mail_data_dir_with_app_dir, merge_imported_accounts, validate_target_mail_dir,
+    DiscoveredAccountDir, MailDirInspection, MailDirSwitchMode,
 };
 
 use crate::config::{self, AccountConfig};

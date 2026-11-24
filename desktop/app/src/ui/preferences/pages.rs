@@ -11,7 +11,6 @@ use gpui_kit::{
     div, px, AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElement,
     ParentElement, ScrollAnchor, SharedString, StatefulInteractiveElement, Styled, Window,
 };
-use hylki_mail_core::cache::MailDirSwitchMode;
 use hylki_mail_core::config::{
     self, ListColumn, NotificationButton, NotificationButtons, ToolbarItem, ToolbarSide,
     DEFAULT_ATTACHMENT_KEYWORDS, UI_TEXT_SCALE_STEPS,
@@ -3408,14 +3407,93 @@ fn render_system(
                     is_hit(win, "pref-mail-data-dir"),
                     p,
                 ),
-                info_row(
-                    "pref-storage-stats",
-                    "本地缓存与附件占用",
-                    storage_text,
-                    is_hit(win, "pref-storage-stats"),
-                    p,
-                ),
             ];
+            if let Some((ok, ref msg)) = win.mail_dir_feedback {
+                storage_rows.push(
+                    h_flex()
+                        .id("pref-mail-dir-feedback")
+                        .w_full()
+                        .px_4()
+                        .py_2p5()
+                        .gap_3()
+                        .items_center()
+                        .justify_between()
+                        .bg(if ok {
+                            p.accent.opacity(0.10)
+                        } else {
+                            p.danger.opacity(0.10)
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(if ok { p.accent } else { p.danger })
+                                .child(msg.clone()),
+                        )
+                        .child(
+                            Button::new("btn-dismiss-mail-dir-feedback")
+                                .ghost()
+                                .compact()
+                                .label("关闭")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.mail_dir_feedback = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if !demo_mode && !win.mail_dir_switching && !win.current_mail_dir_importable.is_empty()
+            {
+                let count = win.current_mail_dir_importable.len();
+                let preview: String = win
+                    .current_mail_dir_importable
+                    .iter()
+                    .take(2)
+                    .map(|a| a.email.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                let suffix = if count > 2 { " 等" } else { "" };
+                storage_rows.push(
+                    h_flex()
+                        .id("pref-mail-dir-importable")
+                        .w_full()
+                        .px_4()
+                        .py_2p5()
+                        .gap_3()
+                        .items_center()
+                        .justify_between()
+                        .bg(p.accent.opacity(0.08))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(p.text)
+                                .child(format!(
+                                    "检测到当前邮件目录关联的 {count} 个未导入账号（{preview}{suffix}），导入后主窗体可立即加载离线邮件"
+                                )),
+                        )
+                        .child(
+                            Button::new("btn-import-mail-dir-accounts")
+                                .primary()
+                                .compact()
+                                .label("导入账号并加载")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.import_current_mail_dir_accounts(cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+            storage_rows.push(info_row(
+                "pref-storage-stats",
+                "本地缓存与附件占用",
+                storage_text,
+                is_hit(win, "pref-storage-stats"),
+                p,
+            ));
             for acc_stat in &summary.per_account {
                 storage_rows.push(info_row(
                     SharedString::from(format!("pref-acc-storage-{}", acc_stat.account_id)),
@@ -3485,161 +3563,6 @@ fn render_system(
             ]);
             setting_group("本地数据与缓存维护", None, CARD_MAX_WIDTH, storage_rows, p)
         })
-        .when_some(
-            win.pending_mail_dir_switch.as_ref(),
-            |el, (target_opt, inspection)| {
-                let mut rows = vec![info_row(
-                    "mail-switch-target",
-                    if target_opt.is_some() {
-                        "目标存储路径"
-                    } else {
-                        "恢复为默认路径"
-                    },
-                    inspection.target_dir.display().to_string(),
-                    false,
-                    p,
-                )];
-
-                let has_existing = !inspection.existing_accounts.is_empty();
-                let desc = if has_existing {
-                    format!(
-                        "目标目录中已存在 {} 个账号的邮件库（共 {}）。请选择复用已有数据或将当前邮件迁移过去：",
-                        inspection.existing_accounts.len(),
-                        config::format_bytes(inspection.total_bytes)
-                    )
-                } else {
-                    "目标目录中暂无现成 Hylki 账号邮件库。可选择迁移当前全部邮件，或直接启用新目录并重新同步：".to_string()
-                };
-
-                if has_existing {
-                    for (idx, item) in inspection.existing_accounts.iter().enumerate() {
-                        let value = if let Some(ref email) = item.matched_email {
-                            format!(
-                                "匹配当前账号 {} · {}",
-                                email,
-                                config::format_bytes(item.total_bytes)
-                            )
-                        } else {
-                            format!("发现已有 mail.db · {}", config::format_bytes(item.total_bytes))
-                        };
-                        rows.push(info_row(
-                            SharedString::from(format!("mail-switch-acc-{idx}")),
-                            format!("文件夹 {}", item.dir_name),
-                            value,
-                            false,
-                            p,
-                        ));
-                    }
-                } else {
-                    rows.push(info_row(
-                        "mail-switch-empty",
-                        "目录状态",
-                        if inspection.has_any_entries {
-                            "目录非空，未检测到 Hylki 账号子目录"
-                        } else {
-                            "空目录（就绪）"
-                        },
-                        false,
-                        p,
-                    ));
-                }
-
-                let actions = if has_existing {
-                    h_flex()
-                        .px_4()
-                        .py_3()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("mail-switch-cancel")
-                                .outline()
-                                .compact()
-                                .label("取消")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cancel_mail_dir_switch(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("mail-switch-migrate")
-                                .outline()
-                                .compact()
-                                .disabled(win.mail_dir_switching)
-                                .label("迁移当前邮件到此目录")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.confirm_mail_dir_switch(
-                                        MailDirSwitchMode::MigrateCurrent,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .child(
-                            Button::new("mail-switch-reuse")
-                                .primary()
-                                .compact()
-                                .disabled(win.mail_dir_switching)
-                                .label("直接使用已有邮件数据（复用）")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.confirm_mail_dir_switch(
-                                        MailDirSwitchMode::ReuseExisting,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .into_any_element()
-                } else {
-                    h_flex()
-                        .px_4()
-                        .py_3()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("mail-switch-cancel")
-                                .outline()
-                                .compact()
-                                .label("取消")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cancel_mail_dir_switch(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("mail-switch-reuse")
-                                .outline()
-                                .compact()
-                                .disabled(win.mail_dir_switching)
-                                .label("直接使用该目录（不迁移）")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.confirm_mail_dir_switch(
-                                        MailDirSwitchMode::ReuseExisting,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .child(
-                            Button::new("mail-switch-migrate")
-                                .primary()
-                                .compact()
-                                .disabled(win.mail_dir_switching)
-                                .label("确认迁移当前邮件到此目录")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.confirm_mail_dir_switch(
-                                        MailDirSwitchMode::MigrateCurrent,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .into_any_element()
-                };
-                rows.push(actions);
-
-                el.child(setting_group(
-                    "确认切换邮件存储目录",
-                    Some(desc.as_str()),
-                    CARD_MAX_WIDTH,
-                    rows,
-                    p,
-                ))
-            },
-        )
         .child(setting_group(
             "软件更新",
             None,
