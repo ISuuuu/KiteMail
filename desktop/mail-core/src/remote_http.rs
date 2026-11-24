@@ -1,4 +1,4 @@
-//! Remote HTTP image fetcher for `hylki-windows`'s GPUI `HttpClient`.
+//! Remote HTTP image fetcher for `hylki`'s GPUI `HttpClient`.
 
 use std::future::Future;
 use std::io::Read;

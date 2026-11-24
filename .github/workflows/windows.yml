@@ -69,7 +69,7 @@ jobs:
         run: cargo check --manifest-path desktop/Cargo.toml --workspace --target x86_64-pc-windows-msvc --locked
 
       - name: Verify release binary target
-        run: cargo check --manifest-path desktop/Cargo.toml -p hylki-windows --bin hylki-windows --target x86_64-pc-windows-msvc --locked
+        run: cargo check --manifest-path desktop/Cargo.toml -p hylki --bin hylki --target x86_64-pc-windows-msvc --locked
 
       - name: Run unit tests
         run: cargo test --manifest-path desktop/Cargo.toml --workspace --target x86_64-pc-windows-msvc --locked
@@ -135,9 +135,9 @@ jobs:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
           HYLKI_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $exe = 'desktop/target/x86_64-pc-windows-msvc/release/hylki-windows.exe'
+          $exe = 'desktop/target/x86_64-pc-windows-msvc/release/hylki.exe'
           Remove-Item -Force -ErrorAction SilentlyContinue $exe
-          cargo build --manifest-path desktop/Cargo.toml -p hylki-windows --bin hylki-windows --release --target x86_64-pc-windows-msvc --locked
+          cargo build --manifest-path desktop/Cargo.toml -p hylki --bin hylki --release --target x86_64-pc-windows-msvc --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path $exe)) { throw "Expected release binary was not produced: $exe" }
 
@@ -158,7 +158,7 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $stage = "dist/Hylki_v${version}_portable"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/hylki-windows.exe" $stage
+          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/hylki.exe" $stage
           Copy-Item "LICENSE" $stage
           Copy-Item "README.md" $stage
           # 便携版标记：客户端据此选择 zip 就地更新，而不是运行安装包。

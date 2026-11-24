@@ -25,7 +25,9 @@ Unicode True
 
 !define PRODUCT_NAME "Hylki"
 !define PUBLISHER "Hyprlab"
-!define APP_EXE "hylki-windows.exe"
+!define APP_EXE "hylki.exe"
+; 0.1.0 及更早版本的可执行文件名，升级时顺手清掉。
+!define LEGACY_APP_EXE "hylki-windows.exe"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Hylki"
 !define REG_KEY "Software\Hylki"
 
@@ -201,6 +203,10 @@ Section "MainSection" SecMain
   ${EndIf}
   Delete "$INSTDIR\${APP_EXE}.old"
 
+  ; 旧版本的可执行文件名已改为 hylki.exe，升级时清掉残留；文件被占用时忽略失败。
+  Delete "$INSTDIR\${LEGACY_APP_EXE}"
+  ClearErrors
+
   File "/oname=LICENSE" "..\..\LICENSE"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -259,6 +265,7 @@ Section "Uninstall"
 
   Delete "$INSTDIR\uninstall.exe"
   Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\${LEGACY_APP_EXE}"
 
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "${REG_KEY}"

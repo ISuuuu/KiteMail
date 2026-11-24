@@ -288,7 +288,9 @@ fn portable_script(pid: u32, zip: &Path, exe: &Path) -> String {
            if ($process -and -not $process.WaitForExit(60000)) {{ exit 1 }}\n\
            $exited = $true\n\
            Expand-Archive -LiteralPath $zip -DestinationPath $stage\n\
-           Copy-Item -LiteralPath (Join-Path $stage 'hylki-windows.exe') -Destination $new\n\
+           $src = Join-Path $stage 'hylki.exe'\n\
+           if (-not (Test-Path -LiteralPath $src)) {{ $src = Join-Path $stage 'hylki-windows.exe' }}\n\
+           Copy-Item -LiteralPath $src -Destination $new\n\
            [System.IO.File]::Replace($new, $exe, $backup)\n\
            Start-Process -FilePath $exe\n\
            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue\n\
@@ -398,7 +400,7 @@ mod tests {
         let script = portable_script(
             42,
             Path::new(r"C:\temp\it's.zip"),
-            Path::new(r"C:\Hylki\hylki-windows.exe"),
+            Path::new(r"C:\Hylki\hylki.exe"),
         );
         assert!(script.contains("$process.WaitForExit(60000)"));
         assert!(script.contains("it''s.zip"));
