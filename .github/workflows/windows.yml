@@ -1,8 +1,8 @@
 name: Windows x64
 
-# Checks run on every desktop change; the exe is built only for a release tag,
-# the way build-appimage.yml and build-arm64.yml are keyed to v* tags. Nothing
-# is published from here except the zip attached to the tag's release.
+# Checks run on every desktop change; the exe is built only for a release tag.
+# Nothing is published from here except the release's assets and update
+# manifest.
 on:
   push:
     branches: [main]
