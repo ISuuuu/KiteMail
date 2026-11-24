@@ -20,16 +20,16 @@ use gpui_kit::{
     black, div, hsla, px, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, Styled, WeakEntity, Window,
 };
-use hylki_mail_core::config::AppPreferences;
+use hylki_mail_core::config::{self, AppPreferences};
 use hylki_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display_with_options};
 use hylki_mail_core::mime::{split_quoted_html, split_quoted_plain};
 use hylki_mail_core::{format_message_datetime, MessageDetail};
 
-use crate::app::{split_sender, HylkiApp};
+use crate::app::{split_sender, HylkiApp, PopoutReplyKind};
 use crate::theme;
 use crate::ui::{avatar, print_preview, reader, window_controls};
 use crate::webview_host::{
-    build_document_content, supports_document, BodyView, DocumentAppearance, WebViewHost,
+    build_body_document, supports_document, BodyView, DocumentAppearance, WebViewHost,
 };
 use hylki_mail_core::verify::{check_sender_summary, SenderTrust};
 
@@ -48,6 +48,8 @@ pub(crate) struct MessageWindow {
     print_preview: Option<print_preview::PrintPreviewState>,
     webview: Option<Rc<WebViewHost>>,
     webview_appearance: Option<(DocumentAppearance, bool)>,
+    status_notice: Option<SharedString>,
+    last_rem_scale: u32,
 }
 
 impl MessageWindow {
@@ -93,6 +95,19 @@ impl MessageWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let initial_scale = config::clamp_ui_text_scale(prefs.ui_text_scale_percent);
+        window.set_rem_size(px(16.0 * initial_scale as f32 / 100.0));
+
+        let msg_id = detail.id;
+        let app_for_close = app_entity.clone();
+        let this_handle = window.window_handle();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = app_for_close.update(cx, |app, _| {
+                app.unregister_popout_message_window(msg_id, Some(this_handle));
+            });
+            true
+        });
+
         let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("在邮件中查找..."));
         cx.subscribe(
             &find_input,
@@ -114,11 +129,33 @@ impl MessageWindow {
             .detach();
         if let Some(app) = app_entity.upgrade() {
             cx.observe(&app, |this, app, cx| {
-                if this.webview_appearance.is_some_and(|(_, allowed)| {
-                    app.read(cx)
-                        .remote_images_allowed(this.detail.id, &this.detail.sender)
-                        != allowed
-                }) {
+                let app_ref = app.read(cx);
+                let remote_changed = this.webview_appearance.is_some_and(|(_, allowed)| {
+                    app_ref.remote_images_allowed(this.detail.id, &this.detail.sender) != allowed
+                });
+                let next_prefs = &app_ref.prefs;
+                let prefs_changed = this.prefs.reader_zoom_percent
+                    != next_prefs.reader_zoom_percent
+                    || this.prefs.message_theme != next_prefs.message_theme
+                    || this.prefs.date_style != next_prefs.date_style
+                    || this.prefs.clock_style != next_prefs.clock_style
+                    || this.prefs.show_remote_banner != next_prefs.show_remote_banner
+                    || this.prefs.clean_links != next_prefs.clean_links
+                    || this.prefs.block_remote_images != next_prefs.block_remote_images
+                    || this.prefs.allowed_remote_senders != next_prefs.allowed_remote_senders
+                    || this.prefs.ui_text_scale_percent != next_prefs.ui_text_scale_percent;
+                let dark_changed = this.webview_appearance.is_some_and(|(appearance, _)| {
+                    let forced_dark = match next_prefs.message_theme.as_str() {
+                        "light" => Some(false),
+                        "dark" => Some(true),
+                        _ => None,
+                    };
+                    forced_dark.unwrap_or(app_ref.dark_mode) != appearance.dark
+                });
+                if prefs_changed {
+                    this.prefs = next_prefs.clone();
+                }
+                if remote_changed || prefs_changed || dark_changed {
                     cx.notify();
                 }
             })
@@ -140,6 +177,8 @@ impl MessageWindow {
             print_preview: None,
             webview: None,
             webview_appearance: None,
+            status_notice: None,
+            last_rem_scale: initial_scale,
         }
     }
 
@@ -267,6 +306,11 @@ pub(crate) fn find_case_insensitive_ranges(
 
 impl Render for MessageWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let scale_percent = config::clamp_ui_text_scale(self.prefs.ui_text_scale_percent);
+        if self.last_rem_scale != scale_percent {
+            window.set_rem_size(px(16.0 * scale_percent as f32 / 100.0));
+            self.last_rem_scale = scale_percent;
+        }
         let p = theme::current(cx);
         let (canvas, border, muted_fg) = (p.canvas, p.border, p.text_muted);
         let d = self.detail.clone();
@@ -357,7 +401,7 @@ impl Render for MessageWindow {
                 .as_deref()
                 .filter(|html| supports_document(html))
             {
-                let document = build_document_content(html, appearance);
+                let document = build_body_document(html, appearance);
                 load_scheduled = true;
                 cx.defer_in(window, move |this, window, cx| {
                     if this.webview_appearance != settings {
@@ -384,32 +428,8 @@ impl Render for MessageWindow {
         }
         let text_state =
             (body_view == BodyView::Native).then(|| self.ensure_text_state(d.id, &main_html, cx));
-        let win_controls = h_flex()
-            .flex_shrink_0()
-            .h_full()
-            .items_center()
-            .child(
-                Button::new("popout-win-min")
-                    .ghost()
-                    .compact()
-                    .icon(IconName::Minus)
-                    .on_click(|_, window, _| window.minimize_window()),
-            )
-            .child(
-                Button::new("popout-win-max")
-                    .ghost()
-                    .compact()
-                    .icon(IconName::Square)
-                    .on_click(|_, window, _| window.zoom_window()),
-            )
-            .child(
-                Button::new("popout-win-close")
-                    .ghost()
-                    .compact()
-                    .icon(IconName::X)
-                    .on_click(|_, window, _| window.remove_window()),
-            );
-        let app_weak = self.app_entity.clone();
+        let win_controls =
+            window_controls::render_standalone_window_controls("popout-wc", window, cx);
         let d_reply = d.clone();
         let d_reply_all = d.clone();
         let d_fwd = d.clone();
@@ -450,53 +470,84 @@ impl Render for MessageWindow {
                             .compact()
                             .icon(IconName::Reply)
                             .tooltip("回复")
-                            .on_click(move |_, window, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 let d = d_reply.clone();
-                                let _ = app_weak.update(cx, |app, cx| {
-                                    app.start_reply(&d, window, cx);
-                                    if !app.compose_detached {
-                                        app.pop_out_compose(cx);
-                                    }
-                                });
-                                window.remove_window();
-                            }),
+                                let started = this
+                                    .app_entity
+                                    .update(cx, |app, cx| {
+                                        app.start_popout_compose_from_message(
+                                            d,
+                                            PopoutReplyKind::Reply,
+                                            cx,
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                if started {
+                                    window.remove_window();
+                                } else {
+                                    this.status_notice = Some(SharedString::from(
+                                        "当前写信尚未完成，请先发送、存草稿或取消",
+                                    ));
+                                    cx.notify();
+                                }
+                            })),
                     )
-                    .child({
-                        let app_w = self.app_entity.clone();
+                    .child(
                         Button::new("popout-reply-all")
                             .ghost()
                             .compact()
                             .icon(IconName::ReplyAll)
                             .tooltip("回复全部")
-                            .on_click(move |_, window, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 let d = d_reply_all.clone();
-                                let _ = app_w.update(cx, |app, cx| {
-                                    app.start_reply_all(&d, window, cx);
-                                    if !app.compose_detached {
-                                        app.pop_out_compose(cx);
-                                    }
-                                });
-                                window.remove_window();
-                            })
-                    })
-                    .child({
-                        let app_w = self.app_entity.clone();
+                                let started = this
+                                    .app_entity
+                                    .update(cx, |app, cx| {
+                                        app.start_popout_compose_from_message(
+                                            d,
+                                            PopoutReplyKind::ReplyAll,
+                                            cx,
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                if started {
+                                    window.remove_window();
+                                } else {
+                                    this.status_notice = Some(SharedString::from(
+                                        "当前写信尚未完成，请先发送、存草稿或取消",
+                                    ));
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
                         Button::new("popout-forward")
                             .ghost()
                             .compact()
                             .icon(IconName::Forward)
                             .tooltip("转发")
-                            .on_click(move |_, window, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 let d = d_fwd.clone();
-                                let _ = app_w.update(cx, |app, cx| {
-                                    app.start_forward(&d, window, cx);
-                                    if !app.compose_detached {
-                                        app.pop_out_compose(cx);
-                                    }
-                                });
-                                window.remove_window();
-                            })
-                    })
+                                let started = this
+                                    .app_entity
+                                    .update(cx, |app, cx| {
+                                        app.start_popout_compose_from_message(
+                                            d,
+                                            PopoutReplyKind::Forward,
+                                            cx,
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                if started {
+                                    window.remove_window();
+                                } else {
+                                    this.status_notice = Some(SharedString::from(
+                                        "当前写信尚未完成，请先发送、存草稿或取消",
+                                    ));
+                                    cx.notify();
+                                }
+                            })),
+                    )
                     .child({
                         let app_w = self.app_entity.clone();
                         let flagged = d.flagged;
@@ -566,6 +617,31 @@ impl Render for MessageWindow {
                     )
                     .child(win_controls),
             )
+            .when_some(self.status_notice.as_ref(), |root, notice| {
+                root.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .px_4()
+                        .py_1p5()
+                        .gap_2()
+                        .items_center()
+                        .justify_between()
+                        .bg(p.accent_soft())
+                        .border_b_1()
+                        .border_color(border)
+                        .child(div().text_xs().text_color(p.text).child(notice.clone()))
+                        .child(
+                            Button::new("popout-notice-close")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::X)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.status_notice = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             // 页内查找条。
             .when(self.find_open, |root| {
                 let match_text = if self.find_query.trim().is_empty() {
@@ -678,6 +754,7 @@ impl Render for MessageWindow {
                 let has_att = !d.attachments.is_empty();
 
                 v_flex()
+                    .flex_shrink_0()
                     .px_6()
                     .pt_4()
                     .pb_3()
@@ -707,6 +784,7 @@ impl Render for MessageWindow {
                                     .min_w_0()
                                     .child(
                                         h_flex()
+                                            .min_w_0()
                                             .gap_2()
                                             .items_center()
                                             .child(
@@ -731,6 +809,7 @@ impl Render for MessageWindow {
                                             .when_some(trust_badge, |el, (label, color)| {
                                                 el.child(
                                                     div()
+                                                        .flex_shrink_0()
                                                         .px_2()
                                                         .py_0p5()
                                                         .rounded_full()
@@ -774,55 +853,61 @@ impl Render for MessageWindow {
                     )
                     .when(has_att, |el| {
                         el.child(
-                            h_flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .children(d.attachments.iter().map(|att| {
-                                    let att_id = att.id;
-                                    let filename = att.filename.clone();
-                                    let size_kb = (att.size_bytes + 1023) / 1024;
-                                    let app_w = app_for_att.clone();
+                            div()
+                                .id("popout-att-list")
+                                .max_h(px(120.0))
+                                .overflow_y_scrollbar()
+                                .child(
                                     h_flex()
-                                        .items_center()
+                                        .flex_wrap()
                                         .gap_2()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded(px(8.0))
-                                        .border_1()
-                                        .border_color(border)
-                                        .bg(canvas)
-                                        .child(
-                                            Icon::new(IconName::Paperclip)
-                                                .with_size(px(14.0))
-                                                .text_color(muted_fg),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .max_w(px(200.0))
-                                                .truncate()
-                                                .child(SharedString::from(filename.clone())),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted_fg)
-                                                .child(SharedString::from(format!("{size_kb} KB"))),
-                                        )
-                                        .child(
-                                            Button::new(("popout-save-att", att_id))
-                                                .ghost()
-                                                .compact()
-                                                .icon(IconName::Download)
-                                                .tooltip("保存附件")
-                                                .on_click(move |_, _, cx| {
-                                                    let fn_clone = filename.clone();
-                                                    let _ = app_w.update(cx, |app, cx| {
-                                                        app.save_attachment(att_id, &fn_clone, cx);
-                                                    });
-                                                }),
-                                        )
-                                })),
+                                        .children(d.attachments.iter().map(|att| {
+                                            let att_id = att.id;
+                                            let filename = att.filename.clone();
+                                            let size_kb = (att.size_bytes + 1023) / 1024;
+                                            let app_w = app_for_att.clone();
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded(px(8.0))
+                                                .border_1()
+                                                .border_color(border)
+                                                .bg(canvas)
+                                                .child(
+                                                    Icon::new(IconName::Paperclip)
+                                                        .with_size(px(14.0))
+                                                        .text_color(muted_fg),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .max_w(px(200.0))
+                                                        .truncate()
+                                                        .child(SharedString::from(filename.clone())),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(muted_fg)
+                                                        .child(SharedString::from(format!("{size_kb} KB"))),
+                                                )
+                                                .child(
+                                                    Button::new(("popout-save-att", att_id))
+                                                        .ghost()
+                                                        .compact()
+                                                        .icon(IconName::Download)
+                                                        .tooltip("保存附件")
+                                                        .on_click(move |_, _, cx| {
+                                                            let fn_clone = filename.clone();
+                                                            let _ = app_w.update(cx, |app, cx| {
+                                                                app.save_attachment(att_id, &fn_clone, cx);
+                                                            });
+                                                        }),
+                                                )
+                                        })),
+                                ),
                         )
                     })
             })

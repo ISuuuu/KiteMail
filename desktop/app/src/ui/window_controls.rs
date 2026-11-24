@@ -11,7 +11,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{h_flex, Icon, Sizable};
 use gpui_kit::{
-    div, px, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    div, px, App, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
     StatefulInteractiveElement, Styled, Window, WindowControlArea,
 };
 
@@ -22,6 +22,79 @@ use crate::theme;
 pub(crate) const HEADER_HEIGHT: f32 = 48.0;
 /// Windows 原生风格单颗控制按钮宽度。
 const CONTROL_BTN_WIDTH: f32 = 46.0;
+
+/// 渲染独立窗口（独立写信 / 独立阅读）的 Windows 原生风格三联控制按钮：
+/// 最小化仅缩小当前窗口（不写主窗口几何偏好、不隐藏到托盘）；关闭走原生 `WM_CLOSE` -> `on_window_should_close`。
+pub(crate) fn render_standalone_window_controls(
+    id_prefix: &'static str,
+    window: &Window,
+    cx: &App,
+) -> gpui_kit::AnyElement {
+    let p = theme::current(cx);
+    let (text, hover_bg, danger, danger_fg) = (p.text, p.accent_soft(), p.danger, p.accent_fg);
+    let is_maximized = window.is_maximized();
+
+    h_flex()
+        .flex_shrink_0()
+        .h_full()
+        .items_center()
+        .child(
+            div()
+                .id((id_prefix, 0u32))
+                .w(px(CONTROL_BTN_WIDTH))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(text)
+                .hover(move |s| s.bg(hover_bg))
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_click(|_, window, _| {
+                    window.minimize_window();
+                })
+                .child(Icon::new(IconName::Minus).with_size(px(14.0))),
+        )
+        .child(
+            div()
+                .id((id_prefix, 1u32))
+                .w(px(CONTROL_BTN_WIDTH))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(text)
+                .hover(move |s| s.bg(hover_bg))
+                .window_control_area(WindowControlArea::Max)
+                .child(
+                    Icon::new(if is_maximized {
+                        IconName::Copy
+                    } else {
+                        IconName::Square
+                    })
+                    .with_size(px(12.0)),
+                ),
+        )
+        .child(
+            div()
+                .id((id_prefix, 2u32))
+                .w(px(CONTROL_BTN_WIDTH))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(text)
+                .hover(move |s| s.bg(danger).text_color(danger_fg))
+                .window_control_area(WindowControlArea::Close)
+                .child(Icon::new(IconName::X).with_size(px(14.0))),
+        )
+        .into_any_element()
+}
 
 /// 渲染 Windows 原生风格的「最小化 / 最大化(还原) / 关闭」三联控制按钮。
 pub(crate) fn render_window_controls(

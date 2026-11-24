@@ -165,7 +165,7 @@ fn row_context_menu(
             .item(
                 PopupMenuItem::new("在独立窗口中打开").on_click(move |_, _, cx| {
                     entity_for_popout.update(cx, |this, cx| {
-                        this.select_message(
+                        this.open_message_in_window(
                             account_id,
                             message_id,
                             uid,
@@ -173,15 +173,6 @@ fn row_context_menu(
                             &folder_path_for_popout,
                             cx,
                         );
-                        if let Some(ref detail) = this
-                            .selected_message
-                            .as_ref()
-                            .filter(|m| m.id == message_id)
-                        {
-                            this.pop_out_message_window((*detail).clone(), cx);
-                        } else {
-                            this.pending_popout_message_ids.insert(message_id);
-                        }
                     });
                 }),
             )
@@ -850,7 +841,7 @@ fn message_row(
                 this.list_focused = true;
                 this.kbd_cursor_message_id = None;
                 let is_double_click = match event {
-                    gpui_kit::ClickEvent::Mouse(m) => m.up.click_count >= 2,
+                    gpui_kit::ClickEvent::Mouse(m) => m.up.click_count == 2,
                     _ => false,
                 };
                 match draft.as_ref() {
@@ -866,15 +857,24 @@ fn message_row(
                             this.toggle_message_selection(msg_id, cx);
                         } else {
                             this.selected_message_ids.clear();
-                            this.select_message(account_id, msg_id, uid, unread, &folder_path, cx);
                             if is_double_click {
-                                if let Some(ref detail) =
-                                    this.selected_message.as_ref().filter(|m| m.id == msg_id)
-                                {
-                                    this.pop_out_message_window((*detail).clone(), cx);
-                                } else {
-                                    this.pending_popout_message_ids.insert(msg_id);
-                                }
+                                this.open_message_in_window_from_double_click(
+                                    account_id,
+                                    msg_id,
+                                    uid,
+                                    unread,
+                                    &folder_path,
+                                    cx,
+                                );
+                            } else {
+                                this.select_message(
+                                    account_id,
+                                    msg_id,
+                                    uid,
+                                    unread,
+                                    &folder_path,
+                                    cx,
+                                );
                             }
                         }
                     }

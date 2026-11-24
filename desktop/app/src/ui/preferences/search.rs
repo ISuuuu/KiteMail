@@ -327,9 +327,16 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     PrefSearchItem {
         tab: PrefTab::Composing,
         row_id: "pref-compose-inline",
-        title: "回复与转发在阅读器内联分屏",
-        subtitle: "写信面板贴在下半部分，原邮件留在上半部分对照；点 ↗ 可弹出为独立窗口",
-        keywords: "compose inline split reader reply forward window pop out 内联 分屏 写信 独立窗口",
+        title: "在主窗口中新建邮件",
+        subtitle: "关闭时点击写信将在独立窗口中打开新邮件",
+        keywords: "compose inline window pop out 新建 写信 独立窗口 主窗口",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Composing,
+        row_id: "pref-reply-inline",
+        title: "在主窗口中回复与转发",
+        subtitle: "关闭时回复与转发将在独立窗口中打开；开启时在主窗口分屏对照原邮件",
+        keywords: "reply forward inline split reader window pop out 内联 分屏 回复 转发 独立窗口",
     },
     PrefSearchItem {
         tab: PrefTab::Composing,
@@ -732,6 +739,16 @@ mod tests {
         let broad = filter_search_items("a");
         assert!(!broad.is_empty());
         assert!(broad.len() <= 60);
+
+        let compose_hits = filter_search_items("在主窗口中新建邮件");
+        assert!(compose_hits
+            .iter()
+            .any(|item| item.row_id == "pref-compose-inline"));
+
+        let reply_hits = filter_search_items("在主窗口中回复与转发");
+        assert!(reply_hits
+            .iter()
+            .any(|item| item.row_id == "pref-reply-inline"));
     }
 
     #[test]

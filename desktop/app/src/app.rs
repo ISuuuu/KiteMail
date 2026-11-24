@@ -117,6 +117,46 @@ fn peek_sidebar_width(pref_width: f32, viewport_w: f32) -> f32 {
         .min((viewport_w - sidebar::RAIL_WIDTH).max(0.0))
 }
 
+fn is_selected_message_ready_for_popout(
+    selected_id: Option<u32>,
+    target_id: u32,
+    pending_body_id: Option<u32>,
+    is_placeholder: bool,
+) -> bool {
+    !is_placeholder && pending_body_id != Some(target_id) && selected_id == Some(target_id)
+}
+
+fn should_update_main_reader_on_body_loaded(
+    detail_id: u32,
+    pending_body_id: Option<u32>,
+    popped_out: bool,
+    selected_id: Option<u32>,
+) -> bool {
+    match pending_body_id {
+        Some(id) => id == detail_id,
+        None => !popped_out || selected_id == Some(detail_id),
+    }
+}
+
+fn popout_cascade_offset(open_count: usize) -> f32 {
+    (open_count % 8) as f32 * 28.0
+}
+
+fn compose_session_active(right_mode: RightPaneMode, compose_detached: bool) -> bool {
+    right_mode == RightPaneMode::Compose || compose_detached
+}
+
+fn should_use_compose_split(split: bool, reply_inline: bool, has_selected_message: bool) -> bool {
+    split && reply_inline && has_selected_message
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PopoutReplyKind {
+    Reply,
+    ReplyAll,
+    Forward,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RightPaneMode {
     Reader,
@@ -740,6 +780,8 @@ pub(crate) struct HylkiApp {
     pub(crate) backfill: BackfillDriveState,
     pub(crate) current_page: MailPage,
     pub(crate) selected_message: Option<MessageDetail>,
+    /// `selected_message` 是否仅是 `show_message_loading` 写入的空占位详情。
+    pub(crate) selected_message_is_placeholder: bool,
     /// 正在等待远端正文的邮件 ID：用于立即占位显示并丢弃过期正文回包。
     pub(crate) pending_body_message_id: Option<u32>,
     /// Ctrl+点击多选的邮件 ID 集合。
@@ -787,7 +829,7 @@ pub(crate) struct HylkiApp {
     /// WP-10-4 写信任意弹出为独立窗口：主窗口回到阅读器，不再重复画写信页。
     pub(crate) compose_detached: bool,
     /// 独立写信窗口的句柄（`None` = 未弹出或在别处已被关掉）。
-    compose_window: Option<AnyWindowHandle>,
+    pub(crate) compose_window: Option<AnyWindowHandle>,
     /// WP-10-5 定时发送：自定义时间输入行是否展开（预设时间直接从下拉里选）。
     pub(crate) compose_schedule_open: bool,
     /// WP-10-5 自定义定时时间手输框（`YYYY-MM-DD HH:MM`）。
@@ -928,8 +970,10 @@ pub(crate) struct HylkiApp {
     pub(crate) print_preview: Option<PrintPreviewState>,
     /// B-2：列表行菜单挂起的后续动作（等对应正文加载完成后执行）。
     pub(crate) pending_row_action: Option<(u32, PendingRowAction)>,
-    /// 双击列表行时若正文尚未拉取完成，记录此邮件 ID 集合，待 MessageBodyLoaded 时自动弹出独立窗口。
+    /// 双击列表行或右键「在独立窗口中打开」时若正文尚未拉取完成，记录此邮件 ID 集合，待 MessageBodyLoaded 时自动弹出独立窗口。
     pub(crate) pending_popout_message_ids: std::collections::HashSet<u32>,
+    /// 已打开的独立阅读窗口句柄表（按邮件 ID 去重激活，关闭时移除）。
+    popout_message_windows: HashMap<u32, AnyWindowHandle>,
     /// B-2：正在抓取原始 MIME 以导出 .eml 的邮件 ID（「导出中…」状态，防重复点击）。
     pub(crate) pending_eml_export: Option<u32>,
     /// F-3：进行中的移动 / 删除 / 归档（成功回执到达后转成 `last_move_undo`）。
@@ -1308,6 +1352,7 @@ impl HylkiApp {
                 backfill: BackfillDriveState::default(),
                 current_page,
                 selected_message,
+                selected_message_is_placeholder: false,
                 pending_body_message_id: None,
                 selected_message_ids: HashSet::new(),
                 drafts: Vec::new(),
@@ -1417,6 +1462,7 @@ impl HylkiApp {
                 print_preview: None,
                 pending_row_action: None,
                 pending_popout_message_ids: std::collections::HashSet::new(),
+                popout_message_windows: HashMap::new(),
                 pending_eml_export: None,
                 pending_undo: None,
                 last_move_undo: None,
@@ -1535,6 +1581,7 @@ impl HylkiApp {
                 items: Vec::new(),
             },
             selected_message: None,
+            selected_message_is_placeholder: false,
             pending_body_message_id: None,
             selected_message_ids: HashSet::new(),
             drafts: Vec::new(),
@@ -1648,6 +1695,7 @@ impl HylkiApp {
             print_preview: None,
             pending_row_action: None,
             pending_popout_message_ids: std::collections::HashSet::new(),
+            popout_message_windows: HashMap::new(),
             pending_eml_export: None,
             pending_undo: None,
             last_move_undo: None,
@@ -1921,19 +1969,22 @@ impl HylkiApp {
                     self.maybe_drive_backfill(cx);
                 }
                 WorkerEvent::MessageBodyLoaded(detail) => {
-                    if self
-                        .pending_body_message_id
-                        .is_some_and(|id| id != detail.id)
-                    {
-                        // 用户已切换到其他邮件：丢弃迟到的正文回包，避免阅读器回跳。
+                    let popped_out = self.pending_popout_message_ids.remove(&detail.id);
+                    if popped_out {
+                        self.pop_out_message_window(detail.clone(), cx);
+                    }
+                    if !should_update_main_reader_on_body_loaded(
+                        detail.id,
+                        self.pending_body_message_id,
+                        popped_out,
+                        self.selected_message.as_ref().map(|m| m.id),
+                    ) {
+                        // 用户已切换主阅读器邮件，或仅在独立窗口打开：不覆盖主阅读器。
                         continue;
                     }
                     let pending = self.pending_row_action.take();
                     self.set_selected_message(detail.clone());
                     self.error_banner = None;
-                    if self.pending_popout_message_ids.remove(&detail.id) {
-                        self.pop_out_message_window(detail.clone(), cx);
-                    }
                     // B-2：行菜单挂起的动作（回复 / 复制正文 / 查看原文）在正文就绪后执行。
                     if let Some((msg_id, action)) = pending {
                         if msg_id == detail.id {
@@ -2096,7 +2147,7 @@ impl HylkiApp {
                                 let _ = cx.update(|cx| {
                                     handle.update(cx, |_, window, cx| {
                                         let _ = this.update(cx, |app, cx| {
-                                            if app.right_mode != RightPaneMode::Compose {
+                                            if !app.has_active_compose() {
                                                 app.restore_pending_send_to_compose(
                                                     &pending, window, cx,
                                                 );
@@ -2169,6 +2220,7 @@ impl HylkiApp {
                     self.pending_eml_export = None;
                     // 正文拉取失败：解除占位态，让阅读器重新出现「加载完整正文」入口。
                     self.pending_body_message_id = None;
+                    self.pending_popout_message_ids.clear();
                     self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
                     self.error_banner = Some(SharedString::from(message.clone()));
                     self.status_line = SharedString::from(message);
@@ -2308,7 +2360,7 @@ impl HylkiApp {
                 }
                 // F-4：草稿落库回执——绑定新分配的本地草稿 ID，自动保存时显示提示。
                 WorkerEvent::DraftSaved { draft_id } => {
-                    if self.right_mode == RightPaneMode::Compose && draft_id > 0 {
+                    if self.has_active_compose() && draft_id > 0 {
                         if self.compose_draft_id.is_none() {
                             self.compose_draft_id = Some(draft_id);
                             if self.compose_autosave_pending {
@@ -3240,6 +3292,7 @@ impl HylkiApp {
         let Some(msg) = self.current_page.items.iter().find(|m| m.id == message_id) else {
             return;
         };
+        self.selected_message_is_placeholder = true;
         self.selected_message = Some(MessageDetail {
             id: msg.id,
             account_id: msg.account_id,
@@ -3299,6 +3352,7 @@ impl HylkiApp {
             );
         }
         self.pending_body_message_id = None;
+        self.selected_message_is_placeholder = false;
         self.selected_message = Some(detail);
     }
 
@@ -3431,6 +3485,7 @@ impl HylkiApp {
         };
         if was_displayed {
             self.selected_message = None;
+            self.selected_message_is_placeholder = false;
         }
         // 先请求相邻邮件正文、后刷新列表：worker 按顺序处理，详情先回、页面后回，
         // 避免 merge_loaded_page 在 selected_message 仍为空时误选第一封。
@@ -3669,9 +3724,15 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) {
         match action {
-            PendingRowAction::Reply => self.start_reply(detail, window, cx),
-            PendingRowAction::ReplyAll => self.start_reply_all(detail, window, cx),
-            PendingRowAction::Forward => self.start_forward(detail, window, cx),
+            PendingRowAction::Reply => {
+                self.start_reply(detail, window, cx);
+            }
+            PendingRowAction::ReplyAll => {
+                self.start_reply_all(detail, window, cx);
+            }
+            PendingRowAction::Forward => {
+                self.start_forward(detail, window, cx);
+            }
             PendingRowAction::EditAsNew => self.start_edit_as_new(detail, window, cx),
             PendingRowAction::CopyBody => {
                 let text = detail.body_text.clone();
@@ -4478,7 +4539,7 @@ impl HylkiApp {
             InputEvent::Change => {
                 self.compose_autocomplete_field = Some(field);
                 self.schedule_draft_autosave(cx);
-                let handle = self.window_handle;
+                let handle = self.compose_window.unwrap_or(self.window_handle);
                 let entity = cx.entity();
                 cx.defer(move |cx| {
                     let _ = handle.update(cx, |_, window, cx| {
@@ -4491,7 +4552,7 @@ impl HylkiApp {
                 if self.compose_autocomplete_field == Some(field) {
                     self.compose_autocomplete_field = None;
                 }
-                let handle = self.window_handle;
+                let handle = self.compose_window.unwrap_or(self.window_handle);
                 let entity = cx.entity();
                 cx.defer(move |cx| {
                     let _ = handle.update(cx, |_, window, cx| {
@@ -4829,11 +4890,39 @@ impl HylkiApp {
 
     // ---- WP-10-4：内联上下分屏回复与独立写信窗口 ----
 
+    pub(crate) fn has_active_compose(&self) -> bool {
+        compose_session_active(self.right_mode, self.compose_detached)
+    }
+
+    fn is_selected_message_ready_for_popout(&self, message_id: u32) -> bool {
+        is_selected_message_ready_for_popout(
+            self.selected_message.as_ref().map(|m| m.id),
+            message_id,
+            self.pending_body_message_id,
+            self.selected_message_is_placeholder,
+        )
+    }
+
+    pub(crate) fn unregister_popout_message_window(
+        &mut self,
+        message_id: u32,
+        handle: Option<AnyWindowHandle>,
+    ) {
+        let should_remove = match (self.popout_message_windows.get(&message_id), handle) {
+            (Some(current), Some(target)) => *current == target,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if should_remove {
+            self.popout_message_windows.remove(&message_id);
+        }
+    }
+
     /// 进入写信会话时决定挂载方式。
     ///
     /// 对齐原版 "where composers live"（`src/app/compose_host.rs`）：
     /// - `split = true`（回复 / 回复全部 / 转发 / 作为新邮件编辑）且偏好
-    ///   `compose_inline` 打开、阅读器里还留着一封可对照的邮件时，写信面板贴在
+    ///   `reply_inline` 打开、阅读器里还留着一封可对照的邮件时，写信面板贴在
     ///   分屏上半部分（默认落点），原邮件在下方对照，中间带可拖拽的 `.split-grab-pill`；
     /// - `split = false`（新写信 / 打开草稿 / 撤销发送回填）时整栏呈现。
     ///
@@ -4849,7 +4938,11 @@ impl HylkiApp {
         self.compose_schedule_open = false;
         self.compose_schedule_error = None;
         self.compose_template_save_open = false;
-        self.compose_split = split && self.prefs.compose_inline && self.selected_message.is_some();
+        self.compose_split = should_use_compose_split(
+            split,
+            self.prefs.reply_inline,
+            self.selected_message.is_some(),
+        );
         if self.compose_split_height < COMPOSE_SPLIT_MIN_HEIGHT {
             self.compose_split_height = COMPOSE_SPLIT_DEFAULT_HEIGHT;
         }
@@ -4878,6 +4971,11 @@ impl HylkiApp {
     /// 所以草稿自动保存、发送、附件等逻辑无需复制；主窗口同时回到阅读器。
     pub(crate) fn pop_out_compose(&mut self, cx: &mut Context<Self>) {
         if self.compose_detached {
+            if let Some(handle) = self.compose_window {
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                });
+            }
             return;
         }
         self.close_compose_window(cx);
@@ -4892,6 +4990,7 @@ impl HylkiApp {
         } else {
             subject
         };
+        let generation = self.compose_session_generation;
         let app_entity = cx.entity();
         let centered = Bounds::centered(None, size(px(780.0), px(700.0)), cx);
         let options = WindowOptions {
@@ -4906,6 +5005,13 @@ impl HylkiApp {
         // 独立窗口首帧渲染会借用主窗口实体，等当前更新释放实体借用后再打开，避免重入 panic。
         let app_entity_for_new = app_entity.clone();
         cx.defer(move |cx| {
+            let still_valid = {
+                let app = app_entity.read(cx);
+                app.compose_session_generation == generation && app.compose_detached
+            };
+            if !still_valid {
+                return;
+            }
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {
                 window.set_window_title(&title);
                 cx.new(|cx| ComposeWindow::new(app_entity_for_new, window, cx))
@@ -4933,22 +5039,10 @@ impl HylkiApp {
         cx.notify();
     }
 
-    /// 把独立窗口里的写信收回主窗口（`↙` 按钮；窗口关闭回调也走这里）。
+    /// 把独立窗口里的写信收回主窗口（`↙` 按钮）。
     pub(crate) fn attach_compose_back(&mut self, cx: &mut Context<Self>) {
         self.close_compose_window(cx);
-        self.set_compose_detached(false, cx);
         self.right_mode = RightPaneMode::Compose;
-    }
-
-    /// 标记写信是否仍寄居在独立窗口（窗口被关掉时由关闭回调复位）。
-    pub(crate) fn set_compose_detached(&mut self, detached: bool, cx: &mut Context<Self>) {
-        if self.compose_detached == detached {
-            return;
-        }
-        self.compose_detached = detached;
-        if !detached {
-            self.compose_window = None;
-        }
         cx.notify();
     }
 
@@ -4958,18 +5052,19 @@ impl HylkiApp {
         self.compose_session_generation += 1;
         self.compose_split = false;
         self.right_mode = RightPaneMode::Reader;
-        if self.compose_detached {
+        if self.compose_detached || self.compose_window.is_some() {
             self.close_compose_window(cx);
-            self.compose_detached = false;
         }
     }
 
-    /// 关掉残留的独立写信窗口（新写信会话抢占 / 重复弹出前调用）。
+    /// 关掉残留的独立写信窗口（新写信会话抢占 / 发送 / 放弃 / 收回前调用）。
     fn close_compose_window(&mut self, cx: &mut Context<Self>) {
-        if let Some(handle) = self.compose_window.take() {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
-        }
         self.compose_detached = false;
+        if let Some(handle) = self.compose_window.take() {
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            });
+        }
     }
 
     pub(crate) fn start_new_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5063,7 +5158,7 @@ impl HylkiApp {
             let _ = this.update(cx, |app, cx| {
                 if app.compose_autosave_generation == generation
                     && app.compose_autosave_dirty
-                    && app.right_mode == RightPaneMode::Compose
+                    && app.has_active_compose()
                 {
                     app.autosave_draft_now(cx);
                 }
@@ -5096,13 +5191,49 @@ impl HylkiApp {
         }
     }
 
+    pub(crate) fn start_popout_compose_from_message(
+        &mut self,
+        detail: MessageDetail,
+        kind: PopoutReplyKind,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.has_active_compose() && self.compose_has_unsaved_content(cx) {
+            self.status_line = SharedString::from("当前写信尚未完成，请先发送、存草稿或取消");
+            if let Some(handle) = self.compose_window {
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                });
+            }
+            cx.notify();
+            return false;
+        }
+        self.unregister_popout_message_window(detail.id, None);
+        let entity = cx.entity();
+        let handle = self.window_handle;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                entity.update(cx, |app, cx| {
+                    let ok = match kind {
+                        PopoutReplyKind::Reply => app.start_reply(&detail, window, cx),
+                        PopoutReplyKind::ReplyAll => app.start_reply_all(&detail, window, cx),
+                        PopoutReplyKind::Forward => app.start_forward(&detail, window, cx),
+                    };
+                    if ok && !app.compose_detached {
+                        app.pop_out_compose(cx);
+                    }
+                });
+            });
+        });
+        true
+    }
+
     pub(crate) fn start_reply(
         &mut self,
         detail: &MessageDetail,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.start_reply_with(detail, "Re:", &detail.sender, window, cx);
+    ) -> bool {
+        self.start_reply_with(detail, "Re:", &detail.sender, window, cx)
     }
 
     /// 回复全部：收件人 = 原发件人 + 原收件人（沿用现有写信状态，无新 API）。
@@ -5111,14 +5242,14 @@ impl HylkiApp {
         detail: &MessageDetail,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let mut to = detail.sender.clone();
         let recipients = detail.recipients.trim();
         if !recipients.is_empty() {
             to.push_str(", ");
             to.push_str(recipients);
         }
-        self.start_reply_with(detail, "Re:", &to, window, cx);
+        self.start_reply_with(detail, "Re:", &to, window, cx)
     }
 
     /// 转发：主题加 Fwd: 前缀，正文引用原邮件，收件人留空，并自动携带原邮件已缓存附件。
@@ -5127,13 +5258,13 @@ impl HylkiApp {
         detail: &MessageDetail,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         // WP-10-4：内联分屏时原邮件仍在眼前，回复 / 转发按钮随时可点；
         // 当前写信已有内容时先拦下，避免一次误点把正在写的正文换掉。
-        if self.right_mode == RightPaneMode::Compose && self.compose_has_unsaved_content(cx) {
+        if self.has_active_compose() && self.compose_has_unsaved_content(cx) {
             self.status_line = SharedString::from("当前写信尚未完成，请先发送、存草稿或取消");
             cx.notify();
-            return;
+            return false;
         }
         let forward_subject = if detail.subject.to_lowercase().starts_with("fwd:") {
             detail.subject.clone()
@@ -5198,6 +5329,7 @@ impl HylkiApp {
             self.pop_out_compose(cx);
         }
         cx.notify();
+        true
     }
 
     /// WP-08：作为新邮件编辑（保留原主题、收件人与正文，打开新写信面板）。
@@ -5244,13 +5376,13 @@ impl HylkiApp {
         to: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         // WP-10-4：内联分屏时原邮件仍在眼前，回复 / 转发按钮随时可点；
         // 当前写信已有内容时先拦下，避免一次误点把正在写的正文换掉。
-        if self.right_mode == RightPaneMode::Compose && self.compose_has_unsaved_content(cx) {
+        if self.has_active_compose() && self.compose_has_unsaved_content(cx) {
             self.status_line = SharedString::from("当前写信尚未完成，请先发送、存草稿或取消");
             cx.notify();
-            return;
+            return false;
         }
         let reply_subject = if detail
             .subject
@@ -5301,6 +5433,7 @@ impl HylkiApp {
             self.pop_out_compose(cx);
         }
         cx.notify();
+        true
     }
 
     /// 判断当前写信表单是否存在未保存内容。
@@ -5942,15 +6075,155 @@ impl HylkiApp {
         .detach();
     }
 
+    /// 右键「在独立窗口中打开」：仅单独弹出该邮件，不改变主窗口当前选中的邮件。
+    pub(crate) fn open_message_in_window(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        unread: bool,
+        folder_path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&handle) = self.popout_message_windows.get(&message_id) {
+            let app_entity = cx.entity();
+            let folder_path = folder_path.to_string();
+            cx.defer(move |cx| {
+                if handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_err()
+                {
+                    let _ = app_entity.update(cx, |app, cx| {
+                        app.unregister_popout_message_window(message_id, Some(handle));
+                        app.open_message_in_window(
+                            account_id,
+                            message_id,
+                            uid,
+                            unread,
+                            &folder_path,
+                            cx,
+                        );
+                    });
+                }
+            });
+            return;
+        }
+        if self.demo_mode {
+            if unread && self.prefs.read_mark_mode == "shown" {
+                self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+            }
+            if let Some(detail) = self.demo_message_detail(message_id) {
+                self.pop_out_message_window(detail, cx);
+            }
+            cx.notify();
+            return;
+        }
+        if self.is_selected_message_ready_for_popout(message_id) {
+            if let Some(detail) = self.selected_message.clone() {
+                if unread && self.prefs.read_mark_mode == "shown" {
+                    self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+                }
+                self.pop_out_message_window(detail, cx);
+            }
+            return;
+        }
+        self.pending_popout_message_ids.insert(message_id);
+        if unread && self.prefs.read_mark_mode == "shown" {
+            self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+        }
+        if self.pending_body_message_id != Some(message_id) {
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::LoadMessageBody {
+                    account_id,
+                    message_id,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// 列表行双击：在主窗口选中并弹出独立窗口；若正文尚未拉取完成，等正文返回后再弹出完整窗。
+    pub(crate) fn open_message_in_window_from_double_click(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        uid: u32,
+        unread: bool,
+        folder_path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&handle) = self.popout_message_windows.get(&message_id) {
+            let app_entity = cx.entity();
+            let folder_path = folder_path.to_string();
+            cx.defer(move |cx| {
+                if handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_err()
+                {
+                    let _ = app_entity.update(cx, |app, cx| {
+                        app.unregister_popout_message_window(message_id, Some(handle));
+                        app.open_message_in_window_from_double_click(
+                            account_id,
+                            message_id,
+                            uid,
+                            unread,
+                            &folder_path,
+                            cx,
+                        );
+                    });
+                }
+            });
+            return;
+        }
+        if self.is_selected_message_ready_for_popout(message_id) {
+            if let Some(detail) = self.selected_message.clone() {
+                self.pop_out_message_window(detail, cx);
+            }
+            return;
+        }
+        if self.pending_body_message_id != Some(message_id) {
+            self.select_message(account_id, message_id, uid, unread, folder_path, cx);
+        }
+        if self.is_selected_message_ready_for_popout(message_id) {
+            if let Some(detail) = self.selected_message.clone() {
+                self.pop_out_message_window(detail, cx);
+            }
+            return;
+        }
+        self.pending_popout_message_ids.insert(message_id);
+        cx.notify();
+    }
+
     pub(crate) fn pop_out_message_window(&mut self, detail: MessageDetail, cx: &mut Context<Self>) {
-        let app_weak = cx.entity().downgrade();
+        if let Some(&existing) = self.popout_message_windows.get(&detail.id) {
+            let app_entity = cx.entity();
+            let msg_id = detail.id;
+            cx.defer(move |cx| {
+                if existing
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_err()
+                {
+                    let _ = app_entity.update(cx, |app, cx| {
+                        app.unregister_popout_message_window(msg_id, Some(existing));
+                        app.pop_out_message_window(detail, cx);
+                    });
+                }
+            });
+            return;
+        }
+        let msg_id = detail.id;
+        let app_entity = cx.entity();
+        let app_weak = app_entity.downgrade();
         let prefs = self.prefs.clone();
         let title = if detail.subject.trim().is_empty() {
             "邮件阅读".to_string()
         } else {
             detail.subject.clone()
         };
-        let centered = Bounds::centered(None, size(px(860.0), px(720.0)), cx);
+        let offset = popout_cascade_offset(self.popout_message_windows.len());
+        let mut centered = Bounds::centered(None, size(px(860.0), px(720.0)), cx);
+        centered.origin.x += px(offset);
+        centered.origin.y += px(offset);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(centered)),
             titlebar: Some(TitlebarOptions {
@@ -5962,12 +6235,31 @@ impl HylkiApp {
         };
         // 独立窗口首帧会读取主窗口状态，等当前更新释放主窗口实体后再打开。
         cx.defer(move |cx| {
-            if let Ok((_handle, _entity)) = gpui_kit::open_window(options, cx, move |window, cx| {
+            if let Some(existing) = app_entity
+                .read(cx)
+                .popout_message_windows
+                .get(&msg_id)
+                .copied()
+            {
+                if existing
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+                {
+                    return;
+                }
+                let _ = app_entity.update(cx, |app, _| {
+                    app.unregister_popout_message_window(msg_id, Some(existing));
+                });
+            }
+            if let Ok((handle, _entity)) = gpui_kit::open_window(options, cx, move |window, cx| {
                 window.set_window_title(&title);
                 cx.new(|cx| MessageWindow::new(detail, app_weak, prefs, window, cx))
             }) {
                 #[cfg(target_os = "windows")]
                 crate::apply_window_icon();
+                let _ = app_entity.update(cx, |app, _| {
+                    app.popout_message_windows.insert(msg_id, handle);
+                });
             }
         });
     }
@@ -6278,7 +6570,7 @@ impl HylkiApp {
             return;
         }
         if pending.enqueue_failed {
-            if self.right_mode == RightPaneMode::Compose {
+            if self.has_active_compose() {
                 self.status_line = SharedString::from("请先关闭当前写信页，再恢复未保存的邮件");
             } else {
                 let pending = self.pending_send.take().unwrap();
@@ -9209,13 +9501,41 @@ impl HylkiApp {
                             })),
                     )
                     .when(pane_top, |bar| {
-                        bar.child(window_controls::render_window_controls(
-                            "compose-wc",
-                            window,
-                            cx,
-                        ))
+                        bar.child(if detached {
+                            window_controls::render_standalone_window_controls(
+                                "compose-wc",
+                                window,
+                                cx,
+                            )
+                        } else {
+                            window_controls::render_window_controls("compose-wc", window, cx)
+                        })
                     }),
             )
+            .when(detached, |el| {
+                el.when_some(self.error_banner.as_ref(), |el, err| {
+                    el.child(
+                        h_flex()
+                            .px_3()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(p.border)
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_xs().text_color(p.danger).child(err.clone()))
+                            .child(
+                                Button::new("compose-dismiss-err")
+                                    .ghost()
+                                    .compact()
+                                    .label("关闭")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.error_banner = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
+            })
             .child(compose::render(self, cx))
             .into_any_element()
     }
@@ -11660,5 +11980,86 @@ mod tests {
         assert!(prefs.is_remote_sender_allowed("trusted@example.com"));
         assert!(prefs.is_remote_sender_allowed("Trusted User <trusted@example.com>"));
         assert!(!prefs.is_remote_sender_allowed("untrusted@example.com"));
+    }
+
+    #[test]
+    fn compose_session_and_split_preferences_respect_detached_and_reply_inline() {
+        assert!(compose_session_active(RightPaneMode::Compose, false));
+        assert!(compose_session_active(RightPaneMode::Reader, true));
+        assert!(!compose_session_active(RightPaneMode::Reader, false));
+        assert!(!compose_session_active(RightPaneMode::Welcome, false));
+
+        // 新建邮件关闭内联（compose_inline=false）但回复内联开启（reply_inline=true）时仍应启用分屏。
+        assert!(should_use_compose_split(true, true, true));
+        assert!(!should_use_compose_split(true, false, true));
+        assert!(!should_use_compose_split(false, true, true));
+        assert!(!should_use_compose_split(true, true, false));
+    }
+
+    #[test]
+    fn popout_readiness_and_main_reader_update_rules_work() {
+        // 仅当不是占位详情、未在加载中且 ID 匹配时才允许直接用 selected_message 弹窗。
+        assert!(is_selected_message_ready_for_popout(
+            Some(42),
+            42,
+            None,
+            false
+        ));
+        assert!(!is_selected_message_ready_for_popout(
+            Some(42),
+            42,
+            None,
+            true
+        ));
+        assert!(!is_selected_message_ready_for_popout(
+            Some(42),
+            42,
+            Some(42),
+            false
+        ));
+        assert!(!is_selected_message_ready_for_popout(
+            Some(10),
+            42,
+            None,
+            false
+        ));
+        assert!(!is_selected_message_ready_for_popout(None, 42, None, false));
+
+        // 右键独立打开其他邮件：不改变主窗口当前邮件。
+        assert!(!should_update_main_reader_on_body_loaded(
+            20,
+            None,
+            true,
+            Some(10)
+        ));
+        // 主窗口正在加载 10 时，独立弹出 20 返回不应更新主窗口。
+        assert!(!should_update_main_reader_on_body_loaded(
+            20,
+            Some(10),
+            true,
+            Some(10)
+        ));
+        // 双击打开 10 且主窗口也在等待 10：主窗口同步更新。
+        assert!(should_update_main_reader_on_body_loaded(
+            10,
+            Some(10),
+            true,
+            Some(10)
+        ));
+        // 主窗口无在途选中请求时，会话内卡片手动「加载完整正文」仍正常更新主窗口。
+        assert!(should_update_main_reader_on_body_loaded(
+            11,
+            None,
+            false,
+            Some(10)
+        ));
+    }
+
+    #[test]
+    fn popout_cascade_offset_wraps_every_eight_windows() {
+        assert_eq!(popout_cascade_offset(0), 0.0);
+        assert_eq!(popout_cascade_offset(1), 28.0);
+        assert_eq!(popout_cascade_offset(7), 196.0);
+        assert_eq!(popout_cascade_offset(8), 0.0);
     }
 }

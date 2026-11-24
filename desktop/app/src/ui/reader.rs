@@ -176,7 +176,9 @@ fn build_card_more_menu(
                         .icon(Icon::new(IconName::Reply))
                         .on_click(move |_, window, cx| {
                             let d = d_reply.clone();
-                            e_reply.update(cx, |this, cx| this.start_reply(&d, window, cx));
+                            e_reply.update(cx, |this, cx| {
+                                this.start_reply(&d, window, cx);
+                            });
                         }),
                 )
                 .item(
@@ -184,7 +186,9 @@ fn build_card_more_menu(
                         .icon(Icon::new(IconName::ReplyAll))
                         .on_click(move |_, window, cx| {
                             let d = d_reply_all.clone();
-                            e_reply_all.update(cx, |this, cx| this.start_reply_all(&d, window, cx));
+                            e_reply_all.update(cx, |this, cx| {
+                                this.start_reply_all(&d, window, cx);
+                            });
                         }),
                 )
                 .item(
@@ -192,7 +196,9 @@ fn build_card_more_menu(
                         .icon(Icon::new(IconName::Forward))
                         .on_click(move |_, window, cx| {
                             let d = d_forward.clone();
-                            e_forward.update(cx, |this, cx| this.start_forward(&d, window, cx));
+                            e_forward.update(cx, |this, cx| {
+                                this.start_forward(&d, window, cx);
+                            });
                         }),
                 )
                 .separator()
