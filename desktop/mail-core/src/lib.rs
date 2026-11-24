@@ -113,6 +113,14 @@ pub struct MessageSummary {
     pub snoozed_until_ts: i64,
 }
 
+/// 自动随正文一起缓存的附件体积上限（2 MB）；超过该体积的附件只保存元数据，
+/// 在用户预览、保存或转发时按需下载。
+pub const AUTO_CACHE_ATTACHMENT_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+pub(crate) fn default_true() -> bool {
+    true
+}
+
 /// Cached attachment metadata shown in the reading pane.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentMeta {
@@ -120,6 +128,8 @@ pub struct AttachmentMeta {
     pub filename: String,
     pub mime_type: String,
     pub size_bytes: usize,
+    #[serde(default = "default_true")]
+    pub downloaded: bool,
 }
 
 /// One message card within a conversation thread shown in the reading pane.
@@ -787,6 +797,10 @@ pub enum MailRequest {
     BackfillHistoryBatch,
     /// Clear all cached message bodies (headers and accounts are kept).
     ClearBodyCaches,
+    /// 按保留天数清理本地已过期正文与附件缓存（0 = 永久保留）。
+    PruneExpiredDownloads {
+        keep_days: u32,
+    },
     /// Batch-mark every message in `folder_path` as read on the server
     /// (IMAP: chunked `UID STORE +FLAGS (\Seen)`; Graph: per-message update
     /// over cached unread messages), zero the folder's local unread count
@@ -969,6 +983,12 @@ pub enum WorkerEvent {
     AttachmentsSaved {
         count: usize,
         dest_dir: std::path::PathBuf,
+    },
+    /// 某个按需下载的远程附件已落盘缓存。
+    AttachmentDownloaded {
+        message_id: u32,
+        attachment_id: u32,
+        size_bytes: usize,
     },
     /// An attachment was stripped from its message on the server (#289).
     AttachmentStripped {

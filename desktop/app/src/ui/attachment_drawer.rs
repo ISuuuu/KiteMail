@@ -151,7 +151,17 @@ pub(crate) fn render_drawer(
             let filename = item.meta.filename.clone();
             let mime_type = item.meta.mime_type.clone();
             let size_bytes = item.meta.size_bytes;
-            let size_label = format_bytes(size_bytes);
+            let downloaded = item.meta.downloaded;
+            let size_label = if downloaded {
+                format_bytes(size_bytes)
+            } else {
+                format!("约 {} · 未下载", format_bytes(size_bytes))
+            };
+            let save_tooltip = if downloaded {
+                "保存附件"
+            } else {
+                "下载并保存附件"
+            };
             let is_stripping = stripping_ids.contains(&att_id);
             let is_confirming = pending_strip_id == Some(att_id);
             let (badge_label, badge_color) = file_badge(&filename, &mime_type, accent);
@@ -221,7 +231,7 @@ pub(crate) fn render_drawer(
                                 .ghost()
                                 .compact()
                                 .icon(IconName::Download)
-                                .tooltip("保存附件")
+                                .tooltip(save_tooltip)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.save_attachment(att_id, &save_name, cx);
                                 })),
@@ -368,7 +378,7 @@ pub(crate) fn render_drawer(
                                                 .ghost()
                                                 .compact()
                                                 .icon(IconName::Download)
-                                                .tooltip("保存附件")
+                                                .tooltip(save_tooltip)
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.save_attachment(att_id, &save_name, cx);
                                                 })),

@@ -1,23 +1,165 @@
 //! Dedicated Tokio worker thread orchestrating cache, credentials, IMAP, SMTP, and Graph OAuth2.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::cache::CacheStore;
+use crate::cache::{AttachmentRecord, CacheStore};
 use crate::config::{self, AccountConfig, AuthBackend};
 use crate::search_query::SearchQuery;
 use crate::secrets::{self, AccountSecrets};
 use crate::smtp_client::SendOutcome;
 use crate::{
-    graph_client, imap_client, oauth, smtp_client, MailRequest, MessageFilter, MessageSort,
-    MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
+    graph_client, imap_client, oauth, smtp_client, FetchedMessageBody, MailRequest, MessageDetail,
+    MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet,
+    UnifiedView, WorkerEvent,
 };
 
 type TokenCache = HashMap<u32, (String, Instant)>;
 type IdleWatchers = HashMap<u32, tokio::task::JoinHandle<()>>;
+type SharedAsyncCache = Arc<std::sync::Mutex<Option<CacheStore>>>;
+
+#[derive(Clone, Default)]
+struct SharedTokenCache {
+    cache: Arc<tokio::sync::Mutex<TokenCache>>,
+    refresh_locks: Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl SharedTokenCache {
+    async fn insert(&self, account_id: u32, token: String, expires_at: Instant) {
+        let mut guard = self.cache.lock().await;
+        guard.insert(account_id, (token, expires_at));
+    }
+
+    async fn remove(&self, account_id: u32) {
+        {
+            let mut guard = self.cache.lock().await;
+            guard.remove(&account_id);
+        }
+        if let Ok(mut locks) = self.refresh_locks.lock() {
+            locks.remove(&account_id);
+        }
+    }
+
+    fn account_refresh_lock(&self, account_id: u32) -> Arc<tokio::sync::Mutex<()>> {
+        let mut guard = self
+            .refresh_locks
+            .lock()
+            .expect("refresh lock map poisoned");
+        guard
+            .entry(account_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    async fn cached_valid_token(&self, account_id: u32) -> Option<String> {
+        let guard = self.cache.lock().await;
+        guard
+            .get(&account_id)
+            .filter(|(_, exp)| Instant::now() < *exp)
+            .map(|(tok, _)| tok.clone())
+    }
+
+    async fn ensure_graph_token(&self, account: &AccountConfig) -> Result<String, String> {
+        if let Some(tok) = self.cached_valid_token(account.id).await {
+            return Ok(tok);
+        }
+        let refresh_lock = self.account_refresh_lock(account.id);
+        let _refresh_guard = refresh_lock.lock().await;
+        if let Some(tok) = self.cached_valid_token(account.id).await {
+            return Ok(tok);
+        }
+
+        let refresh_token = secrets::load_oauth_refresh_token(account.id)?;
+        let client_id = account.oauth_client_id.clone();
+        let refreshed = tokio::task::spawn_blocking(move || {
+            oauth::refresh_microsoft_token(&client_id, &refresh_token)
+        })
+        .await
+        .map_err(|e| format!("刷新令牌任务异常: {e}"))??;
+
+        if let Some(new_rt) = refreshed.refresh_token {
+            let _ = secrets::save_oauth_refresh_token(account.id, new_rt);
+        }
+        let expires_at =
+            Instant::now() + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
+        self.insert(account.id, refreshed.access_token.clone(), expires_at)
+            .await;
+        Ok(refreshed.access_token)
+    }
+}
+
+fn open_existing_or_create_cache(db_path: &Path) -> Result<CacheStore, String> {
+    if db_path.exists() {
+        if let Ok(c) = CacheStore::open_existing(db_path) {
+            return Ok(c);
+        }
+    }
+    CacheStore::open(db_path)
+}
+
+fn with_shared_cache<T>(
+    shared: &SharedAsyncCache,
+    data_dir: &Path,
+    f: impl FnOnce(&mut CacheStore) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut guard = shared.lock().map_err(|_| "异步缓存锁已损坏".to_string())?;
+    if guard.is_none() {
+        *guard = Some(open_existing_or_create_cache(&config::cache_db_in(
+            data_dir,
+        ))?);
+    }
+    let cache = guard
+        .as_mut()
+        .ok_or_else(|| "异步缓存初始化失败".to_string())?;
+    let res = f(cache);
+    if res.is_err() {
+        *guard = None;
+    }
+    res
+}
+
+#[derive(Clone)]
+pub(crate) struct EventSender {
+    tx: mpsc::Sender<WorkerEvent>,
+    on_event: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl EventSender {
+    fn new(tx: mpsc::Sender<WorkerEvent>, on_event: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+        Self { tx, on_event }
+    }
+
+    fn noop() -> Self {
+        let (tx, _rx) = mpsc::channel();
+        Self { tx, on_event: None }
+    }
+
+    pub(crate) fn send(&self, evt: WorkerEvent) -> Result<(), mpsc::SendError<WorkerEvent>> {
+        let res = self.tx.send(evt);
+        if res.is_ok() {
+            if let Some(ref cb) = self.on_event {
+                cb();
+            }
+        }
+        res
+    }
+}
+
+struct InFlightBodyGuard {
+    message_id: u32,
+    set: Arc<std::sync::Mutex<HashSet<u32>>>,
+}
+
+impl Drop for InFlightBodyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.set.lock() {
+            guard.remove(&self.message_id);
+        }
+    }
+}
 
 /// 任务四：后台历史索引每批拉取的邮件数上限。比前台滚动拉取的 100 小，
 /// 批次在独立任务中执行，不占用交互请求（读信 / 搜索 / 发信）队列。
@@ -32,13 +174,25 @@ pub struct MailWorkerHandle {
     evt_rx: mpsc::Receiver<WorkerEvent>,
     /// 数据目录：退出时主线程直接打开缓存库落盘，不排队等待单线程 worker。
     data_dir: PathBuf,
+    /// UI 线程只读 SQLite 连接：已缓存正文直接毫秒级读取，不进 worker 队列。
+    read_cache: std::sync::Mutex<Option<CacheStore>>,
 }
 
 impl MailWorkerHandle {
     /// Spawn the background Tokio runtime and worker loop using `data_dir`.
     pub fn spawn(data_dir: PathBuf) -> Result<Self, String> {
+        Self::spawn_with_notifier(data_dir, None)
+    }
+
+    /// Spawn the background worker with an optional callback invoked whenever a new
+    /// [`WorkerEvent`] is queued for the UI.
+    pub fn spawn_with_notifier(
+        data_dir: PathBuf,
+        on_event: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<Self, String> {
         let (req_tx, req_rx) = mpsc::channel::<MailRequest>();
-        let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
+        let (raw_evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
+        let evt_tx = EventSender::new(raw_evt_tx, on_event);
         let worker_req_tx = req_tx.clone();
         let worker_data_dir = data_dir.clone();
 
@@ -59,7 +213,41 @@ impl MailWorkerHandle {
             req_tx,
             evt_rx,
             data_dir,
+            read_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Read already-cached message details directly on the UI thread via a read-only
+    /// SQLite connection, bypassing the worker channel completely.
+    pub fn try_load_cached_message(
+        &self,
+        message_id: u32,
+        newest_first: bool,
+    ) -> Result<Option<(MessageDetail, bool)>, String> {
+        let Ok(mut guard) = self.read_cache.lock() else {
+            return Ok(None);
+        };
+        if guard.is_none() {
+            let db_path = config::cache_db_in(&self.data_dir);
+            if !db_path.exists() {
+                return Ok(None);
+            }
+            match CacheStore::open_read_only(&db_path) {
+                Ok(store) => *guard = Some(store),
+                Err(_) => return Ok(None),
+            }
+        }
+        let Some(store) = guard.as_ref() else {
+            return Ok(None);
+        };
+        match store.get_message_detail_ordered(message_id, newest_first) {
+            Ok(Some((detail, _uid, body_loaded))) => Ok(Some((detail, body_loaded))),
+            Ok(None) => Ok(None),
+            Err(_) => {
+                *guard = None;
+                Ok(None)
+            }
+        }
     }
 
     /// 同步准备退出：不经 worker 队列，直接把仍排队的发件箱记录标记为到期，
@@ -95,7 +283,7 @@ async fn worker_loop(
     data_dir: PathBuf,
     req_tx: mpsc::Sender<MailRequest>,
     req_rx: mpsc::Receiver<MailRequest>,
-    evt_tx: mpsc::Sender<WorkerEvent>,
+    evt_tx: EventSender,
 ) {
     let db_path = config::cache_db_in(&data_dir);
     let mut cache = match CacheStore::open(&db_path) {
@@ -108,16 +296,40 @@ async fn worker_loop(
             return;
         }
     };
-    let mut tokens: TokenCache = HashMap::new();
+    let tokens = SharedTokenCache::default();
+    let async_cache: SharedAsyncCache = Arc::new(std::sync::Mutex::new(
+        open_existing_or_create_cache(&db_path).ok(),
+    ));
+    let in_flight_bodies: Arc<std::sync::Mutex<HashSet<u32>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
     let mut watchers: IdleWatchers = HashMap::new();
-    let background = BackgroundTasks::new(data_dir.clone(), db_path.clone(), evt_tx.clone());
+    let background = BackgroundTasks::new(
+        data_dir.clone(),
+        db_path.clone(),
+        tokens.clone(),
+        evt_tx.clone(),
+    );
+
+    if let Ok(prefs) = config::load_preferences_in(&data_dir) {
+        if prefs.keep_downloads_days > 0 {
+            let keep_days = prefs.keep_downloads_days;
+            let async_cache_cl = Arc::clone(&async_cache);
+            let prune_data_dir = data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let now_ts = chrono::Utc::now().timestamp();
+                let _ = with_shared_cache(&async_cache_cl, &prune_data_dir, |c| {
+                    c.prune_expired_downloads(keep_days, now_ts)
+                });
+            });
+        }
+    }
 
     if let Ok(accounts) = config::load_accounts_in(&data_dir) {
         cache.set_own_emails(accounts.iter().map(|a| a.email.clone()).collect());
         for acc in &accounts {
             refresh_account_watcher(&mut watchers, &data_dir, acc, &req_tx);
         }
-        deliver_due_outbox(&data_dir, &mut cache, &mut tokens, &accounts, &evt_tx).await;
+        deliver_due_outbox(&data_dir, &mut cache, &tokens, &accounts, &evt_tx).await;
     }
     wake_due_snoozed_messages(&mut cache, &evt_tx);
 
@@ -138,7 +350,7 @@ async fn worker_loop(
 
         // 定时发送投递：内部先查有无到期记录，没有就立刻返回（不读盘），
         // 所以每次唤醒都调用也不影响交互请求的响应速度。
-        deliver_due_outbox_tick(&data_dir, &mut cache, &mut tokens, &evt_tx).await;
+        deliver_due_outbox_tick(&data_dir, &mut cache, &tokens, &evt_tx).await;
 
         let Some(req) = req else {
             // 空闲唤醒才巡检稍后提醒，避免在交互请求路径上多加一次查库。
@@ -163,7 +375,9 @@ async fn worker_loop(
         handle_request(
             &data_dir,
             &mut cache,
-            &mut tokens,
+            &tokens,
+            &async_cache,
+            &in_flight_bodies,
             &mut watchers,
             &req_tx,
             req,
@@ -211,30 +425,37 @@ impl BackgroundJob {
     async fn run(
         self,
         data_dir: &PathBuf,
-        tokens: &mut TokenCache,
+        tokens: &SharedTokenCache,
         backfill: Arc<tokio::sync::Mutex<BackfillIndexState>>,
+        bg_cache: &Arc<tokio::sync::Mutex<Option<CacheStore>>>,
         db_path: &PathBuf,
-        evt_tx: &mpsc::Sender<WorkerEvent>,
+        evt_tx: &EventSender,
     ) {
-        let mut cache = match CacheStore::open(db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: None,
-                    message: e,
-                });
-                if matches!(&self, Self::Backfill) {
-                    // 同时回一个「无剩余候选」的批次完成事件，避免界面端的
-                    // in_flight 标志永远卡住导致索引不再续排。
-                    let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
-                        folder_id: 0,
-                        fetched_count: 0,
-                        body_only: false,
-                        has_more_remote: false,
+        let mut cache_guard = bg_cache.lock().await;
+        if cache_guard.is_none() {
+            match open_existing_or_create_cache(db_path) {
+                Ok(c) => *cache_guard = Some(c),
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
                     });
+                    if matches!(&self, Self::Backfill) {
+                        // 同时回一个「无剩余候选」的批次完成事件，避免界面端的
+                        // in_flight 标志永远卡住导致索引不再续排。
+                        let _ = evt_tx.send(WorkerEvent::BackfillHistoryBatchDone {
+                            folder_id: 0,
+                            fetched_count: 0,
+                            body_only: false,
+                            has_more_remote: false,
+                        });
+                    }
+                    return;
                 }
-                return;
             }
+        }
+        let Some(cache) = cache_guard.as_mut() else {
+            return;
         };
         // 独立连接也要设置本机账号邮箱，保证「发给我」类筛选与主连接口径一致。
         let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
@@ -242,12 +463,11 @@ impl BackgroundJob {
         match self {
             Self::Backfill => {
                 let mut state = backfill.lock().await;
-                backfill_history_batch_inner(data_dir, &mut cache, tokens, &mut state, evt_tx)
-                    .await;
+                backfill_history_batch_inner(data_dir, cache, tokens, &mut state, evt_tx).await;
             }
             Self::SyncAllAccounts => {
                 for acc in accounts.into_iter().filter(|a| a.enabled) {
-                    sync_account_inner(data_dir, &mut cache, tokens, acc.id, evt_tx).await;
+                    sync_account_inner(data_dir, cache, tokens, acc.id, evt_tx).await;
                 }
                 let page_size = pref_page_size(data_dir);
                 let allowed = unified_account_ids(data_dir);
@@ -263,7 +483,7 @@ impl BackgroundJob {
                 }
             }
             Self::SyncAccount(account_id) => {
-                sync_account_inner(data_dir, &mut cache, tokens, account_id, evt_tx).await;
+                sync_account_inner(data_dir, cache, tokens, account_id, evt_tx).await;
             }
             Self::SyncFolder {
                 account_id,
@@ -279,7 +499,7 @@ impl BackgroundJob {
                 };
                 let page_size = pref_page_size(data_dir);
                 sync_folder_inner(
-                    &mut cache,
+                    cache,
                     tokens,
                     &account,
                     folder_id,
@@ -293,24 +513,29 @@ impl BackgroundJob {
     }
 }
 
-/// 后台任务执行环境：每次改派都开一条独立的 SQLite 连接，并按信号量让后台
-/// 任务彼此串行（避免同一账号并发同步），但都不占用交互请求队列。
+/// 后台任务执行环境：在串行信号量内懒加载并复用一条 SQLite 连接，并与交互路径共享同一 Graph 令牌缓存。
 struct BackgroundTasks {
     gate: Arc<tokio::sync::Semaphore>,
     backfill: Arc<tokio::sync::Mutex<BackfillIndexState>>,
-    /// 后台任务自己的 Graph 令牌缓存：跨批次复用，避免每批都刷新一次令牌。
-    tokens: Arc<tokio::sync::Mutex<TokenCache>>,
+    tokens: SharedTokenCache,
+    cache: Arc<tokio::sync::Mutex<Option<CacheStore>>>,
     data_dir: PathBuf,
     db_path: PathBuf,
-    evt_tx: mpsc::Sender<WorkerEvent>,
+    evt_tx: EventSender,
 }
 
 impl BackgroundTasks {
-    fn new(data_dir: PathBuf, db_path: PathBuf, evt_tx: mpsc::Sender<WorkerEvent>) -> Self {
+    fn new(
+        data_dir: PathBuf,
+        db_path: PathBuf,
+        tokens: SharedTokenCache,
+        evt_tx: EventSender,
+    ) -> Self {
         Self {
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
             backfill: Arc::new(tokio::sync::Mutex::new(BackfillIndexState::default())),
-            tokens: Arc::new(tokio::sync::Mutex::new(TokenCache::new())),
+            tokens,
+            cache: Arc::new(tokio::sync::Mutex::new(None)),
             data_dir,
             db_path,
             evt_tx,
@@ -324,7 +549,8 @@ impl BackgroundTasks {
         };
         let gate = Arc::clone(&self.gate);
         let backfill = Arc::clone(&self.backfill);
-        let tokens = Arc::clone(&self.tokens);
+        let tokens = self.tokens.clone();
+        let bg_cache = Arc::clone(&self.cache);
         let data_dir = self.data_dir.clone();
         let db_path = self.db_path.clone();
         let evt_tx = self.evt_tx.clone();
@@ -332,16 +558,14 @@ impl BackgroundTasks {
             let Ok(_permit) = gate.acquire_owned().await else {
                 return;
             };
-            // 后台任务彼此串行（信号量 1），因此可以整段持有令牌缓存。
-            let mut tokens = tokens.lock().await;
-            job.run(&data_dir, &mut tokens, backfill, &db_path, &evt_tx)
+            job.run(&data_dir, &tokens, backfill, &bg_cache, &db_path, &evt_tx)
                 .await;
         });
         true
     }
 }
 
-fn wake_due_snoozed_messages(cache: &mut CacheStore, evt_tx: &mpsc::Sender<WorkerEvent>) {
+fn wake_due_snoozed_messages(cache: &mut CacheStore, evt_tx: &EventSender) {
     let now_ts = chrono::Utc::now().timestamp();
     if let Ok(woken) = cache.wake_due_snoozed(now_ts) {
         for (message_id, account_id, _subject) in woken {
@@ -612,11 +836,13 @@ async fn run_graph_fast_poll_fallback(account: &AccountConfig, req_tx: &mpsc::Se
 async fn handle_request(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
+    async_cache: &SharedAsyncCache,
+    in_flight_bodies: &Arc<std::sync::Mutex<HashSet<u32>>>,
     watchers: &mut IdleWatchers,
     req_tx: &mpsc::Sender<MailRequest>,
     req: MailRequest,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     match req {
         MailRequest::VerifyAccount {
@@ -875,7 +1101,9 @@ async fn handle_request(
                 }
                 let expires_at = Instant::now()
                     + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
-                tokens.insert(account_id, (result.access_token, expires_at));
+                tokens
+                    .insert(account_id, result.access_token, expires_at)
+                    .await;
                 let _ = evt_tx.send(WorkerEvent::OAuthReauthorized {
                     account_id,
                     email: result.email,
@@ -947,7 +1175,9 @@ async fn handle_request(
 
             let expires_at =
                 Instant::now() + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
-            tokens.insert(account_id, (result.access_token, expires_at));
+            tokens
+                .insert(account_id, result.access_token, expires_at)
+                .await;
 
             let _ = evt_tx.send(WorkerEvent::AccountVerified {
                 ok: true,
@@ -975,7 +1205,7 @@ async fn handle_request(
 
         MailRequest::DeleteAccount { account_id } => {
             stop_account_idle_watcher(watchers, account_id);
-            tokens.remove(&account_id);
+            tokens.remove(account_id).await;
             let _ = secrets::delete_account_secrets(account_id);
             let _ = config::delete_account_in(data_dir, account_id);
             let _ = cache.delete_account_data(account_id);
@@ -1151,76 +1381,116 @@ async fn handle_request(
                 return;
             };
 
-            let _ = evt_tx.send(WorkerEvent::Status {
-                account_id: Some(account_id),
-                text: format!("[{}] 正在获取邮件正文...", account.email),
-            });
-
-            let fetch_res = match account.auth_backend {
+            let (remote_id_opt, folder_path_opt) = match account.auth_backend {
                 AuthBackend::MicrosoftGraphOAuth2 => {
                     let Some(remote_id) = cache.get_message_remote_id(message_id).ok().flatten()
                     else {
                         let _ = evt_tx.send(WorkerEvent::MessageBodyLoaded(detail));
                         return;
                     };
-                    match ensure_graph_token(tokens, &account).await {
-                        Ok(token) => tokio::task::spawn_blocking(move || {
-                            graph_client::fetch_message_body(&token, &remote_id)
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
-                        Err(e) => Err(e),
-                    }
+                    (Some(remote_id), None)
                 }
                 AuthBackend::Password => {
                     let Ok(Some((folder_path, _))) = cache.folder_meta(detail.folder_id) else {
                         return;
                     };
-                    match secrets::load_account_secrets(account_id) {
-                        Ok(sec) => {
-                            imap_client::fetch_message_body(
-                                &account,
-                                &sec.imap_password,
-                                &folder_path,
-                                uid,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
-                    }
+                    (None, Some(folder_path))
                 }
             };
 
-            match fetch_res {
-                Ok(fetched) => {
-                    if let Err(e) = cache.store_message_body_with_html(
-                        message_id,
-                        &fetched.body_text,
-                        fetched.body_html.as_deref(),
-                        &fetched.attachments,
-                        fetched.unsubscribe_url.as_deref(),
-                        fetched.unsubscribe_one_click,
-                        fetched.auth_results.as_deref(),
-                    ) {
-                        let _ = evt_tx.send(WorkerEvent::Error {
-                            account_id: Some(account_id),
-                            message: e,
-                        });
-                        return;
-                    }
-                    if let Ok(Some((updated, _, _))) =
-                        cache.get_message_detail_ordered(message_id, newest_first)
-                    {
-                        let _ = evt_tx.send(WorkerEvent::MessageBodyLoaded(updated));
-                    }
-                }
-                Err(e) => {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
-                        message: format!("[{}] {e}", account.email),
-                    });
+            {
+                let Ok(mut set) = in_flight_bodies.lock() else {
+                    return;
+                };
+                if !set.insert(message_id) {
+                    return;
                 }
             }
+
+            let _ = evt_tx.send(WorkerEvent::Status {
+                account_id: Some(account_id),
+                text: format!("[{}] 正在获取邮件正文...", account.email),
+            });
+
+            let data_dir_cl = data_dir.clone();
+            let tokens_cl = tokens.clone();
+            let async_cache_cl = Arc::clone(async_cache);
+            let in_flight_cl = Arc::clone(in_flight_bodies);
+            let evt_tx_cl = evt_tx.clone();
+            tokio::spawn(async move {
+                let _guard = InFlightBodyGuard {
+                    message_id,
+                    set: in_flight_cl,
+                };
+                let fetch_res = match account.auth_backend {
+                    AuthBackend::MicrosoftGraphOAuth2 => {
+                        let remote_id = remote_id_opt.unwrap_or_default();
+                        match tokens_cl.ensure_graph_token(&account).await {
+                            Ok(token) => tokio::task::spawn_blocking(move || {
+                                graph_client::fetch_message_body(&token, &remote_id)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    AuthBackend::Password => {
+                        let folder_path = folder_path_opt.unwrap_or_default();
+                        match secrets::load_account_secrets(account_id) {
+                            Ok(sec) => {
+                                imap_client::fetch_message_body(
+                                    &account,
+                                    &sec.imap_password,
+                                    &folder_path,
+                                    uid,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                };
+
+                match fetch_res {
+                    Ok(fetched) => {
+                        let db_res = tokio::task::spawn_blocking(move || {
+                            with_shared_cache(&async_cache_cl, &data_dir_cl, |c| {
+                                c.store_message_body_with_html(
+                                    message_id,
+                                    &fetched.body_text,
+                                    fetched.body_html.as_deref(),
+                                    &fetched.attachments,
+                                    fetched.unsubscribe_url.as_deref(),
+                                    fetched.unsubscribe_one_click,
+                                    fetched.auth_results.as_deref(),
+                                )?;
+                                c.get_message_detail_ordered(message_id, newest_first)
+                            })
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("写入正文缓存任务异常: {e}")));
+
+                        match db_res {
+                            Ok(Some((updated, _, _))) => {
+                                let _ = evt_tx_cl.send(WorkerEvent::MessageBodyLoaded(updated));
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                    account_id: Some(account_id),
+                                    message: e,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = evt_tx_cl.send(WorkerEvent::Error {
+                            account_id: Some(account_id),
+                            message: format!("[{}] {e}", account.email),
+                        });
+                    }
+                }
+            });
         }
 
         MailRequest::FetchRawMessage {
@@ -1297,42 +1567,51 @@ async fn handle_request(
                 });
             }
             if let Ok(account) = load_account_config(data_dir, account_id) {
-                let res = match account.auth_backend {
-                    AuthBackend::MicrosoftGraphOAuth2 => {
-                        if let Ok(Some(remote_id)) = cache.get_message_remote_id(message_id) {
-                            match ensure_graph_token(tokens, &account).await {
-                                Ok(token) => tokio::task::spawn_blocking(move || {
-                                    graph_client::set_seen(&token, &remote_id, seen)
-                                })
-                                .await
-                                .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
-                                Err(e) => Err(e),
-                            }
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    AuthBackend::Password => match secrets::load_account_secrets(account_id) {
-                        Ok(sec) => {
-                            imap_client::set_flag(
-                                &account,
-                                &sec.imap_password,
-                                &folder_path,
-                                uid,
-                                "\\Seen",
-                                seen,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
-                    },
+                let remote_id_opt = if account.auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                    cache.get_message_remote_id(message_id).ok().flatten()
+                } else {
+                    None
                 };
-                if let Err(e) = res {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
-                        message: format!("[{}] {e}", account.email),
-                    });
-                }
+                let tokens_cl = tokens.clone();
+                let evt_tx_cl = evt_tx.clone();
+                tokio::spawn(async move {
+                    let res = match account.auth_backend {
+                        AuthBackend::MicrosoftGraphOAuth2 => {
+                            if let Some(remote_id) = remote_id_opt {
+                                match tokens_cl.ensure_graph_token(&account).await {
+                                    Ok(token) => tokio::task::spawn_blocking(move || {
+                                        graph_client::set_seen(&token, &remote_id, seen)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        AuthBackend::Password => match secrets::load_account_secrets(account_id) {
+                            Ok(sec) => {
+                                imap_client::set_flag(
+                                    &account,
+                                    &sec.imap_password,
+                                    &folder_path,
+                                    uid,
+                                    "\\Seen",
+                                    seen,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        },
+                    };
+                    if let Err(e) = res {
+                        let _ = evt_tx_cl.send(WorkerEvent::Error {
+                            account_id: Some(account_id),
+                            message: format!("[{}] {e}", account.email),
+                        });
+                    }
+                });
             }
         }
 
@@ -1351,42 +1630,51 @@ async fn handle_request(
                 let _ = evt_tx.send(WorkerEvent::MessageBodyLoaded(updated));
             }
             if let Ok(account) = load_account_config(data_dir, account_id) {
-                let res = match account.auth_backend {
-                    AuthBackend::MicrosoftGraphOAuth2 => {
-                        if let Ok(Some(remote_id)) = cache.get_message_remote_id(message_id) {
-                            match ensure_graph_token(tokens, &account).await {
-                                Ok(token) => tokio::task::spawn_blocking(move || {
-                                    graph_client::set_flagged(&token, &remote_id, flagged)
-                                })
-                                .await
-                                .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
-                                Err(e) => Err(e),
-                            }
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    AuthBackend::Password => match secrets::load_account_secrets(account_id) {
-                        Ok(sec) => {
-                            imap_client::set_flag(
-                                &account,
-                                &sec.imap_password,
-                                &folder_path,
-                                uid,
-                                "\\Flagged",
-                                flagged,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
-                    },
+                let remote_id_opt = if account.auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                    cache.get_message_remote_id(message_id).ok().flatten()
+                } else {
+                    None
                 };
-                if let Err(e) = res {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
-                        message: format!("[{}] {e}", account.email),
-                    });
-                }
+                let tokens_cl = tokens.clone();
+                let evt_tx_cl = evt_tx.clone();
+                tokio::spawn(async move {
+                    let res = match account.auth_backend {
+                        AuthBackend::MicrosoftGraphOAuth2 => {
+                            if let Some(remote_id) = remote_id_opt {
+                                match tokens_cl.ensure_graph_token(&account).await {
+                                    Ok(token) => tokio::task::spawn_blocking(move || {
+                                        graph_client::set_flagged(&token, &remote_id, flagged)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| Err(format!("Graph 任务异常: {e}"))),
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        AuthBackend::Password => match secrets::load_account_secrets(account_id) {
+                            Ok(sec) => {
+                                imap_client::set_flag(
+                                    &account,
+                                    &sec.imap_password,
+                                    &folder_path,
+                                    uid,
+                                    "\\Flagged",
+                                    flagged,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        },
+                    };
+                    if let Err(e) = res {
+                        let _ = evt_tx_cl.send(WorkerEvent::Error {
+                            account_id: Some(account_id),
+                            message: format!("[{}] {e}", account.email),
+                        });
+                    }
+                });
             }
         }
 
@@ -1596,15 +1884,53 @@ async fn handle_request(
             }
         }
 
-        // F-6 附件总览图片预览：读取本地缓存的附件字节（仅图片附件点击时抓取）。
+        // F-6 附件预览/字节获取：已落盘直接返回，大附件按需下载后再缓存返回。
         MailRequest::FetchAttachmentBytes { attachment_id } => {
-            match cache.get_attachment_bytes(attachment_id) {
-                Ok(Some((filename, mime_type, bytes))) => {
+            match cache.get_attachment_record(attachment_id) {
+                Ok(Some(AttachmentRecord::Local {
+                    filename,
+                    mime_type,
+                    bytes,
+                    ..
+                })) => {
                     let _ = evt_tx.send(WorkerEvent::AttachmentBytesFetched {
                         attachment_id,
                         filename,
                         mime_type,
                         bytes,
+                    });
+                }
+                Ok(Some(pending @ AttachmentRecord::PendingRemote { .. })) => {
+                    let data_dir_cl = data_dir.clone();
+                    let tokens_cl = tokens.clone();
+                    let async_cache_cl = Arc::clone(async_cache);
+                    let evt_tx_cl = evt_tx.clone();
+                    tokio::spawn(async move {
+                        match download_and_cache_pending_attachment(
+                            &data_dir_cl,
+                            &tokens_cl,
+                            &async_cache_cl,
+                            attachment_id,
+                            pending,
+                            &evt_tx_cl,
+                        )
+                        .await
+                        {
+                            Ok((filename, mime_type, bytes)) => {
+                                let _ = evt_tx_cl.send(WorkerEvent::AttachmentBytesFetched {
+                                    attachment_id,
+                                    filename,
+                                    mime_type,
+                                    bytes,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                    account_id: None,
+                                    message: e,
+                                });
+                            }
+                        }
                     });
                 }
                 Ok(None) => {
@@ -1796,39 +2122,148 @@ async fn handle_request(
 
         MailRequest::ExportForwardAttachments { message_id } => {
             let dest_dir = std::env::temp_dir().join(format!("hylki-forward-{message_id}"));
-            match cache.export_message_attachments(message_id, &dest_dir) {
-                Ok(paths) => {
-                    let paths = paths
-                        .into_iter()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .collect();
-                    let _ =
-                        evt_tx.send(WorkerEvent::ForwardAttachmentsExported { message_id, paths });
-                }
+            let att_ids = match cache.list_message_attachment_ids(message_id) {
+                Ok(ids) => ids,
                 Err(e) => {
                     let _ = evt_tx.send(WorkerEvent::Error {
                         account_id: None,
-                        message: format!("导出转发附件失败: {e}"),
+                        message: format!("查询转发附件失败: {e}"),
                     });
+                    return;
                 }
+            };
+            let mut pending: Vec<(u32, AttachmentRecord)> = Vec::new();
+            for att_id in att_ids {
+                if let Ok(Some(rec @ AttachmentRecord::PendingRemote { .. })) =
+                    cache.get_attachment_record(att_id)
+                {
+                    pending.push((att_id, rec));
+                }
+            }
+            if pending.is_empty() {
+                match cache.export_message_attachments(message_id, &dest_dir) {
+                    Ok(paths) => {
+                        let paths = paths
+                            .into_iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect();
+                        let _ = evt_tx
+                            .send(WorkerEvent::ForwardAttachmentsExported { message_id, paths });
+                    }
+                    Err(e) => {
+                        let _ = evt_tx.send(WorkerEvent::Error {
+                            account_id: None,
+                            message: format!("导出转发附件失败: {e}"),
+                        });
+                    }
+                }
+            } else {
+                let data_dir_cl = data_dir.clone();
+                let tokens_cl = tokens.clone();
+                let async_cache_cl = Arc::clone(async_cache);
+                let evt_tx_cl = evt_tx.clone();
+                tokio::spawn(async move {
+                    for (att_id, rec) in pending {
+                        if let Err(e) = download_and_cache_pending_attachment(
+                            &data_dir_cl,
+                            &tokens_cl,
+                            &async_cache_cl,
+                            att_id,
+                            rec,
+                            &evt_tx_cl,
+                        )
+                        .await
+                        {
+                            let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                account_id: None,
+                                message: format!("下载转发附件失败: {e}"),
+                            });
+                            return;
+                        }
+                    }
+                    let exported = tokio::task::spawn_blocking(move || {
+                        with_shared_cache(&async_cache_cl, &data_dir_cl, |c| {
+                            c.export_message_attachments(message_id, &dest_dir)
+                        })
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("导出转发附件任务异常: {e}")));
+                    match exported {
+                        Ok(paths) => {
+                            let paths = paths
+                                .into_iter()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .collect();
+                            let _ = evt_tx_cl.send(WorkerEvent::ForwardAttachmentsExported {
+                                message_id,
+                                paths,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                account_id: None,
+                                message: format!("导出转发附件失败: {e}"),
+                            });
+                        }
+                    }
+                });
             }
         }
 
         MailRequest::SaveAttachment {
             attachment_id,
             dest_path,
-        } => match cache.get_attachment_bytes(attachment_id) {
-            Ok(Some((_name, _mime, bytes))) => match std::fs::write(&dest_path, bytes) {
-                Ok(()) => {
-                    let _ = evt_tx.send(WorkerEvent::AttachmentSaved { path: dest_path });
+        } => match cache.get_attachment_record(attachment_id) {
+            Ok(Some(AttachmentRecord::Local { bytes, .. })) => {
+                match std::fs::write(&dest_path, bytes) {
+                    Ok(()) => {
+                        let _ = evt_tx.send(WorkerEvent::AttachmentSaved { path: dest_path });
+                    }
+                    Err(e) => {
+                        let _ = evt_tx.send(WorkerEvent::Error {
+                            account_id: None,
+                            message: format!("保存附件失败: {e}"),
+                        });
+                    }
                 }
-                Err(e) => {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: None,
-                        message: format!("保存附件失败: {e}"),
-                    });
-                }
-            },
+            }
+            Ok(Some(pending @ AttachmentRecord::PendingRemote { .. })) => {
+                let data_dir_cl = data_dir.clone();
+                let tokens_cl = tokens.clone();
+                let async_cache_cl = Arc::clone(async_cache);
+                let evt_tx_cl = evt_tx.clone();
+                tokio::spawn(async move {
+                    match download_and_cache_pending_attachment(
+                        &data_dir_cl,
+                        &tokens_cl,
+                        &async_cache_cl,
+                        attachment_id,
+                        pending,
+                        &evt_tx_cl,
+                    )
+                    .await
+                    {
+                        Ok((_name, _mime, bytes)) => match std::fs::write(&dest_path, bytes) {
+                            Ok(()) => {
+                                let _ = evt_tx_cl
+                                    .send(WorkerEvent::AttachmentSaved { path: dest_path });
+                            }
+                            Err(e) => {
+                                let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                    account_id: None,
+                                    message: format!("保存附件失败: {e}"),
+                                });
+                            }
+                        },
+                        Err(e) => {
+                            let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                account_id: None,
+                                message: e,
+                            });
+                        }
+                    }
+                });
+            }
             Ok(None) => {
                 let _ = evt_tx.send(WorkerEvent::Error {
                     account_id: None,
@@ -1854,20 +2289,15 @@ async fn handle_request(
                 });
                 return;
             }
-            let mut saved_count = 0usize;
+            let mut records = Vec::with_capacity(attachment_ids.len());
+            let mut any_pending = false;
             for att_id in attachment_ids {
-                match cache.get_attachment_bytes(att_id) {
-                    Ok(Some((name, _mime, bytes))) => {
-                        let dest_path = crate::cache::unique_attachment_path(&dest_dir, &name);
-                        match std::fs::write(&dest_path, bytes) {
-                            Ok(()) => saved_count += 1,
-                            Err(e) => {
-                                let _ = evt_tx.send(WorkerEvent::Error {
-                                    account_id: None,
-                                    message: format!("保存附件 {} 失败: {e}", name),
-                                });
-                            }
+                match cache.get_attachment_record(att_id) {
+                    Ok(Some(rec)) => {
+                        if matches!(rec, AttachmentRecord::PendingRemote { .. }) {
+                            any_pending = true;
                         }
+                        records.push((att_id, rec));
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -1878,10 +2308,83 @@ async fn handle_request(
                     }
                 }
             }
-            let _ = evt_tx.send(WorkerEvent::AttachmentsSaved {
-                count: saved_count,
-                dest_dir,
-            });
+
+            if !any_pending {
+                let mut saved_count = 0usize;
+                for (_att_id, rec) in records {
+                    if let AttachmentRecord::Local {
+                        filename, bytes, ..
+                    } = rec
+                    {
+                        let dest_path = crate::cache::unique_attachment_path(&dest_dir, &filename);
+                        match std::fs::write(&dest_path, bytes) {
+                            Ok(()) => saved_count += 1,
+                            Err(e) => {
+                                let _ = evt_tx.send(WorkerEvent::Error {
+                                    account_id: None,
+                                    message: format!("保存附件 {filename} 失败: {e}"),
+                                });
+                            }
+                        }
+                    }
+                }
+                let _ = evt_tx.send(WorkerEvent::AttachmentsSaved {
+                    count: saved_count,
+                    dest_dir,
+                });
+            } else {
+                let data_dir_cl = data_dir.clone();
+                let tokens_cl = tokens.clone();
+                let async_cache_cl = Arc::clone(async_cache);
+                let evt_tx_cl = evt_tx.clone();
+                tokio::spawn(async move {
+                    let mut saved_count = 0usize;
+                    for (att_id, rec) in records {
+                        let resolved = match rec {
+                            AttachmentRecord::Local {
+                                filename, bytes, ..
+                            } => Ok((filename, bytes)),
+                            pending @ AttachmentRecord::PendingRemote { .. } => {
+                                download_and_cache_pending_attachment(
+                                    &data_dir_cl,
+                                    &tokens_cl,
+                                    &async_cache_cl,
+                                    att_id,
+                                    pending,
+                                    &evt_tx_cl,
+                                )
+                                .await
+                                .map(|(name, _mime, bytes)| (name, bytes))
+                            }
+                        };
+                        match resolved {
+                            Ok((name, bytes)) => {
+                                let dest_path =
+                                    crate::cache::unique_attachment_path(&dest_dir, &name);
+                                match std::fs::write(&dest_path, bytes) {
+                                    Ok(()) => saved_count += 1,
+                                    Err(e) => {
+                                        let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                            account_id: None,
+                                            message: format!("保存附件 {name} 失败: {e}"),
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                    account_id: None,
+                                    message: e,
+                                });
+                            }
+                        }
+                    }
+                    let _ = evt_tx_cl.send(WorkerEvent::AttachmentsSaved {
+                        count: saved_count,
+                        dest_dir,
+                    });
+                });
+            }
         }
 
         MailRequest::StripAttachment {
@@ -2271,6 +2774,24 @@ async fn handle_request(
                 });
             }
         },
+
+        MailRequest::PruneExpiredDownloads { keep_days } => {
+            match cache.prune_expired_downloads(keep_days, chrono::Utc::now().timestamp()) {
+                Ok(pruned) if pruned > 0 => {
+                    let _ = evt_tx.send(WorkerEvent::Status {
+                        account_id: None,
+                        text: format!("已清理 {pruned} 封过期离线正文与附件缓存"),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: None,
+                        message: e,
+                    });
+                }
+            }
+        }
 
         MailRequest::SetPushEnabled { enabled } => {
             if let Ok(accounts) = config::load_accounts_in(data_dir) {
@@ -2662,11 +3183,11 @@ enum MoveTarget {
 async fn move_message_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     account_id: u32,
     message_id: u32,
     target: MoveTarget,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let Some((detail, uid, _)) = cache.get_message_detail(message_id).ok().flatten() else {
         let _ = evt_tx.send(WorkerEvent::Error {
@@ -2857,37 +3378,94 @@ async fn move_message_inner(
 }
 
 async fn ensure_graph_token(
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     account: &AccountConfig,
 ) -> Result<String, String> {
-    if let Some((tok, exp)) = tokens.get(&account.id) {
-        if Instant::now() < *exp {
-            return Ok(tok.clone());
+    tokens.ensure_graph_token(account).await
+}
+
+async fn download_and_cache_pending_attachment(
+    data_dir: &PathBuf,
+    tokens: &SharedTokenCache,
+    async_cache: &SharedAsyncCache,
+    attachment_id: u32,
+    record: AttachmentRecord,
+    evt_tx: &EventSender,
+) -> Result<(String, String, Vec<u8>), String> {
+    let AttachmentRecord::PendingRemote {
+        message_id,
+        account_id,
+        folder_path,
+        uid,
+        remote_msg_id,
+        filename,
+        mime_type,
+        remote_part,
+        transfer_encoding,
+        ..
+    } = record
+    else {
+        return Err("附件状态异常".to_string());
+    };
+
+    let account = load_account_config(data_dir, account_id)?;
+    let _ = evt_tx.send(WorkerEvent::Status {
+        account_id: Some(account_id),
+        text: format!("正在下载附件 {filename}..."),
+    });
+
+    let bytes = match account.auth_backend {
+        AuthBackend::MicrosoftGraphOAuth2 => {
+            if remote_msg_id.is_empty() || remote_part.is_empty() {
+                return Err(format!("缺少远端附件定位信息 ({filename})"));
+            }
+            let token = tokens.ensure_graph_token(&account).await?;
+            tokio::task::spawn_blocking(move || {
+                graph_client::fetch_attachment_content(&token, &remote_msg_id, &remote_part)
+            })
+            .await
+            .map_err(|e| format!("下载 Graph 附件任务异常: {e}"))??
         }
-    }
-    let refresh_token = secrets::load_oauth_refresh_token(account.id)?;
-    let client_id = account.oauth_client_id.clone();
-    let refreshed = tokio::task::spawn_blocking(move || {
-        oauth::refresh_microsoft_token(&client_id, &refresh_token)
+        AuthBackend::Password => {
+            let sec = secrets::load_account_secrets(account_id)?;
+            imap_client::fetch_attachment_section(
+                &account,
+                &sec.imap_password,
+                &folder_path,
+                uid,
+                &remote_part,
+                &transfer_encoding,
+                &filename,
+            )
+            .await?
+        }
+    };
+
+    let data_dir_cl = data_dir.clone();
+    let async_cache_cl = Arc::clone(async_cache);
+    let bytes_for_db = bytes.clone();
+    let stored_size = tokio::task::spawn_blocking(move || {
+        with_shared_cache(&async_cache_cl, &data_dir_cl, |c| {
+            c.store_downloaded_attachment_bytes(attachment_id, &bytes_for_db)
+        })
     })
     .await
-    .map_err(|e| format!("刷新令牌任务异常: {e}"))??;
+    .map_err(|e| format!("保存已下载附件任务异常: {e}"))??;
 
-    if let Some(new_rt) = refreshed.refresh_token {
-        let _ = secrets::save_oauth_refresh_token(account.id, new_rt);
-    }
-    let expires_at =
-        Instant::now() + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
-    tokens.insert(account.id, (refreshed.access_token.clone(), expires_at));
-    Ok(refreshed.access_token)
+    let _ = evt_tx.send(WorkerEvent::AttachmentDownloaded {
+        message_id,
+        attachment_id,
+        size_bytes: stored_size,
+    });
+    Ok((filename, mime_type, bytes))
 }
 
 async fn sync_account_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     account_id: u32,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let Ok(account) = load_account_config(data_dir, account_id) else {
         let _ = evt_tx.send(WorkerEvent::Error {
@@ -3012,12 +3590,12 @@ fn pref_thread_newest_first(data_dir: &PathBuf) -> bool {
 
 async fn sync_folder_inner(
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     account: &AccountConfig,
     folder_id: u32,
     folder_path: &str,
     page_size: usize,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let sync_res: Result<(), String> = match account.auth_backend {
         AuthBackend::MicrosoftGraphOAuth2 => {
@@ -3148,12 +3726,12 @@ struct FolderBatchError {
 async fn fetch_older_batch_for_folder(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     fid: u32,
     batch: usize,
     enforce_unified_scope: bool,
     uid_snapshot: &mut Option<(u32, Vec<u32>)>,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) -> Result<Option<(usize, bool)>, FolderBatchError> {
     let Some((account_id, folder_path, has_more_flag, next_link, min_cached_uid, _)) =
         cache.folder_remote_cursor(fid).ok().flatten()
@@ -3251,7 +3829,7 @@ async fn fetch_older_batch_for_folder(
                         }
                     }
                     Err(e) if e == "UIDVALIDITY_CHANGED" => {
-                        let (background_events, _) = mpsc::channel();
+                        let background_events = EventSender::noop();
                         sync_folder_inner(
                             cache,
                             tokens,
@@ -3294,10 +3872,10 @@ async fn fetch_older_batch_for_folder(
 async fn load_older_messages_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     folder_id: u32,
     limit: usize,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let batch = if limit == 0 { 100 } else { limit };
     let targets: Vec<u32> = if folder_id == 0 {
@@ -3419,9 +3997,9 @@ fn select_backfill_target(
 async fn backfill_history_batch_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     state: &mut BackfillIndexState,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
     let allowed: std::collections::HashSet<u32> = accounts
@@ -3448,7 +4026,7 @@ async fn backfill_history_batch_inner(
 
     if let Some((_, account_id, path, true)) = folders.iter().find(|(id, _, _, _)| *id == fid) {
         if let Some(account) = accounts.iter().find(|a| a.id == *account_id && a.enabled) {
-            let (background_events, _) = mpsc::channel();
+            let background_events = EventSender::noop();
             sync_folder_inner(
                 cache,
                 tokens,
@@ -3514,34 +4092,68 @@ async fn backfill_history_batch_inner(
             .flatten()
             .map(|(_, validity)| validity)
             .unwrap_or(0);
-        let results: Vec<(u32, Result<String, String>)> = match account.auth_backend {
-            AuthBackend::Password => match secrets::load_account_secrets(account.id) {
-                Ok(sec) => {
-                    let uids: Vec<u32> = missing.iter().map(|(_, uid, _)| *uid).collect();
-                    match imap_client::fetch_index_texts_batch(
-                        account,
-                        &sec.imap_password,
-                        path,
-                        &uids,
-                        validity,
-                    )
-                    .await
-                    {
-                        Ok(batch) => {
-                            let by_uid: std::collections::HashMap<u32, String> = batch
+        let results: Vec<(u32, Result<(String, Option<FetchedMessageBody>), String>)> =
+            match account.auth_backend {
+                AuthBackend::Password => match secrets::load_account_secrets(account.id) {
+                    Ok(sec) => {
+                        let uids: Vec<u32> = missing.iter().map(|(_, uid, _)| *uid).collect();
+                        match imap_client::fetch_index_texts_batch(
+                            account,
+                            &sec.imap_password,
+                            path,
+                            &uids,
+                            validity,
+                        )
+                        .await
+                        {
+                            Ok(batch) => {
+                                let mut by_uid: std::collections::HashMap<
+                                    u32,
+                                    (String, Option<FetchedMessageBody>),
+                                > = batch
+                                    .into_iter()
+                                    .map(|(uid, text, full)| (uid, (text, full)))
+                                    .collect();
+                                missing
+                                    .into_iter()
+                                    .map(|(message_id, uid, _)| {
+                                        let result = match by_uid.remove(&uid) {
+                                            Some(pair) => Ok(pair),
+                                            None => Err("服务器未返回索引正文".to_string()),
+                                        };
+                                        (message_id, result)
+                                    })
+                                    .collect()
+                            }
+                            Err(e) => missing
                                 .into_iter()
-                                .map(|(uid, text, _, _)| (uid, text))
-                                .collect();
-                            missing
-                                .into_iter()
-                                .map(|(message_id, uid, _)| {
-                                    let result = match by_uid.get(&uid) {
-                                        Some(text) => Ok(text.clone()),
-                                        None => Err("服务器未返回索引正文".to_string()),
-                                    };
-                                    (message_id, result)
+                                .map(|(message_id, _, _)| (message_id, Err(e.clone())))
+                                .collect(),
+                        }
+                    }
+                    Err(e) => missing
+                        .into_iter()
+                        .map(|(message_id, _, _)| (message_id, Err(e.clone())))
+                        .collect(),
+                },
+                AuthBackend::MicrosoftGraphOAuth2 => {
+                    match ensure_graph_token(tokens, account).await {
+                        Ok(token) => {
+                            let mut out = Vec::new();
+                            for (message_id, _uid, remote_id) in missing {
+                                if remote_id.is_empty() {
+                                    out.push((message_id, Err("缺少 Graph 邮件标识".to_string())));
+                                    continue;
+                                }
+                                let token = token.clone();
+                                let result = tokio::task::spawn_blocking(move || {
+                                    graph_client::fetch_index_text(&token, &remote_id)
                                 })
-                                .collect()
+                                .await
+                                .unwrap_or_else(|e| Err(format!("Graph 索引任务异常: {e}")));
+                                out.push((message_id, result));
+                            }
+                            out
                         }
                         Err(e) => missing
                             .into_iter()
@@ -3549,40 +4161,28 @@ async fn backfill_history_batch_inner(
                             .collect(),
                     }
                 }
-                Err(e) => missing
-                    .into_iter()
-                    .map(|(message_id, _, _)| (message_id, Err(e.clone())))
-                    .collect(),
-            },
-            AuthBackend::MicrosoftGraphOAuth2 => match ensure_graph_token(tokens, account).await {
-                Ok(token) => {
-                    let mut out = Vec::new();
-                    for (message_id, _uid, remote_id) in missing {
-                        if remote_id.is_empty() {
-                            out.push((message_id, Err("缺少 Graph 邮件标识".to_string())));
-                            continue;
-                        }
-                        let token = token.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            graph_client::fetch_index_text(&token, &remote_id)
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(format!("Graph 索引任务异常: {e}")));
-                        out.push((message_id, result));
-                    }
-                    out
-                }
-                Err(e) => missing
-                    .into_iter()
-                    .map(|(message_id, _, _)| (message_id, Err(e.clone())))
-                    .collect(),
-            },
-        };
+            };
         let mut stored_count = 0usize;
         let mut needs_resync = false;
         for (message_id, result) in &results {
             match result {
-                Ok(text) => {
+                Ok((_text, Some(full))) => {
+                    if cache
+                        .store_message_body_with_html(
+                            *message_id,
+                            &full.body_text,
+                            full.body_html.as_deref(),
+                            &full.attachments,
+                            full.unsubscribe_url.as_deref(),
+                            full.unsubscribe_one_click,
+                            full.auth_results.as_deref(),
+                        )
+                        .is_ok()
+                    {
+                        stored_count += 1;
+                    }
+                }
+                Ok((text, None)) => {
                     if cache.store_index_text(*message_id, text).is_ok() {
                         stored_count += 1;
                     }
@@ -3597,7 +4197,7 @@ async fn backfill_history_batch_inner(
         }
         if needs_resync {
             state.uid_snapshots.remove(&fid);
-            let (background_events, _) = mpsc::channel();
+            let background_events = EventSender::noop();
             sync_folder_inner(
                 cache,
                 tokens,
@@ -3724,8 +4324,8 @@ fn next_outbox_wait(cache: &CacheStore) -> Duration {
 async fn deliver_due_outbox_tick(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    tokens: &SharedTokenCache,
+    evt_tx: &EventSender,
 ) {
     let now = chrono::Utc::now().timestamp();
     let has_due = cache
@@ -3750,9 +4350,9 @@ async fn deliver_due_outbox_tick(
 async fn deliver_due_outbox(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     accounts: &[AccountConfig],
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let now = chrono::Utc::now().timestamp();
     let enabled: std::collections::HashSet<u32> = accounts
@@ -3774,10 +4374,10 @@ async fn deliver_due_outbox(
 async fn send_outbox_item(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     account_id: u32,
     outbox_id: u32,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let now = chrono::Utc::now().timestamp();
     let item = match cache.claim_outbox_for_delivery(outbox_id, now) {
@@ -3799,10 +4399,10 @@ async fn send_outbox_item(
 async fn retry_outbox_item(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     account_id: u32,
     outbox_id: u32,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     match load_account_config(data_dir, account_id) {
         Ok(account) if account.enabled => {}
@@ -3855,11 +4455,11 @@ fn resolve_imap_sent_append_target(
 async fn deliver_outbox_item(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     account_id: u32,
     outbox_id: u32,
     item: OutboxItem,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let Ok(account) = load_account_config(data_dir, account_id) else {
         let _ = cache.update_outbox_status(outbox_id, OutboxStatus::Failed, "缺少账号配置");
@@ -4055,10 +4655,10 @@ fn unsubscribe_one_click_post(url: &str) -> Result<(), String> {
 async fn search_server_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
-    tokens: &mut TokenCache,
+    tokens: &SharedTokenCache,
     raw_query: &str,
     target_account_id: Option<u32>,
-    evt_tx: &mpsc::Sender<WorkerEvent>,
+    evt_tx: &EventSender,
 ) {
     let parsed = SearchQuery::parse(raw_query);
     let search_text = {
@@ -4392,5 +4992,45 @@ mod tests {
             resolve_imap_sent_append_target(&account, Some("Sent".to_string())),
             None
         );
+    }
+
+    #[test]
+    fn shared_token_cache_inserts_reads_removes_and_isolates_refresh_locks() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tokens = SharedTokenCache::default();
+            tokens
+                .insert(
+                    1,
+                    "valid-tok".to_string(),
+                    Instant::now() + Duration::from_secs(300),
+                )
+                .await;
+            tokens
+                .insert(
+                    2,
+                    "expired-tok".to_string(),
+                    Instant::now() - Duration::from_secs(1),
+                )
+                .await;
+
+            assert_eq!(
+                tokens.cached_valid_token(1).await.as_deref(),
+                Some("valid-tok")
+            );
+            assert_eq!(tokens.cached_valid_token(2).await, None);
+
+            let lock_1a = tokens.account_refresh_lock(1);
+            let lock_1b = tokens.account_refresh_lock(1);
+            let lock_2 = tokens.account_refresh_lock(2);
+            assert!(Arc::ptr_eq(&lock_1a, &lock_1b));
+            assert!(!Arc::ptr_eq(&lock_1a, &lock_2));
+
+            tokens.remove(1).await;
+            assert_eq!(tokens.cached_valid_token(1).await, None);
+        });
     }
 }

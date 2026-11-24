@@ -42,12 +42,35 @@ pub struct CachedHeaderInput {
     pub has_attachment: bool,
 }
 
-/// Attachment payload extracted from a fetched RFC 822 message.
+/// Attachment payload extracted from a fetched RFC 822 / Graph message
+/// (or metadata-only placeholder when the payload exceeds the auto-cache threshold).
 #[derive(Clone, Debug)]
 pub struct CachedAttachmentInput {
     pub filename: String,
     pub mime_type: String,
-    pub content: Vec<u8>,
+    pub size_bytes: usize,
+    pub content: Option<Vec<u8>>,
+    pub remote_part: String,
+    pub transfer_encoding: String,
+}
+
+impl CachedAttachmentInput {
+    /// Construct an already-downloaded attachment payload.
+    pub fn downloaded(
+        filename: impl Into<String>,
+        mime_type: impl Into<String>,
+        content: Vec<u8>,
+    ) -> Self {
+        let size_bytes = content.len();
+        Self {
+            filename: filename.into(),
+            mime_type: mime_type.into(),
+            size_bytes,
+            content: Some(content),
+            remote_part: String::new(),
+            transfer_encoding: String::new(),
+        }
+    }
 }
 
 /// Cached attachment joined with its owning message for the gallery view.
@@ -65,6 +88,32 @@ pub struct CachedAttachment {
     /// F-6 表头日期排序用的 Unix 时间戳（`date_display` 字符串排序无法跨年比较）。
     #[serde(default)]
     pub date_ts: i64,
+    #[serde(default = "crate::default_true")]
+    pub downloaded: bool,
+}
+
+/// Resolved attachment lookup result: either locally cached bytes or remote
+/// download coordinates for an on-demand fetch.
+#[derive(Clone, Debug)]
+pub enum AttachmentRecord {
+    Local {
+        message_id: u32,
+        filename: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+    },
+    PendingRemote {
+        message_id: u32,
+        account_id: u32,
+        folder_path: String,
+        uid: u32,
+        remote_msg_id: String,
+        filename: String,
+        mime_type: String,
+        size_bytes: usize,
+        remote_part: String,
+        transfer_encoding: String,
+    },
 }
 
 /// WP-06：持久化自定义标签（存入 SQLite `tags` 表，支持调色板颜色与 `1..9` 快捷键绑定）。
@@ -332,6 +381,7 @@ pub fn unique_attachment_path(dir: &Path, filename: &str) -> PathBuf {
 pub struct CacheStore {
     conn: Connection,
     own_emails: Vec<String>,
+    attachments_dir: Option<PathBuf>,
 }
 
 impl CacheStore {
@@ -346,9 +396,44 @@ impl CacheStore {
         let store = Self {
             conn,
             own_emails: Vec::new(),
+            attachments_dir: path.parent().map(|p| p.join("attachments")),
         };
         store.configure_and_migrate()?;
         Ok(store)
+    }
+
+    /// Open a read-only SQLite connection without running schema migrations.
+    /// Intended for fast UI-thread lookups of already cached message details.
+    pub fn open_read_only(path: &Path) -> Result<Self, String> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)
+            .map_err(|e| format!("以只读方式打开缓存数据库失败 ({}): {e}", path.display()))?;
+        conn.execute_batch("PRAGMA busy_timeout = 2000; PRAGMA query_only = ON;")
+            .map_err(|e| format!("配置只读缓存连接失败: {e}"))?;
+        Ok(Self {
+            conn,
+            own_emails: Vec::new(),
+            attachments_dir: path.parent().map(|p| p.join("attachments")),
+        })
+    }
+
+    /// Open an already-migrated SQLite cache in read-write mode without re-running
+    /// schema DDL or `PRAGMA journal_mode = WAL`, reducing write-lock contention.
+    pub fn open_existing(path: &Path) -> Result<Self, String> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)
+            .map_err(|e| format!("打开已有缓存数据库失败 ({}): {e}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
+        )
+        .map_err(|e| format!("配置已有缓存连接失败: {e}"))?;
+        Ok(Self {
+            conn,
+            own_emails: Vec::new(),
+            attachments_dir: path.parent().map(|p| p.join("attachments")),
+        })
     }
 
     /// Open an isolated in-memory cache database for unit tests.
@@ -357,6 +442,7 @@ impl CacheStore {
         let store = Self {
             conn,
             own_emails: Vec::new(),
+            attachments_dir: None,
         };
         store.configure_and_migrate()?;
         Ok(store)
@@ -503,6 +589,16 @@ impl CacheStore {
         self.ensure_column("messages", "answered", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("messages", "forwarded", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("messages", "snoozed_until_ts", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("messages", "thread_subject", "TEXT NOT NULL DEFAULT ''")?;
+        // 方案 A：附件独立落盘路径、下载状态与按需下载定位信息。
+        self.ensure_column("attachments", "storage_path", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("attachments", "downloaded", "INTEGER NOT NULL DEFAULT 1")?;
+        self.ensure_column("attachments", "remote_part", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column(
+            "attachments",
+            "transfer_encoding",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
         // F-5 用户手动维护的联系人（与邮件聚合联系人合并展示；新增表对旧库无侵入，
         // `CREATE TABLE IF NOT EXISTS` 即完成迁移）。
         self.conn
@@ -553,9 +649,21 @@ impl CacheStore {
             let _ = self.conn.execute(col_sql, []);
         }
         self.conn
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_messages_account_msgid ON messages(account_id, message_id)",
-                [],
+            .execute_batch(
+                "
+                CREATE INDEX IF NOT EXISTS idx_messages_account_msgid
+                    ON messages(account_id, message_id);
+                CREATE TABLE IF NOT EXISTS message_rfc_refs (
+                    account_id INTEGER NOT NULL,
+                    message_row_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    token TEXT NOT NULL,
+                    PRIMARY KEY (account_id, token, message_row_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_rfc_refs_row
+                    ON message_rfc_refs(message_row_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_account_thread_subj
+                    ON messages(account_id, thread_subject, date_ts DESC, uid DESC);
+                ",
             )
             .map_err(|e| format!("创建会话索引失败: {e}"))?;
         // FTS5 全文索引：覆盖主题、发件人、收件人、摘要与正文，由触发器自动维护。
@@ -627,6 +735,50 @@ impl CacheStore {
             self.conn
                 .execute("PRAGMA user_version = 1", [])
                 .map_err(|e| format!("更新缓存 schema 版本失败: {e}"))?;
+        }
+        if schema_version < 2 {
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| format!("开启会话索引迁移事务失败: {e}"))?;
+            let rows: Vec<(u32, u32, String, String, String, String)> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id, account_id, subject, message_id, in_reply_to, references_header FROM messages",
+                    )
+                    .map_err(|e| format!("读取待迁移会话记录失败: {e}"))?;
+                let collected = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, u32>(0)?,
+                            row.get::<_, u32>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    })
+                    .map_err(|e| format!("遍历待迁移会话记录失败: {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("收集待迁移会话记录失败: {e}"))?;
+                collected
+            };
+            {
+                let mut upd_stmt = tx
+                    .prepare("UPDATE messages SET thread_subject = ?1 WHERE id = ?2")
+                    .map_err(|e| format!("准备回填会话主题失败: {e}"))?;
+                for (row_id, account_id, subject, msg_id, irt, refs) in rows {
+                    let norm_subj = normalize_thread_subject(&subject);
+                    upd_stmt
+                        .execute(params![norm_subj, row_id])
+                        .map_err(|e| format!("回填会话主题失败: {e}"))?;
+                    sync_message_rfc_refs(&tx, account_id, row_id, &msg_id, &irt, &refs)?;
+                }
+            }
+            tx.execute("PRAGMA user_version = 2", [])
+                .map_err(|e| format!("更新缓存 schema 版本到 2 失败: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("提交会话索引迁移事务失败: {e}"))?;
         }
         Ok(())
     }
@@ -758,12 +910,26 @@ impl CacheStore {
         account_id: u32,
         folder_id: u32,
     ) -> Result<Vec<FolderSummary>, String> {
-        self.conn
-            .execute(
-                "DELETE FROM folders WHERE id = ?1 AND account_id = ?2",
-                params![folder_id, account_id],
-            )
-            .map_err(|e| format!("删除本地文件夹缓存失败: {e}"))?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("开启删除文件夹缓存事务失败: {e}"))?;
+        let old_paths = collect_attachment_paths(
+            &tx,
+            "SELECT a.storage_path FROM attachments a
+             JOIN messages m ON m.id = a.message_id
+             JOIN folders f ON f.id = m.folder_id
+             WHERE f.id = ?1 AND f.account_id = ?2 AND a.storage_path != ''",
+            params![folder_id, account_id],
+        )?;
+        tx.execute(
+            "DELETE FROM folders WHERE id = ?1 AND account_id = ?2",
+            params![folder_id, account_id],
+        )
+        .map_err(|e| format!("删除本地文件夹缓存失败: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("提交删除文件夹缓存事务失败: {e}"))?;
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_paths);
         self.list_folders(account_id)
     }
 
@@ -991,6 +1157,7 @@ impl CacheStore {
             .transaction()
             .map_err(|e| format!("开启邮件同步事务失败: {e}"))?;
 
+        let mut old_attachment_paths: Vec<String> = Vec::new();
         let previous_validity: u32 = tx
             .query_row(
                 "SELECT uid_validity FROM folders WHERE id = ?1",
@@ -1000,6 +1167,13 @@ impl CacheStore {
             .map_err(|e| format!("读取文件夹 UIDVALIDITY 失败: {e}"))?;
 
         if previous_validity != 0 && previous_validity != uid_validity {
+            old_attachment_paths.extend(collect_attachment_paths(
+                &tx,
+                "SELECT a.storage_path FROM attachments a
+                 JOIN messages m ON m.id = a.message_id
+                 WHERE m.folder_id = ?1 AND a.storage_path != ''",
+                params![folder_id],
+            )?);
             tx.execute(
                 "DELETE FROM messages WHERE folder_id = ?1",
                 params![folder_id],
@@ -1022,6 +1196,11 @@ impl CacheStore {
             let live_set: std::collections::HashSet<u32> = live_uids.iter().copied().collect();
             for (msg_id, uid) in existing {
                 if !live_set.contains(&uid) {
+                    old_attachment_paths.extend(collect_attachment_paths(
+                        &tx,
+                        "SELECT storage_path FROM attachments WHERE message_id = ?1 AND storage_path != ''",
+                        params![msg_id],
+                    )?);
                     tx.execute("DELETE FROM messages WHERE id = ?1", params![msg_id])
                         .map_err(|e| format!("清理服务端已删除邮件失败: {e}"))?;
                 }
@@ -1029,13 +1208,15 @@ impl CacheStore {
         }
 
         for (item, remote_id) in headers {
+            let thread_subj = normalize_thread_subject(&item.subject);
             tx.execute(
                 "
                 INSERT INTO messages (
                     account_id, folder_id, uid, remote_id, message_id, in_reply_to, references_header,
-                    sender, recipients, cc, subject, preview, date_ts, date_display, unread, flagged, has_attachment
+                    sender, recipients, cc, subject, thread_subject, preview, date_ts, date_display,
+                    unread, flagged, has_attachment
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                 ON CONFLICT(folder_id, uid) DO UPDATE SET
                     remote_id = CASE
                         WHEN excluded.remote_id = '' THEN messages.remote_id
@@ -1054,6 +1235,7 @@ impl CacheStore {
                     recipients = excluded.recipients,
                     cc = excluded.cc,
                     subject = excluded.subject,
+                    thread_subject = excluded.thread_subject,
                     preview = CASE
                         WHEN messages.body_text IS NULL THEN excluded.preview
                         ELSE messages.preview
@@ -1076,6 +1258,7 @@ impl CacheStore {
                     item.recipients,
                     item.cc,
                     item.subject,
+                    thread_subj,
                     item.preview,
                     item.date_ts,
                     item.date_display,
@@ -1085,6 +1268,23 @@ impl CacheStore {
                 ],
             )
             .map_err(|e| format!("写入邮件头失败 (UID {}): {e}", item.uid))?;
+
+            let (msg_row_id, stored_mid, stored_irt, stored_refs): (u32, String, String, String) =
+                tx.query_row(
+                    "SELECT id, message_id, in_reply_to, references_header
+                     FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                    params![folder_id, item.uid],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|e| format!("读取写入后的邮件索引失败: {e}"))?;
+            sync_message_rfc_refs(
+                &tx,
+                account_id,
+                msg_row_id,
+                &stored_mid,
+                &stored_irt,
+                &stored_refs,
+            )?;
         }
 
         let unread_count: u32 = tx
@@ -1114,6 +1314,7 @@ impl CacheStore {
 
         tx.commit()
             .map_err(|e| format!("提交邮件同步事务失败: {e}"))?;
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_attachment_paths);
         Ok(())
     }
 
@@ -2401,68 +2602,120 @@ impl CacheStore {
             }
         }
 
-        // 2. Try RFC header-based transitive grouping first.
+        let map_raw_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<RawRow> {
+            Ok(RawRow {
+                id: row.get(0)?,
+                folder_id: row.get(1)?,
+                folder_name: row.get(2)?,
+                folder_path: row.get(3)?,
+                uid: row.get(4)?,
+                rfc_message_id: row.get(5)?,
+                in_reply_to: row.get(6)?,
+                references_header: row.get(7)?,
+                sender: row.get(8)?,
+                recipients: row.get(9)?,
+                subject: row.get(10)?,
+                date_ts: row.get(11)?,
+                date_display: row.get(12)?,
+                body_opt: row.get(13)?,
+                body_html: row.get(14)?,
+                preview: row.get(15)?,
+                unread: row.get::<_, i32>(16)? != 0,
+                flagged: row.get::<_, i32>(17)? != 0,
+                cc: row.get(18)?,
+            })
+        };
+
+        // 2. Try RFC header-based transitive grouping via indexed `message_rfc_refs`.
+        const MAX_THREAD_BFS_ROWS: usize = 200;
         let mut matched_ids: HashSet<u32> = HashSet::new();
         if !seed_ids.is_empty() {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "
-                    SELECT id, message_id, in_reply_to, references_header
-                    FROM messages
-                    WHERE account_id = ?1
-                      AND (message_id != '' OR in_reply_to != '' OR references_header != '')
-                    ",
-                )
-                .map_err(|e| format!("准备 RFC 会话索引查询失败: {e}"))?;
-            let candidates: Vec<(u32, Vec<String>)> = stmt
-                .query_map(params![account_id], |row| {
-                    let id: u32 = row.get(0)?;
-                    let mid: String = row.get(1)?;
-                    let irt: String = row.get(2)?;
-                    let refs: String = row.get(3)?;
-                    let mut ids = extract_rfc_message_ids(&mid);
-                    ids.extend(extract_rfc_message_ids(&irt));
-                    ids.extend(extract_rfc_message_ids(&refs));
-                    Ok((id, ids))
-                })
-                .map_err(|e| format!("执行 RFC 会话索引查询失败: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("解析 RFC 会话索引失败: {e}"))?;
+            let mut frontier: Vec<String> = seed_ids.iter().cloned().collect();
+            let mut seen_tokens: HashSet<String> = seed_ids;
 
-            let mut thread_ids = seed_ids;
             for _ in 0..8 {
-                let mut changed = false;
-                for (cid, cids) in &candidates {
-                    if cids.iter().any(|t| thread_ids.contains(t)) {
-                        if matched_ids.insert(*cid) {
-                            changed = true;
-                        }
-                        for t in cids {
-                            if thread_ids.insert(t.clone()) {
-                                changed = true;
+                if frontier.is_empty() || matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                    break;
+                }
+                let mut new_rows: Vec<u32> = Vec::new();
+                for chunk in frontier.chunks(200) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let sql = format!(
+                        "SELECT DISTINCT message_row_id
+                         FROM message_rfc_refs
+                         WHERE account_id = ?1 AND token IN ({placeholders})"
+                    );
+                    let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + chunk.len());
+                    args.push(i64::from(account_id).into());
+                    for tok in chunk {
+                        args.push(tok.clone().into());
+                    }
+                    let mut stmt = self
+                        .conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("准备 RFC 会话索引查询失败: {e}"))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                            row.get::<_, u32>(0)
+                        })
+                        .map_err(|e| format!("执行 RFC 会话索引查询失败: {e}"))?;
+                    for row_res in rows {
+                        let rid = row_res.map_err(|e| format!("解析 RFC 会话索引失败: {e}"))?;
+                        if matched_ids.insert(rid) {
+                            new_rows.push(rid);
+                            if matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                                break;
                             }
                         }
                     }
+                    if matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                        break;
+                    }
                 }
-                if !changed {
+                if new_rows.is_empty() || matched_ids.len() >= MAX_THREAD_BFS_ROWS {
                     break;
                 }
+                let mut next_frontier: Vec<String> = Vec::new();
+                for chunk in new_rows.chunks(200) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let sql = format!(
+                        "SELECT token FROM message_rfc_refs WHERE message_row_id IN ({placeholders})"
+                    );
+                    let args: Vec<rusqlite::types::Value> =
+                        chunk.iter().map(|&id| i64::from(id).into()).collect();
+                    let mut stmt = self
+                        .conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("准备 RFC 会话关联查询失败: {e}"))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(|e| format!("执行 RFC 会话关联查询失败: {e}"))?;
+                    for tok_res in rows {
+                        let tok = tok_res.map_err(|e| format!("解析 RFC 会话关联失败: {e}"))?;
+                        if seen_tokens.insert(tok.clone()) {
+                            next_frontier.push(tok);
+                        }
+                    }
+                }
+                frontier = next_frontier;
             }
             if message_id != 0 && anchor_info.is_some() {
                 matched_ids.insert(message_id);
             }
         }
 
-        // 3. Load candidate rows either from RFC matches or from subject fallback.
+        // 3. Load candidate rows either from RFC matches or from normalized thread_subject index.
         let use_rfc =
             matched_ids.len() >= 2 || (anchor_has_reply_headers && !matched_ids.is_empty());
 
         let mut raw_rows: Vec<RawRow> = Vec::new();
         if use_rfc {
-            let mut stmt = self
-                .conn
-                .prepare(
+            let ids_vec: Vec<u32> = matched_ids.into_iter().collect();
+            for chunk in ids_vec.chunks(200) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let sql = format!(
                     "
                     SELECT m.id, m.folder_id, f.name, f.path, m.uid, m.message_id,
                            m.in_reply_to, m.references_header, m.sender, m.recipients,
@@ -2470,38 +2723,21 @@ impl CacheStore {
                            m.preview, m.unread, m.flagged, m.cc
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
-                    WHERE m.id = ?1
-                    ",
-                )
-                .map_err(|e| format!("准备 RFC 会话详情查询失败: {e}"))?;
-            for cid in matched_ids {
-                if let Some(row) = stmt
-                    .query_row(params![cid], |row| {
-                        Ok(RawRow {
-                            id: row.get(0)?,
-                            folder_id: row.get(1)?,
-                            folder_name: row.get(2)?,
-                            folder_path: row.get(3)?,
-                            uid: row.get(4)?,
-                            rfc_message_id: row.get(5)?,
-                            in_reply_to: row.get(6)?,
-                            references_header: row.get(7)?,
-                            sender: row.get(8)?,
-                            recipients: row.get(9)?,
-                            subject: row.get(10)?,
-                            date_ts: row.get(11)?,
-                            date_display: row.get(12)?,
-                            body_opt: row.get(13)?,
-                            body_html: row.get(14)?,
-                            preview: row.get(15)?,
-                            unread: row.get::<_, i32>(16)? != 0,
-                            flagged: row.get::<_, i32>(17)? != 0,
-                            cc: row.get(18)?,
-                        })
-                    })
-                    .optional()
+                    WHERE m.id IN ({placeholders})
+                    "
+                );
+                let args: Vec<rusqlite::types::Value> =
+                    chunk.iter().map(|&id| i64::from(id).into()).collect();
+                let mut stmt = self
+                    .conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("准备 RFC 会话详情查询失败: {e}"))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(args.iter()), map_raw_row)
                     .map_err(|e| format!("读取 RFC 会话行失败: {e}"))?
-                {
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("解析 RFC 会话行失败: {e}"))?;
+                for row in rows {
                     let _ = (&row.in_reply_to, &row.references_header);
                     raw_rows.push(row);
                 }
@@ -2511,7 +2747,6 @@ impl CacheStore {
             if key.is_empty() {
                 return Ok(Vec::new());
             }
-            let pattern = format!("%{key}%");
             let order_sql = if newest_first {
                 "m.date_ts DESC, m.uid DESC"
             } else {
@@ -2527,7 +2762,7 @@ impl CacheStore {
                            m.preview, m.unread, m.flagged, m.cc
                     FROM messages m
                     JOIN folders f ON f.id = m.folder_id
-                    WHERE m.account_id = ?1 AND LOWER(m.subject) LIKE ?2
+                    WHERE m.account_id = ?1 AND m.thread_subject = ?2
                     ORDER BY {order_sql}
                     LIMIT 60
                     "
@@ -2535,37 +2770,36 @@ impl CacheStore {
                 .map_err(|e| format!("准备会话查询失败: {e}"))?;
 
             let rows = stmt
-                .query_map(params![account_id, pattern], |row| {
-                    Ok(RawRow {
-                        id: row.get(0)?,
-                        folder_id: row.get(1)?,
-                        folder_name: row.get(2)?,
-                        folder_path: row.get(3)?,
-                        uid: row.get(4)?,
-                        rfc_message_id: row.get(5)?,
-                        in_reply_to: row.get(6)?,
-                        references_header: row.get(7)?,
-                        sender: row.get(8)?,
-                        recipients: row.get(9)?,
-                        subject: row.get(10)?,
-                        date_ts: row.get(11)?,
-                        date_display: row.get(12)?,
-                        body_opt: row.get(13)?,
-                        body_html: row.get(14)?,
-                        preview: row.get(15)?,
-                        unread: row.get::<_, i32>(16)? != 0,
-                        flagged: row.get::<_, i32>(17)? != 0,
-                        cc: row.get(18)?,
-                    })
-                })
+                .query_map(params![account_id, key], map_raw_row)
                 .map_err(|e| format!("执行会话查询失败: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("解析会话结果失败: {e}"))?;
 
             for row in rows {
-                if normalize_thread_subject(&row.subject) == key {
-                    let _ = (&row.in_reply_to, &row.references_header);
-                    raw_rows.push(row);
+                let _ = (&row.in_reply_to, &row.references_header);
+                raw_rows.push(row);
+            }
+            if message_id != 0 && !raw_rows.iter().any(|r| r.id == message_id) {
+                if let Some(anchor_row) = self
+                    .conn
+                    .query_row(
+                        "
+                        SELECT m.id, m.folder_id, f.name, f.path, m.uid, m.message_id,
+                               m.in_reply_to, m.references_header, m.sender, m.recipients,
+                               m.subject, m.date_ts, m.date_display, m.body_text, m.body_html,
+                               m.preview, m.unread, m.flagged, m.cc
+                        FROM messages m
+                        JOIN folders f ON f.id = m.folder_id
+                        WHERE m.id = ?1 AND m.account_id = ?2 AND m.thread_subject = ?3
+                        ",
+                        params![message_id, account_id, key],
+                        map_raw_row,
+                    )
+                    .optional()
+                    .map_err(|e| format!("补查会话锚点邮件失败: {e}"))?
+                {
+                    let _ = (&anchor_row.in_reply_to, &anchor_row.references_header);
+                    raw_rows.push(anchor_row);
                 }
             }
         }
@@ -2643,7 +2877,23 @@ impl CacheStore {
                     .then_with(|| a.id.cmp(&b.id))
             });
         }
-        deduped.truncate(40);
+        if deduped.len() > 40 {
+            if message_id != 0 {
+                if let Some(anchor_pos) = deduped.iter().position(|r| r.id == message_id) {
+                    if anchor_pos >= 40 {
+                        let anchor = deduped.remove(anchor_pos);
+                        deduped.truncate(39);
+                        deduped.push(anchor);
+                    } else {
+                        deduped.truncate(40);
+                    }
+                } else {
+                    deduped.truncate(40);
+                }
+            } else {
+                deduped.truncate(40);
+            }
+        }
 
         let mut out = Vec::with_capacity(deduped.len());
         for row in deduped {
@@ -2677,7 +2927,7 @@ impl CacheStore {
             .conn
             .prepare(
                 "
-                SELECT id, filename, mime_type, size_bytes
+                SELECT id, filename, mime_type, size_bytes, downloaded
                 FROM attachments
                 WHERE message_id = ?1
                 ORDER BY id ASC
@@ -2692,6 +2942,7 @@ impl CacheStore {
                     filename: row.get(1)?,
                     mime_type: row.get(2)?,
                     size_bytes: row.get::<_, i64>(3)?.max(0) as usize,
+                    downloaded: row.get::<_, i32>(4)? != 0,
                 })
             })
             .map_err(|e| format!("读取附件记录失败: {e}"))?
@@ -2759,35 +3010,81 @@ impl CacheStore {
         )
         .map_err(|e| format!("保存邮件正文失败: {e}"))?;
 
+        let old_paths = collect_attachment_paths(
+            &tx,
+            "SELECT storage_path FROM attachments WHERE message_id = ?1 AND storage_path != ''",
+            params![message_id],
+        )?;
+
         tx.execute(
             "DELETE FROM attachments WHERE message_id = ?1",
             params![message_id],
         )
         .map_err(|e| format!("清理旧附件缓存失败: {e}"))?;
 
+        let mut written_files: Vec<String> = Vec::new();
         for att in attachments {
+            let downloaded = att.content.is_some();
+            let stored_size = att.content.as_ref().map_or(att.size_bytes, Vec::len);
+            let initial_blob: &[u8] = match (self.attachments_dir.as_ref(), att.content.as_deref())
+            {
+                (None, Some(bytes)) => bytes,
+                _ => &[],
+            };
             tx.execute(
                 "
-                INSERT INTO attachments (message_id, filename, mime_type, size_bytes, content)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                INSERT INTO attachments (
+                    message_id, filename, mime_type, size_bytes, content,
+                    storage_path, downloaded, remote_part, transfer_encoding
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8)
                 ",
                 params![
                     message_id,
                     att.filename,
                     att.mime_type,
-                    att.content.len() as i64,
-                    att.content,
+                    stored_size as i64,
+                    initial_blob,
+                    downloaded as i32,
+                    att.remote_part,
+                    att.transfer_encoding,
                 ],
             )
             .map_err(|e| format!("保存附件失败 ({}): {e}", att.filename))?;
+
+            if let (Some(dir), Some(bytes)) =
+                (self.attachments_dir.as_deref(), att.content.as_deref())
+            {
+                let att_id = u32::try_from(tx.last_insert_rowid())
+                    .map_err(|_| "附件行 ID 超出范围".to_string())?;
+                let rel_path = match write_attachment_file(dir, att_id, bytes) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        delete_attachment_files(Some(dir), &written_files);
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = tx.execute(
+                    "UPDATE attachments SET storage_path = ?1, content = X'' WHERE id = ?2",
+                    params![rel_path, att_id],
+                ) {
+                    delete_attachment_files(Some(dir), &[rel_path]);
+                    delete_attachment_files(Some(dir), &written_files);
+                    return Err(format!("更新附件磁盘路径失败: {err}"));
+                }
+                written_files.push(rel_path);
+            }
         }
 
-        tx.commit()
-            .map_err(|e| format!("提交正文缓存事务失败: {e}"))?;
+        if let Err(err) = tx.commit() {
+            delete_attachment_files(self.attachments_dir.as_deref(), &written_files);
+            return Err(format!("提交正文缓存事务失败: {err}"));
+        }
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_paths);
         Ok(())
     }
 
-    /// Clear cached bodies, search text and attachment blobs while keeping
+    /// Clear cached bodies, search text and attachment blobs/files while keeping
     /// message headers (sender / subject / preview / flags) intact.
     /// Returns the number of messages whose cached body was dropped.
     pub fn clear_message_bodies(&mut self) -> Result<usize, String> {
@@ -2805,6 +3102,11 @@ impl CacheStore {
             .conn
             .transaction()
             .map_err(|e| format!("开启正文缓存清理事务失败: {e}"))?;
+        let old_paths = collect_attachment_paths(
+            &tx,
+            "SELECT storage_path FROM attachments WHERE storage_path != ''",
+            [],
+        )?;
         tx.execute(
             "UPDATE messages SET body_text = NULL, body_html = NULL, index_text = NULL
              WHERE body_text IS NOT NULL OR body_html IS NOT NULL OR index_text IS NOT NULL",
@@ -2815,7 +3117,66 @@ impl CacheStore {
             .map_err(|e| format!("清空附件缓存失败: {e}"))?;
         tx.commit()
             .map_err(|e| format!("提交正文缓存清理事务失败: {e}"))?;
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_paths);
+        let _ = self.conn.execute_batch("VACUUM");
         Ok(cleared)
+    }
+
+    /// Prune cached message bodies and attachment binaries older than `keep_days`
+    /// while preserving headers and flags (`keep_days == 0` disables pruning).
+    pub fn prune_expired_downloads(
+        &mut self,
+        keep_days: u32,
+        now_ts: i64,
+    ) -> Result<usize, String> {
+        if keep_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = now_ts.saturating_sub(i64::from(keep_days) * 86_400);
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("开启过期缓存清理事务失败: {e}"))?;
+
+        let old_paths = collect_attachment_paths(
+            &tx,
+            "SELECT a.storage_path
+             FROM attachments a
+             JOIN messages m ON m.id = a.message_id
+             WHERE m.date_ts > 0 AND m.date_ts < ?1 AND a.storage_path != ''",
+            params![cutoff],
+        )?;
+
+        let pruned = tx
+            .execute(
+                "UPDATE messages
+                 SET body_text = NULL,
+                     body_html = NULL,
+                     index_text = COALESCE(index_text, '')
+                 WHERE date_ts > 0
+                   AND date_ts < ?1
+                   AND (
+                       body_text IS NOT NULL
+                       OR body_html IS NOT NULL
+                       OR EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = messages.id)
+                   )",
+                params![cutoff],
+            )
+            .map_err(|e| format!("清理过期正文缓存失败: {e}"))?;
+
+        tx.execute(
+            "DELETE FROM attachments
+             WHERE message_id IN (
+                 SELECT id FROM messages WHERE date_ts > 0 AND date_ts < ?1
+             )",
+            params![cutoff],
+        )
+        .map_err(|e| format!("清理过期附件缓存失败: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("提交过期缓存清理事务失败: {e}"))?;
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_paths);
+        Ok(pruned)
     }
 
     /// Look up the Graph remote string ID for `message_id`.
@@ -2846,7 +3207,7 @@ impl CacheStore {
                 .prepare(
                     "
                     SELECT a.id, a.message_id, m.account_id, a.filename, a.mime_type, a.size_bytes,
-                           m.sender, m.subject, m.date_display, m.date_ts
+                           m.sender, m.subject, m.date_display, m.date_ts, a.downloaded
                     FROM attachments a
                     JOIN messages m ON m.id = a.message_id
                     ORDER BY m.date_ts DESC, a.id ASC
@@ -2867,7 +3228,7 @@ impl CacheStore {
                 .prepare(
                     "
                     SELECT a.id, a.message_id, m.account_id, a.filename, a.mime_type, a.size_bytes,
-                           m.sender, m.subject, m.date_display, m.date_ts
+                           m.sender, m.subject, m.date_display, m.date_ts, a.downloaded
                     FROM attachments a
                     JOIN messages m ON m.id = a.message_id
                     WHERE (a.filename LIKE ?1 OR m.sender LIKE ?1 OR m.subject LIKE ?1)
@@ -3510,6 +3871,11 @@ impl CacheStore {
         let Some(folder_id) = folder_id else {
             return Ok(None);
         };
+        let old_paths = collect_attachment_paths(
+            &tx,
+            "SELECT storage_path FROM attachments WHERE message_id = ?1 AND storage_path != ''",
+            params![message_id],
+        )?;
         tx.execute("DELETE FROM messages WHERE id = ?1", params![message_id])
             .map_err(|e| format!("移除缓存邮件失败: {e}"))?;
         tx.execute(
@@ -3524,7 +3890,179 @@ impl CacheStore {
         .map_err(|e| format!("更新文件夹计数失败: {e}"))?;
         tx.commit()
             .map_err(|e| format!("提交邮件清理事务失败: {e}"))?;
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_paths);
         Ok(Some(folder_id))
+    }
+
+    /// Look up attachment metadata/content or remote download coordinates.
+    pub fn get_attachment_record(
+        &self,
+        attachment_id: u32,
+    ) -> Result<Option<AttachmentRecord>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "
+                SELECT a.message_id, m.account_id, f.path, m.uid, m.remote_id,
+                       a.filename, a.mime_type, a.size_bytes, a.content,
+                       a.storage_path, a.downloaded, a.remote_part, a.transfer_encoding
+                FROM attachments a
+                JOIN messages m ON m.id = a.message_id
+                JOIN folders f ON f.id = m.folder_id
+                WHERE a.id = ?1
+                ",
+                params![attachment_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u32>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?.max(0) as usize,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, i32>(10)? != 0,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("读取附件记录失败: {e}"))?;
+
+        let Some((
+            message_id,
+            account_id,
+            folder_path,
+            uid,
+            remote_msg_id,
+            filename,
+            mime_type,
+            size_bytes,
+            content,
+            storage_path,
+            downloaded,
+            remote_part,
+            transfer_encoding,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        if downloaded {
+            if !storage_path.is_empty() {
+                if let Some(file_name) = Path::new(&storage_path).file_name() {
+                    if let Some(dir) = self.attachments_dir.as_deref() {
+                        if let Ok(bytes) = std::fs::read(dir.join(file_name)) {
+                            return Ok(Some(AttachmentRecord::Local {
+                                message_id,
+                                filename,
+                                mime_type,
+                                bytes,
+                            }));
+                        }
+                    }
+                }
+            } else {
+                return Ok(Some(AttachmentRecord::Local {
+                    message_id,
+                    filename,
+                    mime_type,
+                    bytes: content,
+                }));
+            }
+        }
+
+        Ok(Some(AttachmentRecord::PendingRemote {
+            message_id,
+            account_id,
+            folder_path,
+            uid,
+            remote_msg_id,
+            filename,
+            mime_type,
+            size_bytes,
+            remote_part,
+            transfer_encoding,
+        }))
+    }
+
+    /// Persist on-demand downloaded attachment bytes to disk (or BLOB for memory DB)
+    /// and mark `downloaded = 1`.
+    pub fn store_downloaded_attachment_bytes(
+        &mut self,
+        attachment_id: u32,
+        bytes: &[u8],
+    ) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("开启附件落盘事务失败: {e}"))?;
+        let old_path: Option<String> = tx
+            .query_row(
+                "SELECT storage_path FROM attachments WHERE id = ?1",
+                params![attachment_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("查询目标附件失败: {e}"))?;
+        let Some(old_path) = old_path else {
+            return Err("目标附件记录不存在".to_string());
+        };
+
+        let mut new_path = String::new();
+        let blob: &[u8] = if let Some(dir) = self.attachments_dir.as_deref() {
+            new_path = write_attachment_file(dir, attachment_id, bytes)?;
+            &[]
+        } else {
+            bytes
+        };
+
+        if let Err(err) = tx.execute(
+            "
+            UPDATE attachments
+            SET size_bytes = ?1,
+                content = ?2,
+                storage_path = ?3,
+                downloaded = 1
+            WHERE id = ?4
+            ",
+            params![bytes.len() as i64, blob, new_path, attachment_id],
+        ) {
+            if !new_path.is_empty() && new_path != old_path {
+                delete_attachment_files(self.attachments_dir.as_deref(), &[new_path]);
+            }
+            return Err(format!("更新已下载附件状态失败: {err}"));
+        }
+
+        if let Err(err) = tx.commit() {
+            if !new_path.is_empty() && new_path != old_path {
+                delete_attachment_files(self.attachments_dir.as_deref(), &[new_path]);
+            }
+            return Err(format!("提交附件落盘事务失败: {err}"));
+        }
+
+        if !old_path.is_empty() && old_path != new_path {
+            delete_attachment_files(self.attachments_dir.as_deref(), &[old_path]);
+        }
+        Ok(bytes.len())
+    }
+
+    /// Return ordered attachment row IDs belonging to `message_id`.
+    pub fn list_message_attachment_ids(&self, message_id: u32) -> Result<Vec<u32>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM attachments WHERE message_id = ?1 ORDER BY id ASC")
+            .map_err(|e| format!("查询邮件附件 ID 列表失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![message_id], |row| row.get::<_, u32>(0))
+            .map_err(|e| format!("读取邮件附件 ID 列表失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析邮件附件 ID 列表失败: {e}"))?;
+        Ok(rows)
     }
 
     /// Read raw attachment bytes (with filename and MIME type) from local cache.
@@ -3532,20 +4070,15 @@ impl CacheStore {
         &self,
         attachment_id: u32,
     ) -> Result<Option<(String, String, Vec<u8>)>, String> {
-        self.conn
-            .query_row(
-                "SELECT filename, mime_type, content FROM attachments WHERE id = ?1",
-                params![attachment_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| format!("读取附件内容失败: {e}"))
+        match self.get_attachment_record(attachment_id)? {
+            Some(AttachmentRecord::Local {
+                filename,
+                mime_type,
+                bytes,
+                ..
+            }) => Ok(Some((filename, mime_type, bytes))),
+            _ => Ok(None),
+        }
     }
 
     /// Look up `(folder_path, uid)` for a cached message ID.
@@ -3569,30 +4102,45 @@ impl CacheStore {
         attachment_id: u32,
         new_uid: Option<u32>,
     ) -> Result<Vec<AttachmentMeta>, String> {
-        self.conn
-            .execute(
-                "DELETE FROM attachments WHERE id = ?1 AND message_id = ?2",
-                params![attachment_id, message_id],
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("开启删除本地附件事务失败: {e}"))?;
+        let old_paths = collect_attachment_paths(
+            &tx,
+            "SELECT storage_path FROM attachments WHERE id = ?1 AND message_id = ?2 AND storage_path != ''",
+            params![attachment_id, message_id],
+        )?;
+        tx.execute(
+            "DELETE FROM attachments WHERE id = ?1 AND message_id = ?2",
+            params![attachment_id, message_id],
+        )
+        .map_err(|e| format!("删除本地附件缓存失败: {e}"))?;
+        let remaining_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM attachments WHERE message_id = ?1",
+                params![message_id],
+                |row| row.get(0),
             )
-            .map_err(|e| format!("删除本地附件缓存失败: {e}"))?;
-        let remaining = self.list_attachments(message_id)?;
-        let has_att = if remaining.is_empty() { 0i64 } else { 1i64 };
+            .unwrap_or(0);
+        let has_att = if remaining_count == 0 { 0i64 } else { 1i64 };
         if let Some(uid) = new_uid {
-            self.conn
-                .execute(
-                    "UPDATE messages SET has_attachment = ?1, uid = ?2 WHERE id = ?3",
-                    params![has_att, uid, message_id],
-                )
-                .map_err(|e| format!("更新邮件附件状态失败: {e}"))?;
+            tx.execute(
+                "UPDATE messages SET has_attachment = ?1, uid = ?2 WHERE id = ?3",
+                params![has_att, uid, message_id],
+            )
+            .map_err(|e| format!("更新邮件附件状态失败: {e}"))?;
         } else {
-            self.conn
-                .execute(
-                    "UPDATE messages SET has_attachment = ?1 WHERE id = ?2",
-                    params![has_att, message_id],
-                )
-                .map_err(|e| format!("更新邮件附件状态失败: {e}"))?;
+            tx.execute(
+                "UPDATE messages SET has_attachment = ?1 WHERE id = ?2",
+                params![has_att, message_id],
+            )
+            .map_err(|e| format!("更新邮件附件状态失败: {e}"))?;
         }
-        Ok(remaining)
+        tx.commit()
+            .map_err(|e| format!("提交删除本地附件事务失败: {e}"))?;
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_paths);
+        self.list_attachments(message_id)
     }
 
     /// Export all cached attachments of `message_id` into `dest_dir` (used when
@@ -3602,19 +4150,13 @@ impl CacheStore {
         message_id: u32,
         dest_dir: &Path,
     ) -> Result<Vec<std::path::PathBuf>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT filename, content FROM attachments WHERE message_id = ?1 ORDER BY id ASC",
-            )
-            .map_err(|e| format!("查询邮件附件失败: {e}"))?;
-        let rows = stmt
-            .query_map(params![message_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|e| format!("读取邮件附件失败: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("解析邮件附件失败: {e}"))?;
+        let att_ids = self.list_message_attachment_ids(message_id)?;
+        let mut rows = Vec::with_capacity(att_ids.len());
+        for att_id in att_ids {
+            if let Some((filename, _mime, bytes)) = self.get_attachment_bytes(att_id)? {
+                rows.push((filename, bytes));
+            }
+        }
 
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -3694,23 +4236,35 @@ impl CacheStore {
     /// Remove every cached message of `folder_id` (attachments cascade) and
     /// zero its counters (right-click "Empty Folder" after server expunge).
     pub fn clear_folder(&mut self, folder_id: u32) -> Result<(), String> {
-        self.conn
-            .execute(
-                "DELETE FROM messages WHERE folder_id = ?1",
-                params![folder_id],
-            )
-            .map_err(|e| format!("清空文件夹缓存失败: {e}"))?;
-        self.conn
-            .execute(
-                "
-                UPDATE folders
-                SET unread_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND unread = 1),
-                    total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1)
-                WHERE id = ?1
-                ",
-                params![folder_id],
-            )
-            .map_err(|e| format!("更新文件夹计数失败: {e}"))?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("开启清空文件夹事务失败: {e}"))?;
+        let old_paths = collect_attachment_paths(
+            &tx,
+            "SELECT a.storage_path FROM attachments a
+             JOIN messages m ON m.id = a.message_id
+             WHERE m.folder_id = ?1 AND a.storage_path != ''",
+            params![folder_id],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE folder_id = ?1",
+            params![folder_id],
+        )
+        .map_err(|e| format!("清空文件夹缓存失败: {e}"))?;
+        tx.execute(
+            "
+            UPDATE folders
+            SET unread_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND unread = 1),
+                total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1)
+            WHERE id = ?1
+            ",
+            params![folder_id],
+        )
+        .map_err(|e| format!("更新文件夹计数失败: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("提交清空文件夹事务失败: {e}"))?;
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_paths);
         Ok(())
     }
 
@@ -4322,6 +4876,13 @@ impl CacheStore {
             .conn
             .transaction()
             .map_err(|e| format!("开启账号清理事务失败: {e}"))?;
+        let old_paths = collect_attachment_paths(
+            &tx,
+            "SELECT a.storage_path FROM attachments a
+             JOIN messages m ON m.id = a.message_id
+             WHERE m.account_id = ?1 AND a.storage_path != ''",
+            params![account_id],
+        )?;
         tx.execute(
             "DELETE FROM folders WHERE account_id = ?1",
             params![account_id],
@@ -4338,7 +4899,9 @@ impl CacheStore {
         )
         .map_err(|e| format!("清理账号草稿失败: {e}"))?;
         tx.commit()
-            .map_err(|e| format!("提交账号清理事务失败: {e}"))
+            .map_err(|e| format!("提交账号清理事务失败: {e}"))?;
+        delete_attachment_files(self.attachments_dir.as_deref(), &old_paths);
+        Ok(())
     }
 
     /// WP-08: Return lightweight [`MessageSummary`] items for a conversation thread
@@ -4448,34 +5011,36 @@ impl CacheStore {
         target_account_id: u32,
         target_folder_path: &str,
     ) -> Result<(), String> {
-        let target_folder_id: u32 = self
+        let tx = self
             .conn
+            .transaction()
+            .map_err(|e| format!("开启复制邮件事务失败: {e}"))?;
+        let target_folder_id: u32 = tx
             .query_row(
                 "SELECT id FROM folders WHERE account_id = ?1 AND path = ?2",
                 params![target_account_id, target_folder_path],
                 |row| row.get(0),
             )
             .map_err(|e| format!("未找到目标文件夹 {target_folder_path}: {e}"))?;
-        let next_uid: u32 = self
-            .conn
+        let next_uid: u32 = tx
             .query_row(
                 "SELECT COALESCE(MAX(uid), 0) + 1 FROM messages WHERE folder_id = ?1",
                 params![target_folder_id],
                 |row| row.get(0),
             )
             .unwrap_or(1);
-        self.conn
+        let inserted = tx
             .execute(
                 "
                 INSERT INTO messages (
                     account_id, folder_id, uid, remote_id, message_id, in_reply_to, references_header,
-                    sender, recipients, subject, preview, date_ts, date_display,
+                    sender, recipients, subject, thread_subject, preview, date_ts, date_display,
                     unread, flagged, has_attachment, body_text, body_html, index_text,
                     importance, tags, answered, forwarded, snoozed_until_ts
                 )
                 SELECT
                     ?1, ?2, ?3, '', message_id, in_reply_to, references_header,
-                    sender, recipients, subject, preview, date_ts, date_display,
+                    sender, recipients, subject, thread_subject, preview, date_ts, date_display,
                     unread, flagged, has_attachment, body_text, body_html, index_text,
                     importance, tags, answered, forwarded, snoozed_until_ts
                 FROM messages
@@ -4484,6 +5049,20 @@ impl CacheStore {
                 params![target_account_id, target_folder_id, next_uid, message_id],
             )
             .map_err(|e| format!("复制邮件到本地缓存失败: {e}"))?;
+        if inserted > 0 {
+            let new_row_id = u32::try_from(tx.last_insert_rowid())
+                .map_err(|_| "复制邮件行 ID 超出范围".to_string())?;
+            let (msg_id, irt, refs): (String, String, String) = tx
+                .query_row(
+                    "SELECT message_id, in_reply_to, references_header FROM messages WHERE id = ?1",
+                    params![new_row_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|e| format!("读取复制邮件索引失败: {e}"))?;
+            sync_message_rfc_refs(&tx, target_account_id, new_row_id, &msg_id, &irt, &refs)?;
+        }
+        tx.commit()
+            .map_err(|e| format!("提交复制邮件事务失败: {e}"))?;
         Ok(())
     }
 }
@@ -4532,6 +5111,7 @@ fn map_attachment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedAttachm
         subject: row.get(7)?,
         date_display: row.get(8)?,
         date_ts: row.get(9)?,
+        downloaded: row.get::<_, i32>(10)? != 0,
     })
 }
 
@@ -5781,22 +6361,22 @@ mod tests {
             .store_message_body(
                 photo_id,
                 "正文",
-                &[CachedAttachmentInput {
-                    filename: "holiday.jpg".to_string(),
-                    mime_type: "image/jpeg".to_string(),
-                    content: vec![1, 2, 3],
-                }],
+                &[CachedAttachmentInput::downloaded(
+                    "holiday.jpg",
+                    "image/jpeg",
+                    vec![1, 2, 3],
+                )],
             )
             .unwrap();
         cache
             .store_message_body(
                 contract_id,
                 "正文",
-                &[CachedAttachmentInput {
-                    filename: "contract.pdf".to_string(),
-                    mime_type: "application/pdf".to_string(),
-                    content: vec![4],
-                }],
+                &[CachedAttachmentInput::downloaded(
+                    "contract.pdf",
+                    "application/pdf",
+                    vec![4],
+                )],
             )
             .unwrap();
 
@@ -5919,11 +6499,11 @@ mod tests {
             .store_message_body(
                 with_body_id,
                 "这是邮件正文",
-                &[CachedAttachmentInput {
-                    filename: "report.pdf".to_string(),
-                    mime_type: "application/pdf".to_string(),
-                    content: vec![9, 9, 9],
-                }],
+                &[CachedAttachmentInput::downloaded(
+                    "report.pdf",
+                    "application/pdf",
+                    vec![9, 9, 9],
+                )],
             )
             .unwrap();
 
@@ -6056,11 +6636,11 @@ mod tests {
             .store_message_body(
                 target_id,
                 "正文",
-                &[CachedAttachmentInput {
-                    filename: "gone.txt".to_string(),
-                    mime_type: "text/plain".to_string(),
-                    content: vec![1],
-                }],
+                &[CachedAttachmentInput::downloaded(
+                    "gone.txt",
+                    "text/plain",
+                    vec![1],
+                )],
             )
             .unwrap();
         assert_eq!(cache.list_cached_attachments("", 0, 10).unwrap().len(), 1);
@@ -7191,21 +7771,21 @@ mod tests {
                 msg_id,
                 "hello",
                 &[
-                    CachedAttachmentInput {
-                        filename: "report.pdf".to_string(),
-                        mime_type: "application/pdf".to_string(),
-                        content: b"pdf-1".to_vec(),
-                    },
-                    CachedAttachmentInput {
-                        filename: "report.pdf".to_string(),
-                        mime_type: "application/pdf".to_string(),
-                        content: b"pdf-2".to_vec(),
-                    },
-                    CachedAttachmentInput {
-                        filename: "../bad:name?.txt".to_string(),
-                        mime_type: "text/plain".to_string(),
-                        content: b"txt".to_vec(),
-                    },
+                    CachedAttachmentInput::downloaded(
+                        "report.pdf",
+                        "application/pdf",
+                        b"pdf-1".to_vec(),
+                    ),
+                    CachedAttachmentInput::downloaded(
+                        "report.pdf",
+                        "application/pdf",
+                        b"pdf-2".to_vec(),
+                    ),
+                    CachedAttachmentInput::downloaded(
+                        "../bad:name?.txt",
+                        "text/plain",
+                        b"txt".to_vec(),
+                    ),
                 ],
             )
             .unwrap();
@@ -7683,6 +8263,443 @@ mod tests {
         assert_eq!(unread, 0);
         assert_eq!(flagged, 1);
     }
+
+    fn temp_cache_dir(suffix: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hylki-cache-test-{suffix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn disk_attachments_are_stored_as_files_and_cleaned_up_on_delete() {
+        let dir = temp_cache_dir("disk-cleanup");
+        let db_path = dir.join("cache.db");
+        let mut cache = CacheStore::open(&db_path).unwrap();
+        let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let inbox = folders[0].id;
+        cache
+            .commit_folder_headers(1, inbox, 1, &[sample_header(1, "附件落盘测试")], None)
+            .unwrap();
+        let msg_id = cache.list_messages_page(inbox, "", 0, 10).unwrap().items[0].id;
+
+        cache
+            .store_message_body(
+                msg_id,
+                "正文",
+                &[CachedAttachmentInput::downloaded(
+                    "doc.pdf",
+                    "application/pdf",
+                    b"hello-disk-bytes".to_vec(),
+                )],
+            )
+            .unwrap();
+
+        let (detail, _, _) = cache.get_message_detail(msg_id).unwrap().unwrap();
+        assert_eq!(detail.attachments.len(), 1);
+        assert!(detail.attachments[0].downloaded);
+        let att_id = detail.attachments[0].id;
+        let expected_file = dir.join("attachments").join(format!("{att_id}.bin"));
+        assert!(expected_file.exists());
+        assert_eq!(std::fs::read(&expected_file).unwrap(), b"hello-disk-bytes");
+
+        // SQLite row stores empty content BLOB and file storage_path.
+        let (blob_len, storage_path): (i64, String) = cache
+            .conn
+            .query_row(
+                "SELECT length(content), storage_path FROM attachments WHERE id = ?1",
+                params![att_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(blob_len, 0);
+        assert_eq!(storage_path, format!("{att_id}.bin"));
+
+        let (_, _, bytes) = cache.get_attachment_bytes(att_id).unwrap().unwrap();
+        assert_eq!(bytes, b"hello-disk-bytes");
+
+        // remove_message cleans up the disk file too.
+        cache.remove_message(msg_id).unwrap();
+        assert!(!expected_file.exists());
+
+        // Re-insert and verify clear_message_bodies deletes disk files too.
+        cache
+            .commit_folder_headers(1, inbox, 1, &[sample_header(2, "批量清理测试")], None)
+            .unwrap();
+        let msg2 = cache.list_messages_page(inbox, "", 0, 10).unwrap().items[0].id;
+        cache
+            .store_message_body(
+                msg2,
+                "正文2",
+                &[CachedAttachmentInput::downloaded(
+                    "two.bin",
+                    "application/octet-stream",
+                    b"abc".to_vec(),
+                )],
+            )
+            .unwrap();
+        let att2 = cache
+            .get_message_detail(msg2)
+            .unwrap()
+            .unwrap()
+            .0
+            .attachments[0]
+            .id;
+        let file2 = dir.join("attachments").join(format!("{att2}.bin"));
+        assert!(file2.exists());
+        cache.clear_message_bodies().unwrap();
+        assert!(!file2.exists());
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_blob_attachment_still_readable_after_migration() {
+        let dir = temp_cache_dir("legacy-blob");
+        let db_path = dir.join("cache.db");
+        let mut cache = CacheStore::open(&db_path).unwrap();
+        let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let inbox = folders[0].id;
+        cache
+            .commit_folder_headers(1, inbox, 1, &[sample_header(1, "旧库 BLOB 兼容")], None)
+            .unwrap();
+        let msg_id = cache.list_messages_page(inbox, "", 0, 10).unwrap().items[0].id;
+
+        // Simulate legacy row where content BLOB lives in SQLite and storage_path is ''.
+        cache
+            .conn
+            .execute(
+                "INSERT INTO attachments (message_id, filename, mime_type, size_bytes, content, storage_path, downloaded)
+                 VALUES (?1, 'legacy.txt', 'text/plain', 6, ?2, '', 1)",
+                params![msg_id, b"legacy".to_vec()],
+            )
+            .unwrap();
+        let att_id = u32::try_from(cache.conn.last_insert_rowid()).unwrap();
+        let (name, mime, bytes) = cache.get_attachment_bytes(att_id).unwrap().unwrap();
+        assert_eq!(name, "legacy.txt");
+        assert_eq!(mime, "text/plain");
+        assert_eq!(bytes, b"legacy");
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_remote_attachment_transitions_to_local_after_download() {
+        let dir = temp_cache_dir("pending-remote");
+        let db_path = dir.join("cache.db");
+        let mut cache = CacheStore::open(&db_path).unwrap();
+        let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let inbox = folders[0].id;
+        cache
+            .commit_folder_headers(1, inbox, 1, &[sample_header(9, "按需附件")], None)
+            .unwrap();
+        let msg_id = cache.list_messages_page(inbox, "", 0, 10).unwrap().items[0].id;
+
+        cache
+            .store_message_body(
+                msg_id,
+                "正文",
+                &[CachedAttachmentInput {
+                    filename: "large.zip".to_string(),
+                    mime_type: "application/zip".to_string(),
+                    size_bytes: 5_000_000,
+                    content: None,
+                    remote_part: "1.2".to_string(),
+                    transfer_encoding: "base64".to_string(),
+                }],
+            )
+            .unwrap();
+
+        let (detail, _, _) = cache.get_message_detail(msg_id).unwrap().unwrap();
+        assert_eq!(detail.attachments.len(), 1);
+        assert!(!detail.attachments[0].downloaded);
+        assert_eq!(detail.attachments[0].size_bytes, 5_000_000);
+        let att_id = detail.attachments[0].id;
+
+        assert!(cache.get_attachment_bytes(att_id).unwrap().is_none());
+        match cache.get_attachment_record(att_id).unwrap().unwrap() {
+            AttachmentRecord::PendingRemote {
+                uid,
+                remote_part,
+                transfer_encoding,
+                size_bytes,
+                ..
+            } => {
+                assert_eq!(uid, 9);
+                assert_eq!(remote_part, "1.2");
+                assert_eq!(transfer_encoding, "base64");
+                assert_eq!(size_bytes, 5_000_000);
+            }
+            AttachmentRecord::Local { .. } => panic!("expected PendingRemote before download"),
+        }
+
+        let payload = vec![7u8; 42];
+        let stored_len = cache
+            .store_downloaded_attachment_bytes(att_id, &payload)
+            .unwrap();
+        assert_eq!(stored_len, 42);
+
+        let (detail_after, _, _) = cache.get_message_detail(msg_id).unwrap().unwrap();
+        assert!(detail_after.attachments[0].downloaded);
+        assert_eq!(detail_after.attachments[0].size_bytes, 42);
+        let (_, _, bytes) = cache.get_attachment_bytes(att_id).unwrap().unwrap();
+        assert_eq!(bytes, payload);
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_expired_downloads_drops_old_bodies_and_files_only() {
+        let dir = temp_cache_dir("prune-expired");
+        let db_path = dir.join("cache.db");
+        let mut cache = CacheStore::open(&db_path).unwrap();
+        let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let inbox = folders[0].id;
+
+        let now_ts = 1_700_000_000i64;
+        let old_ts = now_ts - 40 * 86_400;
+        let fresh_ts = now_ts - 5 * 86_400;
+
+        cache
+            .commit_folder_headers(
+                1,
+                inbox,
+                1,
+                &[
+                    header_with(1, "旧邮件", "a@a.com", "b@b.com", false, false, old_ts),
+                    header_with(2, "新邮件", "a@a.com", "b@b.com", false, false, fresh_ts),
+                ],
+                None,
+            )
+            .unwrap();
+        let page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
+        let old_id = page
+            .items
+            .iter()
+            .find(|m| m.subject == "旧邮件")
+            .unwrap()
+            .id;
+        let fresh_id = page
+            .items
+            .iter()
+            .find(|m| m.subject == "新邮件")
+            .unwrap()
+            .id;
+
+        cache
+            .store_message_body(
+                old_id,
+                "旧正文",
+                &[CachedAttachmentInput::downloaded(
+                    "old.pdf",
+                    "application/pdf",
+                    b"old-bytes".to_vec(),
+                )],
+            )
+            .unwrap();
+        cache
+            .store_message_body(
+                fresh_id,
+                "新正文",
+                &[CachedAttachmentInput::downloaded(
+                    "fresh.pdf",
+                    "application/pdf",
+                    b"fresh-bytes".to_vec(),
+                )],
+            )
+            .unwrap();
+
+        let old_att_id = cache
+            .get_message_detail(old_id)
+            .unwrap()
+            .unwrap()
+            .0
+            .attachments[0]
+            .id;
+        let fresh_att_id = cache
+            .get_message_detail(fresh_id)
+            .unwrap()
+            .unwrap()
+            .0
+            .attachments[0]
+            .id;
+        let old_file = dir.join("attachments").join(format!("{old_att_id}.bin"));
+        let fresh_file = dir.join("attachments").join(format!("{fresh_att_id}.bin"));
+        assert!(old_file.exists() && fresh_file.exists());
+
+        // keep_days = 0 means never prune.
+        assert_eq!(cache.prune_expired_downloads(0, now_ts).unwrap(), 0);
+        // Prune items older than 30 days.
+        assert_eq!(cache.prune_expired_downloads(30, now_ts).unwrap(), 1);
+
+        let (old_detail, _, old_loaded) = cache.get_message_detail(old_id).unwrap().unwrap();
+        assert!(!old_loaded);
+        assert!(old_detail.attachments.is_empty());
+        assert!(!old_file.exists());
+        // Should not leave index_text NULL (would trigger backfill loop).
+        let idx_is_null: bool = cache
+            .conn
+            .query_row(
+                "SELECT index_text IS NULL FROM messages WHERE id = ?1",
+                params![old_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!idx_is_null);
+
+        let (fresh_detail, _, fresh_loaded) = cache.get_message_detail(fresh_id).unwrap().unwrap();
+        assert!(fresh_loaded);
+        assert_eq!(fresh_detail.attachments.len(), 1);
+        assert!(fresh_file.exists());
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thread_index_preserves_anchor_beyond_forty_messages_and_read_only_works() {
+        let dir = temp_cache_dir("thread-readonly");
+        let db_path = dir.join("cache.db");
+        let mut cache = CacheStore::open(&db_path).unwrap();
+        let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+        let inbox = folders[0].id;
+
+        // Insert 45 messages sharing normalized subject via fallback index and mark oldest loaded.
+        let mut batch = Vec::new();
+        for uid in 1..=45u32 {
+            let mut h = sample_header(uid, "Re: 长对话索引");
+            h.message_id = String::new();
+            h.date_ts = 1_700_000_000 + uid as i64;
+            batch.push(h);
+        }
+        cache
+            .commit_folder_headers(1, inbox, 1, &batch, None)
+            .unwrap();
+
+        let anchor_id: u32 = cache
+            .conn
+            .query_row(
+                "SELECT id FROM messages WHERE folder_id = ?1 AND uid = 1",
+                params![inbox],
+                |r| r.get(0),
+            )
+            .unwrap();
+        cache
+            .store_message_body(anchor_id, "锚点正文已加载", &[])
+            .unwrap();
+
+        let ro = CacheStore::open_read_only(&db_path).unwrap();
+        let (detail, _, loaded) = ro
+            .get_message_detail_ordered(anchor_id, true)
+            .unwrap()
+            .unwrap();
+        assert!(loaded);
+        assert_eq!(detail.body_text, "锚点正文已加载");
+        assert_eq!(detail.thread_messages.len(), 40);
+        assert!(
+            detail.thread_messages.iter().any(|m| m.id == anchor_id),
+            "anchor beyond index 40 must be retained"
+        );
+
+        drop(ro);
+
+        let mut rw = CacheStore::open_existing(&db_path).unwrap();
+        rw.set_message_flagged(anchor_id, true).unwrap();
+        let (detail_rw, _, _) = cache.get_message_detail(anchor_id).unwrap().unwrap();
+        assert!(detail_rw.flagged);
+
+        drop(rw);
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+fn sync_message_rfc_refs(
+    conn: &Connection,
+    account_id: u32,
+    message_row_id: u32,
+    message_id: &str,
+    in_reply_to: &str,
+    references_header: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM message_rfc_refs WHERE message_row_id = ?1",
+        params![message_row_id],
+    )
+    .map_err(|e| format!("清理旧 RFC 会话索引失败: {e}"))?;
+
+    let mut tokens: HashSet<String> = HashSet::new();
+    for tok in extract_rfc_message_ids(message_id)
+        .into_iter()
+        .chain(extract_rfc_message_ids(in_reply_to))
+        .chain(extract_rfc_message_ids(references_header))
+    {
+        tokens.insert(tok);
+    }
+    if tokens.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO message_rfc_refs (account_id, message_row_id, token)
+             VALUES (?1, ?2, ?3)",
+        )
+        .map_err(|e| format!("准备写入 RFC 会话索引失败: {e}"))?;
+    for tok in tokens {
+        stmt.execute(params![account_id, message_row_id, tok])
+            .map_err(|e| format!("写入 RFC 会话索引失败: {e}"))?;
+    }
+    Ok(())
+}
+
+fn collect_attachment_paths<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("准备查询附件路径失败: {e}"))?;
+    let rows = stmt
+        .query_map(params, |row| row.get::<_, String>(0))
+        .map_err(|e| format!("读取附件路径失败: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("收集附件路径失败: {e}"))?;
+    Ok(rows)
+}
+
+fn delete_attachment_files(attachments_dir: Option<&Path>, paths: &[String]) {
+    let Some(dir) = attachments_dir else {
+        return;
+    };
+    for rel in paths {
+        if let Some(file_name) = Path::new(rel).file_name() {
+            let _ = std::fs::remove_file(dir.join(file_name));
+        }
+    }
+}
+
+fn write_attachment_file(dir: &Path, attachment_id: u32, bytes: &[u8]) -> Result<String, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("创建附件缓存目录失败 ({}): {e}", dir.display()))?;
+    let rel = format!("{attachment_id}.bin");
+    let target = dir.join(&rel);
+    let tmp = dir.join(format!("{attachment_id}.bin.tmp"));
+    std::fs::write(&tmp, bytes)
+        .map_err(|e| format!("写入临时附件文件失败 ({}): {e}", tmp.display()))?;
+    if target.exists() {
+        let _ = std::fs::remove_file(&target);
+    }
+    if let Err(err) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("提交附件文件失败 ({}): {err}", target.display()));
+    }
+    Ok(rel)
 }
 
 fn sanitize_attachment_filename(raw: &str) -> String {

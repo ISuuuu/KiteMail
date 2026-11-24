@@ -965,6 +965,8 @@ pub(crate) struct HylkiApp {
     pub(crate) reader_webview: Option<std::rc::Rc<crate::webview_host::WebViewHost>>,
     #[cfg(windows)]
     pub(crate) reader_webview_key: Option<u64>,
+    #[cfg(windows)]
+    pub(crate) reader_webview_warmup_scheduled: bool,
     pub(crate) reader_popup_open: bool,
     /// WP-09：打印预览浮层状态。
     pub(crate) print_preview: Option<PrintPreviewState>,
@@ -1458,6 +1460,8 @@ impl HylkiApp {
                 reader_webview: None,
                 #[cfg(windows)]
                 reader_webview_key: None,
+                #[cfg(windows)]
+                reader_webview_warmup_scheduled: false,
                 reader_popup_open: false,
                 print_preview: None,
                 pending_row_action: None,
@@ -1505,7 +1509,15 @@ impl HylkiApp {
             };
         }
 
-        let worker = MailWorkerHandle::spawn(data_dir).ok().map(Arc::new);
+        let (worker_evt_tx, mut worker_evt_rx) = futures::channel::mpsc::channel::<()>(16);
+        let worker = MailWorkerHandle::spawn_with_notifier(
+            data_dir,
+            Some(Arc::new(move || {
+                let _ = worker_evt_tx.clone().try_send(());
+            })),
+        )
+        .ok()
+        .map(Arc::new);
         if let Some(ref w) = worker {
             if !existing_accounts.is_empty() {
                 w.send(MailRequest::LoadAllCached);
@@ -1519,19 +1531,25 @@ impl HylkiApp {
                 w.send(MailRequest::SyncAllAccounts);
             }
             let weak_worker = Arc::downgrade(w);
-            cx.spawn(async move |this, cx| loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(80))
-                    .await;
-                let Some(w) = weak_worker.upgrade() else {
-                    break;
-                };
-                let events = w.drain_events();
-                if !events.is_empty() {
-                    let res = this.update(cx, |app, cx| {
-                        app.apply_worker_events(events, cx);
-                    });
-                    if res.is_err() {
+            cx.spawn(async move |this, cx| {
+                use futures::StreamExt as _;
+                loop {
+                    let Some(w) = weak_worker.upgrade() else {
+                        break;
+                    };
+                    let events = w.drain_events();
+                    if !events.is_empty() {
+                        if this
+                            .update(cx, |app, cx| {
+                                app.apply_worker_events(events, cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if worker_evt_rx.next().await.is_none() {
                         break;
                     }
                 }
@@ -1691,6 +1709,8 @@ impl HylkiApp {
             reader_webview: None,
             #[cfg(windows)]
             reader_webview_key: None,
+            #[cfg(windows)]
+            reader_webview_warmup_scheduled: false,
             reader_popup_open: false,
             print_preview: None,
             pending_row_action: None,
@@ -2460,6 +2480,45 @@ impl HylkiApp {
                         }
                     }
                 }
+                WorkerEvent::AttachmentDownloaded {
+                    message_id,
+                    attachment_id,
+                    size_bytes,
+                } => {
+                    if let Some(ref mut detail) = self.selected_message {
+                        if detail.id == message_id {
+                            for att in &mut detail.attachments {
+                                if att.id == attachment_id {
+                                    att.downloaded = true;
+                                    att.size_bytes = size_bytes;
+                                }
+                            }
+                        }
+                        for tm in &mut detail.thread_messages {
+                            if tm.id == message_id {
+                                for att in &mut tm.attachments {
+                                    if att.id == attachment_id {
+                                        att.downloaded = true;
+                                        att.size_bytes = size_bytes;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for item in &mut self.gallery_items {
+                        if item.id == attachment_id {
+                            item.downloaded = true;
+                            item.size_bytes = size_bytes;
+                        }
+                    }
+                    if let Some(ref g) = self.gallery {
+                        g.update(cx, |state, cx| {
+                            state.mark_downloaded(attachment_id, size_bytes);
+                            cx.notify();
+                        });
+                    }
+                    cx.notify();
+                }
                 WorkerEvent::AttachmentStripped {
                     account_id: _,
                     message_id,
@@ -2545,14 +2604,27 @@ impl HylkiApp {
                 let mark_now = first.unread
                     && self.reader_position != ReaderPosition::Hidden
                     && self.prefs.read_mark_mode == "shown";
-                self.show_message_loading(first.id);
-                self.request_message_detail(
-                    first.account_id,
-                    first.id,
-                    first.uid,
-                    mark_now,
-                    &first.folder_path,
-                );
+                if let Some((detail, true)) = self.try_load_cached_detail(first.id) {
+                    self.set_selected_message(detail);
+                    self.error_banner = None;
+                    if mark_now {
+                        self.mark_message_seen_now(
+                            first.account_id,
+                            first.id,
+                            first.uid,
+                            &first.folder_path,
+                        );
+                    }
+                } else {
+                    self.show_message_loading(first.id);
+                    self.request_message_detail(
+                        first.account_id,
+                        first.id,
+                        first.uid,
+                        mark_now,
+                        &first.folder_path,
+                    );
+                }
             }
         }
     }
@@ -3061,6 +3133,66 @@ impl HylkiApp {
         cx.notify();
     }
 
+    fn try_load_cached_detail(&self, message_id: u32) -> Option<(MessageDetail, bool)> {
+        if self.demo_mode {
+            return None;
+        }
+        self.worker.as_ref().and_then(|w| {
+            w.try_load_cached_message(message_id, self.prefs.thread_newest_first)
+                .ok()
+                .flatten()
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn ensure_reader_webview(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<std::rc::Rc<crate::webview_host::WebViewHost>> {
+        if let Some(host) = &self.reader_webview {
+            return Some(host.clone());
+        }
+        let host = crate::webview_host::WebViewHost::for_window(window, Some(window.to_async(cx)))?;
+        let (tx, mut rx) = futures::channel::mpsc::channel::<()>(16);
+        host.set_notifier(tx);
+        let host = std::rc::Rc::new(host);
+        self.reader_webview = Some(host.clone());
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            let mut previous = None;
+            while rx.next().await.is_some() {
+                if this
+                    .update(cx, |this, cx| {
+                        let Some(host) = this.reader_webview.clone() else {
+                            return;
+                        };
+                        let status = Some(host.load_status());
+                        if status != previous {
+                            previous = status;
+                            cx.notify();
+                        }
+                        if this.active_modal == ActiveModal::None
+                            && !this.reader_find_open
+                            && !this.reader_popup_open
+                        {
+                            for link in host.take_links() {
+                                this.open_mail_link(&link, cx);
+                            }
+                        } else {
+                            let _ = host.take_links();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        Some(host)
+    }
+
     pub(crate) fn select_message(
         &mut self,
         account_id: u32,
@@ -3094,6 +3226,24 @@ impl HylkiApp {
             } else {
                 self.selected_message = None;
             }
+            if should_mark_now {
+                self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+            } else if should_mark_delay {
+                self.schedule_delayed_read_mark(
+                    gen,
+                    account_id,
+                    message_id,
+                    uid,
+                    folder_path.to_string(),
+                    cx,
+                );
+            }
+            cx.notify();
+            return;
+        }
+        if let Some((detail, true)) = self.try_load_cached_detail(message_id) {
+            self.set_selected_message(detail);
+            self.error_banner = None;
             if should_mark_now {
                 self.mark_message_seen_now(account_id, message_id, uid, folder_path);
             } else if should_mark_delay {
@@ -5779,8 +5929,14 @@ impl HylkiApp {
         cx.notify();
     }
 
-    pub(crate) fn ensure_attachment_thumbnail(&mut self, att_id: u32, mime_type: &str) {
+    pub(crate) fn ensure_attachment_thumbnail(
+        &mut self,
+        att_id: u32,
+        mime_type: &str,
+        downloaded: bool,
+    ) {
         if self.demo_mode
+            || !downloaded
             || attachment_drawer::image_format_for_mime(mime_type).is_none()
             || self.attachment_thumb_cache.contains_key(&att_id)
             || !self.attachment_thumb_requested.insert(att_id)
@@ -5841,7 +5997,7 @@ impl HylkiApp {
     ) {
         let cached = self.attachment_thumb_cache.get(&att_id).cloned();
         if cached.is_none() {
-            self.ensure_attachment_thumbnail(att_id, &mime_type);
+            self.ensure_attachment_thumbnail(att_id, &mime_type, true);
         }
         self.drawer_image_preview = Some((att_id, filename, cached));
         cx.notify();
@@ -6127,6 +6283,14 @@ impl HylkiApp {
             }
             return;
         }
+        if let Some((detail, true)) = self.try_load_cached_detail(message_id) {
+            if unread && self.prefs.read_mark_mode == "shown" {
+                self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+            }
+            self.pop_out_message_window(detail, cx);
+            cx.notify();
+            return;
+        }
         self.pending_popout_message_ids.insert(message_id);
         if unread && self.prefs.read_mark_mode == "shown" {
             self.mark_message_seen_now(account_id, message_id, uid, folder_path);
@@ -6188,6 +6352,15 @@ impl HylkiApp {
             if let Some(detail) = self.selected_message.clone() {
                 self.pop_out_message_window(detail, cx);
             }
+            return;
+        }
+        if let Some((detail, true)) = self.try_load_cached_detail(message_id) {
+            self.set_selected_message(detail.clone());
+            if unread && self.prefs.read_mark_mode == "shown" {
+                self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+            }
+            self.pop_out_message_window(detail, cx);
+            cx.notify();
             return;
         }
         self.pending_popout_message_ids.insert(message_id);
@@ -8051,6 +8224,12 @@ impl HylkiApp {
         let account_id = item.account_id;
         self.main_view = MainContentView::Mail;
         self.right_mode = RightPaneMode::Reader;
+        if let Some((detail, true)) = self.try_load_cached_detail(message_id) {
+            self.set_selected_message(detail);
+            self.error_banner = None;
+            cx.notify();
+            return;
+        }
         self.show_message_loading(message_id);
         if let Some(ref w) = self.worker {
             self.pending_body_message_id = Some(message_id);
@@ -8607,6 +8786,7 @@ impl HylkiApp {
         let show_accounts_changed = self.prefs.show_accounts != prev.show_accounts;
         let default_reader_mode_changed =
             self.prefs.reader_default_mode != prev.reader_default_mode;
+        let keep_downloads_changed = self.prefs.keep_downloads_days != prev.keep_downloads_days;
 
         if reader_pos_changed {
             self.reader_position = ReaderPosition::from_key(&self.prefs.reader_position)
@@ -8649,6 +8829,13 @@ impl HylkiApp {
                 "on" => self.reader_prefer_plain = true,
                 "off" => self.reader_prefer_plain = false,
                 _ => {}
+            }
+        }
+        if keep_downloads_changed && self.prefs.keep_downloads_days > 0 {
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::PruneExpiredDownloads {
+                    keep_days: self.prefs.keep_downloads_days,
+                });
             }
         }
         cx.notify();
@@ -9603,6 +9790,24 @@ impl Render for HylkiApp {
             self.last_rem_scale = scale;
         }
         self.retain_current_reader_text_states();
+        #[cfg(windows)]
+        if !self.reader_webview_warmup_scheduled && self.reader_webview.is_none() {
+            self.reader_webview_warmup_scheduled = true;
+            let handle = self.window_handle;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let _ = cx.update(|cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            let _ = app.ensure_reader_webview(window, cx);
+                        });
+                    });
+                });
+            })
+            .detach();
+        }
         #[cfg(windows)]
         if self.selected_message.is_none() && self.reader_webview_key.take().is_some() {
             if let Some(host) = self.reader_webview.clone() {

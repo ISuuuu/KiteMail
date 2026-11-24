@@ -1,6 +1,7 @@
 //! 异步 WebView2 宿主。调用方必须在创建父窗口的 STA 线程使用。
 #![allow(dead_code)]
 
+use futures::channel::mpsc as futures_mpsc;
 use gpui_kit::{
     point, px, AsyncWindowContext, Hsla, PlatformInput, Rgba, ScrollDelta, ScrollEvent, TouchPhase,
     Window,
@@ -13,12 +14,13 @@ use std::{
 };
 use webview2_com::{
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
-    WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
+    DOMContentLoadedEventHandler, Microsoft::Web::WebView2::Win32::*,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    NewWindowRequestedEventHandler, ProcessFailedEventHandler, WebMessageReceivedEventHandler,
+    WebResourceRequestedEventHandler,
 };
 use windows::{
-    core::w,
+    core::{w, Interface},
     Win32::{
         Foundation::{HWND, POINT, RECT},
         UI::{
@@ -258,6 +260,8 @@ struct State {
     loaded: bool,
     links: Vec<(u64, String)>,
     scroll_window: Option<AsyncWindowContext>,
+    scroll_script_version: u64,
+    notifier: Option<futures_mpsc::Sender<()>>,
     in_thread: bool,
     bounds: RECT,
     visible: bool,
@@ -265,6 +269,66 @@ struct State {
     window_shown: bool,
     failed: bool,
     closed: bool,
+}
+
+impl State {
+    fn notify_ui(&mut self) {
+        if let Some(tx) = &mut self.notifier {
+            let _ = tx.try_send(());
+        }
+    }
+}
+
+fn apply_dom_content_loaded(state: &mut State, navigation_id: u64) -> bool {
+    if state.navigation_id == Some(navigation_id) && !state.closed {
+        state.loaded = true;
+        state.failed = false;
+        state.notify_ui();
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_navigation_completed(state: &mut State, navigation_id: u64, success: bool) -> bool {
+    if state.navigation_id == Some(navigation_id) {
+        state.loaded = success;
+        state.failed = !success;
+        state.notify_ui();
+        success
+    } else {
+        false
+    }
+}
+
+fn maybe_install_thread_scroll(state: &Rc<RefCell<State>>, view: Option<&ICoreWebView2>) {
+    let should_install = {
+        let mut inner = state.borrow_mut();
+        let version = inner.version;
+        if inner.loaded
+            && inner.in_thread
+            && inner.scroll_window.is_some()
+            && inner.scroll_script_version != version
+        {
+            inner.scroll_script_version = version;
+            true
+        } else {
+            false
+        }
+    };
+    if let Some(view) = view.filter(|_| should_install) {
+        // Run the trusted listener in the wrapper. The mail frame stays scriptless.
+        let script: Vec<u16> = include_str!("thread_scroll.js")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            let _ = view.ExecuteScript(
+                windows::core::PCWSTR(script.as_ptr()),
+                None::<&ICoreWebView2ExecuteScriptCompletedHandler>,
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -301,7 +365,9 @@ fn create_controller(
                 return Ok(());
             };
             let Some(controller) = controller.filter(|_| result.is_ok()) else {
-                state.borrow_mut().failed = true;
+                let mut inner = state.borrow_mut();
+                inner.failed = true;
+                inner.notify_ui();
                 return Ok(());
             };
             if state.borrow().closed {
@@ -314,7 +380,9 @@ fn create_controller(
                 unsafe {
                     let _ = controller.Close();
                 }
-                state.borrow_mut().failed = true;
+                let mut inner = state.borrow_mut();
+                inner.failed = true;
+                inner.notify_ui();
                 return Ok(());
             }
             let mut inner = state.borrow_mut();
@@ -329,13 +397,17 @@ fn create_controller(
                 let _ = controller.SetIsVisible(visible);
             }
             if navigate && unsafe { navigate_to(&controller, &url) }.is_err() {
-                state.borrow_mut().failed = true;
+                let mut inner = state.borrow_mut();
+                inner.failed = true;
+                inner.notify_ui();
             }
             Ok(())
         },
     ));
     if unsafe { environment.CreateCoreWebView2Controller(parent, &handler) }.is_err() {
-        state.borrow_mut().failed = true;
+        let mut inner = state.borrow_mut();
+        inner.failed = true;
+        inner.notify_ui();
     }
 }
 
@@ -433,7 +505,9 @@ impl WebViewHost {
                     if let Some(environment) = &environment {
                         create_controller(environment, parent, weak);
                     } else if let Some(state) = weak.upgrade() {
-                        state.borrow_mut().failed = true;
+                        let mut inner = state.borrow_mut();
+                        inner.failed = true;
+                        inner.notify_ui();
                     }
                 }
                 Ok(())
@@ -467,7 +541,9 @@ impl WebViewHost {
             });
             for (_, weak) in waiters {
                 if let Some(state) = weak.upgrade() {
-                    state.borrow_mut().failed = true;
+                    let mut inner = state.borrow_mut();
+                    inner.failed = true;
+                    inner.notify_ui();
                 }
             }
             unsafe {
@@ -476,6 +552,10 @@ impl WebViewHost {
             return Err(error);
         }
         Ok(Self(state))
+    }
+
+    pub(crate) fn set_notifier(&self, tx: futures_mpsc::Sender<()>) {
+        self.0.borrow_mut().notifier = Some(tx);
     }
 
     pub(crate) fn load_status(&self) -> (u64, BodyView) {
@@ -747,6 +827,23 @@ unsafe fn configure(
         Ok(())
     }));
     view.add_NavigationStarting(&nav, &mut token)?;
+    if let Ok(view2) = view.cast::<ICoreWebView2_2>() {
+        let dom_state = state.clone();
+        let dom_loaded = DOMContentLoadedEventHandler::create(Box::new(move |view, args| {
+            if let (Some(state), Some(args)) = (dom_state.upgrade(), args) {
+                let mut id = 0;
+                unsafe {
+                    args.NavigationId(&mut id)?;
+                }
+                let matched = apply_dom_content_loaded(&mut state.borrow_mut(), id);
+                if matched {
+                    maybe_install_thread_scroll(&state, view.as_ref());
+                }
+            }
+            Ok(())
+        }));
+        let _ = view2.add_DOMContentLoaded(&dom_loaded, &mut token);
+    }
     let complete_state = state.clone();
     let complete = NavigationCompletedEventHandler::create(Box::new(move |view, args| {
         if let (Some(state), Some(args)) = (complete_state.upgrade(), args) {
@@ -756,26 +853,10 @@ unsafe fn configure(
                 args.NavigationId(&mut id)?;
                 args.IsSuccess(&mut success)?;
             }
-            let mut state = state.borrow_mut();
-            if state.navigation_id == Some(id) {
-                state.loaded = success.as_bool();
-                state.failed = !state.loaded;
-                let install_scroll =
-                    state.loaded && state.in_thread && state.scroll_window.is_some();
-                drop(state);
-                if let Some(view) = view.filter(|_| install_scroll) {
-                    // Run the trusted listener in the wrapper. The mail frame stays scriptless.
-                    let script: Vec<u16> = include_str!("thread_scroll.js")
-                        .encode_utf16()
-                        .chain(Some(0))
-                        .collect();
-                    unsafe {
-                        let _ = view.ExecuteScript(
-                            windows::core::PCWSTR(script.as_ptr()),
-                            None::<&ICoreWebView2ExecuteScriptCompletedHandler>,
-                        );
-                    }
-                }
+            let matched =
+                apply_navigation_completed(&mut state.borrow_mut(), id, success.as_bool());
+            if matched {
+                maybe_install_thread_scroll(&state, view.as_ref());
             }
         }
         Ok(())
@@ -807,6 +888,7 @@ unsafe fn configure(
             let mut state = state.borrow_mut();
             state.loaded = false;
             state.failed = true;
+            state.notify_ui();
         }
         Ok(())
     }));
@@ -834,6 +916,7 @@ unsafe fn configure(
                             .is_some_and(|(v, last)| *v == version && *last == url)
                         {
                             state.links.push((version, url.clone()));
+                            state.notify_ui();
                         }
                     }
                 }
@@ -866,6 +949,7 @@ unsafe fn configure(
                             .is_some_and(|(v, last)| *v == version && *last == url)
                         {
                             state.links.push((version, url));
+                            state.notify_ui();
                         }
                     }
                 }
@@ -1210,5 +1294,31 @@ mod tests {
         let document = String::from_utf8(build_body_document("<p>正文内容</p>", light)).unwrap();
         assert!(!document.contains("<header>"));
         assert!(document.contains("<iframe"));
+    }
+
+    #[test]
+    fn dom_content_loaded_marks_ready_and_wakes_notifier_before_navigation_completed() {
+        let (tx, mut rx) = futures_mpsc::channel::<()>(4);
+        let mut state = State::default();
+        state.version = 3;
+        state.navigation_id = Some(42);
+        state.notifier = Some(tx);
+
+        // Stale navigation ID is ignored.
+        assert!(!apply_dom_content_loaded(&mut state, 7));
+        assert!(!state.loaded);
+        assert!(rx.try_recv().is_err());
+
+        // Matching DOMContentLoaded wakes UI immediately while remote images may still load.
+        assert!(apply_dom_content_loaded(&mut state, 42));
+        assert!(state.loaded);
+        assert!(!state.failed);
+        assert_eq!(rx.try_recv().ok(), Some(()));
+
+        // Explicit main-document navigation failure resets loaded back to false.
+        assert!(!apply_navigation_completed(&mut state, 42, false));
+        assert!(!state.loaded);
+        assert!(state.failed);
+        assert_eq!(rx.try_recv().ok(), Some(()));
     }
 }

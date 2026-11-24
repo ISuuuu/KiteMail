@@ -3007,6 +3007,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "data-url",
+ "futures",
  "gpui-kit",
  "html5ever",
  "hylki-mail-core",

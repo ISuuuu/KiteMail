@@ -1,8 +1,12 @@
 //! Async IMAP client supporting TLS and STARTTLS with MIME header/body parsing.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use async_imap::imap_proto::types::{
+    BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure, ContentEncoding,
+    SectionPath,
+};
 use async_native_tls::TlsConnector;
 use futures::StreamExt;
 use mail_parser::{MessageParser, MimeHeaders};
@@ -10,12 +14,16 @@ use tokio::net::TcpStream;
 
 use crate::cache::{CachedAttachmentInput, CachedHeaderInput, RemoteFolder};
 use crate::config::{AccountConfig, SecurityMode};
-use crate::FetchedMessageBody;
+use crate::{FetchedMessageBody, AUTO_CACHE_ATTACHMENT_MAX_BYTES};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 /// 单封正文拉取的超时：附件较大的邮件给更宽的窗口，但必须封顶，
 /// 否则卡住的连接会一直占住发信 / 读信请求的处理队列。
 const BODY_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// 按需下载大附件的超时窗口。
+const ATTACHMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(180);
+/// 内联 `cid:` 图片允许自动随正文一并缓存的上限。
+const MAX_INLINE_CID_BYTES: usize = 5 * 1024 * 1024;
 const MAX_INITIAL_FETCH: usize = 100;
 
 type TlsStream = async_native_tls::TlsStream<TcpStream>;
@@ -500,7 +508,7 @@ pub async fn fetch_index_texts_batch(
     folder_path: &str,
     uids: &[u32],
     expected_validity: u32,
-) -> Result<Vec<(u32, String, Option<String>, Option<String>)>, String> {
+) -> Result<Vec<(u32, String, Option<FetchedMessageBody>)>, String> {
     const MAX_BYTES: usize = 262_144;
     if uids.is_empty() {
         return Ok(Vec::new());
@@ -539,14 +547,28 @@ pub async fn fetch_index_texts_batch(
     Ok(fetched
         .into_iter()
         .map(|(uid, bytes)| {
-            let (index_text, text, html) = index_parts_from_mime(&bytes, MAX_BYTES);
-            (uid, index_text, text, html)
+            if bytes.len() <= MAX_BYTES {
+                if let Ok(full) = parse_rfc822_message(&bytes) {
+                    let index_text = if !full.body_text.is_empty()
+                        && full.body_text != "(此邮件无可读正文)"
+                    {
+                        full.body_text.clone()
+                    } else if let Some(ref html) = full.body_html {
+                        html_to_readable_text(html)
+                    } else {
+                        String::new()
+                    };
+                    return (uid, index_text, Some(full));
+                }
+            }
+            (uid, String::new(), None)
         })
         .collect())
 }
 
 /// 将单封邮件的 MIME 字节转换为 `(索引文本, 纯文本正文, HTML 正文)`。
 /// 超过 `max_bytes` 或无法解析时全部返回空，供服务器搜索覆盖。
+#[cfg_attr(not(test), allow(dead_code))]
 fn index_parts_from_mime(
     bytes: &[u8],
     max_bytes: usize,
@@ -567,44 +589,452 @@ fn index_parts_from_mime(
     (index_text, text, html)
 }
 
-/// Fetch full RFC 822 message body and attachments for `uid` in `folder_path`.
-pub async fn fetch_message_body(
-    account: &AccountConfig,
-    password: &str,
-    folder_path: &str,
-    uid: u32,
-) -> Result<FetchedMessageBody, String> {
-    let mut session = connect_imap(account, password).await?;
-    tokio::time::timeout(BODY_FETCH_TIMEOUT, session.select(folder_path))
-        .await
-        .map_err(|_| format!("打开文件夹 {folder_path} 超时"))?
-        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedBodyPart {
+    section: String,
+    mime_type: String,
+    charset: Option<String>,
+    transfer_encoding: String,
+}
 
-    // 正文 + 附件的整段拉取必须封顶：连接卡死时若无限等待，会一直占住
-    // worker 的串行队列，导致后续点击的邮件也迟迟没有反应。
-    let raw_body = tokio::time::timeout(BODY_FETCH_TIMEOUT, async {
-        let mut fetches = session
-            .uid_fetch(uid.to_string(), "RFC822")
-            .await
-            .map_err(|e| format!("拉取邮件正文失败 (UID {uid}): {e}"))?;
-        let mut raw_body: Option<Vec<u8>> = None;
-        while let Some(fetch_res) = fetches.next().await {
-            if let Ok(fetch) = fetch_res {
-                if let Some(body) = fetch.body() {
-                    raw_body = Some(body.to_vec());
-                    break;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedInlineCid {
+    section: String,
+    cid: String,
+    mime_type: String,
+    transfer_encoding: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedAttachment {
+    section: String,
+    filename: String,
+    mime_type: String,
+    estimated_size: usize,
+    transfer_encoding: String,
+    download_now: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BodyStructureFetchPlan {
+    body_parts: Vec<PlannedBodyPart>,
+    inline_cids: Vec<PlannedInlineCid>,
+    attachments: Vec<PlannedAttachment>,
+}
+
+impl BodyStructureFetchPlan {
+    fn has_deferred_attachments(&self) -> bool {
+        self.attachments.iter().any(|a| !a.download_now)
+    }
+}
+
+fn estimated_decoded_size(
+    common: &BodyContentCommon<'_>,
+    other: &BodyContentSinglePart<'_>,
+) -> usize {
+    if let Some(size) = common
+        .disposition
+        .as_ref()
+        .and_then(|d| body_param_value(&d.params, "size"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&s| s > 0)
+    {
+        return size;
+    }
+    let octets = other.octets as usize;
+    match other.transfer_encoding {
+        ContentEncoding::Base64 => {
+            // Base64 按 RFC 2045 每 76 字符插入一对 `\r\n`（约占 2/78）。
+            let effective = octets.saturating_sub((octets / 78) * 2);
+            effective / 4 * 3
+        }
+        _ => octets,
+    }
+}
+
+fn encoding_str(enc: &ContentEncoding<'_>) -> String {
+    match enc {
+        ContentEncoding::SevenBit => "7bit".to_string(),
+        ContentEncoding::EightBit => "8bit".to_string(),
+        ContentEncoding::Binary => "binary".to_string(),
+        ContentEncoding::Base64 => "base64".to_string(),
+        ContentEncoding::QuotedPrintable => "quoted-printable".to_string(),
+        ContentEncoding::Other(s) => s.to_string(),
+    }
+}
+
+fn decode_mime_param(raw: &str) -> String {
+    let cleaned = raw.replace(['\r', '\n'], "").trim().to_string();
+    if !cleaned.contains("=?") {
+        return cleaned;
+    }
+    let synthetic = format!("Subject: {cleaned}\r\n\r\n");
+    MessageParser::default()
+        .parse(synthetic.as_bytes())
+        .and_then(|msg| msg.subject().map(str::to_string))
+        .unwrap_or(cleaned)
+}
+
+fn body_param_value(params: &BodyParams<'_>, key: &str) -> Option<String> {
+    params.as_ref()?.iter().find_map(|(k, v)| {
+        k.eq_ignore_ascii_case(key)
+            .then(|| decode_mime_param(v.as_ref()))
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn percent_decode_bytes(raw: &str) -> Vec<u8> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
                 }
             }
         }
-        Ok::<Option<Vec<u8>>, String>(raw_body)
-    })
-    .await
-    .map_err(|_| format!("拉取邮件正文超时 (UID {uid})"))??;
-    let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
 
-    let bytes = raw_body.ok_or_else(|| format!("服务器未返回 UID {uid} 的邮件内容"))?;
+fn decode_charset_octets(bytes: &[u8], charset: Option<&str>) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let use_utf8 = charset.is_none_or(|cs| {
+        let c = cs.trim();
+        c.is_empty() || c.eq_ignore_ascii_case("utf-8") || c.eq_ignore_ascii_case("us-ascii")
+    });
+    let text = if use_utf8 {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        decode_text_section(b64.as_bytes(), "text/plain", charset, "base64", false)
+            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+    };
+    text.replace(['\r', '\n'], "").trim().to_string()
+}
+
+fn decode_rfc2231_param(params: &BodyParams<'_>, base_key: &str) -> Option<String> {
+    let list = params.as_ref()?;
+    let prefix = format!("{base_key}*");
+    let mut segments: Vec<(usize, bool, &str)> = Vec::new();
+    for (k, v) in list {
+        let raw_k = k.as_ref();
+        if raw_k.len() <= prefix.len() || !raw_k[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            continue;
+        }
+        let suffix = &raw_k[prefix.len()..];
+        let (digits, encoded) = match suffix.strip_suffix('*') {
+            Some(d) => (d, true),
+            None => (suffix, false),
+        };
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(idx) = digits.parse::<usize>() {
+                segments.push((idx, encoded, v.as_ref()));
+            }
+        }
+    }
+    if !segments.is_empty() {
+        segments.sort_by_key(|(idx, _, _)| *idx);
+        let mut charset: Option<String> = None;
+        let mut octets: Vec<u8> = Vec::new();
+        for (pos, (_idx, encoded, val)) in segments.into_iter().enumerate() {
+            if encoded {
+                let raw_part = if pos == 0 {
+                    let mut parts = val.splitn(3, '\'');
+                    match (parts.next(), parts.next(), parts.next()) {
+                        (Some(cs), Some(_lang), Some(rest)) => {
+                            let cs = cs.trim();
+                            if !cs.is_empty() {
+                                charset = Some(cs.to_string());
+                            }
+                            rest
+                        }
+                        _ => val,
+                    }
+                } else {
+                    val
+                };
+                octets.extend_from_slice(&percent_decode_bytes(raw_part));
+            } else {
+                octets.extend_from_slice(val.as_bytes());
+            }
+        }
+        let decoded = decode_charset_octets(&octets, charset.as_deref());
+        if !decoded.is_empty() {
+            return Some(decoded);
+        }
+    }
+
+    if let Some((_, v)) = list
+        .iter()
+        .find(|(k, _)| k.as_ref().eq_ignore_ascii_case(&prefix))
+    {
+        let val = v.as_ref();
+        let mut parts = val.splitn(3, '\'');
+        let (charset, rest) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(cs), Some(_lang), Some(rest)) => {
+                let cs = cs.trim();
+                ((!cs.is_empty()).then_some(cs), rest)
+            }
+            _ => (None, val),
+        };
+        let octets = percent_decode_bytes(rest);
+        let decoded = decode_charset_octets(&octets, charset);
+        if !decoded.is_empty() {
+            return Some(decoded);
+        }
+    }
+
+    body_param_value(params, base_key)
+}
+
+fn extract_bs_filename(
+    common: &BodyContentCommon<'_>,
+    fallback_idx: usize,
+    default_ext: &str,
+) -> String {
+    common
+        .disposition
+        .as_ref()
+        .and_then(|d| decode_rfc2231_param(&d.params, "filename"))
+        .or_else(|| decode_rfc2231_param(&common.ty.params, "name"))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("attachment-{fallback_idx}{default_ext}"))
+}
+
+fn plan_bodystructure_fetch(bs: &BodyStructure<'_>) -> BodyStructureFetchPlan {
+    fn walk(bs: &BodyStructure<'_>, section: &str, plan: &mut BodyStructureFetchPlan) {
+        match bs {
+            BodyStructure::Multipart { bodies, .. } => {
+                for (i, child) in bodies.iter().enumerate() {
+                    let child_section = if section.is_empty() {
+                        format!("{}", i + 1)
+                    } else {
+                        format!("{section}.{}", i + 1)
+                    };
+                    walk(child, &child_section, plan);
+                }
+            }
+            BodyStructure::Text { common, other, .. } => {
+                let is_att_disp = common
+                    .disposition
+                    .as_ref()
+                    .is_some_and(|d| d.ty.eq_ignore_ascii_case("attachment"));
+                let is_plain = common.ty.ty.eq_ignore_ascii_case("text")
+                    && common.ty.subtype.eq_ignore_ascii_case("plain");
+                let is_html = common.ty.ty.eq_ignore_ascii_case("text")
+                    && common.ty.subtype.eq_ignore_ascii_case("html");
+                let is_calendar = common.ty.ty.eq_ignore_ascii_case("text")
+                    && common.ty.subtype.eq_ignore_ascii_case("calendar");
+                let mime_type = format!(
+                    "{}/{}",
+                    common.ty.ty.to_ascii_lowercase(),
+                    common.ty.subtype.to_ascii_lowercase()
+                );
+
+                if !is_att_disp && (is_plain || is_html) && !is_calendar {
+                    plan.body_parts.push(PlannedBodyPart {
+                        section: section.to_string(),
+                        mime_type,
+                        charset: body_param_value(&common.ty.params, "charset"),
+                        transfer_encoding: encoding_str(&other.transfer_encoding),
+                    });
+                } else if is_att_disp || is_calendar {
+                    let size = estimated_decoded_size(common, other);
+                    let default_ext = if is_calendar { ".ics" } else { ".txt" };
+                    let filename =
+                        extract_bs_filename(common, plan.attachments.len() + 1, default_ext);
+                    plan.attachments.push(PlannedAttachment {
+                        section: section.to_string(),
+                        filename,
+                        mime_type,
+                        estimated_size: size,
+                        transfer_encoding: encoding_str(&other.transfer_encoding),
+                        download_now: size <= AUTO_CACHE_ATTACHMENT_MAX_BYTES,
+                    });
+                }
+            }
+            BodyStructure::Basic { common, other, .. }
+            | BodyStructure::Message { common, other, .. } => {
+                let mime_type = format!(
+                    "{}/{}",
+                    common.ty.ty.to_ascii_lowercase(),
+                    common.ty.subtype.to_ascii_lowercase()
+                );
+                if mime_type == "message/disposition-notification" {
+                    return;
+                }
+                let is_att_disp = common
+                    .disposition
+                    .as_ref()
+                    .is_some_and(|d| d.ty.eq_ignore_ascii_case("attachment"));
+                let is_image = common.ty.ty.eq_ignore_ascii_case("image");
+                let cid = other
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|s| {
+                        s.trim_matches(|c| c == '<' || c == '>')
+                            .to_ascii_lowercase()
+                    })
+                    .filter(|s| !s.is_empty());
+                let size = estimated_decoded_size(common, other);
+
+                if let Some(cid) = cid {
+                    if !is_att_disp && (is_image || mime_type == "application/octet-stream") {
+                        if size <= MAX_INLINE_CID_BYTES {
+                            plan.inline_cids.push(PlannedInlineCid {
+                                section: section.to_string(),
+                                cid,
+                                mime_type,
+                                transfer_encoding: encoding_str(&other.transfer_encoding),
+                            });
+                        }
+                        return;
+                    }
+                }
+
+                let default_ext = match mime_type.as_str() {
+                    "message/rfc822" => ".eml",
+                    _ => ".bin",
+                };
+                let filename = extract_bs_filename(common, plan.attachments.len() + 1, default_ext);
+                plan.attachments.push(PlannedAttachment {
+                    section: section.to_string(),
+                    filename,
+                    mime_type,
+                    estimated_size: size,
+                    transfer_encoding: encoding_str(&other.transfer_encoding),
+                    download_now: size <= AUTO_CACHE_ATTACHMENT_MAX_BYTES,
+                });
+            }
+        }
+    }
+
+    let mut plan = BodyStructureFetchPlan::default();
+    let root_section = if matches!(bs, BodyStructure::Multipart { .. }) {
+        ""
+    } else {
+        "1"
+    };
+    walk(bs, root_section, &mut plan);
+    plan
+}
+
+fn section_path_for(section: &str) -> Option<SectionPath> {
+    let nums: Option<Vec<u32>> = section
+        .trim()
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>().ok())
+        .collect();
+    let nums = nums?;
+    if nums.is_empty() {
+        None
+    } else {
+        Some(SectionPath::Part(nums, None))
+    }
+}
+
+fn decode_text_section(
+    raw: &[u8],
+    mime_type: &str,
+    charset: Option<&str>,
+    transfer_encoding: &str,
+    is_html: bool,
+) -> Option<String> {
+    let mut mime_bytes = Vec::with_capacity(raw.len() + 128);
+    let safe_ct = mime_type.replace(['\r', '\n'], "");
+    if let Some(cs) = charset.filter(|s| !s.trim().is_empty()) {
+        let safe_cs = cs.replace(['\r', '\n', '"'], "");
+        mime_bytes.extend_from_slice(
+            format!("Content-Type: {safe_ct}; charset=\"{safe_cs}\"\r\n").as_bytes(),
+        );
+    } else {
+        mime_bytes.extend_from_slice(format!("Content-Type: {safe_ct}\r\n").as_bytes());
+    }
+    if !transfer_encoding.trim().is_empty() {
+        let safe_te = transfer_encoding.replace(['\r', '\n'], "");
+        mime_bytes
+            .extend_from_slice(format!("Content-Transfer-Encoding: {safe_te}\r\n").as_bytes());
+    }
+    mime_bytes.extend_from_slice(b"\r\n");
+    mime_bytes.extend_from_slice(raw);
+
+    let parsed = MessageParser::default().parse(&mime_bytes)?;
+    if is_html {
+        parsed.body_html(0).map(|h| h.into_owned())
+    } else {
+        parsed.body_text(0).map(|t| t.into_owned())
+    }
+}
+
+fn decode_binary_section(raw: &[u8], mime_type: &str, transfer_encoding: &str) -> Vec<u8> {
+    let enc = transfer_encoding.trim().to_ascii_lowercase();
+    if enc.is_empty() || matches!(enc.as_str(), "7bit" | "8bit" | "binary") {
+        return raw.to_vec();
+    }
+    let mut mime_bytes = Vec::with_capacity(raw.len() + 128);
+    let safe_ct = mime_type.replace(['\r', '\n'], "");
+    let safe_te = transfer_encoding.replace(['\r', '\n'], "");
+    mime_bytes.extend_from_slice(
+        format!("Content-Type: {safe_ct}\r\nContent-Transfer-Encoding: {safe_te}\r\n\r\n")
+            .as_bytes(),
+    );
+    mime_bytes.extend_from_slice(raw);
+    MessageParser::default()
+        .parse(&mime_bytes)
+        .and_then(|parsed| parsed.parts.first().map(|p| p.contents().to_vec()))
+        .filter(|bytes| !bytes.is_empty() || raw.is_empty())
+        .unwrap_or_else(|| raw.to_vec())
+}
+
+fn parse_header_metadata(header_bytes: &[u8]) -> (Option<String>, bool, Option<String>) {
+    if header_bytes.is_empty() {
+        return (None, false, None);
+    }
+    let mut msg_bytes = Vec::with_capacity(header_bytes.len() + 4);
+    msg_bytes.extend_from_slice(header_bytes);
+    if !header_bytes.ends_with(b"\r\n\r\n") {
+        msg_bytes.extend_from_slice(b"\r\n\r\n");
+    }
+    let Some(parsed) = MessageParser::default().parse(&msg_bytes) else {
+        return (None, false, None);
+    };
+    let unsubscribe_url =
+        raw_header_value(parsed.header_raw("List-Unsubscribe").unwrap_or_default())
+            .and_then(crate::cache::extract_unsubscribe_url);
+    let unsubscribe_one_click = raw_header_value(
+        parsed
+            .header_raw("List-Unsubscribe-Post")
+            .unwrap_or_default(),
+    )
+    .map(crate::cache::is_one_click_post)
+    .unwrap_or(false);
+    let auth_results = raw_header_value(
+        parsed
+            .header_raw("Authentication-Results")
+            .unwrap_or_default(),
+    )
+    .map(str::to_string)
+    .filter(|v| !v.is_empty());
+    (unsubscribe_url, unsubscribe_one_click, auth_results)
+}
+
+/// Parse complete RFC 822 message bytes into [`FetchedMessageBody`], caching all
+/// attachments within the payload.
+pub(crate) fn parse_rfc822_message(bytes: &[u8]) -> Result<FetchedMessageBody, String> {
     let parsed = MessageParser::default()
-        .parse(&bytes)
+        .parse(bytes)
         .ok_or_else(|| "解析邮件 MIME 内容失败".to_string())?;
 
     let body_html = parsed
@@ -631,15 +1061,13 @@ pub async fn fetch_message_body(
                 None => ct.ctype().to_string(),
             })
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        attachments.push(CachedAttachmentInput {
+        attachments.push(CachedAttachmentInput::downloaded(
             filename,
             mime_type,
-            content: att.contents().to_vec(),
-        });
+            att.contents().to_vec(),
+        ));
     }
 
-    // F-7 一键退订：`List-Unsubscribe` / `List-Unsubscribe-Post` 头随正文抓取
-    // 一并读出（header_raw 含字段名，剥出值后再提取 URL）。
     let unsubscribe_url =
         raw_header_value(parsed.header_raw("List-Unsubscribe").unwrap_or_default())
             .and_then(crate::cache::extract_unsubscribe_url);
@@ -650,7 +1078,6 @@ pub async fn fetch_message_body(
     )
     .map(crate::cache::is_one_click_post)
     .unwrap_or(false);
-    // 发件人真实性校验：收件方网关写入的 SPF / DKIM / DMARC 结论，只读取不验证。
     let auth_results = raw_header_value(
         parsed
             .header_raw("Authentication-Results")
@@ -667,6 +1094,371 @@ pub async fn fetch_message_body(
         unsubscribe_one_click,
         auth_results,
     })
+}
+
+/// Fetch message body and auto-cached attachments for `uid` in `folder_path` using
+/// `BODY.PEEK` so server `\Seen` flags are only updated explicitly by `SetSeen`.
+pub async fn fetch_message_body(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+) -> Result<FetchedMessageBody, String> {
+    let mut session = connect_imap(account, password).await?;
+    tokio::time::timeout(BODY_FETCH_TIMEOUT, session.select(folder_path))
+        .await
+        .map_err(|_| format!("打开文件夹 {folder_path} 超时"))?
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    // 先查 RFC822.SIZE + BODYSTRUCTURE：<= 2 MB 时整封拉取更省往返；
+    // > 2 MB 时仅拉正文、内联图与 <= 2 MB 小附件，大附件只存元数据，点击时再按需下载。
+    let probe = tokio::time::timeout(IO_TIMEOUT, async {
+        let mut fetches = session
+            .uid_fetch(uid.to_string(), "(RFC822.SIZE BODYSTRUCTURE)")
+            .await
+            .map_err(|e| format!("探测邮件结构失败 (UID {uid}): {e}"))?;
+        let mut size_opt: Option<u32> = None;
+        let mut plan_opt: Option<BodyStructureFetchPlan> = None;
+        while let Some(fetch_res) = fetches.next().await {
+            if let Ok(fetch) = fetch_res {
+                if size_opt.is_none() {
+                    size_opt = fetch.size;
+                }
+                if plan_opt.is_none() {
+                    if let Some(bs) = fetch.bodystructure() {
+                        plan_opt = Some(plan_bodystructure_fetch(bs));
+                    }
+                }
+            }
+        }
+        Ok::<(Option<u32>, Option<BodyStructureFetchPlan>), String>((size_opt, plan_opt))
+    })
+    .await;
+
+    let (size_opt, plan_opt) = match probe {
+        Ok(Ok(pair)) => pair,
+        _ => (None, None),
+    };
+
+    let fetch_full = size_opt.is_some_and(|s| (s as usize) <= AUTO_CACHE_ATTACHMENT_MAX_BYTES)
+        || plan_opt
+            .as_ref()
+            .is_none_or(|p| p.body_parts.is_empty() || !p.has_deferred_attachments());
+
+    if !fetch_full {
+        if let Some(plan) = plan_opt {
+            let mut body_and_att_items: Vec<String> = Vec::new();
+            let mut seen_sections: HashSet<String> = HashSet::new();
+            for s in plan
+                .body_parts
+                .iter()
+                .map(|p| p.section.as_str())
+                .chain(plan.inline_cids.iter().map(|c| c.section.as_str()))
+                .chain(
+                    plan.attachments
+                        .iter()
+                        .filter(|a| a.download_now)
+                        .map(|a| a.section.as_str()),
+                )
+            {
+                if seen_sections.insert(s.to_string()) {
+                    body_and_att_items.push(format!("BODY.PEEK[{s}]"));
+                }
+            }
+            let mut items_with_headers = vec![
+                "BODY.PEEK[HEADER.FIELDS (LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST AUTHENTICATION-RESULTS)]"
+                    .to_string(),
+            ];
+            items_with_headers.extend(body_and_att_items.iter().cloned());
+
+            let fetch_has_any_body = |fetches: &[async_imap::types::Fetch]| -> bool {
+                plan.body_parts.iter().any(|bp| {
+                    fetches.iter().any(|f| {
+                        section_path_for(&bp.section)
+                            .and_then(|path| f.section(&path))
+                            .or_else(|| (bp.section == "1").then(|| f.text()).flatten())
+                            .is_some()
+                    })
+                })
+            };
+
+            let mut fetches = uid_fetch_sections(&mut session, uid, &items_with_headers)
+                .await
+                .ok()
+                .unwrap_or_default();
+            if !fetch_has_any_body(&fetches) {
+                // 部分 IMAP 服务器不支持在复合 FETCH 中混合 HEADER.FIELDS 与分段路径，
+                // 先降级为纯正文/内联图/小附件分段请求，避免直接整封下载数十 MB 邮件。
+                if let Ok(plain_fetches) =
+                    uid_fetch_sections(&mut session, uid, &body_and_att_items).await
+                {
+                    fetches = plain_fetches;
+                }
+            }
+
+            if !fetches.is_empty() {
+                let find_section = |section: &str| -> Option<&[u8]> {
+                    let path = section_path_for(section);
+                    fetches.iter().find_map(|f| {
+                        path.as_ref()
+                            .and_then(|p| f.section(p))
+                            .or_else(|| (section == "1").then(|| f.text()).flatten())
+                    })
+                };
+                let header_bytes = fetches.iter().find_map(|f| f.header()).unwrap_or(&[]);
+
+                let mut plain_text: Option<String> = None;
+                let mut html_body: Option<String> = None;
+                for part in &plan.body_parts {
+                    let Some(raw) = find_section(&part.section) else {
+                        continue;
+                    };
+                    let is_html = part.mime_type == "text/html";
+                    let decoded = decode_text_section(
+                        raw,
+                        &part.mime_type,
+                        part.charset.as_deref(),
+                        &part.transfer_encoding,
+                        is_html,
+                    );
+                    if let Some(content) = decoded {
+                        if is_html && html_body.is_none() {
+                            html_body = Some(content);
+                        } else if !is_html && plain_text.is_none() {
+                            plain_text = Some(content);
+                        }
+                    }
+                }
+
+                if plain_text.is_some() || html_body.is_some() {
+                    let mut cid_map: HashMap<String, String> = HashMap::new();
+                    for inline in &plan.inline_cids {
+                        let Some(raw) = find_section(&inline.section) else {
+                            continue;
+                        };
+                        let bytes = decode_binary_section(
+                            raw,
+                            &inline.mime_type,
+                            &inline.transfer_encoding,
+                        );
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        cid_map.insert(
+                            inline.cid.clone(),
+                            format!("data:{};base64,{b64}", inline.mime_type),
+                        );
+                    }
+                    let body_html = html_body.map(|h| crate::mime::replace_cid_urls(h, &cid_map));
+                    let body_text = if let Some(text) = plain_text {
+                        text
+                    } else if let Some(ref html) = body_html {
+                        html_to_readable_text(html)
+                    } else {
+                        "(此邮件无可读正文)".to_string()
+                    };
+
+                    let mut attachments = Vec::with_capacity(plan.attachments.len());
+                    for att in &plan.attachments {
+                        if att.download_now {
+                            if let Some(raw) = find_section(&att.section) {
+                                let bytes = decode_binary_section(
+                                    raw,
+                                    &att.mime_type,
+                                    &att.transfer_encoding,
+                                );
+                                attachments.push(CachedAttachmentInput::downloaded(
+                                    att.filename.clone(),
+                                    att.mime_type.clone(),
+                                    bytes,
+                                ));
+                                continue;
+                            }
+                        }
+                        attachments.push(CachedAttachmentInput {
+                            filename: att.filename.clone(),
+                            mime_type: att.mime_type.clone(),
+                            size_bytes: att.estimated_size,
+                            content: None,
+                            remote_part: att.section.clone(),
+                            transfer_encoding: att.transfer_encoding.clone(),
+                        });
+                    }
+
+                    let (unsubscribe_url, unsubscribe_one_click, auth_results) =
+                        parse_header_metadata(header_bytes);
+                    let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
+                    return Ok(FetchedMessageBody {
+                        body_text,
+                        body_html,
+                        attachments,
+                        unsubscribe_url,
+                        unsubscribe_one_click,
+                        auth_results,
+                    });
+                }
+            }
+        }
+    }
+
+    // 回退路径（<= 2 MB 小邮件、无 BODYSTRUCTURE 或按段拉取未解析出正文）：整封 PEEK 拉取。
+    let raw_body = tokio::time::timeout(BODY_FETCH_TIMEOUT, async {
+        let mut fetches = session
+            .uid_fetch(uid.to_string(), "BODY.PEEK[]")
+            .await
+            .map_err(|e| format!("拉取邮件正文失败 (UID {uid}): {e}"))?;
+        let mut raw_body: Option<Vec<u8>> = None;
+        while let Some(fetch_res) = fetches.next().await {
+            if let Ok(fetch) = fetch_res {
+                if let Some(body) = fetch.body() {
+                    raw_body = Some(body.to_vec());
+                    break;
+                }
+            }
+        }
+        Ok::<Option<Vec<u8>>, String>(raw_body)
+    })
+    .await
+    .map_err(|_| format!("拉取邮件正文超时 (UID {uid})"))??;
+    let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
+
+    let bytes = raw_body.ok_or_else(|| format!("服务器未返回 UID {uid} 的邮件内容"))?;
+    parse_rfc822_message(&bytes)
+}
+
+/// On-demand download of a single MIME attachment section via `BODY.PEEK[{section}]`,
+/// falling back to `BODY.PEEK[]` filename matching when the section fetch fails.
+pub async fn fetch_attachment_section(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+    section: &str,
+    transfer_encoding: &str,
+    fallback_filename: &str,
+) -> Result<Vec<u8>, String> {
+    let mut session = connect_imap(account, password).await?;
+    tokio::time::timeout(IO_TIMEOUT, session.select(folder_path))
+        .await
+        .map_err(|_| format!("打开文件夹 {folder_path} 超时"))?
+        .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
+
+    if !section.trim().is_empty() {
+        if let Some(target_path) = section_path_for(section) {
+            let query = format!("BODY.PEEK[{section}]");
+            let fetched = tokio::time::timeout(ATTACHMENT_FETCH_TIMEOUT, async {
+                let mut fetches = session
+                    .uid_fetch(uid.to_string(), &query)
+                    .await
+                    .map_err(|e| format!("按段下载附件失败 (UID {uid}, section {section}): {e}"))?;
+                let mut bytes_opt: Option<Vec<u8>> = None;
+                while let Some(fetch_res) = fetches.next().await {
+                    if let Ok(fetch) = fetch_res {
+                        if let Some(raw) = fetch.section(&target_path) {
+                            bytes_opt = Some(raw.to_vec());
+                            break;
+                        }
+                    }
+                }
+                Ok::<Option<Vec<u8>>, String>(bytes_opt)
+            })
+            .await;
+
+            if let Ok(Ok(Some(raw))) = fetched {
+                let decoded =
+                    decode_binary_section(&raw, "application/octet-stream", transfer_encoding);
+                let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
+                return Ok(decoded);
+            }
+        }
+    }
+
+    let raw_full = tokio::time::timeout(ATTACHMENT_FETCH_TIMEOUT, async {
+        let mut fetches = session
+            .uid_fetch(uid.to_string(), "BODY.PEEK[]")
+            .await
+            .map_err(|e| format!("整封下载附件失败 (UID {uid}): {e}"))?;
+        let mut raw_body: Option<Vec<u8>> = None;
+        while let Some(fetch_res) = fetches.next().await {
+            if let Ok(fetch) = fetch_res {
+                if let Some(body) = fetch.body() {
+                    raw_body = Some(body.to_vec());
+                    break;
+                }
+            }
+        }
+        Ok::<Option<Vec<u8>>, String>(raw_body)
+    })
+    .await
+    .map_err(|_| format!("下载附件超时 (UID {uid})"))??;
+    let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
+
+    let bytes = raw_full.ok_or_else(|| format!("服务器未返回 UID {uid} 的邮件内容"))?;
+    let parsed = MessageParser::default()
+        .parse(&bytes)
+        .ok_or_else(|| "解析附件所属 MIME 邮件失败".to_string())?;
+    select_fallback_attachment(&parsed, fallback_filename)
+        .ok_or_else(|| format!("未在邮件 UID {uid} 中找到附件 {fallback_filename}"))
+}
+
+async fn uid_fetch_sections(
+    session: &mut ImapSession,
+    uid: u32,
+    items: &[String],
+) -> Result<Vec<async_imap::types::Fetch>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = format!("({})", items.join(" "));
+    tokio::time::timeout(BODY_FETCH_TIMEOUT, async {
+        let mut fetches = session
+            .uid_fetch(uid.to_string(), &query)
+            .await
+            .map_err(|e| format!("按段拉取邮件正文失败 (UID {uid}): {e}"))?;
+        let mut collected = Vec::new();
+        while let Some(item) = fetches.next().await {
+            if let Ok(fetch) = item {
+                collected.push(fetch);
+            }
+        }
+        Ok::<Vec<async_imap::types::Fetch>, String>(collected)
+    })
+    .await
+    .map_err(|_| format!("按段拉取邮件正文超时 (UID {uid})"))?
+}
+
+fn select_fallback_attachment(
+    parsed: &mail_parser::Message<'_>,
+    fallback_filename: &str,
+) -> Option<Vec<u8>> {
+    let all_atts: Vec<_> = parsed.attachments().collect();
+    if let Some(found) = all_atts
+        .iter()
+        .find(|att| att.attachment_name() == Some(fallback_filename))
+    {
+        return Some(found.contents().to_vec());
+    }
+    let target_trim = fallback_filename.trim();
+    if let Some(found) = all_atts.iter().find(|att| {
+        att.attachment_name()
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case(target_trim))
+    }) {
+        return Some(found.contents().to_vec());
+    }
+    let target_sanitized = crate::cache::sanitize_filename(fallback_filename);
+    if let Some(found) = all_atts.iter().find(|att| {
+        att.attachment_name().is_some_and(|name| {
+            crate::cache::sanitize_filename(name).eq_ignore_ascii_case(&target_sanitized)
+        })
+    }) {
+        return Some(found.contents().to_vec());
+    }
+    if all_atts.len() == 1 {
+        return Some(all_atts[0].contents().to_vec());
+    }
+    None
 }
 
 /// 从原始头字段文本（含 `字段名:` 前缀）中剥出值部分。
@@ -2175,5 +2967,264 @@ mod tests {
             cleaned.contains("<td><b>Build</b><br>1m<br></td>"),
             "got: {cleaned}"
         );
+    }
+
+    #[test]
+    fn plan_bodystructure_separates_body_inline_cid_small_and_large_attachments() {
+        use async_imap::imap_proto::types::{
+            BodyContentCommon, BodyContentSinglePart, BodyStructure as Bs, ContentDisposition,
+            ContentEncoding, ContentType,
+        };
+        use std::borrow::Cow;
+
+        fn common(
+            ty: &'static str,
+            subtype: &'static str,
+            disp: Option<(&'static str, Vec<(&'static str, &'static str)>)>,
+            params: Vec<(&'static str, &'static str)>,
+        ) -> BodyContentCommon<'static> {
+            BodyContentCommon {
+                ty: ContentType {
+                    ty: Cow::Borrowed(ty),
+                    subtype: Cow::Borrowed(subtype),
+                    params: (!params.is_empty()).then(|| {
+                        params
+                            .into_iter()
+                            .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
+                            .collect()
+                    }),
+                },
+                disposition: disp.map(|(d, dp)| ContentDisposition {
+                    ty: Cow::Borrowed(d),
+                    params: (!dp.is_empty()).then(|| {
+                        dp.into_iter()
+                            .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
+                            .collect()
+                    }),
+                }),
+                language: None,
+                location: None,
+            }
+        }
+        fn single(
+            id: Option<&'static str>,
+            enc: ContentEncoding<'static>,
+            octets: u32,
+        ) -> BodyContentSinglePart<'static> {
+            BodyContentSinglePart {
+                id: id.map(Cow::Borrowed),
+                md5: None,
+                description: None,
+                transfer_encoding: enc,
+                octets,
+            }
+        }
+
+        let bs = Bs::Multipart {
+            common: common("multipart", "mixed", None, vec![]),
+            bodies: vec![
+                Bs::Multipart {
+                    common: common("multipart", "alternative", None, vec![]),
+                    bodies: vec![
+                        Bs::Text {
+                            common: common("text", "plain", None, vec![("charset", "utf-8")]),
+                            other: single(None, ContentEncoding::EightBit, 120),
+                            lines: 4,
+                            extension: None,
+                        },
+                        Bs::Text {
+                            common: common("text", "html", None, vec![("charset", "utf-8")]),
+                            other: single(None, ContentEncoding::QuotedPrintable, 300),
+                            lines: 8,
+                            extension: None,
+                        },
+                        Bs::Text {
+                            common: common("text", "calendar", None, vec![("name", "invite.ics")]),
+                            other: single(None, ContentEncoding::Base64, 800),
+                            lines: 20,
+                            extension: None,
+                        },
+                    ],
+                    extension: None,
+                },
+                Bs::Basic {
+                    common: common("image", "png", Some(("inline", vec![])), vec![]),
+                    other: single(Some("<logo@cid>"), ContentEncoding::Base64, 40_000),
+                    extension: None,
+                },
+                Bs::Basic {
+                    common: common(
+                        "application",
+                        "pdf",
+                        Some(("attachment", vec![("filename", "small.pdf")])),
+                        vec![],
+                    ),
+                    other: single(None, ContentEncoding::Base64, 800_000),
+                    extension: None,
+                },
+                Bs::Basic {
+                    common: common(
+                        "application",
+                        "zip",
+                        Some(("attachment", vec![("filename", "archive.zip")])),
+                        vec![],
+                    ),
+                    other: single(None, ContentEncoding::Base64, 6_000_000),
+                    extension: None,
+                },
+            ],
+            extension: None,
+        };
+
+        let plan = super::plan_bodystructure_fetch(&bs);
+        assert_eq!(plan.body_parts.len(), 2);
+        assert_eq!(plan.body_parts[0].section, "1.1");
+        assert_eq!(plan.body_parts[1].section, "1.2");
+
+        assert_eq!(plan.inline_cids.len(), 1);
+        assert_eq!(plan.inline_cids[0].section, "2");
+        assert_eq!(plan.inline_cids[0].cid, "logo@cid");
+
+        assert_eq!(plan.attachments.len(), 3);
+        assert_eq!(plan.attachments[0].filename, "invite.ics");
+        assert_eq!(plan.attachments[0].section, "1.3");
+        assert!(plan.attachments[0].download_now);
+
+        assert_eq!(plan.attachments[1].filename, "small.pdf");
+        assert_eq!(plan.attachments[1].section, "3");
+        assert_eq!(plan.attachments[1].estimated_size, 584_616);
+        assert!(plan.attachments[1].download_now);
+        assert!(plan.has_deferred_attachments());
+
+        assert_eq!(plan.attachments[2].filename, "archive.zip");
+        assert_eq!(plan.attachments[2].section, "4");
+        assert_eq!(plan.attachments[2].estimated_size, 4_384_614);
+        assert!(!plan.attachments[2].download_now);
+    }
+
+    #[test]
+    fn rfc2231_and_rfc2183_size_are_decoded_in_bodystructure_plan() {
+        use async_imap::imap_proto::types::{
+            BodyContentCommon, BodyContentSinglePart, BodyStructure as Bs, ContentDisposition,
+            ContentEncoding, ContentType,
+        };
+        use std::borrow::Cow;
+
+        let bs_single = Bs::Basic {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: Cow::Borrowed("application"),
+                    subtype: Cow::Borrowed("pdf"),
+                    params: None,
+                },
+                disposition: Some(ContentDisposition {
+                    ty: Cow::Borrowed("attachment"),
+                    params: Some(vec![
+                        (
+                            Cow::Borrowed("filename*"),
+                            Cow::Borrowed("utf-8''%E6%B5%8B%E8%AF%95%E6%96%87%E6%A1%A3.pdf"),
+                        ),
+                        (Cow::Borrowed("size"), Cow::Borrowed("3145728")),
+                    ]),
+                }),
+                language: None,
+                location: None,
+            },
+            other: BodyContentSinglePart {
+                id: None,
+                md5: None,
+                description: None,
+                transfer_encoding: ContentEncoding::Base64,
+                octets: 4_300_000,
+            },
+            extension: None,
+        };
+        let plan_single = super::plan_bodystructure_fetch(&bs_single);
+        assert_eq!(plan_single.attachments.len(), 1);
+        assert_eq!(plan_single.attachments[0].filename, "测试文档.pdf");
+        assert_eq!(plan_single.attachments[0].estimated_size, 3_145_728);
+        assert!(!plan_single.attachments[0].download_now);
+
+        let bs_cont = Bs::Basic {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: Cow::Borrowed("application"),
+                    subtype: Cow::Borrowed("octet-stream"),
+                    params: Some(vec![
+                        (
+                            Cow::Borrowed("name*0*"),
+                            Cow::Borrowed("utf-8''%E4%B8%AD%E6%96%87"),
+                        ),
+                        (
+                            Cow::Borrowed("name*1*"),
+                            Cow::Borrowed("%E9%99%84%E4%BB%B6"),
+                        ),
+                        (Cow::Borrowed("name*2"), Cow::Borrowed(".bin")),
+                    ]),
+                },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            other: BodyContentSinglePart {
+                id: None,
+                md5: None,
+                description: None,
+                transfer_encoding: ContentEncoding::Binary,
+                octets: 512,
+            },
+            extension: None,
+        };
+        let plan_cont = super::plan_bodystructure_fetch(&bs_cont);
+        assert_eq!(plan_cont.attachments[0].filename, "中文附件.bin");
+        assert!(plan_cont.attachments[0].download_now);
+        assert!(!plan_cont.has_deferred_attachments());
+    }
+
+    #[test]
+    fn select_fallback_attachment_matches_case_and_sanitized_names() {
+        let raw = concat!(
+            "Subject: Att Test\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"B1\"\r\n\r\n",
+            "--B1\r\n",
+            "Content-Type: text/plain\r\n\r\nhello\r\n",
+            "--B1\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-Disposition: attachment; filename=\"Report:2026?.bin\"\r\n\r\nfirst-bytes\r\n",
+            "--B1\r\n",
+            "Content-Type: application/pdf\r\n",
+            "Content-Disposition: attachment; filename=\"Summary.PDF\"\r\n\r\nsecond-bytes\r\n",
+            "--B1--\r\n"
+        );
+        let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+        assert_eq!(
+            super::select_fallback_attachment(&parsed, "summary.pdf").as_deref(),
+            Some(b"second-bytes".as_slice())
+        );
+        assert_eq!(
+            super::select_fallback_attachment(&parsed, "Report_2026_.bin").as_deref(),
+            Some(b"first-bytes".as_slice())
+        );
+    }
+
+    #[test]
+    fn decode_binary_and_text_sections_via_mail_parser() {
+        use base64::Engine as _;
+        let payload = b"PDF-binary-\x00\xFF-data";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        let decoded = super::decode_binary_section(b64.as_bytes(), "application/pdf", "base64");
+        assert_eq!(decoded, payload);
+
+        let text_b64 =
+            base64::engine::general_purpose::STANDARD.encode("你好 MIME 正文".as_bytes());
+        let decoded_text = super::decode_text_section(
+            text_b64.as_bytes(),
+            "text/plain",
+            Some("utf-8"),
+            "base64",
+            false,
+        );
+        assert_eq!(decoded_text.as_deref(), Some("你好 MIME 正文"));
     }
 }

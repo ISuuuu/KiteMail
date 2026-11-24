@@ -774,6 +774,7 @@ impl DemoStore {
                         subject: m.subject.clone(),
                         date_display: m.date_display.clone(),
                         date_ts: m.date_ts,
+                        downloaded: true,
                     },
                     CachedAttachment {
                         id: m.id * 10 + 2,
@@ -786,6 +787,7 @@ impl DemoStore {
                         subject: m.subject.clone(),
                         date_display: m.date_display.clone(),
                         date_ts: m.date_ts,
+                        downloaded: true,
                     },
                 ]
             })
@@ -878,12 +880,14 @@ impl DemoStore {
                     filename: "windows-baseline-notes.txt".to_string(),
                     mime_type: "text/plain".to_string(),
                     size_bytes: 12_288,
+                    downloaded: true,
                 },
                 AttachmentMeta {
                     id: summary.id * 10 + 2,
                     filename: "三栏布局截图.png".to_string(),
                     mime_type: "image/png".to_string(),
                     size_bytes: 188_416,
+                    downloaded: true,
                 },
             ]
         } else {

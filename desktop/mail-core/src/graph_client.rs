@@ -1,5 +1,6 @@
 //! Microsoft Graph REST mail client (folders, messages, attachments, flags, sendMail).
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
@@ -8,7 +9,9 @@ use base64::Engine;
 use crate::cache::{CachedAttachmentInput, CachedHeaderInput, RemoteFolder};
 use crate::imap_client::html_to_readable_text;
 use crate::smtp_client::SendOutcome;
-use crate::FetchedMessageBody;
+use crate::{FetchedMessageBody, AUTO_CACHE_ATTACHMENT_MAX_BYTES};
+
+const MAX_INLINE_CID_BYTES: usize = 5 * 1024 * 1024;
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0/me";
 
@@ -260,7 +263,8 @@ fn parse_graph_messages_json(
     (items, next_link)
 }
 
-/// Fetch message body and file attachments via Microsoft Graph.
+/// Fetch message body, inline `cid:` images, and auto-cached small attachments via Microsoft Graph.
+/// Attachments larger than `AUTO_CACHE_ATTACHMENT_MAX_BYTES` store metadata only (`content: None`).
 pub fn fetch_message_body(
     access_token: &str,
     remote_id: &str,
@@ -280,46 +284,133 @@ pub fn fetch_message_body(
 
     let content_type = json["body"]["contentType"].as_str().unwrap_or("text");
     let raw_content = json["body"]["content"].as_str().unwrap_or("");
-    let (body_text, body_html) = if content_type.eq_ignore_ascii_case("html") {
-        (
-            html_to_readable_text(raw_content),
-            Some(raw_content.to_string()),
-        )
+    let is_html = content_type.eq_ignore_ascii_case("html");
+    let mut body_html = if is_html {
+        Some(raw_content.to_string())
     } else {
-        (raw_content.to_string(), None)
+        None
     };
 
+    let mut cid_map: HashMap<String, String> = HashMap::new();
     let mut attachments = Vec::new();
     if json["hasAttachments"].as_bool().unwrap_or(false) {
-        let att_url = format!("{GRAPH_BASE}/messages/{encoded_id}/attachments");
+        let att_url = format!(
+            "{GRAPH_BASE}/messages/{encoded_id}/attachments?$select=id,name,contentType,size,isInline"
+        );
         let att_resp = ureq::get(&att_url)
             .set("Authorization", &format!("Bearer {access_token}"))
             .call()
             .map_err(format_graph_error)?;
         let att_json: serde_json::Value = att_resp
             .into_json()
-            .map_err(|e| format!("解析 Graph 附件失败: {e}"))?;
+            .map_err(|e| format!("解析 Graph 附件元数据失败: {e}"))?;
         if let Some(arr) = att_json["value"].as_array() {
             for att in arr {
-                if let Some(b64) = att["contentBytes"].as_str() {
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                        attachments.push(CachedAttachmentInput {
-                            filename: att["name"].as_str().unwrap_or("attachment.bin").to_string(),
-                            mime_type: att["contentType"]
-                                .as_str()
-                                .unwrap_or("application/octet-stream")
-                                .to_string(),
-                            content: bytes,
-                        });
+                let att_id = att["id"].as_str().unwrap_or("").trim();
+                let filename = att["name"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("attachment.bin")
+                    .to_string();
+                let mime_type = att["contentType"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let size_bytes = att["size"].as_u64().unwrap_or(0) as usize;
+                let is_inline = att["isInline"].as_bool().unwrap_or(false);
+
+                if is_inline {
+                    if size_bytes <= MAX_INLINE_CID_BYTES && !att_id.is_empty() {
+                        let encoded_att_id = urlencoding_segment(att_id);
+                        let item_url = format!(
+                            "{GRAPH_BASE}/messages/{encoded_id}/attachments/{encoded_att_id}"
+                        );
+                        if let Ok(item_resp) = ureq::get(&item_url)
+                            .set("Authorization", &format!("Bearer {access_token}"))
+                            .call()
+                        {
+                            if let Ok(item_json) = item_resp.into_json::<serde_json::Value>() {
+                                if let (Some(cid_raw), Some(b64)) = (
+                                    item_json["contentId"].as_str(),
+                                    item_json["contentBytes"].as_str(),
+                                ) {
+                                    let cid = cid_raw
+                                        .trim()
+                                        .trim_matches(|c| c == '<' || c == '>')
+                                        .to_ascii_lowercase();
+                                    if !cid.is_empty()
+                                        && mime_type.to_ascii_lowercase().starts_with("image/")
+                                    {
+                                        cid_map
+                                            .insert(cid, format!("data:{mime_type};base64,{b64}"));
+                                        continue;
+                                    }
+                                }
+                                if let Some(b64) = item_json["contentBytes"].as_str() {
+                                    if let Ok(bytes) =
+                                        base64::engine::general_purpose::STANDARD.decode(b64)
+                                    {
+                                        attachments.push(CachedAttachmentInput::downloaded(
+                                            filename, mime_type, bytes,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
+                    continue;
+                }
+
+                if size_bytes <= AUTO_CACHE_ATTACHMENT_MAX_BYTES && !att_id.is_empty() {
+                    if let Ok(bytes) = fetch_attachment_content(access_token, remote_id, att_id) {
+                        attachments.push(CachedAttachmentInput::downloaded(
+                            filename, mime_type, bytes,
+                        ));
+                        continue;
+                    }
+                }
+
+                if !att_id.is_empty() {
+                    attachments.push(CachedAttachmentInput {
+                        filename,
+                        mime_type,
+                        size_bytes,
+                        content: None,
+                        remote_part: att_id.to_string(),
+                        transfer_encoding: "graph".to_string(),
+                    });
                 }
             }
         }
     }
 
+    if !cid_map.is_empty() {
+        body_html = body_html.map(|html| crate::mime::replace_cid_urls(html, &cid_map));
+    }
+    let body_text = if let Some(ref html) = body_html {
+        html_to_readable_text(html)
+    } else {
+        raw_content.to_string()
+    };
+
     // F-7 一键退订：internetMessageHeaders 中查找退订相关头（名称大小写不敏感）。
+    let (unsubscribe_url, unsubscribe_one_click, auth_results) =
+        parse_graph_headers(&json["internetMessageHeaders"]);
+
+    Ok(FetchedMessageBody {
+        body_text,
+        body_html,
+        attachments,
+        unsubscribe_url,
+        unsubscribe_one_click,
+        auth_results,
+    })
+}
+
+fn parse_graph_headers(headers: &serde_json::Value) -> (Option<String>, bool, Option<String>) {
     let header_value = |name: &str| -> Option<String> {
-        json["internetMessageHeaders"]
+        headers
             .as_array()?
             .iter()
             .find(|h| {
@@ -334,23 +425,45 @@ pub fn fetch_message_body(
     let unsubscribe_one_click = header_value("List-Unsubscribe-Post")
         .map(|v| crate::cache::is_one_click_post(&v))
         .unwrap_or(false);
-    let auth_results = header_value("Authentication-Results");
-
-    Ok(FetchedMessageBody {
-        body_text,
-        body_html,
-        attachments,
-        unsubscribe_url,
-        unsubscribe_one_click,
-        auth_results,
-    })
+    let auth_results = header_value("Authentication-Results").filter(|v| !v.is_empty());
+    (unsubscribe_url, unsubscribe_one_click, auth_results)
 }
 
-/// 只取正文供搜索索引，限额读取且不请求附件。
-pub fn fetch_index_text(access_token: &str, remote_id: &str) -> Result<String, String> {
+/// On-demand download of a single Graph file attachment's raw bytes.
+pub fn fetch_attachment_content(
+    access_token: &str,
+    remote_msg_id: &str,
+    remote_att_id: &str,
+) -> Result<Vec<u8>, String> {
+    let encoded_msg = urlencoding_segment(remote_msg_id);
+    let encoded_att = urlencoding_segment(remote_att_id);
+    let url = format!("{GRAPH_BASE}/messages/{encoded_msg}/attachments/{encoded_att}");
+    let resp = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .timeout(std::time::Duration::from_secs(180))
+        .call()
+        .map_err(format_graph_error)?;
+    let json: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("解析 Graph 附件内容失败: {e}"))?;
+    let b64 = json["contentBytes"]
+        .as_str()
+        .ok_or_else(|| "Graph 附件未包含可下载的字节内容".to_string())?;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("解码 Graph 附件 Base64 失败: {e}"))
+}
+
+/// 只取正文供搜索索引；无附件且响应未超限时顺便返回完整 [`FetchedMessageBody`] 供缓存。
+pub fn fetch_index_text(
+    access_token: &str,
+    remote_id: &str,
+) -> Result<(String, Option<FetchedMessageBody>), String> {
     const MAX_BYTES: usize = 262_144;
     let encoded_id = urlencoding_segment(remote_id);
-    let url = format!("{GRAPH_BASE}/messages/{encoded_id}?$select=body");
+    let url = format!(
+        "{GRAPH_BASE}/messages/{encoded_id}?$select=body,hasAttachments,internetMessageHeaders"
+    );
     let response = ureq::get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .timeout(std::time::Duration::from_secs(20))
@@ -363,22 +476,36 @@ pub fn fetch_index_text(access_token: &str, remote_id: &str) -> Result<String, S
         .read_to_end(&mut bytes)
         .map_err(|e| format!("读取 Graph 索引正文失败: {e}"))?;
     if bytes.len() > MAX_BYTES {
-        return Ok(String::new());
+        return Ok((String::new(), None));
     }
     let json: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("解析 Graph 索引正文失败: {e}"))?;
     let content = json["body"]["content"].as_str().unwrap_or("");
-    Ok(
-        if json["body"]["contentType"]
-            .as_str()
-            .unwrap_or("text")
-            .eq_ignore_ascii_case("html")
-        {
-            html_to_readable_text(content)
-        } else {
-            content.to_string()
-        },
-    )
+    let is_html = json["body"]["contentType"]
+        .as_str()
+        .unwrap_or("text")
+        .eq_ignore_ascii_case("html");
+    let text = if is_html {
+        html_to_readable_text(content)
+    } else {
+        content.to_string()
+    };
+    let has_attachments = json["hasAttachments"].as_bool().unwrap_or(false);
+    let full = if !has_attachments {
+        let (unsubscribe_url, unsubscribe_one_click, auth_results) =
+            parse_graph_headers(&json["internetMessageHeaders"]);
+        Some(FetchedMessageBody {
+            body_text: text.clone(),
+            body_html: is_html.then(|| content.to_string()),
+            attachments: Vec::new(),
+            unsubscribe_url,
+            unsubscribe_one_click,
+            auth_results,
+        })
+    } else {
+        None
+    };
+    Ok((text, full))
 }
 
 /// Fetch the complete raw MIME message via Graph `/$value` (used for .eml export).

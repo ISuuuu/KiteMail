@@ -273,6 +273,16 @@ impl GalleryState {
         self.items = items;
     }
 
+    /// 标记指定附件已完成按需下载，并更新展示大小。
+    pub fn mark_downloaded(&mut self, attachment_id: u32, size_bytes: usize) {
+        for item in &mut self.items {
+            if item.id == attachment_id {
+                item.downloaded = true;
+                item.size_bytes = size_bytes;
+            }
+        }
+    }
+
     /// 注入账号列表（`(account_id, 显示名)`，供筛选下拉展示）。
     pub fn set_accounts(&mut self, accounts: Vec<(u32, String)>) {
         self.accounts = accounts;
@@ -325,7 +335,9 @@ impl GalleryState {
         let ids: Vec<u32> = self
             .visible_items()
             .into_iter()
-            .filter(|item| item.mime_type.to_ascii_lowercase().starts_with("image/"))
+            .filter(|item| {
+                item.downloaded && item.mime_type.to_ascii_lowercase().starts_with("image/")
+            })
             .map(|item| item.id)
             .filter(|id| {
                 !self.thumbnails.contains_key(id) && !self.requested_thumbnails.contains(id)
@@ -602,7 +614,12 @@ impl Render for GalleryState {
             .map(|item| {
                 let icon = icon_for_mime(&item.mime_type);
                 let filename = item.filename.clone();
-                let size_text = format_size(item.size_bytes);
+                let downloaded = item.downloaded;
+                let size_text = if downloaded {
+                    format_size(item.size_bytes)
+                } else {
+                    format!("约 {} · 未下载", format_size(item.size_bytes))
+                };
                 let sender = item.sender.clone();
                 let subject = item.subject.clone();
                 let date = item.date_display.clone();
@@ -687,6 +704,11 @@ impl Render for GalleryState {
                                     .compact()
                                     .label("保存")
                                     .icon(IconName::Download)
+                                    .tooltip(if downloaded {
+                                        "保存附件"
+                                    } else {
+                                        "下载并保存附件"
+                                    })
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         cx.emit(GalleryEvent::SaveAttachment(attachment_id));
                                         cx.notify();
@@ -935,7 +957,11 @@ impl Render for GalleryState {
                                 let is_image = item.mime_type.to_lowercase().starts_with("image/");
                                 let filename = item.filename.clone();
                                 let preview_filename = filename.clone();
-                                let size_text = format_size(item.size_bytes);
+                                let size_text = if item.downloaded {
+                                    format_size(item.size_bytes)
+                                } else {
+                                    format!("约 {} · 未下载", format_size(item.size_bytes))
+                                };
                                 let attachment_id = item.id;
                                 let message_id = item.message_id;
                                 let thumb = self.thumbnails.get(&attachment_id).cloned();

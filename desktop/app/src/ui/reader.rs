@@ -43,15 +43,20 @@ const CARD_AVATAR: f32 = 34.0;
 pub(super) fn body_loading(
     background: gpui_kit::Hsla,
     foreground: gpui_kit::Hsla,
+    show_message: bool,
 ) -> gpui_kit::Div {
-    v_flex()
+    let base = v_flex()
         .w_full()
         .items_center()
         .justify_center()
-        .bg(background)
-        .text_sm()
-        .text_color(foreground)
-        .child("正在加载邮件正文…")
+        .bg(background);
+    if show_message {
+        base.text_sm()
+            .text_color(foreground)
+            .child("正在加载邮件正文…")
+    } else {
+        base
+    }
 }
 
 /// 48px 操作栏上的紧凑图标按钮。
@@ -536,7 +541,17 @@ fn render_message_card(
         .map(|att| {
             let att_id = att.id;
             let filename = att.filename.clone();
-            let size_kb = (att.size_bytes + 1023) / 1024;
+            let size_text = hylki_mail_core::config::format_bytes(att.size_bytes as u64);
+            let size_label = if att.downloaded {
+                size_text
+            } else {
+                format!("约 {size_text} · 未下载")
+            };
+            let save_tooltip = if att.downloaded {
+                "保存附件"
+            } else {
+                "下载并保存附件"
+            };
             h_flex()
                 .items_center()
                 .gap_2()
@@ -562,14 +577,14 @@ fn render_message_card(
                     div()
                         .text_xs()
                         .text_color(muted_fg)
-                        .child(SharedString::from(format!("{size_kb} KB"))),
+                        .child(SharedString::from(size_label)),
                 )
                 .child(
                     Button::new(("save-att", att_id))
                         .ghost()
                         .compact()
                         .icon(IconName::Download)
-                        .tooltip("保存附件")
+                        .tooltip(save_tooltip)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.save_attachment(att_id, &filename, cx);
                         })),
@@ -980,7 +995,7 @@ fn render_message_card(
         })
         .when(body_view == BodyView::Loading, |card| {
             card.child(
-                body_loading(body_bg, body_muted)
+                body_loading(body_bg, body_muted, body_pending)
                     .when(webview_in_thread, |el| {
                         el.h(px(500.0)).justify_start().pt_4()
                     })
@@ -1237,7 +1252,7 @@ pub(crate) fn render_with_pane_top(
 
     #[cfg(windows)]
     let body_view = {
-        use crate::webview_host::{build_body_document, DocumentAppearance, WebViewHost};
+        use crate::webview_host::{build_body_document, DocumentAppearance};
         use std::hash::{Hash, Hasher};
 
         let in_thread = thread_count > 1;
@@ -1309,47 +1324,8 @@ pub(crate) fn render_with_pane_top(
                 {
                     return;
                 }
-                if let Some(host) = &this.reader_webview {
+                if let Some(host) = this.ensure_reader_webview(window, cx) {
                     let _ = host.load_document(document, !block_remote, in_thread);
-                } else if let Some(host) =
-                    WebViewHost::for_window(window, Some(window.to_async(cx)))
-                {
-                    let _ = host.load_document(document, !block_remote, in_thread);
-                    this.reader_webview = Some(std::rc::Rc::new(host));
-                    cx.spawn(async move |this, cx| {
-                        let mut previous = None;
-                        loop {
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(100))
-                                .await;
-                            if this
-                                .update(cx, |this, cx| {
-                                    let Some(host) = this.reader_webview.clone() else {
-                                        return;
-                                    };
-                                    let status = Some(host.load_status());
-                                    if status != previous {
-                                        previous = status;
-                                        cx.notify();
-                                    }
-                                    if this.active_modal == crate::app::ActiveModal::None
-                                        && !this.reader_find_open
-                                        && !this.reader_popup_open
-                                    {
-                                        for link in host.take_links() {
-                                            this.open_mail_link(&link, cx);
-                                        }
-                                    } else {
-                                        let _ = host.take_links();
-                                    }
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    })
-                    .detach();
                 }
                 cx.notify();
             });
@@ -1601,7 +1577,11 @@ pub(crate) fn render_with_pane_top(
     };
     if !app.attachment_drawer_collapsed {
         for item in &drawer_items {
-            app.ensure_attachment_thumbnail(item.meta.id, &item.meta.mime_type);
+            app.ensure_attachment_thumbnail(
+                item.meta.id,
+                &item.meta.mime_type,
+                item.meta.downloaded,
+            );
         }
     }
     let drawer_element = attachment_drawer::render_drawer(

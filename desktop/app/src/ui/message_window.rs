@@ -53,13 +53,13 @@ pub(crate) struct MessageWindow {
 }
 
 impl MessageWindow {
-    fn poll_webview(&mut self, cx: &mut Context<Self>) {
+    fn observe_webview(&mut self, host: &Rc<WebViewHost>, cx: &mut Context<Self>) {
+        let (tx, mut rx) = futures::channel::mpsc::channel::<()>(16);
+        host.set_notifier(tx);
         cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
             let mut previous = None;
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(100))
-                    .await;
+            while rx.next().await.is_some() {
                 if this
                     .update(cx, |this, cx| {
                         let Some(host) = this.webview.as_ref() else {
@@ -411,8 +411,9 @@ impl Render for MessageWindow {
                         let _ = host.load_with_remote(document, allow_remote);
                     } else if let Some(host) = WebViewHost::for_window(window, None) {
                         let _ = host.load_with_remote(document, allow_remote);
-                        this.webview = Some(Rc::new(host));
-                        this.poll_webview(cx);
+                        let host = Rc::new(host);
+                        this.observe_webview(&host, cx);
+                        this.webview = Some(host);
                     }
                     cx.notify();
                 });
@@ -864,7 +865,19 @@ impl Render for MessageWindow {
                                         .children(d.attachments.iter().map(|att| {
                                             let att_id = att.id;
                                             let filename = att.filename.clone();
-                                            let size_kb = (att.size_bytes + 1023) / 1024;
+                                            let size_text = hylki_mail_core::config::format_bytes(
+                                                att.size_bytes as u64,
+                                            );
+                                            let size_label = if att.downloaded {
+                                                size_text
+                                            } else {
+                                                format!("约 {size_text} · 未下载")
+                                            };
+                                            let save_tooltip = if att.downloaded {
+                                                "保存附件"
+                                            } else {
+                                                "下载并保存附件"
+                                            };
                                             let app_w = app_for_att.clone();
                                             h_flex()
                                                 .items_center()
@@ -891,14 +904,14 @@ impl Render for MessageWindow {
                                                     div()
                                                         .text_xs()
                                                         .text_color(muted_fg)
-                                                        .child(SharedString::from(format!("{size_kb} KB"))),
+                                                        .child(SharedString::from(size_label)),
                                                 )
                                                 .child(
                                                     Button::new(("popout-save-att", att_id))
                                                         .ghost()
                                                         .compact()
                                                         .icon(IconName::Download)
-                                                        .tooltip("保存附件")
+                                                        .tooltip(save_tooltip)
                                                         .on_click(move |_, _, cx| {
                                                             let fn_clone = filename.clone();
                                                             let _ = app_w.update(cx, |app, cx| {
@@ -913,7 +926,7 @@ impl Render for MessageWindow {
             })
             // 邮件正文滚动区。
             .when(body_view == BodyView::Loading, |root| {
-                root.child(reader::body_loading(background, body_muted).flex_1().min_h_0())
+                root.child(reader::body_loading(background, body_muted, false).flex_1().min_h_0())
             })
             .when(body_view == BodyView::Html, |root| {
                 let host = self.webview.as_ref().unwrap().clone();
