@@ -1164,7 +1164,7 @@ impl SettingsWindow {
                 self.mail_dir_feedback = Some((
                     true,
                     SharedString::from(format!(
-                        "已导入 {added} 个关联账号配置并加载本地邮件；收发新邮件前请在「邮箱账号」补填密码或重新授权"
+                        "已导入 {added} 个关联账号配置，并自动复用本机已保存的邮箱凭据与本地邮件"
                     )),
                 ));
             }
@@ -1461,7 +1461,7 @@ impl SettingsWindow {
         };
         let desc = if has_existing && has_importable {
             format!(
-                "目标目录中已检测到 {} 个账号的邮件库（共 {}），并在关联配置目录发现 {} 个当前尚未导入的账号配置。导入后主窗体可立即浏览离线邮件（收发新邮件前需在「邮箱账号」补填密码或重新授权）：",
+                "目标目录中已检测到 {} 个账号的邮件库（共 {}），并在关联配置目录发现 {} 个当前尚未导入的账号配置。导入后将自动复用本机已保存的邮箱凭据并立即加载邮件：",
                 inspection.existing_accounts.len(),
                 config::format_bytes(inspection.total_bytes),
                 importable_count

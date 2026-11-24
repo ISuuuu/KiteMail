@@ -9026,6 +9026,9 @@ impl HylkiApp {
         if added == 0 {
             return Ok(0);
         }
+        for acc in &import_accounts {
+            let _ = hylki_mail_core::secrets::migrate_legacy_secret_to_email(acc.id, &acc.email);
+        }
         config::save_accounts_in(&data_dir, &merged)?;
         self.accounts = merged;
         if !self
