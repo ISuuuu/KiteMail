@@ -3009,6 +3009,7 @@ dependencies = [
  "keyring",
  "lettre",
  "mail-parser",
+ "native-tls",
  "rusqlite",
  "semver",
  "serde",
@@ -3018,6 +3019,7 @@ dependencies = [
  "toml 0.8.23",
  "ureq",
  "url",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6313,6 +6315,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "socks"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0c3dbbd9ae980613c6dd8e28a9407b50509d3803b57624d5dfe8315218cd58b"
+dependencies = [
+ "byteorder",
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7104,11 +7117,13 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "log",
+ "native-tls",
  "once_cell",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "socks",
  "url",
  "webpki-roots 0.26.11",
 ]

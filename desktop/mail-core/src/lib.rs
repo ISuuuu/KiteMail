@@ -19,6 +19,7 @@ pub mod mime;
 pub mod oauth;
 pub mod pop3;
 pub mod privacy;
+mod proxy;
 pub mod receipt;
 pub mod remote_http;
 pub mod search_query;
