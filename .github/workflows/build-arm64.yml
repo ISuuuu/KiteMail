@@ -13,10 +13,6 @@ run-name: aarch64 ${{ inputs.ref || github.ref_name }}
 # project's GPG key. The signing key never leaves the maintainer's machine.
 
 on:
-  push:
-    tags:
-      # Stable and beta (vX.Y.Z-beta.N) alike: the beta ships for ARM too.
-      - 'v*'
   workflow_dispatch:
     inputs:
       ref:

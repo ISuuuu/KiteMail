@@ -7,17 +7,15 @@ run-name: AppImage ${{ inputs.ref || github.ref_name }}
 # the same one pkgforge builds theirs in. Both architectures build natively,
 # aarch64 on GitHub's arm64 runners.
 #
-# Every tag builds, stable and beta alike: a beta tag (vX.Y.Z-beta.N) makes
-# the beta app, Hylki-Beta-<arch>.AppImage (see tools/build-appimage.sh).
+# Started by hand only: the release tags belong to the Windows client now,
+# so a tag builds nothing here. A beta version still makes the beta app,
+# Hylki-Beta-<arch>.AppImage (see tools/build-appimage.sh).
 # Nothing is published from here. The ship scripts download the two
 # artifacts, attach them to the GitHub release and publish them through
 # Flatout, which serves each channel's newest AppImage and its .zsync at
 # https://hylki.hyprlab.co/download/, the address every bundle updates from.
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       ref:
