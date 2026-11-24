@@ -207,7 +207,6 @@ Section "MainSection" SecMain
   Delete "$INSTDIR\${LEGACY_APP_EXE}"
   ClearErrors
 
-  File "/oname=LICENSE" "..\..\LICENSE"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   WriteRegStr HKCU "${REG_KEY}" "" "$INSTDIR"
@@ -264,7 +263,6 @@ Section "Uninstall"
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
 
   Delete "$INSTDIR\uninstall.exe"
-  Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\${LEGACY_APP_EXE}"
 
   DeleteRegKey HKCU "${UNINST_KEY}"

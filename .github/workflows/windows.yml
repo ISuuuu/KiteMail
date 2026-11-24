@@ -159,16 +159,8 @@ jobs:
           $stage = "dist/Hylki_v${version}_portable"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/hylki.exe" $stage
-          Copy-Item "LICENSE" $stage
-          Copy-Item "README.md" $stage
           # 便携版标记：客户端据此选择 zip 就地更新，而不是运行安装包。
           New-Item -ItemType File -Path "$stage/portable.flag" | Out-Null
-          @(
-            'Hylki Windows x64 - AGPL-3.0-or-later Source Offer',
-            ('Commit: ' + (git rev-parse HEAD)),
-            'Repository: https://github.com/${{ github.repository }}',
-            'License: GNU Affero General Public License v3.0 or later (see LICENSE)'
-          ) | Set-Content -Encoding UTF8 "$stage/SOURCE_OFFER.txt"
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/Hylki_v${version}_portable.zip" -Force
 
       - name: Generate update manifest
