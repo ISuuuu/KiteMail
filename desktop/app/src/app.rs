@@ -36,6 +36,7 @@ use hylki_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_SENT_ID,
 };
 use hylki_mail_core::markup::ComposeFormat;
+use hylki_mail_core::signature;
 use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
     contacts_io, detect_attachment_reminder, format_reply_header, ComposeDraft, FolderSummary,
@@ -6158,12 +6159,12 @@ impl HylkiApp {
         self.set_recipient_field_text(field, "", window, cx);
     }
 
-    /// 查询指定账号配置的邮件签名。
-    fn account_signature(&self, account_id: u32) -> String {
+    /// 查询指定账号配置的邮件签名，以及它是不是 HTML。
+    fn account_signature(&self, account_id: u32) -> (String, bool) {
         self.accounts
             .iter()
             .find(|a| a.id == account_id)
-            .map(|a| a.signature.clone())
+            .map(|a| a.primary_signature())
             .unwrap_or_default()
     }
 
@@ -6631,10 +6632,13 @@ impl HylkiApp {
         self.compose_autocomplete_field = None;
         self.begin_compose_autosave_tracking();
         self.reset_compose_identity(window, cx);
+        let (signature_body, signature_is_html) = self.account_signature(self.compose_account_id);
         let initial_body = append_signature_with_dashes(
             "",
-            &self.account_signature(self.compose_account_id),
+            &signature_body,
+            signature_is_html,
             self.prefs.signature_dashes,
+            self.compose_format,
         );
         self.clear_recipient_field(ComposeAddressField::To, window, cx);
         self.clear_recipient_field(ComposeAddressField::Cc, window, cx);
@@ -6823,13 +6827,6 @@ impl HylkiApp {
             "\n\n------------------ 转发邮件 ------------------\n发件人：{}\n时间：{}\n主题：{}\n\n{}",
             detail.sender, detail.date_display, detail.subject, detail.body_text
         );
-        let body_with_sig = insert_signature_with_quote(
-            &quoted,
-            &self.account_signature(detail.account_id),
-            self.prefs.signature_above_quote,
-            self.prefs.signature_dashes,
-        );
-
         self.compose_account_id = detail.account_id;
         self.compose_draft_id = None;
         self.compose_in_reply_to.clear();
@@ -6846,6 +6843,15 @@ impl HylkiApp {
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(forward_subject, window, cx));
+        let (signature_body, signature_is_html) = self.account_signature(detail.account_id);
+        let body_with_sig = insert_signature_with_quote(
+            &quoted,
+            &signature_body,
+            signature_is_html,
+            self.prefs.signature_above_quote,
+            self.prefs.signature_dashes,
+            self.compose_format,
+        );
         self.compose_body
             .update(cx, |s, cx| s.set_value(body_with_sig, window, cx));
         // WP-10-4：转发时原邮件留在阅读器上半部分对照（偏好可关）。
@@ -6958,13 +6964,6 @@ impl HylkiApp {
             &detail.subject,
         );
         let quoted = format!("\n\n{header}\n\n{}", detail.body_text);
-        let body_with_sig = insert_signature_with_quote(
-            &quoted,
-            &self.account_signature(detail.account_id),
-            self.prefs.signature_above_quote,
-            self.prefs.signature_dashes,
-        );
-
         self.compose_account_id = detail.account_id;
         self.compose_draft_id = None;
         self.compose_in_reply_to = detail.rfc_message_id.clone();
@@ -6981,6 +6980,15 @@ impl HylkiApp {
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
+        let (signature_body, signature_is_html) = self.account_signature(detail.account_id);
+        let body_with_sig = insert_signature_with_quote(
+            &quoted,
+            &signature_body,
+            signature_is_html,
+            self.prefs.signature_above_quote,
+            self.prefs.signature_dashes,
+            self.compose_format,
+        );
         self.compose_body
             .update(cx, |s, cx| s.set_value(body_with_sig, window, cx));
         // WP-10-4：回复 / 回复全部默认把原邮件留在上半部分（对齐原版 reader-split）。
@@ -13891,20 +13899,17 @@ pub(crate) fn split_sender(sender: &str) -> (String, String) {
 }
 
 /// 若账号配置了非空签名，则按是否需要 `-- ` 分隔符格式化后插入正文末尾（新建草稿用）。
-pub(crate) fn append_signature_with_dashes(
+fn append_signature_with_dashes(
     body: &str,
     signature: &str,
+    is_html: bool,
     with_dashes: bool,
+    format: ComposeFormat,
 ) -> String {
-    let sig = signature.trim_end();
-    if sig.trim().is_empty() {
+    let block = signature::signature_for(format, signature, is_html, with_dashes);
+    if block.is_empty() {
         return body.to_string();
     }
-    let block = if with_dashes {
-        format!("-- \n{sig}")
-    } else {
-        sig.to_string()
-    };
     if body.is_empty() {
         format!("\n\n{block}")
     } else {
@@ -13915,25 +13920,22 @@ pub(crate) fn append_signature_with_dashes(
 /// 若账号配置了非空签名，则使用标准 `-- \n` 分隔符将其插入正文末尾。
 #[cfg(test)]
 pub(crate) fn append_signature(body: &str, signature: &str) -> String {
-    append_signature_with_dashes(body, signature, true)
+    append_signature_with_dashes(body, signature, false, true, ComposeFormat::Rich)
 }
 
 /// 回复/转发时按设置决定将签名置于引用正文之前或邮件最末尾。
-pub(crate) fn insert_signature_with_quote(
+fn insert_signature_with_quote(
     quote_block: &str,
     signature: &str,
+    is_html: bool,
     above_quote: bool,
     with_dashes: bool,
+    format: ComposeFormat,
 ) -> String {
-    let sig = signature.trim_end();
-    if sig.trim().is_empty() {
+    let block = signature::signature_for(format, signature, is_html, with_dashes);
+    if block.is_empty() {
         return quote_block.to_string();
     }
-    let block = if with_dashes {
-        format!("-- \n{sig}")
-    } else {
-        sig.to_string()
-    };
     if above_quote {
         format!("\n\n{block}\n\n{}", quote_block.trim_start_matches('\n'))
     } else {
@@ -14688,13 +14690,57 @@ mod tests {
             "\n\n--- 原始邮件 ---\n正文\n\n-- \nBest,\nAlice"
         );
         assert_eq!(
-            append_signature_with_dashes("", "Alice", false),
+            append_signature_with_dashes("", "Alice", false, false, ComposeFormat::Rich),
             "\n\nAlice"
         );
-        let above = insert_signature_with_quote("\n\n--- 引用 ---\n原文", "Alice", true, true);
+        let above = insert_signature_with_quote(
+            "\n\n--- 引用 ---\n原文",
+            "Alice",
+            false,
+            true,
+            true,
+            ComposeFormat::Rich,
+        );
         assert!(above.starts_with("\n\n-- \nAlice\n\n--- 引用 ---"));
-        let below = insert_signature_with_quote("\n\n--- 引用 ---\n原文", "Alice", false, false);
+        let below = insert_signature_with_quote(
+            "\n\n--- 引用 ---\n原文",
+            "Alice",
+            false,
+            false,
+            false,
+            ComposeFormat::Rich,
+        );
         assert!(below.ends_with("--- 引用 ---\n原文\n\nAlice"));
+    }
+
+    /// HTML 签名在 HTML 正文里保留真实标签；在富文本 / 纯文本正文里先转成
+    /// 对应表示，不能把标签当文字发出去。
+    #[test]
+    fn html_signature_follows_the_body_format() {
+        assert_eq!(
+            append_signature_with_dashes(
+                "<p>hi</p>",
+                "<p><b>Ada</b></p>",
+                true,
+                true,
+                ComposeFormat::Html,
+            ),
+            "<p>hi</p>\n\n<div class=\"hylki-sig\"><br>-- <br><p><b>Ada</b></p></div>"
+        );
+
+        let rich =
+            append_signature_with_dashes("", "<p><b>Ada</b></p>", true, true, ComposeFormat::Rich);
+        assert!(rich.contains("**Ada**"), "{rich}");
+        assert!(!rich.contains("<p>"), "{rich}");
+
+        let plain = append_signature_with_dashes(
+            "",
+            "<p><b>Ada</b></p>",
+            true,
+            false,
+            ComposeFormat::Plain,
+        );
+        assert_eq!(plain.trim(), "Ada");
     }
 
     #[test]

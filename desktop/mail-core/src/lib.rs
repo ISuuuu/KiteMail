@@ -24,6 +24,7 @@ pub mod receipt;
 pub mod remote_http;
 pub mod search_query;
 pub mod secrets;
+pub mod signature;
 pub mod smtp_client;
 pub mod snooze;
 pub mod strip;

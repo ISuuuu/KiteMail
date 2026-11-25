@@ -24,7 +24,7 @@ use hylki_mail_core::config::{
     self, AccountConfig, AuthBackend, NamedSignature, SecurityMode, SendAsAlias,
     SpecialFoldersConfig,
 };
-use hylki_mail_core::MailRequest;
+use hylki_mail_core::{markup, signature, MailRequest};
 
 use crate::app::HylkiApp;
 use crate::theme::{self, HylkiPalette};
@@ -33,6 +33,7 @@ use crate::ui::preferences::widgets::{
     combo_button, combo_button_dynamic, setting_group, CARD_MAX_WIDTH,
 };
 use crate::ui::preferences::SettingsWindow;
+use crate::ui::toast::ToastKind;
 
 /// 常用快捷 Emoji 预设列表。
 const QUICK_EMOJIS: &[&str] = &["💼", "🏠", "📧", "⭐", "🚀", "🎨", "🌿", "📮"];
@@ -556,6 +557,105 @@ fn normalize_emoji_opt(emoji: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(4).collect())
+}
+
+/// 签名落盘前规整（对齐原版把源码粘进签名后立即清洗的做法）：
+/// 看起来就是 HTML 源码的按 HTML 处理，并过一遍白名单清洗；
+/// HTML 模式下的纯文本转义成等价 HTML，避免标签被当成文字发出去。
+fn normalize_signatures(signatures: &mut [NamedSignature]) {
+    for sig in signatures.iter_mut() {
+        let body = sig.body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let html_source =
+            markup::looks_like_html(body) || (body.contains('<') && body.contains('>'));
+        if sig.is_html || markup::looks_like_html(body) {
+            sig.is_html = true;
+            sig.body = if html_source {
+                signature::sanitize_signature_html(body)
+            } else {
+                signature::signature_to_html(body, false)
+            };
+        }
+    }
+}
+
+impl SettingsWindow {
+    /// 「导入 HTML…」：选一个 HTML / 文本文件，清洗后放进当前签名。
+    /// 本地图片按文件所在目录内联（对齐原版 Import File…）。
+    pub(crate) fn import_signature_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_dialog_open {
+            return;
+        }
+        self.file_dialog_open = true;
+        let generation = self.account_form.session_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let path = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_title("选择签名文件")
+                        .add_filter("HTML 与文本文件", &["html", "htm", "txt"])
+                        .pick_file()
+                })
+                .await;
+            let Some(path) = path else {
+                let _ = this.update(cx, |this, _| this.file_dialog_open = false);
+                return;
+            };
+            let read = std::fs::read_to_string(&path);
+            let _ = cx.update(|window, cx| {
+                this.update(cx, |this, cx| {
+                    this.file_dialog_open = false;
+                    if !this.account_editor_open
+                        || this.account_form.session_generation != generation
+                    {
+                        return;
+                    }
+                    match read {
+                        Ok(text) => {
+                            let body = signature::signature_from_source(&text, path.parent());
+                            let is_html = markup::looks_like_html(&text);
+                            this.apply_imported_signature(body, is_html, window, cx);
+                        }
+                        Err(err) => {
+                            let message = format!("读取签名文件失败：{err}");
+                            this.app.update(cx, |app, cx| {
+                                app.push_toast(
+                                    "sig-import-error",
+                                    ToastKind::Error,
+                                    message,
+                                    None,
+                                    cx,
+                                );
+                            });
+                        }
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// 把导入进来的签名正文放进当前编辑的签名。
+    fn apply_imported_signature(
+        &mut self,
+        body: String,
+        is_html: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let idx = self.account_form.active_sig_idx;
+        if let Some(sig) = self.account_form.signatures.get_mut(idx) {
+            sig.is_html = is_html;
+            sig.body = body.clone();
+        }
+        self.account_form
+            .signature
+            .update(cx, |state, cx| state.set_value(body, window, cx));
+        cx.notify();
+    }
 }
 
 impl AccountFormState {
@@ -1118,6 +1218,7 @@ impl AccountFormState {
             };
             active.body = self.signature.read(cx).value().to_string();
         }
+        normalize_signatures(&mut collected_signatures);
         let primary_sig = collected_signatures
             .get(self.default_new_signature.unwrap_or(0))
             .or_else(|| collected_signatures.first())
@@ -2821,6 +2922,16 @@ pub(crate) fn render_editor_page(
                                         sig.is_html = !sig.is_html;
                                         cx.notify();
                                     }
+                                })),
+                        )
+                        .child(
+                            Button::new("acct-sig-import")
+                                .ghost()
+                                .compact()
+                                .disabled(demo_mode)
+                                .label("导入 HTML…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_signature_file(window, cx);
                                 })),
                         ),
                 )

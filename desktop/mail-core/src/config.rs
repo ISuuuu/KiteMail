@@ -174,6 +174,16 @@ impl AccountConfig {
     pub fn effective_push(&self, global_push: bool) -> bool {
         self.push_override.unwrap_or(global_push)
     }
+
+    /// 新邮件使用的签名正文，以及它是不是 HTML（对齐 Linux `AccountConfig::signature_set`）。
+    /// 没有命名签名时退回旧的单签名 `signature`。
+    pub fn primary_signature(&self) -> (String, bool) {
+        let idx = self.default_new_signature.unwrap_or(0);
+        if let Some(sig) = self.signatures.get(idx).or_else(|| self.signatures.first()) {
+            return (sig.body.clone(), sig.is_html);
+        }
+        (self.signature.clone(), false)
+    }
 }
 
 impl Default for AccountConfig {
