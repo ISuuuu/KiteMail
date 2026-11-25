@@ -13,22 +13,30 @@ use std::{
     rc::{Rc, Weak},
 };
 use webview2_com::{
-    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    DOMContentLoadedEventHandler, LaunchingExternalUriSchemeEventHandler,
-    Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
-    WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
+    CapturePreviewCompletedHandler, CreateCoreWebView2ControllerCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler, DOMContentLoadedEventHandler,
+    LaunchingExternalUriSchemeEventHandler, Microsoft::Web::WebView2::Win32::*,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    NewWindowRequestedEventHandler, ProcessFailedEventHandler, WebMessageReceivedEventHandler,
+    WebResourceRequestedEventHandler,
 };
 use windows::{
     core::{w, Interface},
     Win32::{
         Foundation::{HWND, POINT, RECT},
+        Graphics::Gdi::{
+            BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
+            GetMonitorInfoW, MonitorFromRect, ReleaseDC, SelectObject, BITMAPINFO,
+            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTONULL, SRCCOPY,
+        },
+        System::Com::{IStream, STREAM_SEEK_SET},
         UI::{
             Shell::SHCreateMemStream,
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetCursorPos, GetParent, GetWindowInfo,
-                GetWindowRect, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
-                SW_SHOWNOACTIVATE, WINDOWINFO, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
+                CreateWindowExW, DestroyWindow, GetAncestor, GetCursorPos, GetForegroundWindow,
+                GetParent, GetWindowInfo, GetWindowRect, SetWindowPos, ShowWindow, GA_ROOT,
+                SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOWINFO,
+                WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
             },
         },
     },
@@ -258,6 +266,14 @@ fn make_document(
     format!("<!doctype html><meta charset=utf-8><style>:root{{color-scheme:{scheme}}}html,body{{height:100%;margin:0}}body{{display:flex;flex-direction:column;font:14px system-ui;background:{bg};color:{fg}}}header{{padding:24px 24px 12px}}h1{{font-size:20px;margin:0 0 12px}}iframe{{flex:1;width:100%;border:0;min-height:0}}</style>{header}<iframe sandbox=\"allow-same-origin allow-popups\" srcdoc=\"{escaped}\"></iframe>").into_bytes()
 }
 
+#[derive(Clone)]
+pub(crate) struct PopupSnapshot {
+    pub(crate) image: std::sync::Arc<gpui_kit::RenderImage>,
+    /// 非 `None` 时表示仅截取了裁剪后的 `clip_window` 区域，记录其在内容区内的物理偏移与尺寸
+    /// `(offset_x, offset_y, width, height)`；`None` 表示与内容区域 1:1 铺满。
+    pub(crate) clipped_rect_px: Option<(i32, i32, i32, i32)>,
+}
+
 #[derive(Default)]
 struct State {
     controller: Option<ICoreWebView2Controller>,
@@ -269,6 +285,7 @@ struct State {
     loaded: bool,
     links: Vec<(u64, String)>,
     scroll_window: Option<AsyncWindowContext>,
+    svg_renderer: Option<gpui_kit::SvgRenderer>,
     bridge_script_version: u64,
     notifier: Option<futures_mpsc::Sender<()>>,
     in_thread: bool,
@@ -278,6 +295,87 @@ struct State {
     window_shown: bool,
     failed: bool,
     closed: bool,
+    popup_open: bool,
+    capturing: bool,
+    capture_seq: u64,
+    snapshot: Option<(u64, PopupSnapshot)>,
+}
+
+/// 将 top-down 32 位 BGRA 像素打包成 54 字节未压缩 BMP，供同步生成 `RenderImage`。
+fn bmp_from_top_down_bgra(width: i32, height: i32, bgra: &[u8]) -> Option<Vec<u8>> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    if bgra.len() != expected {
+        return None;
+    }
+    let total_size = 54u32.checked_add(u32::try_from(expected).ok()?)?;
+    let mut bmp = Vec::with_capacity(total_size as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&total_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&width.to_le_bytes());
+    bmp.extend_from_slice(&(-height).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&(expected as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0u8; 16]);
+    bmp.extend_from_slice(bgra);
+    Some(bmp)
+}
+
+/// 读取内存流的全部字节。
+fn read_stream(stream: &IStream) -> Option<Vec<u8>> {
+    unsafe { stream.Seek(0, STREAM_SEEK_SET, None).ok()? }
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let mut read = 0u32;
+        let _ = unsafe {
+            stream.Read(
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                Some(&mut read),
+            )
+        };
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read as usize]);
+    }
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+/// 快照拍摄结束（成功或失败）：记下已解码的 RenderImage 并唤醒 UI 换帧。
+fn finish_capture(
+    state: &Rc<RefCell<State>>,
+    version: u64,
+    seq: u64,
+    image: Option<std::sync::Arc<gpui_kit::RenderImage>>,
+) {
+    let mut inner = state.borrow_mut();
+    if inner.capture_seq != seq {
+        return;
+    }
+    inner.capturing = false;
+    if let Some(image) =
+        image.filter(|_| inner.popup_open && inner.version == version && !inner.closed)
+    {
+        inner.snapshot = Some((
+            version,
+            PopupSnapshot {
+                image,
+                clipped_rect_px: None,
+            },
+        ));
+    }
+    inner.notify_ui();
 }
 
 impl State {
@@ -593,6 +691,10 @@ impl WebViewHost {
         self.0.borrow_mut().notifier = Some(tx);
     }
 
+    pub(crate) fn set_svg_renderer(&self, renderer: gpui_kit::SvgRenderer) {
+        self.0.borrow_mut().svg_renderer = Some(renderer);
+    }
+
     pub(crate) fn load_status(&self) -> (u64, BodyView) {
         let state = self.0.borrow();
         let view = if state.failed {
@@ -680,6 +782,266 @@ impl WebViewHost {
             }
         }
     }
+    /// 窗口内浮层（菜单 / 弹层）开关。
+    ///
+    /// 浮层画在窗口自己的绘制层里，会被正文的 WebView2 子窗口盖住。打开时优先在点击
+    /// 当下同步截取 `clip_window` 屏幕像素，在第一帧渲染前就就绪快照，避免异步
+    /// `CapturePreview` 等待期内浮层被 WebView2 遮挡以及随后的切图闪烁；不满足
+    /// 同步截屏条件时再回退到异步 `CapturePreview`。关闭时按需立即放回子窗口。
+    pub(crate) fn set_popup_open(&self, open: bool, restore_visible: bool) {
+        {
+            let mut state = self.0.borrow_mut();
+            state.popup_open = open;
+            state.capture_seq = state.capture_seq.wrapping_add(1);
+            state.capturing = false;
+            // 旧快照一律作废：再次打开要重新拍（正文可能滚动过）。
+            state.snapshot = None;
+        }
+        if open {
+            if let Some((version, snap)) = self.capture_clip_window_sync() {
+                let mut state = self.0.borrow_mut();
+                if state.popup_open && state.version == version && !state.closed {
+                    state.snapshot = Some((version, snap));
+                }
+            } else {
+                self.capture_preview();
+            }
+        } else if restore_visible && self.0.borrow().loaded {
+            self.set_visible(true);
+        }
+    }
+    /// 浮层打开且快照已拍完（或没得拍）：子窗口该让位给快照了。
+    /// 拍摄及解码期间子窗口必须保持可见，否则会拍到空白或出现白屏闪烁。
+    pub(crate) fn popup_settled(&self) -> bool {
+        let state = self.0.borrow();
+        state.popup_open && !state.capturing
+    }
+    /// 当前文档的浮层快照（没有或已过期返回 None）。
+    pub(crate) fn popup_snapshot(&self) -> Option<PopupSnapshot> {
+        let state = self.0.borrow();
+        if !state.popup_open {
+            return None;
+        }
+        state
+            .snapshot
+            .as_ref()
+            .filter(|(version, _)| *version == state.version)
+            .map(|(_, snap)| snap.clone())
+    }
+    fn capture_clip_window_sync(&self) -> Option<(u64, PopupSnapshot)> {
+        let (clip_window, version, bounds, renderer) = {
+            let state = self.0.borrow();
+            if !state.loaded || !state.window_shown || state.closed {
+                return None;
+            }
+            (
+                state.clip_window,
+                state.version,
+                state.bounds,
+                state.svg_renderer.clone()?,
+            )
+        };
+        let mut clip_rect = RECT::default();
+        if unsafe { GetWindowRect(clip_window, &mut clip_rect) }.is_err() {
+            return None;
+        }
+        let width = clip_rect.right - clip_rect.left;
+        let height = clip_rect.bottom - clip_rect.top;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        // 仅当宿主窗口处于前台且完整落在显示器内时，桌面 DC 才准确对应 WebView2 画面。
+        let root = unsafe { GetAncestor(clip_window, GA_ROOT) };
+        if root.is_invalid() || root != unsafe { GetForegroundWindow() } {
+            return None;
+        }
+        let monitor = unsafe { MonitorFromRect(&clip_rect, MONITOR_DEFAULTTONULL) };
+        if monitor.is_invalid() {
+            return None;
+        }
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
+            return None;
+        }
+        let mon = monitor_info.rcMonitor;
+        if clip_rect.left < mon.left
+            || clip_rect.top < mon.top
+            || clip_rect.right > mon.right
+            || clip_rect.bottom > mon.bottom
+        {
+            return None;
+        }
+
+        let screen_dc = unsafe { GetDC(None) };
+        if screen_dc.is_invalid() {
+            return None;
+        }
+        let mem_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
+        if mem_dc.is_invalid() {
+            unsafe {
+                let _ = ReleaseDC(None, screen_dc);
+            }
+            return None;
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let Ok(hbitmap) = (unsafe {
+            CreateDIBSection(Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        }) else {
+            unsafe {
+                let _ = DeleteDC(mem_dc);
+                let _ = ReleaseDC(None, screen_dc);
+            }
+            return None;
+        };
+        let old = unsafe { SelectObject(mem_dc, hbitmap.into()) };
+        let blt_ok = unsafe {
+            BitBlt(
+                mem_dc,
+                0,
+                0,
+                width,
+                height,
+                Some(screen_dc),
+                clip_rect.left,
+                clip_rect.top,
+                SRCCOPY,
+            )
+        }
+        .is_ok();
+        let byte_len = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        let bgra = if blt_ok && !bits.is_null() {
+            Some(unsafe { std::slice::from_raw_parts(bits as *const u8, byte_len) }.to_vec())
+        } else {
+            None
+        };
+        unsafe {
+            SelectObject(mem_dc, old);
+            let _ = DeleteObject(hbitmap.into());
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+        }
+        let bmp = bmp_from_top_down_bgra(width, height, &bgra?)?;
+        let image = gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Bmp, bmp)
+            .to_image_data(renderer)
+            .ok()?;
+        let unclipped =
+            bounds.left == 0 && bounds.top == 0 && bounds.right == width && bounds.bottom == height;
+        let clipped_rect_px = (!unclipped).then_some((-bounds.left, -bounds.top, width, height));
+        Some((
+            version,
+            PopupSnapshot {
+                image,
+                clipped_rect_px,
+            },
+        ))
+    }
+    fn capture_preview(&self) {
+        let (controller, version, seq) = {
+            let mut state = self.0.borrow_mut();
+            // 子窗口没显示出来时 CapturePreview 拍到的是空白，直接跳过。
+            if !state.loaded || !state.window_shown {
+                return;
+            }
+            if state.capturing {
+                return;
+            }
+            state.capturing = true;
+            (state.controller.clone(), state.version, state.capture_seq)
+        };
+        let weak = Rc::downgrade(&self.0);
+        let fail = move || {
+            if let Some(state) = weak.upgrade() {
+                finish_capture(&state, version, seq, None);
+            }
+        };
+        let Some(stream) = (unsafe { SHCreateMemStream(None) }) else {
+            fail();
+            return;
+        };
+        let capture_state = Rc::downgrade(&self.0);
+        let capture_stream = stream.clone();
+        let handler = CapturePreviewCompletedHandler::create(Box::new(
+            move |result: windows::core::Result<()>| {
+                let bytes = result.ok().and_then(|_| read_stream(&capture_stream));
+                let Some(state) = capture_state.upgrade() else {
+                    return Ok(());
+                };
+                let (active, window, renderer) = {
+                    let inner = state.borrow();
+                    let active = inner.popup_open
+                        && inner.version == version
+                        && inner.capture_seq == seq
+                        && !inner.closed;
+                    (
+                        active,
+                        inner.scroll_window.clone(),
+                        inner.svg_renderer.clone(),
+                    )
+                };
+                let (Some(bytes), true, Some(renderer)) = (bytes, active, renderer) else {
+                    finish_capture(&state, version, seq, None);
+                    return Ok(());
+                };
+                if let Some(window) = window {
+                    let decode_state = Rc::downgrade(&state);
+                    window
+                        .spawn(async move |cx| {
+                            let image = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Png, bytes)
+                                        .to_image_data(renderer)
+                                        .ok()
+                                })
+                                .await;
+                            if let Some(state) = decode_state.upgrade() {
+                                finish_capture(&state, version, seq, image);
+                            }
+                        })
+                        .detach();
+                } else {
+                    let image = gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Png, bytes)
+                        .to_image_data(renderer)
+                        .ok();
+                    finish_capture(&state, version, seq, image);
+                }
+                Ok(())
+            },
+        ));
+        let Some(controller) = controller else {
+            fail();
+            return;
+        };
+        let captured = unsafe {
+            controller.CoreWebView2().and_then(|view| {
+                view.CapturePreview(
+                    COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                    &stream,
+                    &handler,
+                )
+            })
+        };
+        if captured.is_err() {
+            fail();
+        }
+    }
     pub(crate) fn load(&self, document: Vec<u8>) -> windows::core::Result<()> {
         self.load_with_remote(document, false)
     }
@@ -704,6 +1066,7 @@ impl WebViewHost {
         state.version = state.version.wrapping_add(1);
         state.loaded = false;
         state.navigation_id = None;
+        state.snapshot = None;
         let url = document_url(state.version);
         let controller = state.controller.clone();
         if controller.is_some() {
@@ -1095,6 +1458,69 @@ mod tests {
         assert_eq!(BodyView::for_document(true, true, None), BodyView::Loading);
         assert_eq!(BodyView::for_document(true, false, None), BodyView::Native);
         assert_eq!(BodyView::for_document(false, true, None), BodyView::Native);
+    }
+
+    #[test]
+    fn snapshot_stream_is_read_from_the_start_and_stops_at_the_end() {
+        let png = b"\x89PNG\r\n\x1a\nnot-really-a-png";
+        let stream = unsafe { SHCreateMemStream(Some(png)) }.unwrap();
+        // 第二次读同样从头开始，对应「拍完再读」的用法。
+        assert_eq!(read_stream(&stream).as_deref(), Some(&png[..]));
+        assert_eq!(read_stream(&stream).as_deref(), Some(&png[..]));
+        let empty = unsafe { SHCreateMemStream(None) }.unwrap();
+        assert!(read_stream(&empty).is_none());
+    }
+
+    #[test]
+    fn bmp_from_top_down_bgra_produces_decodable_bmp() {
+        let bgra = [0x10u8, 0x20, 0x30, 0x00, 0x40, 0x50, 0x60, 0x00];
+        let bmp = bmp_from_top_down_bgra(2, 1, &bgra).unwrap();
+        assert_eq!(bmp.len(), 54 + bgra.len());
+        assert_eq!(&bmp[..2], b"BM");
+        assert!(bmp_from_top_down_bgra(0, 1, &[]).is_none());
+        assert!(bmp_from_top_down_bgra(2, 1, &bgra[..4]).is_none());
+    }
+
+    #[test]
+    fn finish_capture_respects_capture_seq_popup_open_and_version() {
+        let state = Rc::new(RefCell::new(State {
+            version: 3,
+            popup_open: true,
+            capturing: true,
+            capture_seq: 2,
+            ..State::default()
+        }));
+        let host = WebViewHost(state.clone());
+        let img = std::sync::Arc::new(gpui_kit::RenderImage::new(Vec::new()));
+
+        // 拍摄尚未完成前不可让位，也没有快照。
+        assert!(!host.popup_settled());
+        assert!(host.popup_snapshot().is_none());
+
+        // 过期序号（seq=1）不能打断当前拍摄（seq=2）。
+        finish_capture(&state, 3, 1, Some(img.clone()));
+        assert!(!host.popup_settled());
+        assert!(host.popup_snapshot().is_none());
+
+        // 过期版本（version=2）结束拍摄但不能写入快照。
+        finish_capture(&state, 2, 2, Some(img.clone()));
+        assert!(host.popup_settled());
+        assert!(host.popup_snapshot().is_none());
+
+        // 匹配当前版本和序号时保存快照并允许让位。
+        state.borrow_mut().capturing = true;
+        finish_capture(&state, 3, 2, Some(img));
+        assert!(host.popup_settled());
+        assert!(host.popup_snapshot().is_some());
+
+        // 浮层已关闭时不保留新落地的快照。
+        state.borrow_mut().popup_open = false;
+        state.borrow_mut().snapshot = None;
+        state.borrow_mut().capturing = true;
+        let img2 = std::sync::Arc::new(gpui_kit::RenderImage::new(Vec::new()));
+        finish_capture(&state, 3, 2, Some(img2));
+        assert!(!host.popup_settled());
+        assert!(host.popup_snapshot().is_none());
     }
 
     #[test]

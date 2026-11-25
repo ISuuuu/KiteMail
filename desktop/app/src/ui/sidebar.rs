@@ -2090,7 +2090,7 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             })
                             .on_open_change(move |open, _, cx| {
                                 entity_for_tpl_popup.update(cx, |app, cx| {
-                                    app.reader_popup_open = *open;
+                                    app.set_reader_popup_open(*open);
                                     cx.notify();
                                 });
                             }),
@@ -2789,7 +2789,7 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
         })
         .on_open_change(move |open, _, cx| {
             entity_for_popup.update(cx, |app, cx| {
-                app.reader_popup_open = *open;
+                app.set_reader_popup_open(*open);
                 cx.notify();
             });
         })

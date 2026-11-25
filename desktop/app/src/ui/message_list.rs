@@ -27,7 +27,7 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, AppContext, Context, Div, DragMoveEvent, InteractiveElement, IntoElement,
+    div, px, Anchor, AppContext, Context, Div, DragMoveEvent, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, ParentElement, SharedString, Stateful, StatefulInteractiveElement,
     Styled, Window, WindowControlArea,
 };
@@ -1769,7 +1769,7 @@ pub(crate) fn render(
             .icon(IconName::ListFilter)
             .when(has_active_filter, |btn| btn.text_color(p.accent))
             .tooltip(active_tooltip)
-            .dropdown_menu(move |menu, window, cx| {
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
                 let mut menu = menu;
                 for sort in MessageSort::ALL {
                     let entity_for_item = entity.clone();
@@ -1938,7 +1938,7 @@ pub(crate) fn render(
             })
             .on_open_change(move |open, _, cx| {
                 entity_for_popup.update(cx, |app, cx| {
-                    app.reader_popup_open = *open;
+                    app.set_reader_popup_open(*open);
                     cx.notify();
                 });
             })

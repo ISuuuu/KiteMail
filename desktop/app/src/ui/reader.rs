@@ -310,7 +310,7 @@ fn build_card_more_menu(
         })
         .on_open_change(move |open, _, cx| {
             popup_entity.update(cx, |app, cx| {
-                app.reader_popup_open = *open;
+                app.set_reader_popup_open(*open);
                 cx.notify();
             });
         })
@@ -358,6 +358,7 @@ fn render_message_card(
     more_menu: gpui_kit::AnyElement,
     body_view: BodyView,
     webview_in_thread: bool,
+    scale_factor: f32,
     p: &theme::HylkiPalette,
     app: &mut HylkiApp,
     cx: &mut Context<HylkiApp>,
@@ -1011,7 +1012,36 @@ fn render_message_card(
             {
                 let host = app.reader_webview.as_ref().unwrap().clone();
                 let (version, _) = host.load_status();
-                let visible = !app.reader_popup_open;
+                let visible = !app.reader_webview_yields_to_popup();
+                if let Some(snapshot) = host.popup_snapshot() {
+                    // 浮层打开期间：同一布局位置换成正文快照，尺寸与子窗口一致。
+                    use gpui_kit::StyledImage as _;
+
+                    let img_el = if let Some((ox, oy, w, h)) = snapshot.clipped_rect_px {
+                        gpui_kit::img(snapshot.image)
+                            .absolute()
+                            .left(px(ox as f32 / scale_factor))
+                            .top(px(oy as f32 / scale_factor))
+                            .w(px(w as f32 / scale_factor))
+                            .h(px(h as f32 / scale_factor))
+                            .object_fit(gpui_kit::ObjectFit::Fill)
+                    } else {
+                        gpui_kit::img(snapshot.image)
+                            .absolute()
+                            .inset_0()
+                            .size_full()
+                            .object_fit(gpui_kit::ObjectFit::Fill)
+                    };
+                    return card.child(
+                        div()
+                            .relative()
+                            .overflow_hidden()
+                            .w_full()
+                            .when(webview_in_thread, |el| el.h(px(500.0)))
+                            .when(!webview_in_thread, |el| el.flex_1().min_h_0())
+                            .child(img_el),
+                    );
+                }
                 let app_reserved_strip_px = app.reader_webview_bottom_clearance_px();
                 return card.child(
                     gpui_kit::canvas(
@@ -1287,6 +1317,8 @@ pub(crate) fn render_with_pane_top(
             app.raw_source_message_ids.contains(&detail.id),
             app.collapsed_thread_cards.contains(&detail.id),
         );
+        // 浮层打开期间正文由 WebView2 快照顶替（见 WebViewHost::set_popup_open），
+        // 这里只管其它会盖住正文或被正文盖住的界面状态。
         let unobscured = app.active_modal == crate::app::ActiveModal::None
             && app.print_preview.is_none()
             && !app.reader_find_open
@@ -1349,7 +1381,7 @@ pub(crate) fn render_with_pane_top(
             app.reader_webview.as_deref(),
         );
         if let Some(host) = app.reader_webview.clone() {
-            if view != BodyView::Html || app.reader_popup_open {
+            if view != BodyView::Html || app.reader_webview_yields_to_popup() {
                 cx.defer_in(window, move |_, _, _| host.set_visible(false));
             }
         }
@@ -1503,6 +1535,7 @@ pub(crate) fn render_with_pane_top(
                         BodyView::Native
                     },
                     true,
+                    window.scale_factor(),
                     &p,
                     app,
                     cx,
@@ -1556,6 +1589,7 @@ pub(crate) fn render_with_pane_top(
             menu,
             body_view,
             false,
+            window.scale_factor(),
             &p,
             app,
             cx,
@@ -1761,7 +1795,7 @@ pub(crate) fn render_with_pane_top(
                                     })
                                     .on_open_change(move |open, _, cx| {
                                         popup_entity.update(cx, |app, cx| {
-                                            app.reader_popup_open = *open;
+                                            app.set_reader_popup_open(*open);
                                             cx.notify();
                                         });
                                     }),
@@ -1926,7 +1960,7 @@ pub(crate) fn render_with_pane_top(
                                     })
                                     .on_open_change(move |open, _, cx| {
                                         popup_entity.update(cx, |app, cx| {
-                                            app.reader_popup_open = *open;
+                                            app.set_reader_popup_open(*open);
                                             cx.notify();
                                         });
                                     }),
