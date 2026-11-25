@@ -175,14 +175,29 @@ impl AccountConfig {
         self.push_override.unwrap_or(global_push)
     }
 
-    /// 新邮件使用的签名正文，以及它是不是 HTML（对齐 Linux `AccountConfig::signature_set`）。
-    /// 没有命名签名时退回旧的单签名 `signature`。
-    pub fn primary_signature(&self) -> (String, bool) {
-        let idx = self.default_new_signature.unwrap_or(0);
-        if let Some(sig) = self.signatures.get(idx).or_else(|| self.signatures.first()) {
-            return (sig.body.clone(), sig.is_html);
+    fn resolve_signature(&self, index: Option<usize>) -> (String, bool) {
+        if !self.signatures.is_empty() {
+            return index
+                .and_then(|idx| self.signatures.get(idx))
+                .map(|sig| (sig.body.clone(), sig.is_html))
+                .unwrap_or_default();
         }
-        (self.signature.clone(), false)
+        if !self.signature.trim().is_empty() {
+            return (self.signature.clone(), false);
+        }
+        (String::new(), false)
+    }
+
+    /// 新邮件使用的签名正文，以及它是不是 HTML（对齐 Linux `AccountConfig::signature_set`）。
+    /// `default_new_signature == None` 表示「不使用签名」；仅在尚未迁移命名签名列表时退回旧单签名 `signature`。
+    pub fn primary_signature(&self) -> (String, bool) {
+        self.resolve_signature(self.default_new_signature)
+    }
+
+    /// 回复/转发使用的签名正文，以及它是不是 HTML。
+    /// `default_reply_signature == None` 表示「不使用签名」。
+    pub fn reply_signature(&self) -> (String, bool) {
+        self.resolve_signature(self.default_reply_signature)
     }
 }
 
@@ -517,6 +532,10 @@ pub struct AppPreferences {
     /// Place signature above quoted text when replying or forwarding.
     #[serde(default = "default_true")]
     pub signature_above_quote: bool,
+    /// One-time migration marker bringing pre-WP-04 installs (`signature_above_quote = false`)
+    /// up to the default (`true`) without overriding subsequent user choices.
+    #[serde(default)]
+    pub signature_above_quote_default_applied: bool,
     /// Insert standard `"-- "` separator before signatures.
     #[serde(default)]
     pub signature_dashes: bool,
@@ -1164,6 +1183,7 @@ impl Default for AppPreferences {
             compose_inline: true,
             reply_inline: true,
             signature_above_quote: true,
+            signature_above_quote_default_applied: true,
             signature_dashes: false,
             undo_send_secs: 5,
             reply_header_template: String::new(),
@@ -2266,7 +2286,16 @@ pub fn load_preferences_in(dir: &Path) -> Result<AppPreferences, String> {
     }
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("读取偏好设置失败 ({}): {e}", path.display()))?;
-    toml::from_str(&text).map_err(|e| format!("解析偏好设置失败 ({}): {e}", path.display()))
+    let mut prefs: AppPreferences =
+        toml::from_str(&text).map_err(|e| format!("解析偏好设置失败 ({}): {e}", path.display()))?;
+    // WP-04 之前生成的配置文件会把旧默认值 signature_above_quote = false 落盘；
+    // 仅迁移一次，之后用户显式改回「在引用内容下方」会保留。
+    if !prefs.signature_above_quote_default_applied {
+        prefs.signature_above_quote_default_applied = true;
+        prefs.signature_above_quote = true;
+        let _ = save_preferences_in(dir, &prefs);
+    }
+    Ok(prefs)
 }
 
 /// Persist user preferences into `dir`.
@@ -3694,6 +3723,101 @@ smtp_separate_credentials = false
                 legacy_id_in_use_by_peer: false,
             }
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn account_default_signature_respects_none_and_reply_selection() {
+        let sigs = vec![
+            NamedSignature {
+                name: "商务".to_string(),
+                body: "商务签名".to_string(),
+                is_html: false,
+            },
+            NamedSignature {
+                name: "简短".to_string(),
+                body: "<p>简短签名</p>".to_string(),
+                is_html: true,
+            },
+        ];
+
+        // 即使存在签名列表（甚至旧字段非空），选择「不使用签名」(None) 也必须返回空。
+        let none_acc = AccountConfig {
+            signature: "旧签名".to_string(),
+            signatures: sigs.clone(),
+            default_new_signature: None,
+            default_reply_signature: None,
+            ..Default::default()
+        };
+        assert_eq!(none_acc.primary_signature(), (String::new(), false));
+        assert_eq!(none_acc.reply_signature(), (String::new(), false));
+
+        // 分别指定新邮件与回复/转发默认签名。
+        let split_acc = AccountConfig {
+            signatures: sigs.clone(),
+            default_new_signature: None,
+            default_reply_signature: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(split_acc.primary_signature(), (String::new(), false));
+        assert_eq!(
+            split_acc.reply_signature(),
+            ("<p>简短签名</p>".to_string(), true)
+        );
+
+        let new_only_acc = AccountConfig {
+            signatures: sigs,
+            default_new_signature: Some(0),
+            default_reply_signature: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            new_only_acc.primary_signature(),
+            ("商务签名".to_string(), false)
+        );
+        assert_eq!(new_only_acc.reply_signature(), (String::new(), false));
+
+        // 尚未迁移命名签名列表时，保留旧的单签名回退。
+        let legacy_acc = AccountConfig {
+            signature: "旧纯文本签名".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            legacy_acc.primary_signature(),
+            ("旧纯文本签名".to_string(), false)
+        );
+        assert_eq!(
+            legacy_acc.reply_signature(),
+            ("旧纯文本签名".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn legacy_signature_above_quote_false_migrates_once_then_preserves_choice() {
+        let base = std::env::temp_dir().join("hylki test 签名位置一次性迁移");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // 模拟 WP-04 之前生成的配置：显式落盘了 signature_above_quote = false 且无迁移标记。
+        fs::write(
+            preferences_file_in(&base),
+            "theme_id = \"default\"\nsignature_above_quote = false\n",
+        )
+        .expect("write legacy prefs");
+
+        let migrated = load_preferences_in(&base).expect("load legacy prefs");
+        assert!(migrated.signature_above_quote);
+        assert!(migrated.signature_above_quote_default_applied);
+
+        // 迁移后若用户再次显式改回「在引用内容下方」，后续加载必须保留用户选择。
+        let mut user_below = migrated.clone();
+        user_below.signature_above_quote = false;
+        save_preferences_in(&base, &user_below).expect("save user choice");
+
+        let reloaded = load_preferences_in(&base).expect("reload user choice");
+        assert!(!reloaded.signature_above_quote);
+        assert!(reloaded.signature_above_quote_default_applied);
 
         let _ = fs::remove_dir_all(&base);
     }

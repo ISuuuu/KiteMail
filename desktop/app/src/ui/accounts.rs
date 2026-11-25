@@ -13,6 +13,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -24,6 +25,7 @@ use hylki_mail_core::config::{
     self, AccountConfig, AuthBackend, NamedSignature, SecurityMode, SendAsAlias,
     SpecialFoldersConfig,
 };
+use hylki_mail_core::imap_client::sanitize_html_for_display_with_options;
 use hylki_mail_core::{markup, signature, MailRequest};
 
 use crate::app::HylkiApp;
@@ -518,6 +520,8 @@ pub(crate) struct AccountFormState {
     pub(crate) emoji_input: Entity<InputState>,
     pub(crate) avatar: Option<String>,
     pub(crate) signature: Entity<TextareaState>,
+    /// 签名编辑器是否显示渲染预览（仅 HTML 模式有效）。
+    pub(crate) sig_preview: bool,
     // WP-06：高阶账号配置字段
     pub(crate) quota_used_bytes: Option<u64>,
     pub(crate) quota_total_bytes: Option<u64>,
@@ -557,6 +561,31 @@ fn normalize_emoji_opt(emoji: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(4).collect())
+}
+
+/// 签名源码渲染成预览 HTML：先按签名白名单清洗（去脚本、事件属性、危险协议），
+/// 再按阅读器的规则整形，`TextView::html` 才排得开表格。
+fn signature_preview_html(body: &str, is_html: bool) -> String {
+    if !is_html || body.trim().is_empty() {
+        return String::new();
+    }
+    let html = if markup::looks_like_html(body) {
+        body.to_string()
+    } else {
+        signature::signature_to_html(body, false)
+    };
+    let html = signature::sanitize_signature_html(&html);
+    sanitize_html_for_display_with_options(&html, false, false).0
+}
+
+/// 删除第 `rm_idx` 个签名后同步更新默认签名索引：命中被删项时退回「不使用签名」(`None`)，
+/// 其余排在其后的索引前移一位。
+fn adjust_default_sig_after_remove(current: &mut Option<usize>, rm_idx: usize) {
+    match *current {
+        Some(i) if i == rm_idx => *current = None,
+        Some(i) if i > rm_idx => *current = Some(i - 1),
+        _ => {}
+    }
 }
 
 /// 签名落盘前规整（对齐原版把源码粘进签名后立即清洗的做法）：
@@ -651,6 +680,7 @@ impl SettingsWindow {
             sig.is_html = is_html;
             sig.body = body.clone();
         }
+        self.account_form.sig_preview &= is_html;
         self.account_form
             .signature
             .update(cx, |state, cx| state.set_value(body, window, cx));
@@ -756,7 +786,7 @@ impl AccountFormState {
         let signature = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(3, 6)
-                .placeholder("可选：邮件签名（写信 / 回复 / 转发时自动以 -- 分隔插入正文末尾）")
+                .placeholder("可选：邮件签名（可在下方指定新邮件与回复/转发默认签名）")
                 .default_value(initial_sig_body)
         });
         let sig_name_input = cx.new(|cx| {
@@ -876,6 +906,7 @@ impl AccountFormState {
             emoji_input,
             avatar: cfg.avatar,
             signature,
+            sig_preview: false,
             quota_used_bytes: cfg.quota_used_bytes,
             quota_total_bytes: cfg.quota_total_bytes,
             aliases: cfg.aliases,
@@ -972,6 +1003,7 @@ impl AccountFormState {
             .unwrap_or_else(|| "默认签名".to_string());
         self.signatures = loaded_sigs;
         self.active_sig_idx = 0;
+        self.sig_preview = false;
         self.signature
             .update(cx, |s, cx| s.set_value(first_body, window, cx));
         self.sig_name_input
@@ -1062,6 +1094,7 @@ impl AccountFormState {
         }
         self.sync_active_signature_from_inputs(cx);
         self.active_sig_idx = idx;
+        self.sig_preview = false;
         let sig = self.signatures[idx].clone();
         self.sig_name_input
             .update(cx, |s, cx| s.set_value(sig.name, window, cx));
@@ -1219,9 +1252,9 @@ impl AccountFormState {
             active.body = self.signature.read(cx).value().to_string();
         }
         normalize_signatures(&mut collected_signatures);
-        let primary_sig = collected_signatures
-            .get(self.default_new_signature.unwrap_or(0))
-            .or_else(|| collected_signatures.first())
+        let primary_sig = self
+            .default_new_signature
+            .and_then(|idx| collected_signatures.get(idx))
             .map(|s| s.body.clone())
             .unwrap_or_default();
 
@@ -2829,6 +2862,7 @@ pub(crate) fn render_editor_page(
                         this.account_form.signatures.remove(rm_idx);
                         let next_idx = rm_idx.min(this.account_form.signatures.len() - 1);
                         this.account_form.active_sig_idx = next_idx;
+                        this.account_form.sig_preview = false;
                         let sig = this.account_form.signatures[next_idx].clone();
                         this.account_form
                             .sig_name_input
@@ -2836,12 +2870,14 @@ pub(crate) fn render_editor_page(
                         this.account_form
                             .signature
                             .update(cx, |s, cx| s.set_value(sig.body, window, cx));
-                        if this.account_form.default_new_signature == Some(rm_idx) {
-                            this.account_form.default_new_signature = Some(0);
-                        }
-                        if this.account_form.default_reply_signature == Some(rm_idx) {
-                            this.account_form.default_reply_signature = Some(0);
-                        }
+                        adjust_default_sig_after_remove(
+                            &mut this.account_form.default_new_signature,
+                            rm_idx,
+                        );
+                        adjust_default_sig_after_remove(
+                            &mut this.account_form.default_reply_signature,
+                            rm_idx,
+                        );
                         cx.notify();
                     })),
             )
@@ -2882,6 +2918,23 @@ pub(crate) fn render_editor_page(
         .find(|(_, v)| *v == current_reply_sig_val)
         .map(|(l, _)| l.clone())
         .unwrap_or_else(|| SharedString::from("不使用签名"));
+    let signature_preview = form.sig_preview && active_sig_is_html;
+    let signature_body: AnyElement = if signature_preview {
+        let html = signature_preview_html(form.signature.read(cx).value().as_ref(), true);
+        div()
+            .id("acct-sig-preview")
+            .w_full()
+            .h(px(150.0))
+            .overflow_y_scroll()
+            .child(
+                TextView::html("acct-sig-preview-text", html)
+                    .selectable(true)
+                    .image_source(|uri| crate::webview_host::mail_image_source(uri, true)),
+            )
+            .into_any_element()
+    } else {
+        Textarea::new(&form.signature).into_any_element()
+    };
     let win_for_sig_new = cx.entity();
     let win_for_sig_reply = cx.entity();
 
@@ -2920,8 +2973,9 @@ pub(crate) fn render_editor_page(
                                         this.account_form.signatures.get_mut(active_sig_idx)
                                     {
                                         sig.is_html = !sig.is_html;
-                                        cx.notify();
                                     }
+                                    this.account_form.sig_preview = false;
+                                    cx.notify();
                                 })),
                         )
                         .child(
@@ -2933,7 +2987,24 @@ pub(crate) fn render_editor_page(
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.import_signature_file(window, cx);
                                 })),
-                        ),
+                        )
+                        .when(active_sig_is_html, |el| {
+                            el.child(
+                                Button::new("acct-sig-preview-btn")
+                                    .ghost()
+                                    .compact()
+                                    .label(if form.sig_preview {
+                                        "编辑源码"
+                                    } else {
+                                        "预览"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.account_form.sig_preview =
+                                            !this.account_form.sig_preview;
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -2943,7 +3014,7 @@ pub(crate) fn render_editor_page(
                         .border_color(border)
                         .bg(surface)
                         .p_1p5()
-                        .child(Textarea::new(&form.signature)),
+                        .child(signature_body),
                 )
                 .into_any_element(),
             h_flex()
@@ -3720,6 +3791,21 @@ mod tests {
         }
     }
 
+    /// 签名预览：纯文本按 HTML 转义，脚本与事件属性被丢；纯文本模式不预览。
+    #[test]
+    fn signature_preview_sanitizes_source() {
+        let preview = signature_preview_html("Ada & Co\nCEO", true);
+        assert!(preview.contains("Ada &amp; Co<br>CEO"), "{preview}");
+
+        let preview =
+            signature_preview_html(r#"<p onclick="x()">Ada</p><script>alert(1)</script>"#, true);
+        assert!(preview.contains("Ada"), "{preview}");
+        assert!(!preview.contains("script"), "{preview}");
+        assert!(!preview.contains("onclick"), "{preview}");
+
+        assert_eq!(signature_preview_html("<p>x</p>", false), "");
+    }
+
     #[test]
     fn brand_for_account_detects_oauth_hosts_and_domains() {
         let oauth = AccountConfig {
@@ -3784,5 +3870,24 @@ mod tests {
                 provider.id
             );
         }
+    }
+
+    #[test]
+    fn removing_signature_clears_matching_default_and_shifts_later_indices() {
+        let mut selected_removed = Some(1);
+        adjust_default_sig_after_remove(&mut selected_removed, 1);
+        assert_eq!(selected_removed, None);
+
+        let mut later_sig = Some(2);
+        adjust_default_sig_after_remove(&mut later_sig, 0);
+        assert_eq!(later_sig, Some(1));
+
+        let mut earlier_sig = Some(0);
+        adjust_default_sig_after_remove(&mut earlier_sig, 2);
+        assert_eq!(earlier_sig, Some(0));
+
+        let mut none_sig = None;
+        adjust_default_sig_after_remove(&mut none_sig, 0);
+        assert_eq!(none_sig, None);
     }
 }

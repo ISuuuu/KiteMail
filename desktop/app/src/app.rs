@@ -1951,6 +1951,50 @@ impl HylkiApp {
         self.settings_window.is_some() || self.settings_window_opening
     }
 
+    /// 记录窗口里浮层（菜单 / 弹层）的开关。
+    ///
+    /// 浮层画在窗口自己的绘制层里，会被正文的 WebView2 子窗口盖住，所以浮层
+    /// 打开时先给正文拍快照并预解码、再藏起子窗口（见 webview_host.rs 的
+    /// set_popup_open），正文原样不动。浮层一关且当前仍应展示 HTML 正文时立刻把
+    /// webview 放回来——主窗口在设置等另一个窗口激活期间不一定继续出帧，只靠
+    /// 下一个绘制帧恢复会让正文空白一段时间。
+    pub(crate) fn set_reader_popup_open(&mut self, open: bool) {
+        self.reader_popup_open = open;
+        #[cfg(windows)]
+        if let Some(host) = self.reader_webview.clone() {
+            let restore_visible = !open
+                && self.reader_webview_base_visible()
+                && self.reader_webview_key.is_some()
+                && host.load_status().1 == crate::webview_host::BodyView::Html;
+            host.set_popup_open(open, restore_visible);
+        }
+    }
+
+    #[cfg(windows)]
+    fn reader_webview_base_visible(&self) -> bool {
+        self.main_view == MainContentView::Mail
+            && self.selected_message.is_some()
+            && self.right_mode == RightPaneMode::Reader
+            && self.reader_position != ReaderPosition::Hidden
+            && self.active_modal == ActiveModal::None
+            && self.pending_empty_folder.is_none()
+            && self.pending_remove_account.is_none()
+            && self.print_preview.is_none()
+            && !self.reader_find_open
+            && !self.compose_split
+            && !self.sidebar_peek_open
+            && self.drawer_image_preview.is_none()
+            && !self.mail_dir_switching
+    }
+
+    /// 浮层打开期间 WebView2 是否该让位（快照已到手，或没得拍）。
+    #[cfg(windows)]
+    pub(crate) fn reader_webview_yields_to_popup(&self) -> bool {
+        self.reader_webview
+            .as_ref()
+            .is_some_and(|host| host.popup_settled())
+    }
+
     pub(crate) fn push_settings_or_main_toast(
         &mut self,
         key: impl Into<String>,
@@ -4319,6 +4363,7 @@ impl HylkiApp {
         let host = crate::webview_host::WebViewHost::for_window(window, Some(window.to_async(cx)))?;
         let (tx, mut rx) = futures::channel::mpsc::channel::<()>(16);
         host.set_notifier(tx);
+        host.set_svg_renderer(cx.svg_renderer());
         let host = std::rc::Rc::new(host);
         self.reader_webview = Some(host.clone());
         cx.spawn(async move |this, cx| {
@@ -4330,7 +4375,7 @@ impl HylkiApp {
                         let Some(host) = this.reader_webview.clone() else {
                             return;
                         };
-                        let status = Some(host.load_status());
+                        let status = Some((host.load_status(), host.popup_settled()));
                         if status != previous {
                             previous = status;
                             cx.notify();
@@ -6159,13 +6204,26 @@ impl HylkiApp {
         self.set_recipient_field_text(field, "", window, cx);
     }
 
-    /// 查询指定账号配置的邮件签名，以及它是不是 HTML。
-    fn account_signature(&self, account_id: u32) -> (String, bool) {
+    fn account_signature_with(
+        &self,
+        account_id: u32,
+        pick: fn(&AccountConfig) -> (String, bool),
+    ) -> (String, bool) {
         self.accounts
             .iter()
             .find(|a| a.id == account_id)
-            .map(|a| a.primary_signature())
+            .map(pick)
             .unwrap_or_default()
+    }
+
+    /// 查询指定账号配置的新邮件默认签名，以及它是不是 HTML。
+    fn account_signature(&self, account_id: u32) -> (String, bool) {
+        self.account_signature_with(account_id, AccountConfig::primary_signature)
+    }
+
+    /// 查询指定账号配置的回复/转发默认签名，以及它是不是 HTML。
+    fn account_reply_signature(&self, account_id: u32) -> (String, bool) {
+        self.account_signature_with(account_id, AccountConfig::reply_signature)
     }
 
     /// 确保写信自动补全有联系人缓存。
@@ -6843,7 +6901,7 @@ impl HylkiApp {
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(forward_subject, window, cx));
-        let (signature_body, signature_is_html) = self.account_signature(detail.account_id);
+        let (signature_body, signature_is_html) = self.account_reply_signature(detail.account_id);
         let body_with_sig = insert_signature_with_quote(
             &quoted,
             &signature_body,
@@ -6980,7 +7038,7 @@ impl HylkiApp {
         self.clear_compose_cc_bcc(window, cx);
         self.compose_subject
             .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
-        let (signature_body, signature_is_html) = self.account_signature(detail.account_id);
+        let (signature_body, signature_is_html) = self.account_reply_signature(detail.account_id);
         let body_with_sig = insert_signature_with_quote(
             &quoted,
             &signature_body,
@@ -11960,7 +12018,7 @@ impl HylkiApp {
                             })
                             .on_open_change(move |open, _, cx| {
                                 ent_tpl_popup.update(cx, |app, cx| {
-                                    app.reader_popup_open = *open;
+                                    app.set_reader_popup_open(*open);
                                     cx.notify();
                                 });
                             })
@@ -12002,7 +12060,7 @@ impl HylkiApp {
                             })
                             .on_open_change(move |open, _, cx| {
                                 ent_schedule_popup.update(cx, |app, cx| {
-                                    app.reader_popup_open = *open;
+                                    app.set_reader_popup_open(*open);
                                     cx.notify();
                                 });
                             })
@@ -12101,20 +12159,8 @@ impl Render for HylkiApp {
         }
         #[cfg(windows)]
         if let Some(host) = self.reader_webview.clone() {
-            let visible = self.main_view == MainContentView::Mail
-                && self.selected_message.is_some()
-                && self.right_mode == RightPaneMode::Reader
-                && self.reader_position != ReaderPosition::Hidden
-                && self.active_modal == ActiveModal::None
-                && self.pending_empty_folder.is_none()
-                && self.pending_remove_account.is_none()
-                && self.print_preview.is_none()
-                && !self.reader_find_open
-                && !self.compose_split
-                && !self.sidebar_peek_open
-                && self.drawer_image_preview.is_none()
-                && !self.reader_popup_open
-                && !self.mail_dir_switching;
+            let visible =
+                self.reader_webview_base_visible() && !self.reader_webview_yields_to_popup();
             if !visible {
                 cx.defer_in(window, move |_, _, _| host.set_visible(false));
             }
