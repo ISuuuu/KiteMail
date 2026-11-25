@@ -316,6 +316,20 @@ impl Render for ComposeSplitDrag {
     }
 }
 
+/// 缓存已清洗/拆分后的阅读器正文，避免拖拽/重绘时每帧重复跑 html5ever 解析。
+#[derive(Clone)]
+pub(crate) struct CachedReaderBody {
+    pub(crate) body_view_is_native: bool,
+    pub(crate) prefer_plain: bool,
+    pub(crate) block_remote_images: bool,
+    pub(crate) clean_links: bool,
+    pub(crate) raw_html: Option<String>,
+    pub(crate) body_text: String,
+    pub(crate) main_html: String,
+    pub(crate) quoted_part: Option<(String, usize)>,
+    pub(crate) blocked_images: usize,
+}
+
 // 全局快捷键动作（方案文档五.3）；键绑定注册在 main.rs，
 // 动作监听挂在根节点 render 上。
 //
@@ -1027,6 +1041,7 @@ pub(crate) struct HylkiApp {
     pub(crate) reader_find_active_match: usize,
     pub(crate) reader_find_total_matches: usize,
     pub(crate) reader_text_states: HashMap<u32, (String, Entity<TextViewState>)>,
+    pub(crate) reader_body_cache: HashMap<u32, CachedReaderBody>,
     #[cfg(windows)]
     pub(crate) reader_webview: Option<std::rc::Rc<crate::webview_host::WebViewHost>>,
     #[cfg(windows)]
@@ -1545,6 +1560,7 @@ impl HylkiApp {
                 reader_find_active_match: 0,
                 reader_find_total_matches: 0,
                 reader_text_states: HashMap::new(),
+                reader_body_cache: HashMap::new(),
                 #[cfg(windows)]
                 reader_webview: None,
                 #[cfg(windows)]
@@ -1818,6 +1834,7 @@ impl HylkiApp {
             reader_find_active_match: 0,
             reader_find_total_matches: 0,
             reader_text_states: HashMap::new(),
+            reader_body_cache: HashMap::new(),
             #[cfg(windows)]
             reader_webview: None,
             #[cfg(windows)]
@@ -6542,8 +6559,11 @@ impl HylkiApp {
         let container_height = event.bounds.size.height.as_f32();
         let max =
             (container_height - COMPOSE_SPLIT_READER_MIN_HEIGHT).max(COMPOSE_SPLIT_MIN_HEIGHT);
-        self.compose_split_height =
-            (pointer_y - container_top).clamp(COMPOSE_SPLIT_MIN_HEIGHT, max);
+        let next = (pointer_y - container_top).clamp(COMPOSE_SPLIT_MIN_HEIGHT, max);
+        if (next - self.compose_split_height).abs() < 0.01 {
+            return;
+        }
+        self.compose_split_height = next;
         cx.notify();
     }
 
@@ -7411,6 +7431,11 @@ impl HylkiApp {
         let bottom_y = event.bounds.bottom().as_f32();
         // 抽屉位于底部，总高度约为 bottom_y - pointer_y；减去标题与手柄高度（~48px）得到内容区高度。
         let body_h = (bottom_y - pointer_y - 48.0).clamp(DRAWER_MIN_HEIGHT, DRAWER_MAX_HEIGHT);
+        if !self.attachment_drawer_collapsed
+            && (body_h - self.attachment_drawer_height).abs() < 0.01
+        {
+            return;
+        }
         self.attachment_drawer_collapsed = false;
         self.attachment_drawer_height = body_h;
         cx.notify();
@@ -7529,9 +7554,18 @@ impl HylkiApp {
     pub(crate) fn retain_current_reader_text_states(&mut self) {
         let Some(detail) = self.selected_message.as_ref() else {
             self.reader_text_states.clear();
+            self.reader_body_cache.clear();
             return;
         };
         self.reader_text_states.retain(|id, _| {
+            !self.collapsed_thread_cards.contains(id)
+                && (*id == detail.id
+                    || detail
+                        .thread_messages
+                        .iter()
+                        .any(|message| message.id == *id))
+        });
+        self.reader_body_cache.retain(|id, _| {
             !self.collapsed_thread_cards.contains(id)
                 && (*id == detail.id
                     || detail
@@ -9094,7 +9128,11 @@ impl HylkiApp {
     fn on_sidebar_drag_move(&mut self, event: &DragMoveEvent<SidebarDrag>, cx: &mut Context<Self>) {
         let pointer_x = event.event.position.x.as_f32();
         let row_left = event.bounds.left().as_f32();
-        self.sidebar_width = (pointer_x - row_left).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        let next = (pointer_x - row_left).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        if (next - self.sidebar_width).abs() < 0.01 {
+            return;
+        }
+        self.sidebar_width = next;
         self.schedule_layout_save(cx);
         cx.notify();
     }
@@ -9107,8 +9145,12 @@ impl HylkiApp {
         let row_width = event.bounds.size.width.as_f32();
         let max_list =
             (row_width - self.sidebar_visual_width() - READER_MIN_WIDTH).max(LIST_MIN_WIDTH);
-        self.list_width =
+        let next =
             (pointer_x - row_left - self.sidebar_visual_width()).clamp(LIST_MIN_WIDTH, max_list);
+        if (next - self.list_width).abs() < 0.01 {
+            return;
+        }
+        self.list_width = next;
         // 原版迟滞：进入宽表格 ≥600，退出 <560，两侧留余量防拖拽抖动。
         self.list_wide = list_wide_next(self.list_wide, self.list_width);
         self.schedule_layout_save(cx);
@@ -9122,7 +9164,11 @@ impl HylkiApp {
         let row_top = event.bounds.top().as_f32();
         let row_height = event.bounds.size.height.as_f32();
         let max_list = (row_height - BELOW_PANE_MIN_HEIGHT).max(BELOW_LIST_MIN_HEIGHT);
-        self.list_below_height = (pointer_y - row_top).clamp(BELOW_LIST_MIN_HEIGHT, max_list);
+        let next = (pointer_y - row_top).clamp(BELOW_LIST_MIN_HEIGHT, max_list);
+        if (next - self.list_below_height).abs() < 0.01 {
+            return;
+        }
+        self.list_below_height = next;
         self.schedule_layout_save(cx);
         cx.notify();
     }
@@ -9406,6 +9452,13 @@ impl HylkiApp {
         let drag = event.drag(cx);
         let delta = event.event.position.x.as_f32() - drag.start_x;
         let next = (drag.start_width + delta).clamp(32.0, 500.0);
+        if self
+            .list_column_widths
+            .get(&drag.column)
+            .is_some_and(|prev| (next - *prev).abs() < 0.01)
+        {
+            return;
+        }
         self.list_column_widths.insert(drag.column, next);
         cx.notify();
     }

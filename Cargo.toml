@@ -31,3 +31,13 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
 url = "2"
+
+# Keep workspace incremental builds fast while optimizing heavy UI/layout/HTML
+# dependencies (gpui-kit, taffy, html5ever, etc.) so `cargo run` stays smooth.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -76,12 +76,6 @@ fn row_context_menu(
     row: Stateful<Div>,
     msg: &MessageSummary,
     draft: Option<LocalDraft>,
-    account_folders: Vec<(String, String)>,
-    all_account_folders: Vec<(u32, String, Vec<(String, String)>)>,
-    demo_mode: bool,
-    exporting_eml: bool,
-    in_trash_or_junk: bool,
-    inbox_path: Option<String>,
     cx: &mut Context<HylkiApp>,
 ) -> ContextMenu<Stateful<Div>> {
     let entity = cx.entity();
@@ -89,6 +83,7 @@ fn row_context_menu(
     let flagged = msg.flagged;
     let account_id = msg.account_id;
     let message_id = msg.id;
+    let folder_id = msg.folder_id;
     let uid = msg.uid;
     let folder_path = msg.folder_path.clone();
     let msg_tags = msg.tags.clone();
@@ -152,8 +147,50 @@ fn row_context_menu(
         let folder_path_for_source = folder_path.clone();
         let folder_path_for_eml = folder_path.clone();
         let current_folder_path = folder_path.clone();
-        let folders_for_move = account_folders.clone();
-        let all_folders_for_copy = all_account_folders.clone();
+        let (
+            demo_mode,
+            exporting_eml,
+            in_trash_or_junk,
+            inbox_path,
+            folders_for_move,
+            all_folders_for_copy,
+        ) = {
+            let app = entity.read(cx);
+            let account_folders: Vec<(String, String)> = app
+                .folders_by_account
+                .get(&account_id)
+                .map(|list| {
+                    list.iter()
+                        .map(|f| (f.name.clone(), f.path.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let all_account_folders: Vec<(u32, String, Vec<(String, String)>)> = app
+                .accounts
+                .iter()
+                .filter(|a| a.enabled)
+                .map(|a| {
+                    let folders = app
+                        .folders_by_account
+                        .get(&a.id)
+                        .map(|list| {
+                            list.iter()
+                                .map(|f| (f.name.clone(), f.path.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (a.id, app.account_label_for(a.id), folders)
+                })
+                .collect();
+            (
+                app.demo_mode,
+                app.pending_eml_export == Some(message_id),
+                app.folder_is_trash_or_junk(account_id, folder_id),
+                app.inbox_folder_path(account_id),
+                account_folders,
+                all_account_folders,
+            )
+        };
         let tags_for_menu = msg_tags.clone();
         let sender_for_contact = msg_sender.clone();
         let sender_for_filter = msg_sender.clone();
@@ -1375,48 +1412,7 @@ fn message_row(
             )
     };
 
-    let account_folders: Vec<(String, String)> = app
-        .folders_by_account
-        .get(&account_id)
-        .map(|list| {
-            list.iter()
-                .map(|f| (f.name.clone(), f.path.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let all_account_folders: Vec<(u32, String, Vec<(String, String)>)> = app
-        .accounts
-        .iter()
-        .filter(|a| a.enabled)
-        .map(|a| {
-            let folders = app
-                .folders_by_account
-                .get(&a.id)
-                .map(|list| {
-                    list.iter()
-                        .map(|f| (f.name.clone(), f.path.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            (a.id, app.account_label_for(a.id), folders)
-        })
-        .collect();
-    // B-2：导出进行中状态与回收站 / 垃圾邮件文件夹语义。
-    let exporting_eml = app.pending_eml_export == Some(msg.id);
-    let in_trash_or_junk = app.folder_is_trash_or_junk(account_id, msg.folder_id);
-    let inbox_path = app.inbox_folder_path(account_id);
-    row_context_menu(
-        row,
-        msg,
-        draft,
-        account_folders,
-        all_account_folders,
-        app.demo_mode,
-        exporting_eml,
-        in_trash_or_junk,
-        inbox_path,
-        cx,
-    )
+    row_context_menu(row, msg, draft, cx)
 }
 
 /// 渲染中栏。

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use gpui_kit::{
     div, hsla, img, px, white, Div, FontWeight, Hsla, Image, ImageFormat, ObjectFit, ParentElement,
@@ -93,6 +93,59 @@ type AvatarImageCache = HashMap<PathBuf, (u64, Arc<Image>)>;
 fn avatar_image_cache() -> &'static Mutex<AvatarImageCache> {
     static CACHE: OnceLock<Mutex<AvatarImageCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct CachedSenderAvatar {
+    checked_at: Instant,
+    image: Option<Arc<Image>>,
+}
+
+const SENDER_AVATAR_CACHE_TTL: Duration = Duration::from_secs(10);
+const SENDER_AVATAR_CACHE_MAX_ENTRIES: usize = 2048;
+
+fn sender_avatar_cache() -> &'static Mutex<HashMap<(PathBuf, String), CachedSenderAvatar>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), CachedSenderAvatar>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 解析发送者缓存头像（BIMI / Gravatar），使用短 TTL 内存缓存避免每次重绘做磁盘 stat / 读取和重复构建 Image。
+fn cached_sender_avatar_image(email: &str) -> Option<Arc<Image>> {
+    let data_dir = config::data_dir();
+    let key = (data_dir.clone(), email.to_ascii_lowercase());
+    let now = Instant::now();
+
+    if let Ok(cache) = sender_avatar_cache().lock() {
+        if let Some(entry) = cache.get(&key) {
+            if now.duration_since(entry.checked_at) < SENDER_AVATAR_CACHE_TTL {
+                return entry.image.clone();
+            }
+        }
+    }
+
+    let resolved =
+        kitemail_mail_core::avatar::cached_avatar_path(&data_dir, email).and_then(|cached_path| {
+            let format = image_format_for_path(&cached_path)?;
+            let bytes = std::fs::read(&cached_path).ok()?;
+            Some(Arc::new(Image::from_bytes(format, bytes)))
+        });
+
+    if let Ok(mut cache) = sender_avatar_cache().lock() {
+        if cache.len() >= SENDER_AVATAR_CACHE_MAX_ENTRIES {
+            cache.retain(|_, v| now.duration_since(v.checked_at) < SENDER_AVATAR_CACHE_TTL);
+            if cache.len() >= SENDER_AVATAR_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key,
+            CachedSenderAvatar {
+                checked_at: now,
+                image: resolved.clone(),
+            },
+        );
+    }
+
+    resolved
 }
 
 fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
@@ -241,24 +294,16 @@ pub fn sender_initials(name: &str) -> String {
 pub fn avatar(name: &str, email: &str, size: f32) -> Div {
     let trimmed_email = email.trim();
     if !trimmed_email.is_empty() {
-        let data_dir = config::data_dir();
-        if let Some(cached_path) =
-            kitemail_mail_core::avatar::cached_avatar_path(&data_dir, trimmed_email)
-        {
-            if let Some(format) = image_format_for_path(&cached_path) {
-                if let Ok(bytes) = std::fs::read(&cached_path) {
-                    let image = Arc::new(Image::from_bytes(format, bytes));
-                    return div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .overflow_hidden()
-                        .size(px(size))
-                        .child(img(image).size_full().object_fit(ObjectFit::Cover));
-                }
-            }
+        if let Some(image) = cached_sender_avatar_image(trimmed_email) {
+            return div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .rounded_full()
+                .overflow_hidden()
+                .size(px(size))
+                .child(img(image).size_full().object_fit(ObjectFit::Cover));
         }
         if let Some(brand) = kitemail_mail_core::avatar::lookup_builtin_brand(trimmed_email) {
             let bg = parse_hex_color(brand.color).unwrap_or_else(|| avatar_bg_color(trimmed_email));

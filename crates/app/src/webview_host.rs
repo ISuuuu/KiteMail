@@ -289,6 +289,7 @@ struct State {
     bridge_script_version: u64,
     notifier: Option<futures_mpsc::Sender<()>>,
     in_thread: bool,
+    clip_rect: RECT,
     bounds: RECT,
     visible: bool,
     has_area: bool,
@@ -722,6 +723,10 @@ impl WebViewHost {
         let has_area = result.is_some();
         let (clip, bounds) = result.unwrap_or_default();
         let mut state = self.0.borrow_mut();
+        let prev_has_area = state.has_area;
+        let clip_changed = has_area && (!prev_has_area || state.clip_rect != clip);
+        let bounds_changed = state.bounds != bounds || (has_area && !prev_has_area);
+        state.clip_rect = clip;
         state.bounds = bounds;
         state.has_area = has_area;
         let controller = state.controller.clone();
@@ -731,7 +736,7 @@ impl WebViewHost {
         state.window_shown = visible;
         drop(state);
         unsafe {
-            if has_area {
+            if clip_changed {
                 let _ = SetWindowPos(
                     clip_window,
                     None,
@@ -751,7 +756,9 @@ impl WebViewHost {
         }
         if let Some(controller) = controller {
             unsafe {
-                let _ = controller.SetBounds(bounds);
+                if bounds_changed {
+                    let _ = controller.SetBounds(bounds);
+                }
                 if visibility_changed {
                     let _ = controller.SetIsVisible(visible);
                 }

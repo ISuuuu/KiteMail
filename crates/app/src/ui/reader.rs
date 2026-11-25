@@ -487,6 +487,7 @@ fn render_message_card(
     // 决定原生富文本渲染内容：有 HTML 且未切纯文本模式时渲染净化后的 HTML，
     // 否则将纯文本安全转义后通过 TextView::new(&state) 渲染，
     // 并拆出历史引用块以支持默认折叠（`⋯ 显示引用内容 (N 行)`）。
+    let body_view_is_native = body_view == BodyView::Native;
     let (main_html, quoted_part, blocked_images): (String, Option<(String, usize)>, usize) =
         if show_raw_source {
             let raw = format_raw_source(
@@ -500,18 +501,42 @@ fn render_message_card(
                 body_html,
             );
             (plain_text_to_html(&raw), None, 0)
-        } else if !prefer_plain {
-            if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
-                let (sanitized, blocked) = sanitize_html_for_display_with_options(
-                    raw_html,
-                    block_remote_images,
-                    clean_links,
-                );
-                if body_view == BodyView::Native {
-                    let split = split_quoted_html(&sanitized);
-                    (split.main, split.quoted, blocked)
+        } else if let Some(cached) = app.reader_body_cache.get(&msg_id).filter(|c| {
+            c.body_view_is_native == body_view_is_native
+                && c.prefer_plain == prefer_plain
+                && c.block_remote_images == block_remote_images
+                && c.clean_links == clean_links
+                && c.raw_html.as_deref() == body_html
+                && c.body_text == body_text
+        }) {
+            (
+                cached.main_html.clone(),
+                cached.quoted_part.clone(),
+                cached.blocked_images,
+            )
+        } else {
+            let computed = if !prefer_plain {
+                if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
+                    let (sanitized, blocked) = sanitize_html_for_display_with_options(
+                        raw_html,
+                        block_remote_images,
+                        clean_links,
+                    );
+                    if body_view_is_native {
+                        let split = split_quoted_html(&sanitized);
+                        (split.main, split.quoted, blocked)
+                    } else {
+                        (String::new(), None, blocked)
+                    }
                 } else {
-                    (String::new(), None, blocked)
+                    let split = split_quoted_plain(body_text);
+                    (
+                        plain_text_to_html(&split.main),
+                        split
+                            .quoted
+                            .map(|(q, lines)| (plain_text_to_html(&q), lines)),
+                        0,
+                    )
                 }
             } else {
                 let split = split_quoted_plain(body_text);
@@ -522,16 +547,22 @@ fn render_message_card(
                         .map(|(q, lines)| (plain_text_to_html(&q), lines)),
                     0,
                 )
-            }
-        } else {
-            let split = split_quoted_plain(body_text);
-            (
-                plain_text_to_html(&split.main),
-                split
-                    .quoted
-                    .map(|(q, lines)| (plain_text_to_html(&q), lines)),
-                0,
-            )
+            };
+            app.reader_body_cache.insert(
+                msg_id,
+                crate::app::CachedReaderBody {
+                    body_view_is_native,
+                    prefer_plain,
+                    block_remote_images,
+                    clean_links,
+                    raw_html: body_html.map(str::to_string),
+                    body_text: body_text.to_string(),
+                    main_html: computed.0.clone(),
+                    quoted_part: computed.1.clone(),
+                    blocked_images: computed.2,
+                },
+            );
+            computed
         };
     let text_state: Option<Entity<TextViewState>> = if body_view != BodyView::Native {
         app.reader_text_states.remove(&msg_id);
