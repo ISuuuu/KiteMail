@@ -95,7 +95,10 @@ pub struct MessageSummary {
     /// 收件人（B-6：已发送 / 草稿视图列表行显示「致：…」）。
     #[serde(default)]
     pub recipients: String,
-    /// 同一会话（按归一化主题聚合）的邮件总数，`> 1` 时列表行显示计数胶囊（B-4）。
+    /// 同一会话的邮件总数，`> 1` 时列表行显示计数胶囊（B-4）。
+    /// 与阅读器 [`MessageDetail::thread_messages`] 采用一致的归并规则：
+    /// 优先按 RFC 头 / Graph `conversationId` 关联，无回复头且无跨邮件引用时再按归一化主题回退；
+    /// 锚点不在回收站/垃圾邮件时排除这些文件夹，对跨文件夹副本去重，上限 40。
     #[serde(default)]
     pub thread_count: u32,
     /// 邮件重要性：`0` 普通、`1` 高优先级、`-1` 低优先级。
