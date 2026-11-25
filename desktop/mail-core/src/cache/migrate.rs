@@ -547,10 +547,11 @@ fn migrate_global_tables(old: &Connection, global: &mut GlobalDb) -> Result<(), 
         let send_at = opt_col_expr(old, "outbox", "send_at", "NULL");
         let from_addr = opt_col_expr(old, "outbox", "from_addr", "''");
         let reply_to = opt_col_expr(old, "outbox", "reply_to", "''");
+        let body_format = opt_col_expr(old, "outbox", "body_format", "''");
         let body_html = opt_col_expr(old, "outbox", "body_html", "NULL");
         let mut stmt = old
             .prepare(&format!(
-                "SELECT id, account_id, to_addr, {cc}, {bcc}, subject, body_text, in_reply_to, {from_addr}, {reply_to}, {body_html}, attachment_paths_json, status, last_error, created_at, {send_at} FROM outbox"
+                "SELECT id, account_id, to_addr, {cc}, {bcc}, subject, body_text, in_reply_to, {from_addr}, {reply_to}, {body_format}, {body_html}, attachment_paths_json, status, last_error, created_at, {send_at} FROM outbox"
             ))
             .map_err(|e| format!("读取旧发件箱失败: {e}"))?;
         let rows = stmt
@@ -566,12 +567,13 @@ fn migrate_global_tables(old: &Connection, global: &mut GlobalDb) -> Result<(), 
                     r.get::<_, String>(7)?,
                     r.get::<_, String>(8)?,
                     r.get::<_, String>(9)?,
-                    r.get::<_, Option<String>>(10)?,
-                    r.get::<_, String>(11)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, Option<String>>(11)?,
                     r.get::<_, String>(12)?,
                     r.get::<_, String>(13)?,
-                    r.get::<_, i64>(14)?,
-                    r.get::<_, Option<i64>>(15)?,
+                    r.get::<_, String>(14)?,
+                    r.get::<_, i64>(15)?,
+                    r.get::<_, Option<i64>>(16)?,
                 ))
             })
             .map_err(|e| format!("遍历旧发件箱失败: {e}"))?;
@@ -587,6 +589,7 @@ fn migrate_global_tables(old: &Connection, global: &mut GlobalDb) -> Result<(), 
                 irt,
                 from_a,
                 rto,
+                fmt,
                 html,
                 paths,
                 st,
@@ -595,9 +598,9 @@ fn migrate_global_tables(old: &Connection, global: &mut GlobalDb) -> Result<(), 
                 send_at,
             ) = row.map_err(|e| format!("解析旧发件箱失败: {e}"))?;
             tx.execute(
-                "INSERT OR REPLACE INTO outbox (id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, body_html, attachment_paths_json, status, last_error, created_at, send_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                params![id, acc, to_a, cc_a, bcc_a, subj, body, irt, from_a, rto, html, paths, st, err, created, send_at],
+                "INSERT OR REPLACE INTO outbox (id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, body_format, body_html, attachment_paths_json, status, last_error, created_at, send_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![id, acc, to_a, cc_a, bcc_a, subj, body, irt, from_a, rto, fmt, html, paths, st, err, created, send_at],
             )
             .map_err(|e| format!("迁移发件箱失败: {e}"))?;
         }

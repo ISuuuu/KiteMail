@@ -27,6 +27,7 @@ use hylki_mail_core::{format_message_datetime, MessageDetail};
 
 use crate::app::{split_sender, HylkiApp, PopoutReplyKind};
 use crate::theme;
+use crate::ui::toast::{self, ToastAction, ToastActionKind, ToastKind, WindowToastQueue};
 use crate::ui::{avatar, print_preview, reader, window_controls};
 use crate::webview_host::{
     build_body_document, supports_document, BodyView, DocumentAppearance, WebViewHost,
@@ -48,7 +49,7 @@ pub(crate) struct MessageWindow {
     print_preview: Option<print_preview::PrintPreviewState>,
     webview: Option<Rc<WebViewHost>>,
     webview_appearance: Option<(DocumentAppearance, bool)>,
-    status_notice: Option<SharedString>,
+    toasts: WindowToastQueue,
     last_rem_scale: u32,
 }
 
@@ -177,9 +178,33 @@ impl MessageWindow {
             print_preview: None,
             webview: None,
             webview_appearance: None,
-            status_notice: None,
+            toasts: WindowToastQueue::default(),
             last_rem_scale: initial_scale,
         }
+    }
+
+    fn push_toast(
+        &mut self,
+        key: impl Into<String>,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
+        self.toasts.push_transient(key, kind, message, action);
+        if let Some(deadline) = self.toasts.next_expiry() {
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |win, cx| {
+                    if win.toasts.prune_expired(std::time::Instant::now()) {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -486,10 +511,17 @@ impl Render for MessageWindow {
                                 if started {
                                     window.remove_window();
                                 } else {
-                                    this.status_notice = Some(SharedString::from(
-                                        "当前写信尚未完成，请先发送、存草稿或取消",
-                                    ));
-                                    cx.notify();
+                                    this.push_toast(
+                                        "popout-compose-busy",
+                                        ToastKind::Warning,
+                                        "当前已有正在编辑的邮件，请先完成或保存后再回复",
+                                        Some(ToastAction {
+                                            label: "回到当前草稿".into(),
+                                            primary: true,
+                                            kind: ToastActionKind::FocusActiveCompose,
+                                        }),
+                                        cx,
+                                    );
                                 }
                             })),
                     )
@@ -514,10 +546,17 @@ impl Render for MessageWindow {
                                 if started {
                                     window.remove_window();
                                 } else {
-                                    this.status_notice = Some(SharedString::from(
-                                        "当前写信尚未完成，请先发送、存草稿或取消",
-                                    ));
-                                    cx.notify();
+                                    this.push_toast(
+                                        "popout-compose-busy",
+                                        ToastKind::Warning,
+                                        "当前已有正在编辑的邮件，请先完成或保存后再回复",
+                                        Some(ToastAction {
+                                            label: "回到当前草稿".into(),
+                                            primary: true,
+                                            kind: ToastActionKind::FocusActiveCompose,
+                                        }),
+                                        cx,
+                                    );
                                 }
                             })),
                     )
@@ -542,10 +581,17 @@ impl Render for MessageWindow {
                                 if started {
                                     window.remove_window();
                                 } else {
-                                    this.status_notice = Some(SharedString::from(
-                                        "当前写信尚未完成，请先发送、存草稿或取消",
-                                    ));
-                                    cx.notify();
+                                    this.push_toast(
+                                        "popout-compose-busy",
+                                        ToastKind::Warning,
+                                        "当前已有正在编辑的邮件，请先完成或保存后再回复",
+                                        Some(ToastAction {
+                                            label: "回到当前草稿".into(),
+                                            primary: true,
+                                            kind: ToastActionKind::FocusActiveCompose,
+                                        }),
+                                        cx,
+                                    );
                                 }
                             })),
                     )
@@ -618,31 +664,6 @@ impl Render for MessageWindow {
                     )
                     .child(win_controls),
             )
-            .when_some(self.status_notice.as_ref(), |root, notice| {
-                root.child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .px_4()
-                        .py_1p5()
-                        .gap_2()
-                        .items_center()
-                        .justify_between()
-                        .bg(p.accent_soft())
-                        .border_b_1()
-                        .border_color(border)
-                        .child(div().text_xs().text_color(p.text).child(notice.clone()))
-                        .child(
-                            Button::new("popout-notice-close")
-                                .ghost()
-                                .compact()
-                                .icon(IconName::X)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.status_notice = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            })
             // 页内查找条。
             .when(self.find_open, |root| {
                 let match_text = if self.find_query.trim().is_empty() {
@@ -1037,6 +1058,47 @@ impl Render for MessageWindow {
                                 }),
                         ),
                 )
+            })
+            .child({
+                // 固定底部 GPUI 反馈区：确保 WebView2 视口始终止于此区上方，Toast 可见可点击且不改变正文高度。
+                let strip_h = toast::feedback_strip_height(self.prefs.ui_text_scale_percent);
+                let visible = self.toasts.visible();
+                let entity_act = cx.entity();
+                let entity_dis = cx.entity();
+                let app_act = self.app_entity.clone();
+                let cards = toast::render_toast_stack(
+                    &visible,
+                    false,
+                    &p,
+                    move |kind, key, window, cx| {
+                        let _ = entity_act.update(cx, |win, cx| {
+                            win.toasts.dismiss_by_key(&key);
+                            if matches!(kind, ToastActionKind::FocusActiveCompose) {
+                                let _ = app_act.update(cx, |app, cx| {
+                                    app.focus_active_compose_window(window, cx);
+                                });
+                            }
+                            cx.notify();
+                        });
+                    },
+                    move |key, _, cx| {
+                        let _ = entity_dis.update(cx, |win, cx| {
+                            win.toasts.dismiss_by_key(&key);
+                            cx.notify();
+                        });
+                    },
+                );
+                h_flex()
+                    .h(px(strip_h))
+                    .flex_shrink_0()
+                    .w_full()
+                    .px_4()
+                    .items_center()
+                    .justify_center()
+                    .bg(canvas)
+                    .when(!cards.is_empty(), |strip| {
+                        strip.child(v_flex().gap_1().items_center().children(cards))
+                    })
             })
     }
 }

@@ -484,6 +484,7 @@ fn enqueue_and_draft_handoff_are_atomic() {
             "ref",
             "Me <me@example.com>",
             "replies@example.com",
+            "rich",
             None,
             &["file".into()],
             10,
@@ -508,7 +509,8 @@ fn enqueue_and_draft_handoff_are_atomic() {
             "ref",
             "Me <me@example.com>",
             "replies@example.com",
-            None,
+            "markdown",
+            Some("<p>body</p>"),
             &["file".into()],
             10,
             Some(20),
@@ -520,6 +522,8 @@ fn enqueue_and_draft_handoff_are_atomic() {
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].from_addr, "Me <me@example.com>");
     assert_eq!(outbox[0].reply_to, "replies@example.com");
+    assert_eq!(outbox[0].body_format, "markdown");
+    assert_eq!(outbox[0].send_at, Some(20));
 }
 
 #[test]
@@ -583,29 +587,103 @@ fn undo_rolls_back_when_draft_write_fails() {
 }
 
 #[test]
-fn quit_expiry_only_changes_queued_records() {
+fn undo_outbox_preserves_all_body_formats_and_legacy_fallback() {
     let mut cache = CacheStore::open_in_memory().unwrap();
-    let q = cache
-        .enqueue_outbox(1, "to", "", "", "", "", "", &[], 10, Some(100))
+    for fmt in ["rich", "markdown", "html", "plain", ""] {
+        let id = cache
+            .enqueue_outbox_from_draft(
+                1,
+                "to@example.com",
+                "",
+                "",
+                "主题",
+                "正文",
+                "",
+                "",
+                "",
+                fmt,
+                None,
+                &[],
+                10,
+                Some(100),
+                None,
+            )
+            .unwrap();
+        let draft_id = cache.undo_queued_outbox(1, id).unwrap().unwrap();
+        let draft = cache.load_draft(draft_id).unwrap().unwrap();
+        assert_eq!(draft.body_format, fmt);
+    }
+}
+
+#[test]
+fn quit_preserves_queued_send_at_for_undo_and_scheduled_items() {
+    let dir = std::env::temp_dir().join(format!(
+        "hylki-quit-preserve-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut cache = CacheStore::open_for_data_dir(&dir).unwrap();
+    let now = 1_700_000_000i64;
+    let undo_due = now + 5;
+    let scheduled_due = now + 3600;
+    let undo_id = cache
+        .enqueue_outbox(
+            1,
+            "undo@x.com",
+            "",
+            "",
+            "缓冲",
+            "正文",
+            "",
+            &[],
+            now,
+            Some(undo_due),
+        )
         .unwrap();
-    let f = cache
-        .enqueue_outbox(1, "to", "", "", "", "", "", &[], 10, Some(100))
+    let sched_id = cache
+        .enqueue_outbox(
+            1,
+            "sched@x.com",
+            "",
+            "",
+            "定时",
+            "正文",
+            "",
+            &[],
+            now,
+            Some(scheduled_due),
+        )
         .unwrap();
-    cache
-        .update_outbox_status(f, OutboxStatus::Failed, "error")
-        .unwrap();
-    cache.expire_queued_outbox().unwrap();
-    assert_eq!(cache.list_due_queued_ids(None, 10).unwrap(), vec![(1, q)]);
+    drop(cache);
+
+    let worker = crate::worker::MailWorkerHandle::spawn(dir.clone()).unwrap();
+    worker.prepare_quit_now().unwrap();
+    drop(worker);
+
+    let reopened = CacheStore::open_for_data_dir_existing(&dir).unwrap();
+    let items = reopened.list_outbox(1).unwrap();
     assert_eq!(
-        cache
-            .list_outbox(1)
-            .unwrap()
-            .iter()
-            .find(|i| i.id == f)
-            .unwrap()
-            .last_error,
-        "error"
+        items.iter().find(|i| i.id == undo_id).unwrap().send_at,
+        Some(undo_due)
     );
+    assert_eq!(
+        items.iter().find(|i| i.id == sched_id).unwrap().send_at,
+        Some(scheduled_due)
+    );
+    // 早于缓冲截止时刻重启：两者都不应被提前领取。
+    assert!(reopened
+        .list_due_queued_ids(None, now + 3)
+        .unwrap()
+        .is_empty());
+    // 晚于缓冲截止时刻重启：仅缓冲件到期，定时件仍保留计划时间。
+    assert_eq!(
+        reopened.list_due_queued_ids(None, undo_due).unwrap(),
+        vec![(1, undo_id)]
+    );
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

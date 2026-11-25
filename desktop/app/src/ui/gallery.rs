@@ -174,12 +174,19 @@ impl GallerySortColumn {
     }
 }
 
+#[derive(Clone, Debug)]
+enum GalleryPreviewStatus {
+    Loading,
+    Loaded(ImageFormat, Vec<u8>),
+    Unsupported,
+    Failed(SharedString),
+}
+
 /// F-6 图片预览浮层状态。
 struct GalleryPreview {
     attachment_id: u32,
     filename: String,
-    /// 已加载的图片字节（格式 + 原始字节）；`None` 表示未加载或无法渲染。
-    image: Option<(ImageFormat, Vec<u8>)>,
+    status: GalleryPreviewStatus,
 }
 
 /// 附件总览事件：由集成者订阅并转换为缓存查询 / 文件保存 / 视图跳转。
@@ -231,6 +238,9 @@ pub struct GalleryState {
     accounts: Vec<(u32, String)>,
     /// 集成者注入的附件列表。
     items: Vec<CachedAttachment>,
+    demo_mode: bool,
+    saving_ids: HashSet<u32>,
+    item_errors: HashMap<u32, SharedString>,
 }
 
 impl EventEmitter<GalleryEvent> for GalleryState {}
@@ -265,7 +275,35 @@ impl GalleryState {
             requested_thumbnails: HashSet::new(),
             accounts: Vec::new(),
             items: Vec::new(),
+            demo_mode: false,
+            saving_ids: HashSet::new(),
+            item_errors: HashMap::new(),
         }
+    }
+
+    pub fn set_demo_mode(&mut self, demo: bool) {
+        self.demo_mode = demo;
+    }
+
+    pub fn set_saving(&mut self, attachment_id: u32, saving: bool) {
+        if saving {
+            self.saving_ids.insert(attachment_id);
+            self.item_errors.remove(&attachment_id);
+        } else {
+            self.saving_ids.remove(&attachment_id);
+        }
+    }
+
+    pub fn set_item_error(&mut self, attachment_id: u32, error: impl Into<SharedString>) {
+        self.saving_ids.remove(&attachment_id);
+        self.item_errors.insert(attachment_id, error.into());
+    }
+
+    pub fn dismiss_overlay(&mut self) -> bool {
+        if self.preview.take().is_some() || std::mem::take(&mut self.folders_popover_open) {
+            return true;
+        }
+        false
     }
 
     /// 注入附件数据（集成者在收到缓存查询结果后调用）。
@@ -301,29 +339,47 @@ impl GalleryState {
         }
     }
 
-    /// F-6 回填图片预览字节：MIME 非图片或字节为空时保持占位态。
+    /// F-6 回填图片预览字节：MIME 非图片或字节为空时标明对应状态。
     pub fn set_preview_image(&mut self, filename: &str, mime_type: &str, bytes: Vec<u8>) {
         let format = image_format_for_mime(mime_type);
-        let preview = self.preview.as_mut();
-        if let Some(preview) = preview {
+        if let Some(preview) = self.preview.as_mut() {
             preview.filename = filename.to_string();
-            let img_opt = format
-                .filter(|_| !bytes.is_empty())
-                .map(|f| (f, bytes.clone()));
-            if let Some((fmt, raw)) = img_opt.as_ref() {
-                self.thumbnails.insert(
-                    preview.attachment_id,
-                    Arc::new(gpui_kit::Image::from_bytes(*fmt, raw.clone())),
-                );
-            }
-            preview.image = img_opt;
+            preview.status = match format {
+                None => GalleryPreviewStatus::Unsupported,
+                Some(_) if bytes.is_empty() => {
+                    GalleryPreviewStatus::Failed(SharedString::from("图片数据为空"))
+                }
+                Some(fmt) => {
+                    self.thumbnails.insert(
+                        preview.attachment_id,
+                        Arc::new(gpui_kit::Image::from_bytes(fmt, bytes.clone())),
+                    );
+                    GalleryPreviewStatus::Loaded(fmt, bytes)
+                }
+            };
         }
     }
 
     /// F-6 预览字节不可用（demo / 抓取失败）：显示占位说明。
     pub fn set_preview_unavailable(&mut self) {
         if let Some(preview) = self.preview.as_mut() {
-            preview.image = None;
+            preview.status = if self.demo_mode {
+                GalleryPreviewStatus::Unsupported
+            } else {
+                GalleryPreviewStatus::Failed(SharedString::from(
+                    "未能加载图片数据，请重试或打开所在邮件",
+                ))
+            };
+        }
+    }
+
+    pub fn set_preview_failed(&mut self, attachment_id: u32, reason: impl Into<SharedString>) {
+        if let Some(preview) = self
+            .preview
+            .as_mut()
+            .filter(|p| p.attachment_id == attachment_id)
+        {
+            preview.status = GalleryPreviewStatus::Failed(reason.into());
         }
     }
 
@@ -739,9 +795,8 @@ impl Render for GalleryState {
                 .find(|item| item.id == preview.attachment_id)
                 .map(|item| item.message_id);
             let filename = preview.filename.clone();
-            let image = preview.image.clone().map(|(format, bytes)| {
-                std::sync::Arc::new(gpui_kit::Image::from_bytes(format, bytes))
-            });
+            let attachment_id_for_retry = preview.attachment_id;
+            let status = preview.status.clone();
             div()
                 .absolute()
                 .top(px(0.0))
@@ -795,15 +850,18 @@ impl Render for GalleryState {
                                             })),
                                     ),
                             )
-                            .child(if let Some(image) = image {
-                                img(image)
-                                    .object_fit(ObjectFit::Contain)
-                                    .flex_1()
-                                    .min_h_0()
-                                    .rounded(px(6.0))
-                                    .into_any_element()
-                            } else {
-                                v_flex()
+                            .child(match status {
+                                GalleryPreviewStatus::Loaded(format, bytes) => {
+                                    let image =
+                                        std::sync::Arc::new(gpui_kit::Image::from_bytes(format, bytes));
+                                    img(image)
+                                        .object_fit(ObjectFit::Contain)
+                                        .flex_1()
+                                        .min_h_0()
+                                        .rounded(px(6.0))
+                                        .into_any_element()
+                                }
+                                GalleryPreviewStatus::Loading => v_flex()
                                     .items_center()
                                     .justify_center()
                                     .gap_2()
@@ -817,7 +875,24 @@ impl Render for GalleryState {
                                         div()
                                             .text_xs()
                                             .text_color(muted_fg)
-                                            .child("未能加载图片数据（演示模式或缓存不完整）"),
+                                            .child("正在加载图片预览…"),
+                                    )
+                                    .into_any_element(),
+                                GalleryPreviewStatus::Unsupported => v_flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .py_8()
+                                    .child(
+                                        Icon::new(IconName::Image)
+                                            .with_size(px(32.0))
+                                            .text_color(muted_fg),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child("当前格式或演示模式暂不支持内联预览"),
                                     )
                                     .when_some(message_id, |el, msg_id| {
                                         el.child(
@@ -832,7 +907,60 @@ impl Render for GalleryState {
                                                 })),
                                         )
                                     })
-                                    .into_any_element()
+                                    .into_any_element(),
+                                GalleryPreviewStatus::Failed(reason) => v_flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .py_8()
+                                    .child(
+                                        Icon::new(IconName::TriangleAlert)
+                                            .with_size(px(28.0))
+                                            .text_color(p.danger),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(p.danger)
+                                            .child(reason),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .when(!self.demo_mode, |row| {
+                                                row.child(
+                                                    Button::new("gallery-preview-retry")
+                                                        .primary()
+                                                        .compact()
+                                                        .label("重试")
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            if let Some(ref mut pr) = this.preview {
+                                                                pr.status = GalleryPreviewStatus::Loading;
+                                                            }
+                                                            cx.emit(GalleryEvent::PreviewImage(
+                                                                attachment_id_for_retry,
+                                                            ));
+                                                            cx.notify();
+                                                        })),
+                                                )
+                                            })
+                                            .when_some(message_id, |row, msg_id| {
+                                                row.child(
+                                                    Button::new("gallery-preview-locate")
+                                                        .outline()
+                                                        .compact()
+                                                        .label("打开所在邮件")
+                                                        .icon(IconName::ExternalLink)
+                                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                                            cx.emit(GalleryEvent::LocateMessage(
+                                                                msg_id,
+                                                            ));
+                                                            cx.notify();
+                                                        })),
+                                                )
+                                            }),
+                                    )
+                                    .into_any_element(),
                             }),
                     ),
                 )
@@ -982,11 +1110,11 @@ impl Render for GalleryState {
                                     .justify_between()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if is_image {
-                                            // F-6：先打开占位浮层，字节回传后显示大图。
+                                            // F-6：先进入加载中，字节回传后显示大图或失败重试。
                                             this.preview = Some(GalleryPreview {
                                                 attachment_id,
                                                 filename: preview_filename.clone(),
-                                                image: None,
+                                                status: GalleryPreviewStatus::Loading,
                                             });
                                             cx.emit(GalleryEvent::PreviewImage(attachment_id));
                                         } else {

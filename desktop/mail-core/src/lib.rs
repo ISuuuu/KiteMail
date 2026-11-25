@@ -359,11 +359,15 @@ pub struct OutboxItem {
     pub from_addr: String,
     /// `Reply-To` 行；空表示不写该信头。
     pub reply_to: String,
+    /// 正文格式（`ComposeFormat::as_str`）；空表示历史默认富文本。
+    pub body_format: String,
     /// 投递用的 HTML 正文（`Some` 时发 multipart/alternative）。
     pub body_html: Option<String>,
     pub attachment_paths: Vec<String>,
     pub status: OutboxStatus,
     pub last_error: String,
+    /// 持久化投递截止 UTC 时间戳（秒）；`None` 表示立即发送。
+    pub send_at: Option<i64>,
 }
 
 /// Unified cross-account views backed by dedicated cache queries.
@@ -595,6 +599,22 @@ pub fn date_group_label(date_ts: i64, now_ts: i64) -> &'static str {
     }
 }
 
+/// 发送时机语义（立即发送 / 撤销缓冲秒数 / 用户选定的定时发送 UTC 秒级时间戳）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendTiming {
+    Immediate,
+    DelaySecs(u8),
+    ScheduledAt(i64),
+}
+
+/// 撤销排队发件箱记录的事务结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UndoOutboxOutcome {
+    Restored { draft_id: u32, draft: LocalDraft },
+    AlreadySending,
+    NotFound,
+}
+
 /// Commands sent from the GPUI frontend to the mail worker.
 #[derive(Clone, Debug)]
 pub enum MailRequest {
@@ -618,14 +638,18 @@ pub enum MailRequest {
         account_id: u32,
     },
     LoadAllCached,
-    SyncAllAccounts,
+    SyncAllAccounts {
+        user_initiated: bool,
+    },
     SyncAccount {
         account_id: u32,
+        user_initiated: bool,
     },
     SyncFolder {
         account_id: u32,
         folder_id: u32,
         folder_path: String,
+        user_initiated: bool,
     },
     LoadUnifiedInbox {
         query: String,
@@ -749,11 +773,10 @@ pub enum MailRequest {
         account_id: u32,
         draft: ComposeDraft,
         local_draft_id: Option<u32>,
-        /// 撤销发送客户端令牌（`send_at` 为 `Some` 时用于 `OutboxEnqueued` 回执匹配）。
+        /// 撤销发送 / 入队追踪令牌（用于 `OutboxEnqueued` / `OutboxEnqueueFailed` 回执匹配）。
         undo_token: u64,
-        /// `Some(延迟秒数)` = 仅入队不投递（撤销发送缓冲，到期后由启动恢复 /
-        /// 重新启用账号 / 显式重试投递）；`None` = 入队后立即投递。
-        send_at: Option<i64>,
+        /// 发送时机（立即 / 缓冲秒数 / 定时发送绝对 UTC 时间戳）。
+        timing: SendTiming,
     },
     RetryOutboxItem {
         account_id: u32,
@@ -961,7 +984,9 @@ pub enum WorkerEvent {
     },
     OutboxUndoResult {
         token: u64,
-        result: Result<Option<u32>, String>,
+        account_id: u32,
+        outbox_id: u32,
+        result: Result<UndoOutboxOutcome, String>,
     },
     OutboxEnqueueFailed {
         token: u64,
@@ -972,6 +997,10 @@ pub enum WorkerEvent {
         token: u64,
         account_id: u32,
         outbox_id: u32,
+        /// 实际持久化的 UTC 到期时间戳（秒）；立即发送为 `None`。
+        send_at: Option<i64>,
+        /// 是否属于用户定时发送（与短时撤销缓冲区分）。
+        scheduled: bool,
     },
     /// Microsoft OAuth 重授权返回了与编辑中账号不一致的邮箱：保留原账号、凭据与
     /// 缓存完全不动，提示用户重新选择原邮箱授权或通过「添加账号」流程接入新邮箱。
@@ -987,7 +1016,51 @@ pub enum WorkerEvent {
     },
     DraftSent {
         account_id: u32,
+        outbox_id: u32,
         subject: String,
+    },
+    /// 邮件已由服务端接收，但保存到 IMAP「已发送」文件夹失败。
+    SentCopySaveFailed {
+        account_id: u32,
+        outbox_id: u32,
+        subject: String,
+        message: String,
+    },
+    /// 发件箱记录投递失败或结果待确认（替代通用 Error 避免重复提示）。
+    OutboxDeliveryFailed {
+        account_id: u32,
+        outbox_id: u32,
+        status: OutboxStatus,
+        subject: String,
+        message: String,
+    },
+    /// 文件夹同步/打开失败或已在服务端移除（含 `[NONEXISTENT]` 与 404）。
+    FolderSyncFailed {
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+        folder_name: String,
+        user_initiated: bool,
+        removed_from_server: bool,
+        message: String,
+    },
+    /// 单账号同步结束，携带未成功同步的文件夹详情，避免笼统报「同步完成」。
+    AccountSyncFinished {
+        account_id: u32,
+        user_initiated: bool,
+        failed_folders: Vec<(String, String)>,
+    },
+    /// 正文远程抓取失败（与选中邮件匹配，不清理无关待处理状态）。
+    MessageBodyLoadFailed {
+        account_id: u32,
+        message_id: u32,
+        message: String,
+    },
+    /// .eml 原文拉取失败。
+    EmlExportFailed {
+        account_id: u32,
+        message_id: u32,
+        message: String,
     },
     AttachmentSaved {
         path: std::path::PathBuf,

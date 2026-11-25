@@ -87,6 +87,12 @@ struct ContactEditor {
     error: Option<SharedString>,
 }
 
+#[derive(Clone, Debug)]
+struct ContactsFeedback {
+    ok: bool,
+    message: SharedString,
+}
+
 /// 联系人视图状态（独立 Entity，由 HylkiApp 挂载）。
 pub struct ContactsState {
     search_input: gpui_kit::Entity<InputState>,
@@ -102,8 +108,10 @@ pub struct ContactsState {
     demo_mode: bool,
     /// F-5 当前打开的新建 / 编辑表单（`None` 表示未打开）。
     editor: Option<ContactEditor>,
-    /// F-5 待确认删除的自定义联系人（行 ID + 显示名）。
-    confirm_delete: Option<(u32, String)>,
+    /// F-5 待确认删除的自定义联系人（行 ID + 显示名 + 邮箱）。
+    confirm_delete: Option<(u32, String, String)>,
+    /// 导入/导出及局部操作反馈。
+    feedback: Option<ContactsFeedback>,
 }
 
 impl EventEmitter<ContactsEvent> for ContactsState {}
@@ -117,6 +125,7 @@ impl ContactsState {
                 let query = input.read(cx).value().to_string();
                 this.query = query.clone();
                 this.selected = 0;
+                this.confirm_delete = None;
                 cx.emit(ContactsEvent::QueryChanged(query));
                 cx.notify();
             }
@@ -131,6 +140,7 @@ impl ContactsState {
             demo_mode: false,
             editor: None,
             confirm_delete: None,
+            feedback: None,
         }
     }
 
@@ -145,27 +155,124 @@ impl ContactsState {
         self.demo_mode = demo;
     }
 
-    /// 打开新建联系人表单。
-    fn open_new_editor(&mut self, window: &mut gpui_kit::Window, cx: &mut Context<Self>) {
+    pub fn set_feedback(&mut self, ok: bool, message: impl Into<SharedString>) {
+        self.feedback = Some(ContactsFeedback {
+            ok,
+            message: message.into(),
+        });
+    }
+
+    pub fn dismiss_overlay(&mut self) -> bool {
+        if self.editor.take().is_some() || self.confirm_delete.take().is_some() {
+            return true;
+        }
+        false
+    }
+
+    fn init_editor(
+        &mut self,
+        contact: Option<&KnownContact>,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
         self.confirm_delete = None;
+        let make = |placeholder: &'static str,
+                    initial: Option<String>,
+                    window: &mut gpui_kit::Window,
+                    cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                let state = InputState::new(window, cx).placeholder(placeholder);
+                if let Some(val) = initial {
+                    state.default_value(val)
+                } else {
+                    state
+                }
+            })
+        };
+        let groups_str = contact.map(|c| c.groups.join(", "));
+        let email_input = make(
+            "邮箱地址（必填，如 user@example.com）",
+            contact.map(|c| c.email.clone()),
+            window,
+            cx,
+        );
+        cx.subscribe(&email_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let should_clear = this.editor.as_ref().is_some_and(|e| e.error.is_some());
+                if should_clear {
+                    let err = this.validate_editor_email(cx);
+                    if let Some(ref mut ed) = this.editor {
+                        ed.error = err;
+                    }
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
         self.editor = Some(ContactEditor {
-            id: None,
-            name_input: cx.new(|cx| InputState::new(window, cx).placeholder("显示名称（可选）")),
-            email_input: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("邮箱地址（必填，如 user@example.com）")
-            }),
-            phone_input: cx.new(|cx| InputState::new(window, cx).placeholder("电话号码（可选）")),
-            org_input: cx.new(|cx| InputState::new(window, cx).placeholder("公司 / 组织（可选）")),
-            title_input: cx.new(|cx| InputState::new(window, cx).placeholder("职位（可选）")),
-            birthday_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("生日，如 1995-01-02")),
-            groups_input: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("分组标签，逗号分隔（如 工作, 客户）")
-            }),
-            notes_input: cx.new(|cx| InputState::new(window, cx).placeholder("备注（可选）")),
+            id: contact.map(|c| c.id),
+            name_input: make(
+                "显示名称（可选）",
+                contact.map(|c| c.name.clone()),
+                window,
+                cx,
+            ),
+            email_input,
+            phone_input: make(
+                "电话号码（可选）",
+                contact.map(|c| c.phone.clone()),
+                window,
+                cx,
+            ),
+            org_input: make(
+                "公司 / 组织（可选）",
+                contact.map(|c| c.organization.clone()),
+                window,
+                cx,
+            ),
+            title_input: make(
+                "职位（可选）",
+                contact.map(|c| c.job_title.clone()),
+                window,
+                cx,
+            ),
+            birthday_input: make(
+                "生日，如 1995-01-02",
+                contact.map(|c| c.birthday.clone()),
+                window,
+                cx,
+            ),
+            groups_input: make(
+                "分组标签，逗号分隔（如 工作, 客户）",
+                groups_str,
+                window,
+                cx,
+            ),
+            notes_input: make("备注（可选）", contact.map(|c| c.notes.clone()), window, cx),
             error: None,
         });
         cx.notify();
+    }
+
+    fn validate_editor_email(&self, cx: &Context<Self>) -> Option<SharedString> {
+        let editor = self.editor.as_ref()?;
+        let email = editor.email_input.read(cx).value().trim().to_string();
+        if email.is_empty() || !email.contains('@') {
+            Some(SharedString::from("请填写有效的邮箱地址（需包含 @）"))
+        } else if self
+            .contacts
+            .iter()
+            .any(|c| c.email.eq_ignore_ascii_case(&email) && c.id != editor.id.unwrap_or(0))
+        {
+            Some(SharedString::from(format!("已存在邮箱为 {email} 的联系人")))
+        } else {
+            None
+        }
+    }
+
+    /// 打开新建联系人表单。
+    fn open_new_editor(&mut self, window: &mut gpui_kit::Window, cx: &mut Context<Self>) {
+        self.init_editor(None, window, cx);
     }
 
     /// 打开编辑联系人表单（预填当前值）。
@@ -175,57 +282,20 @@ impl ContactsState {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
-        self.confirm_delete = None;
-        let groups_str = contact.groups.join(", ");
-        self.editor = Some(ContactEditor {
-            id: Some(contact.id),
-            name_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("显示名称（可选）")
-                    .default_value(contact.name.clone())
-            }),
-            email_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("邮箱地址（必填）")
-                    .default_value(contact.email.clone())
-            }),
-            phone_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("电话号码（可选）")
-                    .default_value(contact.phone.clone())
-            }),
-            org_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("公司 / 组织（可选）")
-                    .default_value(contact.organization.clone())
-            }),
-            title_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("职位（可选）")
-                    .default_value(contact.job_title.clone())
-            }),
-            birthday_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("生日，如 1995-01-02")
-                    .default_value(contact.birthday.clone())
-            }),
-            groups_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("分组标签，逗号分隔")
-                    .default_value(groups_str)
-            }),
-            notes_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("备注（可选）")
-                    .default_value(contact.notes.clone())
-            }),
-            error: None,
-        });
-        cx.notify();
+        self.init_editor(Some(contact), window, cx);
     }
 
-    /// 校验并提交表单：邮箱必填、需含 @、不得与其它联系人重复；失败就地提示。
-    fn submit_editor(&mut self, cx: &mut Context<Self>) {
+    /// 校验并提交表单：邮箱必填、需含 @、不得与其它联系人重复；失败就地提示并聚焦异常字段。
+    fn submit_editor(&mut self, window: &mut gpui_kit::Window, cx: &mut Context<Self>) {
+        if let Some(err) = self.validate_editor_email(cx) {
+            if let Some(editor) = self.editor.as_mut() {
+                editor.error = Some(err);
+                let email_input = editor.email_input.clone();
+                email_input.update(cx, |s, cx| s.focus(window, cx));
+            }
+            cx.notify();
+            return;
+        }
         let Some(editor) = self.editor.as_ref() else {
             return;
         };
@@ -244,25 +314,7 @@ impl ContactsState {
             .filter(|s| !s.is_empty())
             .collect();
         let notes = editor.notes_input.read(cx).value().trim().to_string();
-        let error = if email.is_empty() || !email.contains('@') {
-            Some(SharedString::from("请填写有效的邮箱地址（需包含 @）"))
-        } else if self
-            .contacts
-            .iter()
-            .any(|c| c.email.eq_ignore_ascii_case(&email) && c.id != editor.id.unwrap_or(0))
-        {
-            Some(SharedString::from(format!("已存在邮箱为 {email} 的联系人")))
-        } else {
-            None
-        };
-        if let Some(err) = error {
-            if let Some(editor) = self.editor.as_mut() {
-                editor.error = Some(err);
-            }
-            cx.notify();
-            return;
-        }
-        let id = self.editor.as_ref().and_then(|e| e.id);
+        let id = editor.id;
         self.editor = None;
         cx.emit(ContactsEvent::SaveContact {
             id,
@@ -468,7 +520,12 @@ impl Render for ContactsState {
             .ghost()
             .compact()
             .icon(IconName::Download)
-            .tooltip("导出联系人")
+            .disabled(export_items.is_empty())
+            .tooltip(if export_items.is_empty() {
+                "暂无可导出的联系人"
+            } else {
+                "导出联系人"
+            })
             .dropdown_menu(move |menu, _, _| {
                 let items = export_items.clone();
                 let entity = entity.clone();
@@ -535,6 +592,7 @@ impl Render for ContactsState {
                     let edit_contact = contact.clone();
                     let delete_id = contact.id;
                     let delete_name = contact.name.clone();
+                    let delete_email = contact.email.clone();
                     let org_line = match (organization.is_empty(), job_title.is_empty()) {
                         (false, false) => format!("{organization} · {job_title}"),
                         (false, true) => organization,
@@ -718,24 +776,18 @@ impl Render for ContactsState {
                             let confirming_delete = self
                                 .confirm_delete
                                 .as_ref()
-                                .is_some_and(|(id, _)| *id == delete_id);
+                                .is_some_and(|(id, _, _)| *id == delete_id);
+                            let delete_target = if delete_name.trim().is_empty() {
+                                delete_email.clone()
+                            } else {
+                                format!("{delete_name} ({delete_email})")
+                            };
                             let confirm_bar = h_flex()
                                 .gap_1p5()
                                 .items_center()
                                 .child(div().text_xs().text_color(text).child(SharedString::from(
-                                    format!("确认删除「{delete_name}」？"),
+                                    format!("确认删除「{delete_target}」？"),
                                 )))
-                                .child(
-                                    Button::new("contact-delete-yes")
-                                        .primary()
-                                        .compact()
-                                        .label("确认删除")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.confirm_delete = None;
-                                            cx.emit(ContactsEvent::DeleteContact(delete_id));
-                                            cx.notify();
-                                        })),
-                                )
                                 .child(
                                     Button::new("contact-delete-no")
                                         .outline()
@@ -743,6 +795,17 @@ impl Render for ContactsState {
                                         .label("取消")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.confirm_delete = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("contact-delete-yes")
+                                        .danger()
+                                        .compact()
+                                        .label("确认删除")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.confirm_delete = None;
+                                            cx.emit(ContactsEvent::DeleteContact(delete_id));
                                             cx.notify();
                                         })),
                                 );
@@ -768,8 +831,11 @@ impl Render for ContactsState {
                                         .icon(IconName::Trash)
                                         .disabled(self.demo_mode)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.confirm_delete =
-                                                Some((delete_id, delete_name.clone()));
+                                            this.confirm_delete = Some((
+                                                delete_id,
+                                                delete_name.clone(),
+                                                delete_email.clone(),
+                                            ));
                                             cx.notify();
                                         })),
                                 );
@@ -838,7 +904,15 @@ impl Render for ContactsState {
                                                     .text_color(p.text_muted)
                                                     .child("邮箱（必填）"),
                                             )
-                                            .child(Input::new(&editor.email_input)),
+                                            .child(Input::new(&editor.email_input))
+                                            .when_some(error_text, |col, err| {
+                                                col.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(p.danger)
+                                                        .child(SharedString::from(err)),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         v_flex()
@@ -930,14 +1004,6 @@ impl Render for ContactsState {
                                             .child(Input::new(&editor.notes_input)),
                                     ),
                             )
-                            .when_some(error_text, |el, err| {
-                                el.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(p.danger)
-                                        .child(SharedString::from(err)),
-                                )
-                            })
                             .child(
                                 h_flex()
                                     .justify_end()
@@ -957,8 +1023,8 @@ impl Render for ContactsState {
                                             .primary()
                                             .compact()
                                             .label("保存")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.submit_editor(cx);
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.submit_editor(window, cx);
                                             })),
                                     ),
                             ),
@@ -972,6 +1038,39 @@ impl Render for ContactsState {
             .relative()
             .size_full()
             .bg(canvas)
+            .when_some(self.feedback.clone(), |root, fb| {
+                let color = if fb.ok { p.text } else { p.danger };
+                let bg = if fb.ok {
+                    p.accent_soft()
+                } else {
+                    p.danger.opacity(0.10)
+                };
+                root.child(
+                    h_flex()
+                        .px_4()
+                        .py_1p5()
+                        .justify_between()
+                        .items_center()
+                        .bg(bg)
+                        .border_b_1()
+                        .border_color(if fb.ok {
+                            p.border
+                        } else {
+                            p.danger.opacity(0.4)
+                        })
+                        .child(div().text_xs().text_color(color).child(fb.message))
+                        .child(
+                            Button::new("contacts-feedback-close")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::X)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.feedback = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .flex_1()

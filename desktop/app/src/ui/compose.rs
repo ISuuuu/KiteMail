@@ -736,6 +736,35 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                 .bg(p.surface)
                 .px_3()
                 .gap_0p5()
+                .when(!app.demo_mode && app.accounts.is_empty(), |form| {
+                    form.child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(p.border)
+                            .py_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.danger)
+                                    .child("尚未配置可用邮箱账号，可继续编辑并保存草稿"),
+                            )
+                            .child(
+                                Button::new("compose-open-accounts")
+                                    .outline()
+                                    .compact()
+                                    .label("设置邮箱账号")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_settings_on_tab(
+                                            crate::ui::preferences::PrefTab::MailAccounts,
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    )
+                })
                 .when(!app.accounts.is_empty(), |form| {
                     // 发件人行（B-8：From 入信头表单第一行，标签与其它行左对齐）。
                     form.child(
@@ -763,6 +792,19 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                             )
                             // WP-10-2：发件身份下拉（账号默认身份 + 别名 + 自定义）。
                             .child(compose_from_control(app, cx.entity(), &p, cx)),
+                    )
+                    .when_some(
+                        app.compose_field_errors.from_addr.clone(),
+                        |form, err| {
+                            form.child(
+                                div()
+                                    .pl(px(LABEL_WIDTH + 8.0))
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(p.danger)
+                                    .child(err),
+                            )
+                        },
                     )
                 })
                 .child(
@@ -793,6 +835,16 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                                 })),
                         ),
                 )
+                .when_some(app.compose_field_errors.to.clone(), |form, err| {
+                    form.child(
+                        div()
+                            .pl(px(LABEL_WIDTH + 8.0))
+                            .py_1()
+                            .text_xs()
+                            .text_color(p.danger)
+                            .child(err),
+                    )
+                })
                 .children(to_suggestions)
                 .when(app.compose_show_cc_bcc, |el| {
                     el.child(recipient_row(ComposeAddressField::Cc, app, &p, cx))
@@ -801,6 +853,16 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                         .children(bcc_suggestions)
                         // WP-10-2：Reply-To 行（对应原版 `reply_to_row`，默认折叠）。
                         .child(header_row("Reply-To", &app.compose_reply_to, &p))
+                        .when_some(app.compose_field_errors.reply_to.clone(), |el, err| {
+                            el.child(
+                                div()
+                                    .pl(px(LABEL_WIDTH + 8.0))
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(p.danger)
+                                    .child(err),
+                            )
+                        })
                 })
                 .child(header_row("主题", &app.compose_subject, &p)),
         )
@@ -859,42 +921,55 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
         // WP-10-5 存为模板：名称输入行（保存后出现在顶栏书签下拉里）。
         .when(app.compose_template_save_open, |el| {
             el.child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .py_1()
+                v_flex()
+                    .gap_1()
                     .child(
-                        div()
-                            .w(px(LABEL_WIDTH))
-                            .flex_shrink_0()
-                            .text_sm()
-                            .text_color(p.text_muted)
-                            .child("模板名称"),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .w(px(LABEL_WIDTH))
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .text_color(p.text_muted)
+                                    .child("模板名称"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&app.compose_template_name)),
+                            )
+                            .child(
+                                Button::new("compose-template-save-confirm")
+                                    .primary()
+                                    .compact()
+                                    .label("保存")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_save_compose_template(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compose-template-save-cancel")
+                                    .ghost()
+                                    .compact()
+                                    .label("取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_save_compose_template(cx);
+                                    })),
+                            ),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&app.compose_template_name)),
-                    )
-                    .child(
-                        Button::new("compose-template-save-confirm")
-                            .primary()
-                            .compact()
-                            .label("保存")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirm_save_compose_template(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("compose-template-save-cancel")
-                            .ghost()
-                            .compact()
-                            .label("取消")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cancel_save_compose_template(cx);
-                            })),
-                    ),
+                    .when_some(app.compose_template_error.clone(), |col, err| {
+                        col.child(
+                            div()
+                                .pl(px(LABEL_WIDTH + 8.0))
+                                .text_xs()
+                                .text_color(p.danger)
+                                .child(err),
+                        )
+                    }),
             )
         })
         // F-4：草稿自动保存常驻小字提示（右对齐，自动保存成功后出现）。

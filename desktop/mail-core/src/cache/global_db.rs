@@ -163,6 +163,7 @@ impl GlobalDb {
             ("outbox", "send_at", "INTEGER"),
             ("outbox", "from_addr", "TEXT NOT NULL DEFAULT ''"),
             ("outbox", "reply_to", "TEXT NOT NULL DEFAULT ''"),
+            ("outbox", "body_format", "TEXT NOT NULL DEFAULT ''"),
             ("outbox", "body_html", "TEXT"),
             ("drafts", "cc_addr", "TEXT NOT NULL DEFAULT ''"),
             ("drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''"),
@@ -664,6 +665,7 @@ impl GlobalDb {
         in_reply_to: &str,
         from_addr: &str,
         reply_to: &str,
+        body_format: &str,
         body_html: Option<&str>,
         attachment_paths: &[String],
         created_at: i64,
@@ -680,10 +682,10 @@ impl GlobalDb {
             "
             INSERT INTO outbox (
                 account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to,
-                from_addr, reply_to, body_html, attachment_paths_json, status, last_error,
+                from_addr, reply_to, body_format, body_html, attachment_paths_json, status, last_error,
                 created_at, send_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', '', ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'queued', '', ?13, ?14)
             ",
             params![
                 account_id,
@@ -695,6 +697,7 @@ impl GlobalDb {
                 in_reply_to,
                 from_addr,
                 reply_to,
+                body_format,
                 body_html,
                 paths_json,
                 created_at,
@@ -785,7 +788,7 @@ impl GlobalDb {
                 "
                 SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
                        in_reply_to, from_addr, reply_to, attachment_paths_json, status, last_error,
-                       body_html
+                       body_html, body_format, send_at
                 FROM outbox
                 WHERE id = ?1
                 ",
@@ -808,16 +811,34 @@ impl GlobalDb {
                     in_reply_to: row.get(7)?,
                     from_addr: row.get(8)?,
                     reply_to: row.get(9)?,
+                    body_format: row.get(14)?,
                     attachment_paths,
                     status: OutboxStatus::from_str(&status_str),
                     last_error: row.get(12)?,
                     body_html: row.get(13)?,
+                    send_at: row.get(15)?,
                 })
             })
             .map_err(|e| format!("读取发件箱失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析发件箱行失败: {e}"))?;
         Ok(rows.into_iter().next())
+    }
+
+    pub(crate) fn load_outbox_status(
+        &self,
+        account_id: u32,
+        outbox_id: u32,
+    ) -> Result<Option<OutboxStatus>, String> {
+        self.conn
+            .query_row(
+                "SELECT status FROM outbox WHERE id = ?1 AND account_id = ?2",
+                params![outbox_id, account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|opt| opt.map(|s| OutboxStatus::from_str(&s)))
+            .map_err(|e| format!("查询发件箱状态失败: {e}"))
     }
 
     pub(crate) fn list_due_queued_ids(
@@ -862,16 +883,6 @@ impl GlobalDb {
             .map_err(|e| format!("查询下一个定时发送时间失败: {e}"))
     }
 
-    pub(crate) fn expire_queued_outbox(&mut self) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE outbox SET send_at = NULL WHERE status = 'queued' AND send_at IS NOT NULL",
-                [],
-            )
-            .map_err(|e| format!("准备退出发件队列失败: {e}"))?;
-        Ok(())
-    }
-
     pub(crate) fn undo_queued_outbox(
         &mut self,
         account_id: u32,
@@ -884,7 +895,7 @@ impl GlobalDb {
         let inserted = tx
             .execute(
                 "INSERT INTO drafts (account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, body_format, attachment_paths_json, updated_at)
-                 SELECT account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, '', attachment_paths_json, ?3
+                 SELECT account_id, to_addr, cc_addr, bcc_addr, subject, body_text, in_reply_to, from_addr, reply_to, body_format, attachment_paths_json, ?3
                  FROM outbox WHERE id = ?1 AND account_id = ?2 AND status = 'queued'",
                 params![outbox_id, account_id, chrono::Utc::now().timestamp()],
             )
@@ -920,7 +931,7 @@ impl GlobalDb {
                 "
                 SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
                        in_reply_to, from_addr, reply_to, attachment_paths_json, status, last_error,
-                       body_html
+                       body_html, body_format, send_at
                 FROM outbox
                 WHERE account_id = ?1
                 ORDER BY id DESC
@@ -945,10 +956,12 @@ impl GlobalDb {
                     in_reply_to: row.get(7)?,
                     from_addr: row.get(8)?,
                     reply_to: row.get(9)?,
+                    body_format: row.get(14)?,
                     attachment_paths,
                     status: OutboxStatus::from_str(&status_str),
                     last_error: row.get(12)?,
                     body_html: row.get(13)?,
+                    send_at: row.get(15)?,
                 })
             })
             .map_err(|e| format!("读取发件箱失败: {e}"))?
@@ -1059,6 +1072,46 @@ impl GlobalDb {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("解析本地草稿失败: {e}"))?;
         Ok(rows)
+    }
+
+    pub(crate) fn load_draft(&self, draft_id: u32) -> Result<Option<LocalDraft>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT id, account_id, to_addr, cc_addr, bcc_addr, subject, body_text,
+                       in_reply_to, from_addr, reply_to, attachment_paths_json, updated_at,
+                       body_format
+                FROM drafts
+                WHERE id = ?1
+                ",
+            )
+            .map_err(|e| format!("查询本地草稿失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![draft_id], |row| {
+                let paths_json: String = row.get(10)?;
+                let attachment_paths: Vec<String> =
+                    serde_json::from_str(&paths_json).unwrap_or_default();
+                Ok(LocalDraft {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    to_addr: row.get(2)?,
+                    cc_addr: row.get(3)?,
+                    bcc_addr: row.get(4)?,
+                    subject: row.get(5)?,
+                    body_text: row.get(6)?,
+                    in_reply_to: row.get(7)?,
+                    from_addr: row.get(8)?,
+                    reply_to: row.get(9)?,
+                    attachment_paths,
+                    updated_at: row.get(11)?,
+                    body_format: row.get(12)?,
+                })
+            })
+            .map_err(|e| format!("读取本地草稿失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析本地草稿失败: {e}"))?;
+        Ok(rows.into_iter().next())
     }
 
     pub(crate) fn list_templates(&self) -> Result<Vec<MailTemplate>, String> {

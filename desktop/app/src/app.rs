@@ -40,7 +40,8 @@ use hylki_mail_core::worker::MailWorkerHandle;
 use hylki_mail_core::{
     contacts_io, detect_attachment_reminder, format_reply_header, ComposeDraft, FolderSummary,
     LocalDraft, MailPage, MailRequest, MailTemplate, MessageDetail, MessageFilter, MessageSort,
-    MessageSummary, OutboxItem, QuickFilterSet, SearchScope, UnifiedView, UserContact, WorkerEvent,
+    MessageSummary, OutboxItem, QuickFilterSet, SearchScope, SendTiming, UndoOutboxOutcome,
+    UnifiedView, UserContact, WorkerEvent,
 };
 
 use crate::compose_schedule::{self, LaterPreset};
@@ -56,6 +57,10 @@ use crate::ui::gallery::{GalleryEvent, GalleryState};
 use crate::ui::message_window::{self, MessageWindow};
 use crate::ui::preferences::{PrefTab, SettingsWindow};
 use crate::ui::print_preview::{self, PrintPreviewState};
+use crate::ui::toast::{
+    self, SendToastStage, SendToastViewModel, ToastAction, ToastActionKind, ToastKind,
+    WindowToastQueue, MOVE_UNDO_TOAST_DURATION, TRANSIENT_TOAST_DURATION,
+};
 use crate::ui::{compose, message_list, reader, sidebar, welcome, window_controls};
 
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
@@ -633,22 +638,53 @@ pub(crate) fn split_recipient_parts(text: &str) -> Vec<String> {
     parts
 }
 
-/// 撤销发送（Undo Send）缓冲中的待投递邮件。
-/// 记录先持久化到发件箱（Queued + 到期时间），撤销 = 删除该记录，到期 / 立即发送 = 触发投递。
+/// 写信字段就地校验错误（对齐 `compose.rs`）。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ComposeFieldErrors {
+    pub(crate) from_addr: Option<SharedString>,
+    pub(crate) to: Option<SharedString>,
+    pub(crate) reply_to: Option<SharedString>,
+}
+
+impl ComposeFieldErrors {
+    pub(crate) fn clear(&mut self) {
+        self.from_addr = None;
+        self.to = None;
+        self.reply_to = None;
+    }
+}
+
+/// 发起发送时的写信窗口归属，用于撤销恢复到合适的写信形态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendOrigin {
+    MainWindow,
+    ComposeWindow,
+}
+
+/// 撤销发送（Undo Send）与在途发送入队追踪。
+/// 记录先持久化到发件箱（Queued + UTC 截止时间戳），撤销 = 删除该记录，到期 / 立即发送 = Worker 投递。
 #[derive(Clone, Debug)]
 pub(crate) struct PendingSend {
     pub(crate) token: u64,
     pub(crate) account_id: u32,
     pub(crate) draft: ComposeDraft,
     pub(crate) local_draft_id: Option<u32>,
-    pub(crate) remaining_secs: u8,
+    pub(crate) total_delay_secs: u8,
+    /// 与发件箱 `send_at` 对齐的 UTC 截止时间（秒）。
+    pub(crate) deadline_utc_secs: Option<i64>,
+    /// 若为定时发送，记录计划的 UTC 时间戳；仅用于等待入队回执，不展示撤销发送倒计时。
+    pub(crate) scheduled_at: Option<i64>,
+    pub(crate) origin: SendOrigin,
     /// 发件箱记录 ID（worker 落盘回执 `OutboxEnqueued` 到达后回填）。
     pub(crate) outbox_id: Option<u32>,
-    /// 用户已点击撤销但落盘回执未到：回执到达后删除记录并清理缓冲。
+    /// 用户已点击撤销但落盘回执未到：回执到达后删除记录并恢复草稿。
     pub(crate) undo_requested: bool,
-    /// 已触发投递但落盘回执未到：回执到达后立即投递。
+    /// 已点击立即发送但落盘回执未到：回执到达后触发投递。
     pub(crate) commit_requested: bool,
-    enqueue_failed: bool,
+    /// 已点击立即发送或倒计时到期，等待 Worker 确认。
+    pub(crate) sending_now: bool,
+    /// 入队失败且无法写回草稿表时的内存兜底错误文案；存在时阻断退出。
+    pub(crate) enqueue_failed: Option<SharedString>,
 }
 
 /// 主内容区路由（方案文档五.1）：`Mail` 默认三栏，`Gallery` 附件总览，
@@ -878,19 +914,42 @@ pub(crate) struct HylkiApp {
     /// WP-07 侧边栏文件夹右键「新建子文件夹 / 重命名 / 删除」内联确认条。
     pub(crate) folder_action: Option<FolderActionPrompt>,
     pub(crate) folder_action_input: Entity<InputState>,
-    /// 撤销发送（5 秒缓冲）状态。
-    pub(crate) pending_send: Option<PendingSend>,
+    pub(crate) folder_action_error: Option<SharedString>,
+    pub(crate) folder_action_busy: bool,
+    /// 多令牌发送缓冲队列（延迟撤销发送 / 入队中 / 失败内存兜底）。
+    pub(crate) pending_sends: Vec<PendingSend>,
+    send_ticker_running: bool,
     quitting: bool,
     quit_preparing: bool,
     next_send_token: u64,
     /// 写信发送前检测到正文/主题提及附件关键词但未附带文件时触发的内联确认横幅（命中关键词）。
     pub(crate) compose_attachment_reminder: Option<String>,
+    /// 写信字段内联校验错误与模板保存内联错误。
+    pub(crate) compose_field_errors: ComposeFieldErrors,
+    pub(crate) compose_template_error: Option<SharedString>,
 
     // Account management banner state
     pub(crate) cfg_feedback: Option<(bool, SharedString)>,
 
+    /// 持续性连接 / 同步 / 迁移状态文本（不再承担瞬时结果和错误提示）。
     pub(crate) status_line: SharedString,
-    pub(crate) error_banner: Option<SharedString>,
+    /// 主窗口、独立写信窗口与独立设置窗口各自维护的 Toast 队列。
+    pub(crate) toasts: WindowToastQueue,
+    pub(crate) compose_toasts: WindowToastQueue,
+    pub(crate) settings_toasts: WindowToastQueue,
+    toast_expiry_scheduled: bool,
+    /// 侧栏账号级同步进度 / 失败徽标与发件箱焦点展开状态。
+    pub(crate) syncing_accounts: HashSet<u32>,
+    pub(crate) account_sync_errors: HashMap<u32, SharedString>,
+    pub(crate) expanded_account_errors: HashSet<u32>,
+    pub(crate) outbox_expanded: bool,
+    pub(crate) focused_outbox_item: Option<(u32, u32)>,
+    pub(crate) expanded_outbox_errors: HashSet<(u32, u32)>,
+    /// 附件抽屉逐项下载进度、批量保存状态与内联错误。
+    pub(crate) downloading_attachment_ids: HashSet<u32>,
+    pub(crate) saving_all_attachments: bool,
+    pub(crate) attachment_item_errors: HashMap<u32, SharedString>,
+    pub(crate) attachment_drawer_error: Option<SharedString>,
     /// 更新检查 / 下载 / 安装状态。
     pub(crate) update: UpdateState,
 
@@ -1419,14 +1478,32 @@ impl HylkiApp {
                 folder_action: None,
                 folder_action_input: cx
                     .new(|cx| InputState::new(window, cx).placeholder("输入文件夹名称…")),
-                pending_send: None,
+                folder_action_error: None,
+                folder_action_busy: false,
+                pending_sends: Vec::new(),
+                send_ticker_running: false,
                 quitting: false,
                 quit_preparing: false,
                 next_send_token: 1,
                 compose_attachment_reminder: None,
+                compose_field_errors: ComposeFieldErrors::default(),
+                compose_template_error: None,
                 cfg_feedback: None,
-                status_line: SharedString::from("演示模式 (--demo)：已加载 10,000 封模拟邮件"),
-                error_banner: None,
+                status_line: SharedString::from("演示模式 (--demo)：已加载模拟邮件"),
+                toasts: WindowToastQueue::default(),
+                compose_toasts: WindowToastQueue::default(),
+                settings_toasts: WindowToastQueue::default(),
+                toast_expiry_scheduled: false,
+                syncing_accounts: HashSet::new(),
+                account_sync_errors: HashMap::new(),
+                expanded_account_errors: HashSet::new(),
+                outbox_expanded: false,
+                focused_outbox_item: None,
+                expanded_outbox_errors: HashSet::new(),
+                downloading_attachment_ids: HashSet::new(),
+                saving_all_attachments: false,
+                attachment_item_errors: HashMap::new(),
+                attachment_drawer_error: None,
                 update: UpdateState::default(),
                 theme_id: initial_theme_id,
                 dark_mode: initial_dark_mode,
@@ -1541,7 +1618,9 @@ impl HylkiApp {
                     offset: 0,
                     limit: 500,
                 });
-                w.send(MailRequest::SyncAllAccounts);
+                w.send(MailRequest::SyncAllAccounts {
+                    user_initiated: false,
+                });
             }
             let weak_worker = Arc::downgrade(w);
             cx.spawn(async move |this, cx| {
@@ -1588,7 +1667,7 @@ impl HylkiApp {
         let status_line = if has_account {
             SharedString::from("正在从本地缓存加载并同步所有账号...")
         } else {
-            SharedString::from("请先添加至少一个 IMAP / SMTP 邮箱账号")
+            SharedString::default()
         };
 
         let mut app = Self {
@@ -1672,14 +1751,32 @@ impl HylkiApp {
             folder_action: None,
             folder_action_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder("输入文件夹名称…")),
-            pending_send: None,
+            folder_action_error: None,
+            folder_action_busy: false,
+            pending_sends: Vec::new(),
+            send_ticker_running: false,
             quitting: false,
             quit_preparing: false,
             next_send_token: 1,
             compose_attachment_reminder: None,
+            compose_field_errors: ComposeFieldErrors::default(),
+            compose_template_error: None,
             cfg_feedback: None,
             status_line,
-            error_banner: None,
+            toasts: WindowToastQueue::default(),
+            compose_toasts: WindowToastQueue::default(),
+            settings_toasts: WindowToastQueue::default(),
+            toast_expiry_scheduled: false,
+            syncing_accounts: HashSet::new(),
+            account_sync_errors: HashMap::new(),
+            expanded_account_errors: HashSet::new(),
+            outbox_expanded: false,
+            focused_outbox_item: None,
+            expanded_outbox_errors: HashSet::new(),
+            downloading_attachment_ids: HashSet::new(),
+            saving_all_attachments: false,
+            attachment_item_errors: HashMap::new(),
+            attachment_drawer_error: None,
             update: UpdateState::default(),
             theme_id: initial_theme_id,
             dark_mode: initial_dark_mode,
@@ -1809,6 +1906,272 @@ impl HylkiApp {
         }
     }
 
+    pub(crate) fn push_toast(
+        &mut self,
+        key: impl Into<String>,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_toast_with_duration(key, kind, message, action, TRANSIENT_TOAST_DURATION, cx);
+    }
+
+    pub(crate) fn push_toast_with_duration(
+        &mut self,
+        key: impl Into<String>,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        action: Option<ToastAction>,
+        duration: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.toasts
+            .push_with_duration(key, kind, message, action, duration);
+        self.ensure_toast_expiry_tick(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn push_recovery_toast(
+        &mut self,
+        key: impl Into<String>,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
+        self.toasts
+            .push_recovery(key, kind, message, detail, action);
+        cx.notify();
+    }
+
+    pub(crate) fn has_open_settings_window(&self) -> bool {
+        self.settings_window.is_some() || self.settings_window_opening
+    }
+
+    pub(crate) fn push_settings_or_main_toast(
+        &mut self,
+        key: impl Into<String>,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_open_settings_window() {
+            self.settings_toasts
+                .push_transient(key, kind, message, action);
+            self.ensure_toast_expiry_tick(cx);
+            cx.notify();
+        } else {
+            self.push_toast(key, kind, message, action, cx);
+        }
+    }
+
+    pub(crate) fn push_settings_recovery_or_main_toast(
+        &mut self,
+        key: impl Into<String>,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_open_settings_window() {
+            self.settings_toasts
+                .push_recovery(key, kind, message, detail, action);
+            cx.notify();
+        } else {
+            self.push_recovery_toast(key, kind, message, detail, action, cx);
+        }
+    }
+
+    pub(crate) fn push_compose_or_main_toast(
+        &mut self,
+        key: impl Into<String>,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.compose_detached && self.compose_window.is_some() {
+            self.compose_toasts
+                .push_transient(key, kind, message, action);
+        } else {
+            self.toasts.push_transient(key, kind, message, action);
+        }
+        self.ensure_toast_expiry_tick(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_toast(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.toasts.dismiss_by_key(key) {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn dismiss_compose_toast(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.compose_toasts.dismiss_by_key(key) {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn dismiss_settings_toast(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.settings_toasts.dismiss_by_key(key) {
+            cx.notify();
+        }
+    }
+
+    fn ensure_toast_expiry_tick(&mut self, cx: &mut Context<Self>) {
+        if self.toast_expiry_scheduled {
+            return;
+        }
+        let next = [
+            self.toasts.next_expiry(),
+            self.compose_toasts.next_expiry(),
+            self.settings_toasts.next_expiry(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let Some(deadline) = next else {
+            return;
+        };
+        self.toast_expiry_scheduled = true;
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(50));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |app, cx| {
+                app.toast_expiry_scheduled = false;
+                let now = Instant::now();
+                let changed_main = app.toasts.prune_expired(now);
+                let changed_compose = app.compose_toasts.prune_expired(now);
+                let changed_settings = app.settings_toasts.prune_expired(now);
+                app.ensure_toast_expiry_tick(cx);
+                if changed_main || changed_compose || changed_settings {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn dismiss_toast_everywhere(&mut self, key: &str) {
+        self.toasts.dismiss_by_key(key);
+        self.compose_toasts.dismiss_by_key(key);
+        self.settings_toasts.dismiss_by_key(key);
+    }
+
+    pub(crate) fn handle_toast_action(
+        &mut self,
+        kind: ToastActionKind,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match kind {
+            ToastActionKind::UndoLastMove => {
+                self.undo_last_move(cx);
+                self.dismiss_toast_everywhere(&key);
+            }
+            ToastActionKind::ViewOutbox {
+                account_id,
+                outbox_id,
+            } => {
+                self.focused_outbox_item = Some((account_id, outbox_id));
+                self.outbox_expanded = true;
+                self.expanded_outbox_errors.insert((account_id, outbox_id));
+                self.dismiss_toast_everywhere(&key);
+                cx.notify();
+            }
+            ToastActionKind::ViewDrafts => {
+                self.select_unified_view(CurrentView::Drafts, cx);
+                self.dismiss_toast_everywhere(&key);
+            }
+            ToastActionKind::RecoverCompose => {
+                if let Some(token) = self
+                    .pending_sends
+                    .iter()
+                    .find(|p| p.enqueue_failed.is_some())
+                    .map(|p| p.token)
+                {
+                    self.recover_failed_pending_send(token, window, cx);
+                }
+                self.dismiss_toast_everywhere(&key);
+            }
+            ToastActionKind::RefreshFolders { account_id } => {
+                self.sync_account(account_id, cx);
+                self.dismiss_toast_everywhere(&key);
+            }
+            ToastActionKind::OpenAccountSettings { account_id } => {
+                let target_acc =
+                    account_id.and_then(|id| self.accounts.iter().find(|a| a.id == id).cloned());
+                if target_acc.is_some() {
+                    self.open_settings_edit_account(target_acc, cx);
+                } else {
+                    self.open_settings_on_tab(PrefTab::MailAccounts, cx);
+                }
+                self.dismiss_toast_everywhere(&key);
+            }
+            ToastActionKind::FocusActiveCompose => {
+                self.focus_active_compose_window(window, cx);
+            }
+        }
+    }
+
+    pub(crate) fn focus_active_compose_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.compose_window {
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, win, _| win.activate_window());
+            });
+            return;
+        }
+        if let Ok(main_res) = self.window_handle.update(cx, |_, win, _| {
+            win.activate_window();
+        }) {
+            let _ = main_res;
+        } else {
+            window.activate_window();
+        }
+    }
+
+    pub(crate) fn uses_reserved_feedback_strip(&self) -> bool {
+        self.main_view == MainContentView::Mail
+            && self.right_mode == RightPaneMode::Reader
+            && !self.compose_split
+            && toast::main_window_uses_reserved_strip(
+                self.focus_mode,
+                self.reader_position == ReaderPosition::Below,
+                self.reader_position == ReaderPosition::Hidden,
+                self.auto_rail_active,
+                self.list_width,
+            )
+    }
+
+    fn clear_transient_status_line(&mut self) {
+        if !self.syncing_accounts.is_empty() || self.mail_dir_switching {
+            return;
+        }
+        self.status_line = SharedString::default();
+    }
+
+    fn is_persistent_worker_status(text: &str) -> bool {
+        let t = text.trim();
+        !t.starts_with('已')
+            && (t.contains("正在")
+                || t.contains("连接")
+                || t.contains("重连")
+                || t.contains("IDLE")
+                || t.contains("断开")
+                || t.contains("离线"))
+    }
+
     fn apply_worker_events(&mut self, events: Vec<WorkerEvent>, cx: &mut Context<Self>) {
         let mut folders_updated = false;
         let mut total_new_unread: u32 = 0;
@@ -1818,8 +2181,7 @@ impl HylkiApp {
         for evt in events {
             match evt {
                 WorkerEvent::AccountVerified { ok, message } => {
-                    self.cfg_feedback = Some((ok, SharedString::from(message.clone())));
-                    self.status_line = SharedString::from(message);
+                    self.cfg_feedback = Some((ok, SharedString::from(message)));
                     if !ok {
                         self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
                     }
@@ -1832,7 +2194,10 @@ impl HylkiApp {
                     }
                     if account.enabled {
                         self.compose_account_id = account.id;
+                        self.syncing_accounts.insert(account.id);
                     }
+                    self.account_sync_errors.remove(&account.id);
+                    self.expanded_account_errors.remove(&account.id);
                     self.right_mode = RightPaneMode::Reader;
                     self.cfg_feedback = Some((
                         true,
@@ -1845,15 +2210,24 @@ impl HylkiApp {
                     if self.current_view.is_unified() {
                         self.reload_current_page(cx);
                     }
-                    self.error_banner = None;
                     self.status_line =
                         SharedString::from(format!("账号 {} 已保存，正在同步...", account.email));
+                    self.push_settings_or_main_toast(
+                        format!("account-saved-{}", account.id),
+                        ToastKind::Success,
+                        format!("账号 {} 已保存", account.email),
+                        None,
+                        cx,
+                    );
                 }
                 WorkerEvent::AccountDeleted { account_id } => {
                     self.accounts.retain(|a| a.id != account_id);
                     self.folders_by_account.remove(&account_id);
                     self.outbox_by_account.remove(&account_id);
                     self.last_unread_by_account.remove(&account_id);
+                    self.syncing_accounts.remove(&account_id);
+                    self.account_sync_errors.remove(&account_id);
+                    self.expanded_account_errors.remove(&account_id);
                     if self
                         .pending_remove_account
                         .as_ref()
@@ -1883,7 +2257,14 @@ impl HylkiApp {
                     } else {
                         RightPaneMode::Reader
                     };
-                    self.status_line = SharedString::from("账号及本地缓存已移除");
+                    self.clear_transient_status_line();
+                    self.push_settings_or_main_toast(
+                        "account-deleted",
+                        ToastKind::Success,
+                        "账号及本地缓存已移除",
+                        None,
+                        cx,
+                    );
                 }
                 WorkerEvent::AccountsUpdated { accounts } => {
                     self.accounts = accounts;
@@ -1955,6 +2336,11 @@ impl HylkiApp {
                         &folders,
                     );
                     self.folders_by_account.insert(account_id, folders);
+                    if self.folder_action_busy {
+                        self.folder_action_busy = false;
+                        self.folder_action = None;
+                        self.folder_action_error = None;
+                    }
                     if selected_removed {
                         self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                         self.current_view = CurrentView::UnifiedInbox;
@@ -2018,12 +2404,24 @@ impl HylkiApp {
                     has_more_remote: _,
                 } => {
                     self.loading_more_remote = false;
+                    self.clear_transient_status_line();
                     if fetched_count > 0 {
-                        self.status_line =
-                            SharedString::from(format!("已预加载 {fetched_count} 封更早邮件"));
+                        self.push_toast(
+                            "older-messages",
+                            ToastKind::Success,
+                            format!("已加载 {fetched_count} 封更早邮件"),
+                            None,
+                            cx,
+                        );
                         self.reload_current_page(cx);
                     } else {
-                        self.status_line = SharedString::from("已加载全部历史邮件");
+                        self.push_toast(
+                            "older-messages",
+                            ToastKind::Info,
+                            "已加载全部历史邮件",
+                            None,
+                            cx,
+                        );
                     }
                 }
                 WorkerEvent::BackfillHistoryBatchDone {
@@ -2064,7 +2462,6 @@ impl HylkiApp {
                     if mark_thread_seen && self.is_collapsed_thread_head(detail.id) {
                         self.mark_thread_same_folder_unread_seen(&detail);
                     }
-                    self.error_banner = None;
                     // B-2：行菜单挂起的动作（回复 / 复制正文 / 查看原文）在正文就绪后执行。
                     if let Some((msg_id, action)) = pending {
                         if msg_id == detail.id {
@@ -2108,16 +2505,44 @@ impl HylkiApp {
                     self.templates = templates;
                 }
                 WorkerEvent::OutboxUpdated { account_id, items } => {
-                    // 撤销缓冲对应的记录已被投递（如侧栏手动重发）或删除时清除缓冲横幅。
-                    if let Some(outbox_id) = self.pending_send.as_ref().and_then(|p| {
-                        if p.account_id == account_id {
-                            p.outbox_id
-                        } else {
-                            None
+                    // 若正在撤销的令牌还在等待结果，不提前清除，等 OutboxUndoResult 统一处理。
+                    self.pending_sends.retain(|p| {
+                        if p.account_id != account_id
+                            || p.undo_requested
+                            || p.enqueue_failed.is_some()
+                        {
+                            return true;
                         }
-                    }) {
-                        if !items.iter().any(|i| i.id == outbox_id) {
-                            self.pending_send = None;
+                        let Some(outbox_id) = p.outbox_id else {
+                            return true;
+                        };
+                        match items.iter().find(|item| item.id == outbox_id) {
+                            Some(item) => matches!(
+                                item.status,
+                                hylki_mail_core::OutboxStatus::Queued
+                                    | hylki_mail_core::OutboxStatus::Sending
+                            ),
+                            None => false,
+                        }
+                    });
+                    for p in &mut self.pending_sends {
+                        if p.account_id == account_id {
+                            if let Some(outbox_id) = p.outbox_id {
+                                if items.iter().any(|item| {
+                                    item.id == outbox_id
+                                        && item.status == hylki_mail_core::OutboxStatus::Sending
+                                }) {
+                                    p.sending_now = true;
+                                }
+                            }
+                        }
+                    }
+                    self.expanded_outbox_errors.retain(|(aid, oid)| {
+                        *aid != account_id || items.iter().any(|item| item.id == *oid)
+                    });
+                    if let Some((aid, oid)) = self.focused_outbox_item {
+                        if aid == account_id && !items.iter().any(|item| item.id == oid) {
+                            self.focused_outbox_item = None;
                         }
                     }
                     if items.is_empty() {
@@ -2130,19 +2555,74 @@ impl HylkiApp {
                     token,
                     account_id,
                     outbox_id,
+                    send_at,
+                    scheduled,
                 } => {
-                    // 撤销发送：待发记录已落盘发件箱（原草稿同步交接删除），回填缓冲 ID。
-                    let matched = self.pending_send.as_ref().is_some_and(|p| p.token == token);
-                    if !matched {
-                        // 已让位给后续发送或撤销流程已完成的旧回执，忽略。
+                    let Some(pos) = self.pending_sends.iter().position(|p| p.token == token) else {
                         continue;
-                    }
+                    };
+                    let is_scheduled = scheduled || self.pending_sends[pos].scheduled_at.is_some();
                     let undo_requested = {
-                        let pending = self.pending_send.as_mut().unwrap();
+                        let pending = &mut self.pending_sends[pos];
                         pending.outbox_id = Some(outbox_id);
+                        pending.deadline_utc_secs = send_at;
                         pending.undo_requested
                     };
-                    if self.quitting && !undo_requested {
+                    if is_scheduled {
+                        if undo_requested {
+                            let result = self
+                                .worker
+                                .as_ref()
+                                .ok_or_else(|| "邮件后台线程不可用".to_string())
+                                .and_then(|w| {
+                                    w.send_checked(MailRequest::UndoOutboxItem {
+                                        account_id,
+                                        outbox_id,
+                                        token,
+                                    })
+                                });
+                            if let Err(message) = result {
+                                self.quitting = false;
+                                self.update.cancel_install();
+                                if let Some(p) =
+                                    self.pending_sends.iter_mut().find(|p| p.token == token)
+                                {
+                                    p.undo_requested = false;
+                                }
+                                self.push_toast(
+                                    format!("undo-fail-{token}"),
+                                    ToastKind::Error,
+                                    message,
+                                    None,
+                                    cx,
+                                );
+                            }
+                        } else {
+                            let scheduled_at = self.pending_sends[pos].scheduled_at.or(send_at);
+                            self.pending_sends.remove(pos);
+                            let when = scheduled_at
+                                .map(compose_schedule::schedule_label)
+                                .unwrap_or_else(|| "指定时间".to_string());
+                            self.push_toast(
+                                format!("scheduled-ok-{outbox_id}"),
+                                ToastKind::Success,
+                                format!("已排入定时发送：{when}"),
+                                Some(ToastAction {
+                                    label: "查看发件箱".into(),
+                                    primary: false,
+                                    kind: ToastActionKind::ViewOutbox {
+                                        account_id,
+                                        outbox_id,
+                                    },
+                                }),
+                                cx,
+                            );
+                            if self.quitting {
+                                self.quit_app(cx);
+                            }
+                        }
+                    } else if self.quitting && !undo_requested {
+                        // 退出保留发件箱 queued 状态与原有 send_at。
                         self.quit_app(cx);
                     } else if undo_requested {
                         let result = self
@@ -2159,20 +2639,25 @@ impl HylkiApp {
                         if let Err(message) = result {
                             self.quitting = false;
                             self.update.cancel_install();
-                            if let Some(pending) = self.pending_send.as_mut() {
-                                pending.undo_requested = false;
+                            if let Some(p) =
+                                self.pending_sends.iter_mut().find(|p| p.token == token)
+                            {
+                                p.undo_requested = false;
                             }
-                            self.error_banner = Some(SharedString::from(message.clone()));
-                            self.status_line = SharedString::from(message);
+                            self.push_toast(
+                                format!("undo-fail-{token}"),
+                                ToastKind::Error,
+                                message,
+                                None,
+                                cx,
+                            );
                         }
-                    } else if self
-                        .pending_send
-                        .as_ref()
-                        .is_some_and(|p| p.commit_requested)
+                    } else if self.pending_sends[pos].commit_requested
+                        || self.pending_sends[pos].total_delay_secs == 0
                     {
                         self.commit_pending_send(token, cx);
-                    } else if let Some(pending) = self.pending_send.as_ref() {
-                        self.start_send_countdown(token, pending.remaining_secs, cx);
+                    } else {
+                        self.ensure_send_ticker(cx);
                     }
                     cx.notify();
                 }
@@ -2183,20 +2668,44 @@ impl HylkiApp {
                 } => {
                     self.quitting = false;
                     self.update.cancel_install();
-                    if self.pending_send.as_ref().is_some_and(|p| p.token == token) {
+                    if let Some(pos) = self.pending_sends.iter().position(|p| p.token == token) {
                         if recovered_draft_id.is_some() {
-                            self.pending_send = None;
-                        } else if let Some(pending) = self.pending_send.as_mut() {
+                            self.pending_sends.remove(pos);
+                        } else {
+                            let pending = &mut self.pending_sends[pos];
                             pending.undo_requested = false;
-                            pending.enqueue_failed = true;
+                            pending.commit_requested = false;
+                            pending.sending_now = false;
+                            pending.enqueue_failed = Some(SharedString::from(message.clone()));
                         }
                     }
-                    self.error_banner = Some(SharedString::from(message.clone()));
-                    self.status_line = SharedString::from(if recovered_draft_id.is_some() {
-                        format!("{message}；邮件已保存到草稿")
+                    if recovered_draft_id.is_some() {
+                        self.push_recovery_toast(
+                            format!("enqueue-fail-{token}"),
+                            ToastKind::Error,
+                            format!("发送入队失败：{message}"),
+                            Some("原邮件内容已保存到草稿，可随时继续编辑。".into()),
+                            Some(ToastAction {
+                                label: "查看草稿".into(),
+                                primary: true,
+                                kind: ToastActionKind::ViewDrafts,
+                            }),
+                            cx,
+                        );
                     } else {
-                        format!("{message}；请关闭当前写信页后点击撤销发送恢复邮件")
-                    });
+                        self.push_recovery_toast(
+                            format!("enqueue-fail-{token}"),
+                            ToastKind::Error,
+                            format!("发送入队失败：{message}"),
+                            Some("邮件暂时保留在内存中，请点击恢复编辑以免丢失。".into()),
+                            Some(ToastAction {
+                                label: "恢复编辑".into(),
+                                primary: true,
+                                kind: ToastActionKind::RecoverCompose,
+                            }),
+                            cx,
+                        );
+                    }
                     cx.notify();
                 }
                 WorkerEvent::QuitPrepared { result } => {
@@ -2210,58 +2719,125 @@ impl HylkiApp {
                         Err(message) => {
                             self.quitting = false;
                             self.update.cancel_install();
-                            self.error_banner = Some(SharedString::from(message.clone()));
-                            self.status_line = SharedString::from(message);
+                            self.push_toast("quit-failed", ToastKind::Error, message, None, cx);
                         }
                     }
                 }
-                WorkerEvent::OutboxUndoResult { token, result } => {
-                    if self.pending_send.as_ref().map(|p| p.token) != Some(token) {
-                        continue;
-                    }
-                    match result {
-                        Ok(Some(draft_id)) => {
-                            let pending = self.pending_send.take().unwrap();
-                            let handle = self.window_handle;
-                            cx.spawn(async move |this, cx| {
-                                let _ = cx.update(|cx| {
-                                    handle.update(cx, |_, window, cx| {
-                                        let _ = this.update(cx, |app, cx| {
-                                            if !app.has_active_compose() {
-                                                app.restore_pending_send_to_compose(
-                                                    &pending, window, cx,
-                                                );
-                                                app.compose_draft_id = Some(draft_id);
-                                                app.status_line =
-                                                    SharedString::from("已撤销发送，返回编辑邮件");
-                                            } else {
-                                                app.status_line = SharedString::from(
-                                                    "已撤销发送，邮件已保存到草稿",
-                                                );
-                                            }
-                                            cx.notify();
-                                        });
-                                    })
-                                });
-                            })
-                            .detach();
-                        }
-                        Ok(None) => {
-                            self.pending_send = None;
-                            self.status_line = SharedString::from("邮件已开始投递，无法撤销");
-                        }
-                        Err(message) => {
-                            self.quitting = false;
-                            self.update.cancel_install();
-                            if let Some(pending) = self.pending_send.as_mut() {
-                                pending.undo_requested = false;
+                WorkerEvent::OutboxUndoResult {
+                    token,
+                    account_id: _,
+                    outbox_id: _,
+                    result,
+                } => {
+                    if let Some(pos) = self.pending_sends.iter().position(|p| p.token == token) {
+                        match result {
+                            Ok(outcome) => {
+                                let origin = self.pending_sends[pos].origin;
+                                self.pending_sends.remove(pos);
+                                match outcome {
+                                    UndoOutboxOutcome::Restored { draft_id, draft } => {
+                                        let handle = self.window_handle;
+                                        cx.spawn(async move |this, cx| {
+                                            let _ = cx.update(|cx| {
+                                                handle.update(cx, |_, window, cx| {
+                                                    let _ = this.update(cx, |app, cx| {
+                                                        app.handle_restored_draft_from_undo(
+                                                            draft_id,
+                                                            draft,
+                                                            Some(origin),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                })
+                                            });
+                                        })
+                                        .detach();
+                                    }
+                                    UndoOutboxOutcome::AlreadySending => {
+                                        self.push_toast(
+                                            format!("undo-sending-{token}"),
+                                            ToastKind::Warning,
+                                            "邮件已开始投递，无法撤销",
+                                            None,
+                                            cx,
+                                        );
+                                    }
+                                    UndoOutboxOutcome::NotFound => {
+                                        self.push_toast(
+                                            format!("undo-missing-{token}"),
+                                            ToastKind::Info,
+                                            "邮件已发送或不在发件箱队列中",
+                                            None,
+                                            cx,
+                                        );
+                                    }
+                                }
                             }
-                            self.error_banner = Some(SharedString::from(message.clone()));
-                            self.status_line = SharedString::from(message);
+                            Err(message) => {
+                                self.quitting = false;
+                                self.update.cancel_install();
+                                if let Some(pending) = self.pending_sends.get_mut(pos) {
+                                    pending.undo_requested = false;
+                                }
+                                self.push_toast(
+                                    format!("undo-err-{token}"),
+                                    ToastKind::Error,
+                                    format!("撤销发送失败：{message}"),
+                                    None,
+                                    cx,
+                                );
+                            }
                         }
+                    } else if let Ok(outcome) = result {
+                        // 侧栏发件箱直接点击「撤销并恢复草稿 / 取消定时并恢复草稿」
+                        match outcome {
+                            UndoOutboxOutcome::Restored { draft_id, draft } => {
+                                let handle = self.window_handle;
+                                cx.spawn(async move |this, cx| {
+                                    let _ = cx.update(|cx| {
+                                        handle.update(cx, |_, window, cx| {
+                                            let _ = this.update(cx, |app, cx| {
+                                                app.handle_restored_draft_from_undo(
+                                                    draft_id, draft, None, window, cx,
+                                                );
+                                            });
+                                        })
+                                    });
+                                })
+                                .detach();
+                            }
+                            UndoOutboxOutcome::AlreadySending => {
+                                self.push_toast(
+                                    "sidebar-undo-sending",
+                                    ToastKind::Warning,
+                                    "邮件已开始投递，无法撤销",
+                                    None,
+                                    cx,
+                                );
+                            }
+                            UndoOutboxOutcome::NotFound => {
+                                self.push_toast(
+                                    "sidebar-undo-missing",
+                                    ToastKind::Info,
+                                    "发件箱记录已不存在",
+                                    None,
+                                    cx,
+                                );
+                            }
+                        }
+                    } else if let Err(message) = result {
+                        self.push_toast(
+                            "sidebar-undo-err",
+                            ToastKind::Error,
+                            format!("恢复草稿失败：{message}"),
+                            None,
+                            cx,
+                        );
                     }
                     if self.quitting {
-                        if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
+                        let has_undo = self.pending_sends.iter().any(|p| p.undo_requested);
+                        if has_undo {
                             self.quitting = false;
                             self.update.cancel_install();
                         } else {
@@ -2271,63 +2847,351 @@ impl HylkiApp {
                     cx.notify();
                 }
                 WorkerEvent::DraftSent {
-                    account_id: _,
+                    account_id,
+                    outbox_id,
                     subject,
                 } => {
-                    self.status_line = SharedString::from(format!("邮件已发出：{}", subject));
+                    self.pending_sends.retain(|p| {
+                        !(p.account_id == account_id && p.outbox_id == Some(outbox_id))
+                    });
+                    let subj = subject.trim();
+                    let msg = if subj.is_empty() {
+                        "邮件已发出".to_string()
+                    } else {
+                        format!("邮件已发出：「{subj}」")
+                    };
+                    self.push_toast(
+                        format!("draft-sent-{account_id}-{outbox_id}"),
+                        ToastKind::Success,
+                        msg,
+                        None,
+                        cx,
+                    );
                 }
-                WorkerEvent::AttachmentSaved { path } => {
-                    self.status_line =
-                        SharedString::from(format!("附件已保存至：{}", path.display()));
-                }
-                WorkerEvent::AttachmentsSaved { count, dest_dir } => {
-                    self.status_line = SharedString::from(format!(
-                        "已保存 {count} 个附件至：{}",
-                        dest_dir.display()
-                    ));
-                }
-                WorkerEvent::Status {
-                    account_id: _,
-                    text,
-                } => {
-                    self.status_line = SharedString::from(text);
-                }
-                WorkerEvent::Error {
-                    account_id: _,
+                WorkerEvent::SentCopySaveFailed {
+                    account_id,
+                    outbox_id,
+                    subject,
                     message,
                 } => {
-                    // B-2：抓取原文失败时退出「导出中…」状态。
+                    let subj = subject.trim();
+                    let label = if subj.is_empty() {
+                        "(无主题)".to_string()
+                    } else {
+                        subj.to_string()
+                    };
+                    self.push_recovery_toast(
+                        format!("sent-copy-fail-{account_id}-{outbox_id}"),
+                        ToastKind::Warning,
+                        "邮件已发出，但保存到「已发送」失败",
+                        Some(SharedString::from(format!("{label}：{message}"))),
+                        None,
+                        cx,
+                    );
+                }
+                WorkerEvent::OutboxDeliveryFailed {
+                    account_id,
+                    outbox_id,
+                    status,
+                    subject,
+                    message,
+                } => {
+                    self.pending_sends.retain(|p| {
+                        !(p.account_id == account_id && p.outbox_id == Some(outbox_id))
+                    });
+                    self.outbox_expanded = true;
+                    self.focused_outbox_item = Some((account_id, outbox_id));
+                    self.expanded_outbox_errors.insert((account_id, outbox_id));
+                    let subj = subject.trim();
+                    let label = if subj.is_empty() {
+                        "(无主题)".to_string()
+                    } else {
+                        subj.to_string()
+                    };
+                    let uncertain = status == hylki_mail_core::OutboxStatus::Uncertain;
+                    self.push_recovery_toast(
+                        format!("outbox-delivery-fail-{account_id}-{outbox_id}"),
+                        if uncertain {
+                            ToastKind::Warning
+                        } else {
+                            ToastKind::Error
+                        },
+                        if uncertain {
+                            "发件结果待核对（请勿盲目重发）"
+                        } else {
+                            "邮件发送失败"
+                        },
+                        Some(SharedString::from(format!("{label}：{message}"))),
+                        Some(ToastAction {
+                            label: "查看发件箱".into(),
+                            primary: true,
+                            kind: ToastActionKind::ViewOutbox {
+                                account_id,
+                                outbox_id,
+                            },
+                        }),
+                        cx,
+                    );
+                }
+                WorkerEvent::FolderSyncFailed {
+                    account_id,
+                    folder_id: _,
+                    folder_path,
+                    folder_name,
+                    user_initiated,
+                    removed_from_server,
+                    message,
+                } => {
+                    let display = if folder_name.trim().is_empty() {
+                        folder_path.clone()
+                    } else {
+                        folder_name
+                    };
+                    if removed_from_server {
+                        if user_initiated {
+                            self.push_settings_recovery_or_main_toast(
+                                format!("folder-missing-{account_id}-{folder_path}"),
+                                ToastKind::Warning,
+                                format!("文件夹「{display}」在服务器上已不存在"),
+                                Some(SharedString::from(message)),
+                                Some(ToastAction {
+                                    label: "刷新文件夹".into(),
+                                    primary: true,
+                                    kind: ToastActionKind::RefreshFolders { account_id },
+                                }),
+                                cx,
+                            );
+                        }
+                    } else {
+                        self.account_sync_errors
+                            .insert(account_id, SharedString::from(message.clone()));
+                        if user_initiated {
+                            self.push_settings_recovery_or_main_toast(
+                                format!("folder-sync-fail-{account_id}-{folder_path}"),
+                                ToastKind::Error,
+                                format!("同步文件夹「{display}」失败"),
+                                Some(SharedString::from(message)),
+                                Some(ToastAction {
+                                    label: "重试同步".into(),
+                                    primary: true,
+                                    kind: ToastActionKind::RefreshFolders { account_id },
+                                }),
+                                cx,
+                            );
+                        }
+                    }
+                }
+                WorkerEvent::AccountSyncFinished {
+                    account_id,
+                    user_initiated,
+                    failed_folders,
+                } => {
+                    self.syncing_accounts.remove(&account_id);
+                    if failed_folders.is_empty() {
+                        self.account_sync_errors.remove(&account_id);
+                        self.expanded_account_errors.remove(&account_id);
+                        if user_initiated {
+                            let label = self
+                                .accounts
+                                .iter()
+                                .find(|a| a.id == account_id)
+                                .map(|a| a.display_label())
+                                .unwrap_or_else(|| format!("账号 #{account_id}"));
+                            self.push_settings_or_main_toast(
+                                format!("acc-sync-ok-{account_id}"),
+                                ToastKind::Success,
+                                format!("{label} 已完成同步"),
+                                None,
+                                cx,
+                            );
+                        }
+                    } else {
+                        let summary = failed_folders
+                            .iter()
+                            .map(|(f, e)| format!("{f}: {e}"))
+                            .collect::<Vec<_>>()
+                            .join("；");
+                        self.account_sync_errors
+                            .insert(account_id, SharedString::from(summary.clone()));
+                        if user_initiated {
+                            self.push_settings_recovery_or_main_toast(
+                                format!("acc-sync-partial-{account_id}"),
+                                ToastKind::Warning,
+                                format!("部分文件夹同步失败（{} 个）", failed_folders.len()),
+                                Some(SharedString::from(summary)),
+                                Some(ToastAction {
+                                    label: "账号设置".into(),
+                                    primary: false,
+                                    kind: ToastActionKind::OpenAccountSettings {
+                                        account_id: Some(account_id),
+                                    },
+                                }),
+                                cx,
+                            );
+                        }
+                    }
+                    self.clear_transient_status_line();
+                }
+                WorkerEvent::MessageBodyLoadFailed {
+                    account_id: _,
+                    message_id,
+                    message,
+                } => {
+                    if self.pending_body_message_id == Some(message_id) {
+                        self.pending_body_message_id = None;
+                    }
+                    if self.pending_mark_thread_seen == Some(message_id) {
+                        self.pending_mark_thread_seen = None;
+                    }
+                    self.pending_popout_message_ids.remove(&message_id);
+                    self.push_toast(
+                        format!("body-fail-{message_id}"),
+                        ToastKind::Error,
+                        format!("加载邮件正文失败：{message}"),
+                        None,
+                        cx,
+                    );
+                }
+                WorkerEvent::EmlExportFailed {
+                    account_id: _,
+                    message_id,
+                    message,
+                } => {
+                    if self.pending_eml_export == Some(message_id) {
+                        self.pending_eml_export = None;
+                    }
+                    self.push_toast(
+                        format!("eml-fail-{message_id}"),
+                        ToastKind::Error,
+                        format!("导出 .eml 失败：{message}"),
+                        None,
+                        cx,
+                    );
+                }
+                WorkerEvent::AttachmentSaved { path } => {
+                    self.downloading_attachment_ids.clear();
+                    if let Some(ref g) = self.gallery {
+                        g.update(cx, |state, cx| {
+                            for item in self.gallery_items.iter() {
+                                state.set_saving(item.id, false);
+                            }
+                            cx.notify();
+                        });
+                    }
+                    self.push_toast(
+                        "att-saved",
+                        ToastKind::Success,
+                        format!("附件已保存至：{}", path.display()),
+                        None,
+                        cx,
+                    );
+                }
+                WorkerEvent::AttachmentsSaved { count, dest_dir } => {
+                    self.saving_all_attachments = false;
+                    self.push_toast(
+                        "att-saved-all",
+                        ToastKind::Success,
+                        format!("已保存 {count} 个附件至：{}", dest_dir.display()),
+                        None,
+                        cx,
+                    );
+                }
+                WorkerEvent::Status { account_id, text } => {
+                    if Self::is_persistent_worker_status(&text) {
+                        self.status_line = SharedString::from(text);
+                    } else {
+                        self.clear_transient_status_line();
+                        if !text.trim().is_empty() {
+                            let key = account_id
+                                .map(|id| format!("worker-status-{id}"))
+                                .unwrap_or_else(|| "worker-status".to_string());
+                            self.push_settings_or_main_toast(key, ToastKind::Info, text, None, cx);
+                        }
+                    }
+                }
+                WorkerEvent::Error {
+                    account_id,
+                    message,
+                } => {
                     self.pending_eml_export = None;
-                    // 正文拉取失败：解除占位态，让阅读器重新出现「加载完整正文」入口。
                     self.pending_body_message_id = None;
                     self.pending_mark_thread_seen = None;
                     self.pending_popout_message_ids.clear();
+                    self.downloading_attachment_ids.clear();
+                    self.saving_all_attachments = false;
+                    if self.folder_action_busy {
+                        self.folder_action_busy = false;
+                        self.folder_action_error = Some(SharedString::from(message.clone()));
+                    }
                     self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
-                    self.error_banner = Some(SharedString::from(message.clone()));
-                    self.status_line = SharedString::from(message);
+                    if self.main_view == MainContentView::Contacts {
+                        if let Some(ref c) = self.contacts {
+                            let msg = message.clone();
+                            c.update(cx, |state, cx| {
+                                state.set_feedback(false, msg);
+                                cx.notify();
+                            });
+                        }
+                    }
+                    if let Some(aid) = self.gallery_preview_pending.take() {
+                        if let Some(ref g) = self.gallery {
+                            let msg = message.clone();
+                            g.update(cx, |state, cx| {
+                                state.set_preview_failed(aid, msg);
+                                cx.notify();
+                            });
+                        }
+                    }
+                    if let Some(aid) = self.downloading_attachment_ids.iter().next().copied() {
+                        if let Some(ref g) = self.gallery {
+                            let msg = message.clone();
+                            g.update(cx, |state, cx| {
+                                state.set_item_error(aid, msg);
+                                cx.notify();
+                            });
+                        }
+                    }
+                    if let Some(aid) = account_id {
+                        self.account_sync_errors
+                            .insert(aid, SharedString::from(message.clone()));
+                    }
+                    self.clear_transient_status_line();
+                    self.push_settings_or_main_toast(
+                        "worker-error",
+                        ToastKind::Error,
+                        message,
+                        None,
+                        cx,
+                    );
                 }
                 WorkerEvent::OAuthRebindRejected {
                     account_id: _,
                     returned_email,
                 } => {
-                    // 任务二：Microsoft 重授权选择了另一个邮箱，原账号、凭据与缓存
-                    // 保持不动；在设置窗口错误反馈条提示重新授权或走添加账号流程。
                     let message = format!(
                         "微软授权返回了不同的邮箱（{returned_email}），已保留原账号不变。请重新授权并选择原邮箱，或通过「添加账号」接入新邮箱。"
                     );
                     self.cfg_feedback = Some((false, SharedString::from(message.clone())));
                     self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
-                    self.status_line = SharedString::from(message);
+                    self.push_settings_or_main_toast(
+                        "oauth-rebind-rejected",
+                        ToastKind::Warning,
+                        message,
+                        None,
+                        cx,
+                    );
                 }
-                WorkerEvent::OAuthReauthorized {
-                    account_id: _,
-                    email,
-                } => {
-                    // 编辑已有账号重新授权成功：新令牌已写入 Keyring，账号配置与
-                    // 缓存未动；仅提示成功，保留当前编辑表单中未保存的修改。
+                WorkerEvent::OAuthReauthorized { account_id, email } => {
+                    self.account_sync_errors.remove(&account_id);
                     let message = format!("账号 {email} 重新授权成功");
                     self.cfg_feedback = Some((true, SharedString::from(message.clone())));
-                    self.status_line = SharedString::from(message);
+                    self.push_settings_or_main_toast(
+                        "oauth-reauth",
+                        ToastKind::Success,
+                        message,
+                        None,
+                        cx,
+                    );
                 }
                 WorkerEvent::MessageArchived {
                     account_id,
@@ -2347,8 +3211,6 @@ impl HylkiApp {
                     dest_folder_path,
                     rfc_message_id,
                 } => {
-                    // F-3：请求时已捕获撤销前半段，成功回执补全定位信息后转为可撤销条；
-                    // 永久删除（无回收站）或缺少 Message-ID 时不提供撤销。
                     if let Some(pending) = self.pending_undo.take() {
                         if pending.account_id == account_id
                             && pending.message_id == message_id
@@ -2359,8 +3221,6 @@ impl HylkiApp {
                             self.set_last_move_undo(record, cx);
                         }
                     }
-                    // 后端回执：随事件先行到达的 FoldersLoaded 已刷新文件夹计数；
-                    // 这里刷新当前列表并在阅读态显示该邮件时回到空态。
                     self.after_message_moved(account_id, message_id, cx);
                 }
                 WorkerEvent::MessageMoved {
@@ -2393,6 +3253,7 @@ impl HylkiApp {
                         self.server_search_loading = false;
                         self.server_search_query = query;
                         self.server_search_results = items;
+                        self.clear_transient_status_line();
                     }
                 }
                 WorkerEvent::ForwardAttachmentsExported { message_id, paths } => {
@@ -2405,8 +3266,13 @@ impl HylkiApp {
                             }
                         }
                         if added > 0 {
-                            self.status_line =
-                                SharedString::from(format!("已自动携带原邮件 {added} 个附件"));
+                            self.push_compose_or_main_toast(
+                                format!("fwd-att-{message_id}"),
+                                ToastKind::Info,
+                                format!("已自动携带原邮件 {added} 个附件"),
+                                None,
+                                cx,
+                            );
                         }
                     }
                 }
@@ -2458,9 +3324,16 @@ impl HylkiApp {
                 }
                 // F-5：批量导入回执（`KnownContactsLoaded` 已先行刷新列表）。
                 WorkerEvent::ContactsImported { added, skipped } => {
-                    self.status_line = SharedString::from(format!(
-                        "联系人导入完成：新增 {added} 个，跳过 {skipped} 个（重复或无效）"
-                    ));
+                    let msg =
+                        format!("联系人导入完成：新增 {added} 个，跳过 {skipped} 个（重复或无效）");
+                    if let Some(ref c) = self.contacts {
+                        let m = msg.clone();
+                        c.update(cx, |state, cx| {
+                            state.set_feedback(true, m);
+                            cx.notify();
+                        });
+                    }
+                    self.push_toast("contacts-imported", ToastKind::Success, msg, None, cx);
                     cx.notify();
                 }
                 WorkerEvent::ThreadChildrenLoaded {
@@ -2479,7 +3352,7 @@ impl HylkiApp {
                             m.tags = tags.clone();
                         }
                     }
-                    self.status_line = SharedString::from("已更新邮件标签");
+                    self.push_toast("msg-tags", ToastKind::Success, "已更新邮件标签", None, cx);
                     cx.notify();
                 }
                 WorkerEvent::MessageSnoozed {
@@ -2492,18 +3365,29 @@ impl HylkiApp {
                             m.snoozed_until_ts = until_ts;
                         }
                     }
-                    self.status_line = SharedString::from(if until_ts > 0 {
-                        "已设置稍后提醒"
-                    } else {
-                        "已取消稍后提醒"
-                    });
+                    self.push_toast(
+                        "msg-snooze",
+                        ToastKind::Success,
+                        if until_ts > 0 {
+                            "已设置稍后提醒"
+                        } else {
+                            "已取消稍后提醒"
+                        },
+                        None,
+                        cx,
+                    );
                     cx.notify();
                 }
                 WorkerEvent::MessageCopied {
                     target_folder_path, ..
                 } => {
-                    self.status_line =
-                        SharedString::from(format!("已复制邮件到 {target_folder_path}"));
+                    self.push_toast(
+                        "msg-copied",
+                        ToastKind::Success,
+                        format!("已复制邮件到 {target_folder_path}"),
+                        None,
+                        cx,
+                    );
                     cx.notify();
                 }
                 // F-6：附件总览图片预览字节到达（同时回填 WP-09 底部附件抽屉缩略图与大图预览）。
@@ -2546,6 +3430,8 @@ impl HylkiApp {
                     attachment_id,
                     size_bytes,
                 } => {
+                    self.downloading_attachment_ids.remove(&attachment_id);
+                    self.attachment_item_errors.remove(&attachment_id);
                     if let Some(ref mut detail) = self.selected_message {
                         if detail.id == message_id {
                             for att in &mut detail.attachments {
@@ -2610,7 +3496,16 @@ impl HylkiApp {
                     message,
                 } => {
                     self.stripping_attachment_ids.remove(&attachment_id);
-                    self.status_line = SharedString::from(format!("剥离附件失败：{message}"));
+                    let err_text = format!("剥离附件失败：{message}");
+                    self.attachment_item_errors
+                        .insert(attachment_id, SharedString::from(err_text.clone()));
+                    self.push_toast(
+                        format!("att-strip-fail-{attachment_id}"),
+                        ToastKind::Error,
+                        err_text,
+                        None,
+                        cx,
+                    );
                 }
                 WorkerEvent::MailDataDirChanged {
                     ok,
@@ -2675,7 +3570,18 @@ impl HylkiApp {
                             self.reload_current_page(cx);
                         }
                     }
-                    self.status_line = SharedString::from(message.clone());
+                    self.clear_transient_status_line();
+                    self.push_settings_or_main_toast(
+                        "mail-dir-changed",
+                        if ok {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Error
+                        },
+                        message.clone(),
+                        None,
+                        cx,
+                    );
                     let msg_for_win = message;
                     let dir_for_win = mail_data_dir;
                     self.with_settings_window(cx, move |win, _, cx| {
@@ -2745,7 +3651,6 @@ impl HylkiApp {
                 let is_collapsed_head = self.is_collapsed_thread_head(first.id);
                 if let Some((detail, true)) = self.try_load_cached_detail(first.id) {
                     self.set_selected_message(detail.clone());
-                    self.error_banner = None;
                     if mark_now {
                         self.mark_message_seen_now(
                             first.account_id,
@@ -3042,24 +3947,35 @@ impl HylkiApp {
             self.persist_layout_prefs();
         }
         self.quitting = true;
-        if self.pending_send.as_ref().is_some_and(|p| p.enqueue_failed) {
+        if let Some(failed) = self
+            .pending_sends
+            .iter()
+            .find(|p| p.enqueue_failed.is_some())
+        {
+            let token = failed.token;
             self.quitting = false;
             self.update.cancel_install();
-            self.status_line = SharedString::from("请先恢复未保存的邮件，再退出");
+            self.push_recovery_toast(
+                format!("quit-blocked-failed-{token}"),
+                ToastKind::Warning,
+                "尚有未保存成功的邮件，请先恢复或放弃后再退出",
+                None,
+                Some(ToastAction {
+                    label: "恢复编辑".into(),
+                    primary: true,
+                    kind: ToastActionKind::RecoverCompose,
+                }),
+                cx,
+            );
             cx.notify();
             return;
         }
-        if !self.demo_mode
-            && self
-                .pending_send
-                .as_ref()
-                .is_some_and(|p| p.outbox_id.is_none())
-        {
+        if !self.demo_mode && self.pending_sends.iter().any(|p| p.outbox_id.is_none()) {
             self.status_line = SharedString::from("正在保存待发送邮件，完成后退出…");
             cx.notify();
             return;
         }
-        if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
+        if self.pending_sends.iter().any(|p| p.undo_requested) {
             self.status_line = SharedString::from("正在完成撤销，然后退出…");
             cx.notify();
             return;
@@ -3068,16 +3984,21 @@ impl HylkiApp {
             return;
         }
         if let Some(ref worker) = self.worker {
-            // 主线程同步落盘：把仍排队的发件箱记录标记为到期后立即退出。
-            // 不再异步等待 worker 的 QuitPrepared——单线程 worker 可能正执行
-            // 耗时的同步或超时重连，异步请求会排在队尾导致关窗毫无反应。
-            if worker.prepare_quit_now().is_err() && self.pending_send.is_some() {
-                self.quitting = false;
-                self.update.cancel_install();
-                self.error_banner = Some(SharedString::from("退出时保存发件队列失败，请重试"));
-                self.status_line = SharedString::from("退出时保存发件队列失败，请重试");
-                cx.notify();
-                return;
+            // 退出前确保持久化已排队状态，但保留每条记录既有的 `send_at`（撤销窗口与定时发送均不强制提前）。
+            if let Err(err) = worker.prepare_quit_now() {
+                if !self.pending_sends.is_empty() {
+                    self.quitting = false;
+                    self.update.cancel_install();
+                    self.push_toast(
+                        "quit-prepare-failed",
+                        ToastKind::Error,
+                        format!("退出前保存发件队列失败：{err}"),
+                        None,
+                        cx,
+                    );
+                    cx.notify();
+                    return;
+                }
             }
         }
         if let Some((info, bytes)) = self.update.pending_install.take() {
@@ -3160,6 +4081,8 @@ impl HylkiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.folder_action_error = None;
+        self.folder_action_busy = false;
         self.folder_action = Some(FolderActionPrompt::CreateSubfolder {
             account_id,
             parent_path,
@@ -3182,6 +4105,8 @@ impl HylkiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.folder_action_error = None;
+        self.folder_action_busy = false;
         self.folder_action = Some(FolderActionPrompt::RenameFolder {
             account_id,
             folder_id,
@@ -3204,6 +4129,8 @@ impl HylkiApp {
         folder_name: String,
         cx: &mut Context<Self>,
     ) {
+        self.folder_action_error = None;
+        self.folder_action_busy = false;
         self.folder_action = Some(FolderActionPrompt::DeleteFolder {
             account_id,
             folder_id,
@@ -3215,60 +4142,99 @@ impl HylkiApp {
 
     pub(crate) fn cancel_folder_action(&mut self, cx: &mut Context<Self>) {
         self.folder_action = None;
+        self.folder_action_error = None;
+        self.folder_action_busy = false;
         cx.notify();
     }
 
     pub(crate) fn confirm_folder_action(&mut self, cx: &mut Context<Self>) {
-        let Some(action) = self.folder_action.take() else {
+        let Some(action) = self.folder_action.clone() else {
             return;
         };
+        if self.folder_action_busy {
+            return;
+        }
         let input_val = self.folder_action_input.read(cx).value().trim().to_string();
-        if let Some(ref w) = self.worker {
-            match action {
-                FolderActionPrompt::CreateSubfolder {
+        match &action {
+            FolderActionPrompt::CreateSubfolder { .. } if input_val.is_empty() => {
+                self.folder_action_error = Some(SharedString::from("请输入新文件夹名称"));
+                cx.notify();
+                return;
+            }
+            FolderActionPrompt::RenameFolder { current_name, .. } if input_val.is_empty() => {
+                self.folder_action_error = Some(SharedString::from("文件夹名称不能为空"));
+                cx.notify();
+                return;
+            }
+            FolderActionPrompt::RenameFolder { current_name, .. } if input_val == *current_name => {
+                self.folder_action_error = Some(SharedString::from("新名称与当前名称相同"));
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+        if self.demo_mode {
+            self.folder_action = None;
+            self.folder_action_error = None;
+            self.push_toast(
+                "demo-folder-op",
+                ToastKind::Info,
+                "演示模式下不支持修改服务器文件夹",
+                None,
+                cx,
+            );
+            return;
+        }
+        let Some(ref w) = self.worker else {
+            self.folder_action_error = Some(SharedString::from("邮件后台线程不可用"));
+            cx.notify();
+            return;
+        };
+        let req = match action {
+            FolderActionPrompt::CreateSubfolder {
+                account_id,
+                parent_path,
+                delimiter,
+            } => {
+                let folder_path = if parent_path.is_empty() {
+                    input_val
+                } else {
+                    format!("{parent_path}{delimiter}{input_val}")
+                };
+                MailRequest::CreateFolder {
                     account_id,
-                    parent_path,
-                    delimiter,
-                } => {
-                    if !input_val.is_empty() {
-                        let folder_path = if parent_path.is_empty() {
-                            input_val
-                        } else {
-                            format!("{parent_path}{delimiter}{input_val}")
-                        };
-                        w.send(MailRequest::CreateFolder {
-                            account_id,
-                            folder_path,
-                        });
-                    }
-                }
-                FolderActionPrompt::RenameFolder {
-                    account_id,
-                    folder_id,
-                    old_path,
-                    current_name,
-                } => {
-                    if !input_val.is_empty() && input_val != current_name {
-                        w.send(MailRequest::RenameFolder {
-                            account_id,
-                            folder_id,
-                            old_path,
-                            new_name: input_val,
-                        });
-                    }
-                }
-                FolderActionPrompt::DeleteFolder {
-                    account_id,
-                    folder_id,
                     folder_path,
-                    ..
-                } => {
-                    w.send(MailRequest::DeleteFolder {
-                        account_id,
-                        folder_id,
-                        folder_path,
-                    });
                 }
+            }
+            FolderActionPrompt::RenameFolder {
+                account_id,
+                folder_id,
+                old_path,
+                ..
+            } => MailRequest::RenameFolder {
+                account_id,
+                folder_id,
+                old_path,
+                new_name: input_val,
+            },
+            FolderActionPrompt::DeleteFolder {
+                account_id,
+                folder_id,
+                folder_path,
+                ..
+            } => MailRequest::DeleteFolder {
+                account_id,
+                folder_id,
+                folder_path,
+            },
+        };
+        match w.send_checked(req) {
+            Ok(()) => {
+                self.folder_action_error = None;
+                self.folder_action_busy = true;
+            }
+            Err(err) => {
+                self.folder_action_error = Some(SharedString::from(err));
             }
         }
         cx.notify();
@@ -3323,6 +4289,7 @@ impl HylkiApp {
                 account_id,
                 folder_id,
                 folder_path,
+                user_initiated: true,
             });
         }
         cx.notify();
@@ -3405,11 +4372,16 @@ impl HylkiApp {
         let gen = self.read_mark_generation;
 
         // L-6：阅读器关闭时点击邮件仅选中不展示（对齐原版 select_without_reader 语义），
-        // 状态栏提示如何重新打开；正文仍拉取以支撑回复 / 复制等动作，但不自动标已读。
+        // 轻量 Toast 提示如何重新打开；正文仍拉取以支撑回复 / 复制等动作，但不自动标已读。
         let reader_hidden = self.reader_position == ReaderPosition::Hidden;
         if reader_hidden {
-            self.status_line =
-                SharedString::from("阅读器已关闭：邮件已选中，按 Ctrl+Alt+1 重新打开");
+            self.push_toast(
+                "reader-hidden-hint",
+                ToastKind::Info,
+                "阅读器已关闭：按 Ctrl+Alt+1 重新打开",
+                None,
+                cx,
+            );
         }
 
         let mark_mode = self.prefs.read_mark_mode.as_str();
@@ -3440,7 +4412,6 @@ impl HylkiApp {
         }
         if let Some((detail, true)) = self.try_load_cached_detail(message_id) {
             self.set_selected_message(detail.clone());
-            self.error_banner = None;
             if should_mark_now {
                 self.mark_message_seen_now(account_id, message_id, uid, folder_path);
                 if is_collapsed_head {
@@ -3705,22 +4676,23 @@ impl HylkiApp {
                 self.mark_thread_same_folder_unread_seen(&detail);
             }
         }
-        self.status_line = SharedString::from(if next_seen {
-            "已标记为已读"
-        } else {
-            "已标记为未读"
-        });
+        self.push_toast(
+            "mark-seen",
+            ToastKind::Success,
+            if next_seen {
+                "已标记为已读"
+            } else {
+                "已标记为未读"
+            },
+            None,
+            cx,
+        );
         cx.notify();
     }
 
     /// 切换阅读器「原样 HTML / 纯文本」显示模式。
     pub(crate) fn toggle_reader_plain_mode(&mut self, cx: &mut Context<Self>) {
         self.reader_prefer_plain = !self.reader_prefer_plain;
-        self.status_line = SharedString::from(if self.reader_prefer_plain {
-            "阅读器已切换为纯文本模式"
-        } else {
-            "阅读器已切换为富文本 HTML 模式"
-        });
         cx.notify();
     }
 
@@ -3880,9 +4852,8 @@ impl HylkiApp {
         if self.prefs.reader_zoom_percent != clamped {
             self.prefs.reader_zoom_percent = clamped;
             if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
-                self.error_banner = Some(SharedString::from(e));
+                self.push_toast("prefs-save-fail", ToastKind::Error, e, None, cx);
             }
-            self.status_line = SharedString::from(format!("阅读字号已调整为 {clamped}%"));
             cx.notify();
         }
     }
@@ -3890,7 +4861,13 @@ impl HylkiApp {
     /// 复制任意文本到系统剪贴板（供单张会话卡片复制正文使用）。
     pub(crate) fn copy_text_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.status_line = SharedString::from("已复制邮件正文到剪贴板");
+        self.push_toast(
+            "clipboard-copy",
+            ToastKind::Success,
+            "已复制邮件正文到剪贴板",
+            None,
+            cx,
+        );
         cx.notify();
     }
 
@@ -3997,7 +4974,6 @@ impl HylkiApp {
         }
         if let Some(ref w) = self.worker {
             self.pending_undo = self.capture_undo_record(account_id, message_id, "已归档");
-            self.status_line = SharedString::from("正在归档邮件...");
             w.send(MailRequest::ArchiveMessage {
                 account_id,
                 message_id,
@@ -4018,7 +4994,6 @@ impl HylkiApp {
         }
         if let Some(ref w) = self.worker {
             self.pending_undo = self.capture_undo_record(account_id, message_id, "已删除");
-            self.status_line = SharedString::from("正在删除邮件...");
             w.send(MailRequest::DeleteMessage {
                 account_id,
                 message_id,
@@ -4040,7 +5015,6 @@ impl HylkiApp {
         if let Some(ref w) = self.worker {
             self.pending_undo =
                 self.capture_undo_record(account_id, message_id, "已标记为垃圾邮件");
-            self.status_line = SharedString::from("正在标记为垃圾邮件...");
             w.send(MailRequest::MarkSpam {
                 account_id,
                 message_id,
@@ -4062,7 +5036,6 @@ impl HylkiApp {
         }
         if let Some(ref w) = self.worker {
             self.pending_undo = self.capture_undo_record(account_id, message_id, "已移动");
-            self.status_line = SharedString::from("正在移动邮件...");
             w.send(MailRequest::MoveMessage {
                 account_id,
                 message_id,
@@ -4093,10 +5066,23 @@ impl HylkiApp {
         })
     }
 
-    /// F-3：写入可撤销记录并安排 15 秒后自动清理（新记录覆盖旧记录）。
+    /// F-3：写入可撤销记录并弹出 15 秒带撤销按钮的 Toast（新记录覆盖旧记录）。
     fn set_last_move_undo(&mut self, record: UndoRecord, cx: &mut Context<Self>) {
         let at = record.at;
+        let label = record.action_label.clone();
         self.last_move_undo = Some(record);
+        self.push_toast_with_duration(
+            "last-move-undo",
+            ToastKind::Info,
+            format!("{label}邮件"),
+            Some(ToastAction {
+                label: "撤销 (Ctrl+Z)".into(),
+                primary: true,
+                kind: ToastActionKind::UndoLastMove,
+            }),
+            MOVE_UNDO_TOAST_DURATION,
+            cx,
+        );
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_secs(UNDO_TTL_SECS))
@@ -4104,6 +5090,7 @@ impl HylkiApp {
             let _ = this.update(cx, |app, cx| {
                 if app.last_move_undo.as_ref().is_some_and(|r| r.at == at) {
                     app.last_move_undo = None;
+                    app.toasts.dismiss_by_key("last-move-undo");
                     cx.notify();
                 }
             });
@@ -4117,16 +5104,24 @@ impl HylkiApp {
         let Some(record) = self.last_move_undo.take() else {
             return;
         };
-        if let Some(ref w) = self.worker {
-            self.status_line =
-                SharedString::from(format!("正在撤销{}，移回原文件夹...", record.action_label));
-            w.send(MailRequest::UndoMessageMove {
-                account_id: record.account_id,
-                message_id: record.message_id,
-                rfc_message_id: record.rfc_message_id,
-                current_folder_path: record.current_folder_path,
-                original_folder_path: record.original_folder_path,
-            });
+        self.toasts.dismiss_by_key("last-move-undo");
+        if self.worker.is_some() {
+            self.push_toast(
+                "undo-move-progress",
+                ToastKind::Info,
+                format!("正在撤销{}，移回原文件夹...", record.action_label),
+                None,
+                cx,
+            );
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::UndoMessageMove {
+                    account_id: record.account_id,
+                    message_id: record.message_id,
+                    rfc_message_id: record.rfc_message_id,
+                    current_folder_path: record.current_folder_path,
+                    original_folder_path: record.original_folder_path,
+                });
+            }
         }
         cx.notify();
     }
@@ -4240,14 +5235,26 @@ impl HylkiApp {
                     self.export_eml_bytes(&detail.subject, bytes, cx);
                 }
                 None => {
-                    self.status_line = SharedString::from("演示数据没有该邮件的原始正文，无法导出");
+                    self.push_toast(
+                        "eml-demo-unavailable",
+                        ToastKind::Info,
+                        "演示数据没有该邮件的原始正文，无法导出",
+                        None,
+                        cx,
+                    );
                 }
             }
             cx.notify();
             return;
         }
         self.pending_eml_export = Some(message_id);
-        self.status_line = SharedString::from("正在获取邮件原文...");
+        self.push_toast(
+            "eml-fetch",
+            ToastKind::Info,
+            "正在获取邮件原文...",
+            None,
+            cx,
+        );
         if let Some(ref w) = self.worker {
             w.send(MailRequest::FetchRawMessage {
                 account_id,
@@ -4278,14 +5285,20 @@ impl HylkiApp {
             if let Some((dest, result)) = result {
                 let _ = this.update(cx, |app, cx| {
                     match result {
-                        Ok(()) => {
-                            app.status_line =
-                                SharedString::from(format!("已导出邮件原文至：{}", dest.display()))
-                        }
-                        Err(e) => {
-                            app.error_banner =
-                                Some(SharedString::from(format!("保存邮件原文失败: {e}")))
-                        }
+                        Ok(()) => app.push_toast(
+                            "eml-exported",
+                            ToastKind::Success,
+                            format!("已导出邮件原文至：{}", dest.display()),
+                            None,
+                            cx,
+                        ),
+                        Err(e) => app.push_toast(
+                            "eml-exported",
+                            ToastKind::Error,
+                            format!("保存邮件原文失败：{e}"),
+                            None,
+                            cx,
+                        ),
                     }
                     cx.notify();
                 });
@@ -4389,7 +5402,13 @@ impl HylkiApp {
                 }
             }
         }
-        self.status_line = SharedString::from(format!("已批量将 {} 封邮件标为已读", targets.len()));
+        self.push_toast(
+            "batch-mark-read",
+            ToastKind::Success,
+            format!("已将 {} 封邮件标为已读", targets.len()),
+            None,
+            cx,
+        );
         self.selected_message_ids.clear();
         cx.notify();
     }
@@ -4428,11 +5447,17 @@ impl HylkiApp {
                 }
             }
         }
-        self.status_line = SharedString::from(if next_flagged {
-            format!("已批量为 {} 封邮件加星标", targets.len())
-        } else {
-            format!("已批量取消 {} 封邮件的星标", targets.len())
-        });
+        self.push_toast(
+            "batch-flagged",
+            ToastKind::Success,
+            if next_flagged {
+                format!("已为 {} 封邮件加星标", targets.len())
+            } else {
+                format!("已取消 {} 封邮件的星标", targets.len())
+            },
+            None,
+            cx,
+        );
         self.selected_message_ids.clear();
         cx.notify();
     }
@@ -4460,7 +5485,13 @@ impl HylkiApp {
                 });
             }
         }
-        self.status_line = SharedString::from(format!("正在批量归档 {} 封邮件...", targets.len()));
+        self.push_toast(
+            "batch-archive",
+            ToastKind::Info,
+            format!("正在批量归档 {} 封邮件...", targets.len()),
+            None,
+            cx,
+        );
         self.selected_message_ids.clear();
         cx.notify();
     }
@@ -4488,7 +5519,13 @@ impl HylkiApp {
                 });
             }
         }
-        self.status_line = SharedString::from(format!("正在批量删除 {} 封邮件...", targets.len()));
+        self.push_toast(
+            "batch-delete",
+            ToastKind::Info,
+            format!("正在批量删除 {} 封邮件...", targets.len()),
+            None,
+            cx,
+        );
         self.selected_message_ids.clear();
         cx.notify();
     }
@@ -5214,7 +6251,13 @@ impl HylkiApp {
             added += 1;
         }
         if added > 0 {
-            self.status_line = SharedString::from(format!("已添加 {added} 个附件"));
+            self.push_compose_or_main_toast(
+                "compose-attach-drop",
+                ToastKind::Success,
+                format!("已添加 {added} 个附件"),
+                None,
+                cx,
+            );
             self.cancel_draft_autosave();
             cx.notify();
         }
@@ -5252,7 +6295,15 @@ impl HylkiApp {
         }
         self.cancel_draft_autosave();
         self.compose_template_save_open = false;
-        self.status_line = SharedString::from(format!("已套用模板「{}」", template.name));
+        self.compose_template_error = None;
+        self.compose_field_errors.clear();
+        self.push_compose_or_main_toast(
+            "compose-template",
+            ToastKind::Success,
+            format!("已套用模板「{}」", template.name),
+            None,
+            cx,
+        );
         cx.notify();
     }
 
@@ -5269,6 +6320,7 @@ impl HylkiApp {
             subject
         };
         self.compose_template_save_open = true;
+        self.compose_template_error = None;
         self.compose_template_name
             .update(cx, |input, cx| input.set_value(name, window, cx));
         self.compose_template_name
@@ -5286,7 +6338,7 @@ impl HylkiApp {
             .trim()
             .to_string();
         if name.is_empty() {
-            self.status_line = SharedString::from("请填写模板名称");
+            self.compose_template_error = Some(SharedString::from("请填写模板名称"));
             cx.notify();
             return;
         }
@@ -5302,10 +6354,16 @@ impl HylkiApp {
             attachment_paths: self.compose_attachments.clone(),
             created_at: chrono::Local::now().timestamp(),
         };
-        self.compose_template_save_open = false;
         if self.demo_mode {
-            self.status_line =
-                SharedString::from(format!("演示模式：已生成模板「{}」", template.name));
+            self.compose_template_save_open = false;
+            self.compose_template_error = None;
+            self.push_compose_or_main_toast(
+                "compose-template",
+                ToastKind::Info,
+                format!("演示模式：已模拟保存模板「{}」", template.name),
+                None,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -5314,16 +6372,29 @@ impl HylkiApp {
             .as_ref()
             .ok_or_else(|| "邮件后台线程不可用".to_string())
             .and_then(|w| w.send_checked(MailRequest::SaveTemplate { template }));
-        self.status_line = SharedString::from(match result {
-            Ok(()) => "模板已保存".to_string(),
-            Err(message) => message,
-        });
+        match result {
+            Ok(()) => {
+                self.compose_template_save_open = false;
+                self.compose_template_error = None;
+                self.push_compose_or_main_toast(
+                    "compose-template",
+                    ToastKind::Success,
+                    "模板已保存",
+                    None,
+                    cx,
+                );
+            }
+            Err(message) => {
+                self.compose_template_error = Some(SharedString::from(message));
+            }
+        }
         cx.notify();
     }
 
     /// 收起「存为模板」的名称输入行。
     pub(crate) fn cancel_save_compose_template(&mut self, cx: &mut Context<Self>) {
         self.compose_template_save_open = false;
+        self.compose_template_error = None;
         cx.notify();
     }
 
@@ -5481,8 +6552,13 @@ impl HylkiApp {
                 Err(err) => {
                     let _ = app_entity.update(cx, |app, cx| {
                         app.compose_detached = false;
-                        app.status_line =
-                            SharedString::from(format!("无法打开独立写信窗口：{err}"));
+                        app.push_toast(
+                            "popout-compose-fail",
+                            ToastKind::Error,
+                            format!("无法打开独立写信窗口：{err}"),
+                            None,
+                            cx,
+                        );
                         cx.notify();
                     });
                 }
@@ -5650,7 +6726,17 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.has_active_compose() && self.compose_has_unsaved_content(cx) {
-            self.status_line = SharedString::from("当前写信尚未完成，请先发送、存草稿或取消");
+            self.push_toast(
+                "compose-busy",
+                ToastKind::Warning,
+                "当前写信尚未完成，请先发送、存草稿或取消",
+                Some(ToastAction {
+                    label: "回到当前草稿".into(),
+                    primary: true,
+                    kind: ToastActionKind::FocusActiveCompose,
+                }),
+                cx,
+            );
             if let Some(handle) = self.compose_window {
                 cx.defer(move |cx| {
                     let _ = handle.update(cx, |_, window, _| window.activate_window());
@@ -5714,7 +6800,17 @@ impl HylkiApp {
         // WP-10-4：内联分屏时原邮件仍在眼前，回复 / 转发按钮随时可点；
         // 当前写信已有内容时先拦下，避免一次误点把正在写的正文换掉。
         if self.has_active_compose() && self.compose_has_unsaved_content(cx) {
-            self.status_line = SharedString::from("当前写信尚未完成，请先发送、存草稿或取消");
+            self.push_toast(
+                "compose-busy",
+                ToastKind::Warning,
+                "当前写信尚未完成，请先发送、存草稿或取消",
+                Some(ToastAction {
+                    label: "回到当前草稿".into(),
+                    primary: true,
+                    kind: ToastActionKind::FocusActiveCompose,
+                }),
+                cx,
+            );
             cx.notify();
             return false;
         }
@@ -5832,7 +6928,17 @@ impl HylkiApp {
         // WP-10-4：内联分屏时原邮件仍在眼前，回复 / 转发按钮随时可点；
         // 当前写信已有内容时先拦下，避免一次误点把正在写的正文换掉。
         if self.has_active_compose() && self.compose_has_unsaved_content(cx) {
-            self.status_line = SharedString::from("当前写信尚未完成，请先发送、存草稿或取消");
+            self.push_toast(
+                "compose-busy",
+                ToastKind::Warning,
+                "当前写信尚未完成，请先发送、存草稿或取消",
+                Some(ToastAction {
+                    label: "回到当前草稿".into(),
+                    primary: true,
+                    kind: ToastActionKind::FocusActiveCompose,
+                }),
+                cx,
+            );
             cx.notify();
             return false;
         }
@@ -6010,7 +7116,13 @@ impl HylkiApp {
 
     pub(crate) fn save_local_draft(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
-            self.status_line = SharedString::from("演示模式下不支持写入本地草稿数据库");
+            self.push_compose_or_main_toast(
+                "draft-save-demo",
+                ToastKind::Info,
+                "演示模式下不支持写入本地草稿数据库",
+                None,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -6128,10 +7240,17 @@ impl HylkiApp {
         .detach();
     }
 
-    pub(crate) fn save_attachment(&self, att_id: u32, filename: &str, cx: &mut Context<Self>) {
+    pub(crate) fn save_attachment(&mut self, att_id: u32, filename: &str, cx: &mut Context<Self>) {
         if self.demo_mode {
+            self.attachment_item_errors.insert(
+                att_id,
+                SharedString::from("演示模式下不支持导出真实附件文件"),
+            );
+            cx.notify();
             return;
         }
+        self.attachment_item_errors.remove(&att_id);
+        self.attachment_drawer_error = None;
         // 在后台线程弹出系统文件保存对话框，避免嵌套 Win32 消息循环阻塞主线程并在事件分发期间重入 AppCell::borrow_mut。
         let filename = filename.to_string();
         cx.spawn(async move |this, cx| {
@@ -6140,13 +7259,15 @@ impl HylkiApp {
                 .spawn(async move { rfd::FileDialog::new().set_file_name(&filename).save_file() })
                 .await;
             if let Some(dest) = dest {
-                let _ = this.update(cx, |app, _cx| {
+                let _ = this.update(cx, |app, cx| {
+                    app.downloading_attachment_ids.insert(att_id);
                     if let Some(ref w) = app.worker {
                         w.send(MailRequest::SaveAttachment {
                             attachment_id: att_id,
                             dest_path: dest,
                         });
                     }
+                    cx.notify();
                 });
             }
         })
@@ -6163,10 +7284,12 @@ impl HylkiApp {
             return;
         }
         if self.demo_mode {
-            self.status_line = SharedString::from("演示模式下不支持导出真实附件文件");
+            self.attachment_drawer_error =
+                Some(SharedString::from("演示模式下不支持导出真实附件文件"));
             cx.notify();
             return;
         }
+        self.attachment_drawer_error = None;
         // 同上，放到后台线程执行，避免模态目录选择器嵌套消息循环触发 AppCell 重入 panic。
         cx.spawn(async move |this, cx| {
             let dest_dir = cx
@@ -6175,12 +7298,8 @@ impl HylkiApp {
                 .await;
             if let Some(dest_dir) = dest_dir {
                 let _ = this.update(cx, |app, cx| {
+                    app.saving_all_attachments = true;
                     if let Some(ref w) = app.worker {
-                        app.status_line = SharedString::from(format!(
-                            "正在保存 {} 个附件至 {}...",
-                            attachment_ids.len(),
-                            dest_dir.display()
-                        ));
                         w.send(MailRequest::SaveAllAttachments {
                             attachment_ids,
                             dest_dir,
@@ -6273,11 +7392,15 @@ impl HylkiApp {
     ) {
         self.pending_strip_attachment_id = None;
         if self.demo_mode {
+            self.attachment_item_errors.insert(
+                attachment_id,
+                SharedString::from("演示模式下不支持修改服务器附件"),
+            );
+            cx.notify();
             return;
         }
+        self.attachment_item_errors.remove(&attachment_id);
         self.stripping_attachment_ids.insert(attachment_id);
-        self.status_line =
-            SharedString::from(format!("正在从服务器剥离附件：{attachment_name}..."));
         if let Some(ref w) = self.worker {
             w.send(MailRequest::StripAttachment {
                 account_id,
@@ -6446,20 +7569,25 @@ impl HylkiApp {
     }
 
     pub(crate) fn export_print_preview_pdf(&mut self, cx: &mut Context<Self>) {
-        let Some(ref state) = self.print_preview else {
+        let Some(ref mut pp) = self.print_preview else {
             return;
         };
+        if pp.busy {
+            return;
+        }
+        pp.begin_export_pdf();
         let default_name = format!(
             "{}.pdf",
-            sanitize_filename(&state.detail.subject)
+            sanitize_filename(&pp.detail.subject)
                 .chars()
                 .take(48)
                 .collect::<String>()
         );
-        let state = state.clone();
+        let state = pp.clone();
         let date_style = self.prefs.date_style.clone();
         let clock_style = self.prefs.clock_style.clone();
         let generation = self.print_preview_generation;
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -6478,38 +7606,36 @@ impl HylkiApp {
                         })
                 })
                 .await;
-            if let Some(result) = result {
-                let _ = this.update(cx, |app, cx| {
-                    if app.print_preview_generation != generation {
-                        return;
-                    }
+            let _ = this.update(cx, |app, cx| {
+                if app.print_preview_generation != generation {
+                    return;
+                }
+                if let Some(ref mut pp) = app.print_preview {
                     match result {
-                        Ok(msg) => {
-                            if let Some(ref mut pp) = app.print_preview {
-                                pp.status_note = Some(SharedString::from(msg.clone()));
-                            }
-                            app.status_line = SharedString::from(msg);
-                        }
-                        Err(err) => {
-                            if let Some(ref mut pp) = app.print_preview {
-                                pp.status_note = Some(SharedString::from(err));
-                            }
-                        }
+                        Some(Ok(msg)) => pp.mark_pdf_exported(msg),
+                        Some(Err(err)) => pp.set_error(err),
+                        None => pp.clear_feedback(),
                     }
-                    cx.notify();
-                });
-            }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
 
     pub(crate) fn run_system_print(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.print_preview.clone() else {
+        let Some(ref mut pp) = self.print_preview else {
             return;
         };
+        if pp.busy {
+            return;
+        }
+        pp.begin_system_print();
+        let state = pp.clone();
         let date_style = self.prefs.date_style.clone();
         let clock_style = self.prefs.clock_style.clone();
         let generation = self.print_preview_generation;
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -6522,10 +7648,10 @@ impl HylkiApp {
                     return;
                 }
                 if let Some(ref mut pp) = app.print_preview {
-                    pp.status_note = Some(SharedString::from(match result {
-                        Ok(()) => "已在系统打印页打开，请在弹出的打印对话框中确认打印".to_string(),
-                        Err(err) => err,
-                    }));
+                    match result {
+                        Ok(()) => pp.mark_system_print_opened(),
+                        Err(err) => pp.set_error(err),
+                    }
                 }
                 cx.notify();
             });
@@ -6752,42 +7878,59 @@ impl HylkiApp {
         });
     }
 
-    pub(crate) fn send_compose(&mut self, cx: &mut Context<Self>) {
-        self.send_compose_inner(true, None, cx);
+    pub(crate) fn send_compose_with_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let origin = if self.compose_detached {
+            SendOrigin::ComposeWindow
+        } else {
+            SendOrigin::MainWindow
+        };
+        self.send_compose_inner(true, None, origin, Some(window), cx);
+    }
+
+    pub(crate) fn send_compose_in_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_compose_inner(true, None, SendOrigin::ComposeWindow, Some(window), cx);
     }
 
     pub(crate) fn send_compose_forced(&mut self, cx: &mut Context<Self>) {
-        self.send_compose_inner(false, None, cx);
+        let origin = if self.compose_detached {
+            SendOrigin::ComposeWindow
+        } else {
+            SendOrigin::MainWindow
+        };
+        self.send_compose_inner(false, None, origin, None, cx);
     }
 
     /// WP-10-5 定时发送：走与立即发送完全相同的校验，只是把到期时间换成用户
     /// 挑的那一刻，并且不进入撤销发送倒计时。
     pub(crate) fn send_compose_scheduled(&mut self, at: i64, cx: &mut Context<Self>) {
-        self.send_compose_inner(true, Some(at), cx);
+        let origin = if self.compose_detached {
+            SendOrigin::ComposeWindow
+        } else {
+            SendOrigin::MainWindow
+        };
+        self.send_compose_inner(true, Some(at), origin, None, cx);
     }
 
     fn send_compose_inner(
         &mut self,
         check_attachments: bool,
         schedule_at: Option<i64>,
+        origin: SendOrigin,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        if self.quitting
-            || (!self.demo_mode
-                && self
-                    .pending_send
-                    .as_ref()
-                    .is_some_and(|p| p.outbox_id.is_none()))
-        {
-            self.status_line = SharedString::from("上一封邮件尚未保存，请先完成或恢复它");
+        if self.quitting {
+            self.push_compose_or_main_toast(
+                "compose-quitting",
+                ToastKind::Warning,
+                "正在退出应用，无法发起新的发送",
+                None,
+                cx,
+            );
             cx.notify();
             return;
         }
-        if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
-            self.status_line = SharedString::from("正在撤销上一封邮件，请稍候");
-            cx.notify();
-            return;
-        }
+        self.compose_field_errors.clear();
         let to = self.compose_field_text(ComposeAddressField::To, cx);
         let cc = self.compose_field_text(ComposeAddressField::Cc, cx);
         let bcc = self.compose_field_text(ComposeAddressField::Bcc, cx);
@@ -6795,7 +7938,17 @@ impl HylkiApp {
         let body = self.compose_body.read(cx).value().to_string();
 
         if !self.demo_mode && self.accounts.is_empty() {
-            self.error_banner = Some(SharedString::from("请先配置并保存邮箱账号"));
+            self.push_compose_or_main_toast(
+                "compose-no-account",
+                ToastKind::Warning,
+                "请先配置并保存邮箱账号",
+                Some(ToastAction {
+                    label: "设置邮箱账号".into(),
+                    primary: true,
+                    kind: ToastActionKind::OpenAccountSettings { account_id: None },
+                }),
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -6806,8 +7959,8 @@ impl HylkiApp {
                 .iter()
                 .any(|a| a.id == self.compose_account_id && a.enabled)
         {
-            self.error_banner = Some(SharedString::from(
-                "当前所选发件账号已停用或不存在，请先选择可用账号再发送",
+            self.compose_field_errors.from_addr = Some(SharedString::from(
+                "当前所选发件账号已停用或不存在，请选择可用账号",
             ));
             cx.notify();
             return;
@@ -6815,20 +7968,32 @@ impl HylkiApp {
         // WP-10-2：自定义 From 与 Reply-To 都必须是可解析的邮箱，否则不发信。
         if !self.demo_mode && !self.compose_from_addr.trim().is_empty() {
             if !RecipientPill::parse(&self.compose_from_addr).is_some_and(|pill| pill.valid) {
-                self.error_banner = Some(SharedString::from(
+                self.compose_field_errors.from_addr = Some(SharedString::from(
                     "自定义发件人地址格式无效，请填写 `Name <addr>` 或纯邮箱地址",
                 ));
+                if self.compose_from_custom {
+                    if let Some(win) = window {
+                        self.compose_from.focus_handle(cx).focus(win, cx);
+                    }
+                }
                 cx.notify();
                 return;
             }
         }
         if let Some(problem) = self.compose_reply_to_problem(cx) {
-            self.error_banner = Some(SharedString::from(problem));
+            self.compose_field_errors.reply_to = Some(SharedString::from(problem));
+            self.compose_show_cc_bcc = true;
+            if let Some(win) = window {
+                self.compose_reply_to.focus_handle(cx).focus(win, cx);
+            }
             cx.notify();
             return;
         }
         if !self.demo_mode && to.trim().is_empty() {
-            self.error_banner = Some(SharedString::from("请填写收件人邮箱地址"));
+            self.compose_field_errors.to = Some(SharedString::from("请填写收件人邮箱地址"));
+            if let Some(win) = window {
+                self.compose_to.focus_handle(cx).focus(win, cx);
+            }
             cx.notify();
             return;
         }
@@ -6845,26 +8010,21 @@ impl HylkiApp {
         }
         self.compose_attachment_reminder = None;
 
-        // 若已有正在倒计时的待发邮件，先立即投递，避免覆盖丢信。
-        if let Some(prev) = self.pending_send.as_ref().map(|p| p.token) {
-            self.commit_pending_send(prev, cx);
-        }
         let delay_secs = self.prefs.undo_send_secs.min(30) as u8;
-        // WP-10-5：定时发送把绝对时间折算成剩余秒数交给 worker（`SendDraft.send_at`
-        // 的既有语义就是「延迟秒数」），由 worker 定时巡检到点投递。
-        let scheduled_secs = match schedule_at {
-            Some(at) => {
-                let remaining = at - chrono::Local::now().timestamp();
-                if remaining <= 0 {
-                    self.compose_schedule_error =
-                        Some(SharedString::from("定时发送时间必须晚于当前时间"));
-                    cx.notify();
-                    return;
-                }
-                Some(remaining)
+        let timing = if let Some(at) = schedule_at {
+            if at <= chrono::Local::now().timestamp() {
+                self.compose_schedule_error =
+                    Some(SharedString::from("定时发送时间必须晚于当前时间"));
+                cx.notify();
+                return;
             }
-            None => None,
+            SendTiming::ScheduledAt(at)
+        } else if delay_secs == 0 {
+            SendTiming::Immediate
+        } else {
+            SendTiming::DelaySecs(delay_secs)
         };
+
         let token = self.next_send_token;
         self.next_send_token = self.next_send_token.wrapping_add(1).max(1);
         let pending = PendingSend {
@@ -6884,22 +8044,30 @@ impl HylkiApp {
                 attachment_paths: self.compose_attachments.clone(),
             },
             local_draft_id: self.compose_draft_id,
-            remaining_secs: delay_secs,
+            total_delay_secs: if schedule_at.is_some() { 0 } else { delay_secs },
+            deadline_utc_secs: if self.demo_mode && schedule_at.is_none() && delay_secs > 0 {
+                Some(chrono::Utc::now().timestamp() + i64::from(delay_secs))
+            } else {
+                schedule_at
+            },
+            scheduled_at: schedule_at,
+            origin,
             outbox_id: None,
             undo_requested: false,
             commit_requested: false,
-            enqueue_failed: false,
+            sending_now: false,
+            enqueue_failed: None,
         };
-        // 任务一：撤销发送先把待发记录持久化到发件箱（Queued + 到期时间）再启动
-        // 倒计时；撤销 = 删除该记录，倒计时到期 / 立即发送 = 直接触发投递。原草稿
-        // 由 worker 在记录落盘成功后交接删除（保证内容已落盘且不重复）。
+
+        // 任务一：撤销发送先把待发记录持久化到发件箱（Queued + UTC 截止时间）；
+        // 撤销 = 删除该记录，到期 / 立即发送 = 直接触发投递。
         if !self.demo_mode {
             let request = MailRequest::SendDraft {
                 account_id: pending.account_id,
                 draft: pending.draft.clone(),
                 local_draft_id: pending.local_draft_id,
                 undo_token: token,
-                send_at: Some(scheduled_secs.unwrap_or(delay_secs as i64)),
+                timing,
             };
             let result = self
                 .worker
@@ -6907,19 +8075,25 @@ impl HylkiApp {
                 .ok_or_else(|| "邮件后台线程不可用".to_string())
                 .and_then(|w| w.send_checked(request));
             if let Err(message) = result {
-                self.error_banner = Some(SharedString::from(message));
+                self.push_compose_or_main_toast(
+                    format!("send-dispatch-fail-{token}"),
+                    ToastKind::Error,
+                    format!("发起发送失败：{message}"),
+                    None,
+                    cx,
+                );
                 cx.notify();
                 return;
             }
+            self.pending_sends.push(pending);
+        } else if schedule_at.is_none() && delay_secs > 0 {
+            self.pending_sends.push(pending);
         }
-        // 定时发送不进撤销倒计时：记录已在发件箱排队，等 worker 到点投递即可。
-        if scheduled_secs.is_none() {
-            self.pending_send = Some(pending);
-        }
+
         self.compose_confirm_discard = false;
         self.compose_autocomplete_field = None;
         self.pending_forward_msg_id = None;
-        // F-4：发送即清除挂起的自动保存（草稿由发送流程删除，不再落库）。
+        // F-4：发送即清除挂起的自动保存（草稿由发送流程交接删除，不再落库）。
         self.cancel_draft_autosave();
         self.compose_autosaved_new = false;
         self.compose_autosaved_at = None;
@@ -6927,167 +8101,439 @@ impl HylkiApp {
         // WP-10-4：发出后分屏 / 独立写信窗口一并收起，回到阅读器。
         self.finish_compose_session(cx);
         self.right_mode = RightPaneMode::Reader;
-        self.error_banner = None;
 
         if let Some(at) = schedule_at {
             self.compose_schedule_open = false;
             self.compose_schedule_error = None;
-            let when = compose_schedule::schedule_label(at);
-            self.status_line = SharedString::from(if self.demo_mode {
-                format!("演示定时发送：{when}")
-            } else {
-                format!("已排入定时发送：{when}，到点自动发出")
-            });
+            if self.demo_mode {
+                let when = compose_schedule::schedule_label(at);
+                self.push_toast(
+                    "demo-scheduled",
+                    ToastKind::Info,
+                    format!("演示模式：已模拟定时发送（{when}）"),
+                    None,
+                    cx,
+                );
+            }
             cx.notify();
             return;
         }
 
         if self.demo_mode {
-            self.start_send_countdown(token, delay_secs, cx);
+            if delay_secs == 0 {
+                self.push_toast(
+                    "demo-sent",
+                    ToastKind::Success,
+                    "演示模式：邮件已模拟发送",
+                    None,
+                    cx,
+                );
+            } else {
+                self.ensure_send_ticker(cx);
+            }
         } else {
-            self.status_line = SharedString::from("正在保存待发送邮件…");
-            cx.notify();
+            self.ensure_send_ticker(cx);
         }
+        cx.notify();
     }
 
-    fn start_send_countdown(&mut self, token: u64, delay_secs: u8, cx: &mut Context<Self>) {
-        if delay_secs == 0 {
-            self.commit_pending_send(token, cx);
+    fn ensure_send_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.send_ticker_running {
             return;
         }
-
-        self.status_line = SharedString::from(format!(
-            "邮件将在 {delay_secs} 秒后发出，可随时点击「撤销发送」"
-        ));
-
-        cx.spawn(async move |this, cx| {
-            for _ in 0..delay_secs {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                let keep_going = this
-                    .update(cx, |app, cx| {
-                        let Some(pending) = app.pending_send.as_mut() else {
-                            return false;
-                        };
-                        if pending.token != token {
-                            return false;
+        let has_active = self
+            .pending_sends
+            .iter()
+            .any(|p| p.scheduled_at.is_none() && p.enqueue_failed.is_none() && !p.undo_requested);
+        if !has_active {
+            return;
+        }
+        self.send_ticker_running = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let keep_going = this
+                .update(cx, |app, cx| {
+                    let now_ts = chrono::Utc::now().timestamp();
+                    let mut expired_demo_tokens = Vec::new();
+                    for pending in &mut app.pending_sends {
+                        if pending.scheduled_at.is_some()
+                            || pending.enqueue_failed.is_some()
+                            || pending.undo_requested
+                            || pending.sending_now
+                        {
+                            continue;
                         }
-                        if pending.remaining_secs > 1 {
-                            pending.remaining_secs -= 1;
-                            cx.notify();
-                            true
-                        } else {
-                            app.commit_pending_send(token, cx);
-                            false
+                        if let Some(deadline) = pending.deadline_utc_secs {
+                            if now_ts >= deadline {
+                                if app.demo_mode {
+                                    expired_demo_tokens.push(pending.token);
+                                } else {
+                                    // 仅更新界面阶段提示，真实投递由后台按 send_at 到点触发，不重复发 RetryOutboxItem。
+                                    pending.sending_now = true;
+                                }
+                            }
                         }
-                    })
-                    .unwrap_or(false);
-                if !keep_going {
-                    break;
-                }
+                    }
+                    for token in expired_demo_tokens {
+                        app.commit_pending_send(token, cx);
+                    }
+                    let active = app.pending_sends.iter().any(|p| {
+                        p.scheduled_at.is_none()
+                            && p.enqueue_failed.is_none()
+                            && !p.undo_requested
+                            && !p.sending_now
+                    });
+                    if active {
+                        cx.notify();
+                        true
+                    } else {
+                        app.send_ticker_running = false;
+                        cx.notify();
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if !keep_going {
+                break;
             }
         })
         .detach();
-
-        cx.notify();
     }
 
-    /// 真正将 `pending_send` 投递给 Worker（倒计时到期或点击「立即发送」）。
-    /// 记录已在发送时落盘发件箱，此处仅触发投递；落盘回执未到时挂起等待。
+    /// 真正将 `PendingSend` 投递给 Worker（仅用于用户点击「立即发送」或演示模式到期）。
     pub(crate) fn commit_pending_send(&mut self, token: u64, cx: &mut Context<Self>) {
-        if self.quitting || self.pending_send.as_ref().map(|p| p.token) != Some(token) {
+        if self.quitting {
             return;
         }
-        if self.demo_mode {
-            let Some(pending) = self.pending_send.take() else {
-                return;
-            };
-            self.status_line = SharedString::from(format!(
-                "演示发件成功：收件人=\"{}\"，主题=\"{}\"，附件={} 个",
-                if pending.draft.to.is_empty() {
-                    "(未填写)"
-                } else {
-                    &pending.draft.to
-                },
-                if pending.draft.subject.is_empty() {
-                    "(无主题)"
-                } else {
-                    &pending.draft.subject
-                },
-                pending.draft.attachment_paths.len()
-            ));
-            cx.notify();
-            return;
-        }
-
-        // 撤销请求优先：不投递、不让缓冲失效；记录由撤销流程在落盘回执到达后删除。
-        if self.pending_send.as_ref().is_some_and(|p| p.undo_requested) {
-            cx.notify();
-            return;
-        }
-
-        let Some(pending) = self.pending_send.as_mut() else {
+        let Some(pos) = self.pending_sends.iter().position(|p| p.token == token) else {
             return;
         };
-        if pending.outbox_id.is_none() {
-            // 记录落盘回执（OutboxEnqueued）尚未到达：挂起投递，回执到达后自动触发。
-            pending.commit_requested = true;
-            self.status_line = SharedString::from("正在发送...");
+        if self.demo_mode {
+            let pending = self.pending_sends.remove(pos);
+            let recipient = if pending.draft.to.trim().is_empty() {
+                "(未填写)".to_string()
+            } else {
+                pending.draft.to.trim().to_string()
+            };
+            self.push_toast(
+                format!("demo-sent-{token}"),
+                ToastKind::Success,
+                format!("演示模式：已模拟发送给 {recipient}"),
+                None,
+                cx,
+            );
             cx.notify();
             return;
         }
-        let pending = self.pending_send.take().unwrap();
-        if let Some(ref w) = self.worker {
-            self.status_line = SharedString::from("正在发送...");
+
+        // 撤销请求优先：不投递、不让缓冲失效。
+        if self.pending_sends[pos].undo_requested
+            || self.pending_sends[pos].enqueue_failed.is_some()
+        {
+            cx.notify();
+            return;
+        }
+
+        let (account_id, outbox_id) = {
+            let pending = &mut self.pending_sends[pos];
+            pending.sending_now = true;
+            if pending.outbox_id.is_none() {
+                pending.commit_requested = true;
+                cx.notify();
+                return;
+            }
+            (pending.account_id, pending.outbox_id)
+        };
+        if let (Some(oid), Some(w)) = (outbox_id, self.worker.as_ref()) {
             w.send(MailRequest::RetryOutboxItem {
-                account_id: pending.account_id,
-                outbox_id: pending.outbox_id.unwrap_or_default(),
+                account_id,
+                outbox_id: oid,
             });
         }
         cx.notify();
     }
 
-    /// 撤销发送：删除发件箱排队记录并把缓冲内容恢复到写信页。
-    pub(crate) fn undo_pending_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 撤销指定令牌的待发送邮件：删除发件箱排队记录并将内容恢复到写信页/草稿。
+    pub(crate) fn undo_pending_send_token(
+        &mut self,
+        token: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.quitting {
             return;
         }
-        let Some(pending) = self.pending_send.as_mut() else {
+        let Some(pos) = self.pending_sends.iter().position(|p| p.token == token) else {
             return;
         };
-        if pending.undo_requested {
+        if self.pending_sends[pos].enqueue_failed.is_some() {
+            self.recover_failed_pending_send(token, window, cx);
             return;
         }
-        if pending.enqueue_failed {
-            if self.has_active_compose() {
-                self.status_line = SharedString::from("请先关闭当前写信页，再恢复未保存的邮件");
-            } else {
-                let pending = self.pending_send.take().unwrap();
-                self.restore_pending_send_to_compose(&pending, window, cx);
-                self.compose_draft_id = pending.local_draft_id;
-                self.status_line = SharedString::from("已恢复未保存的邮件，请重新保存或发送");
+        if self.pending_sends[pos].undo_requested {
+            return;
+        }
+        if self.pending_sends[pos].sending_now {
+            self.push_toast(
+                format!("undo-locked-{token}"),
+                ToastKind::Warning,
+                "邮件已开始投递，无法撤销",
+                None,
+                cx,
+            );
+            return;
+        }
+        if self.demo_mode {
+            let pending = self.pending_sends.remove(pos);
+            self.restore_pending_send_to_compose(&pending, window, cx);
+            if pending.origin == SendOrigin::ComposeWindow {
+                self.pop_out_compose(cx);
             }
+            self.push_toast(
+                format!("undo-demo-{token}"),
+                ToastKind::Success,
+                "已撤销发送，返回编辑",
+                None,
+                cx,
+            );
             cx.notify();
             return;
         }
-        pending.undo_requested = true;
-        if self.demo_mode {
-            let pending = self.pending_send.take().unwrap();
-            self.restore_pending_send_to_compose(&pending, window, cx);
-            self.status_line = SharedString::from("已撤销发送，返回编辑邮件");
-        } else if let (Some(outbox_id), Some(w)) = (pending.outbox_id, self.worker.as_ref()) {
-            match w.send_checked(MailRequest::UndoOutboxItem {
-                account_id: pending.account_id,
-                outbox_id,
-                token: pending.token,
+        let (account_id, outbox_id) = {
+            let pending = &mut self.pending_sends[pos];
+            pending.undo_requested = true;
+            pending.commit_requested = false;
+            (pending.account_id, pending.outbox_id)
+        };
+        if let (Some(oid), Some(w)) = (outbox_id, self.worker.as_ref()) {
+            if let Err(message) = w.send_checked(MailRequest::UndoOutboxItem {
+                account_id,
+                outbox_id: oid,
+                token,
             }) {
-                Ok(()) => self.status_line = SharedString::from("正在撤销发送…"),
-                Err(message) => {
-                    pending.undo_requested = false;
-                    self.error_banner = Some(SharedString::from(message.clone()));
-                    self.status_line = SharedString::from(message);
+                if let Some(p) = self.pending_sends.iter_mut().find(|p| p.token == token) {
+                    p.undo_requested = false;
                 }
+                self.push_toast(
+                    format!("undo-dispatch-fail-{token}"),
+                    ToastKind::Error,
+                    message,
+                    None,
+                    cx,
+                );
             }
         }
+        cx.notify();
+    }
+
+    pub(crate) fn undo_latest_pending_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(token) = self
+            .pending_sends
+            .iter()
+            .rev()
+            .find(|p| p.scheduled_at.is_none() && !p.undo_requested && !p.sending_now)
+            .map(|p| p.token)
+        {
+            self.undo_pending_send_token(token, window, cx);
+        }
+    }
+
+    pub(crate) fn recover_failed_pending_send(
+        &mut self,
+        token: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pos) = self.pending_sends.iter().position(|p| p.token == token) else {
+            return;
+        };
+        if self.has_active_compose() {
+            self.push_toast(
+                "recover-compose-busy",
+                ToastKind::Warning,
+                "请先完成或保存当前正在编辑的草稿，再恢复未保存邮件",
+                Some(ToastAction {
+                    label: "回到当前草稿".into(),
+                    primary: true,
+                    kind: ToastActionKind::FocusActiveCompose,
+                }),
+                cx,
+            );
+            return;
+        }
+        let pending = self.pending_sends.remove(pos);
+        self.toasts.dismiss_by_key(&format!("enqueue-fail-{token}"));
+        self.toasts
+            .dismiss_by_key(&format!("quit-blocked-failed-{token}"));
+        self.restore_pending_send_to_compose(&pending, window, cx);
+        self.compose_draft_id = pending.local_draft_id;
+        self.push_toast(
+            "recovered-compose",
+            ToastKind::Info,
+            "已恢复未保存邮件到编辑器，请重新发送或保存草稿",
+            None,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn handle_restored_draft_from_undo(
+        &mut self,
+        draft_id: u32,
+        draft: LocalDraft,
+        origin: Option<SendOrigin>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_active_compose() {
+            self.main_view = MainContentView::Mail;
+            self.open_local_draft(&draft, window, cx);
+            self.compose_draft_id = Some(draft_id);
+            if origin == Some(SendOrigin::ComposeWindow) {
+                self.pop_out_compose(cx);
+            }
+            self.push_toast(
+                "undo-send-restored",
+                ToastKind::Success,
+                "已撤销发送，返回编辑",
+                None,
+                cx,
+            );
+        } else {
+            self.push_toast(
+                "undo-send-saved-draft",
+                ToastKind::Info,
+                "已撤销发送，原邮件已恢复到草稿",
+                Some(ToastAction {
+                    label: "查看草稿".into(),
+                    primary: true,
+                    kind: ToastActionKind::ViewDrafts,
+                }),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn active_send_toast_model(&self) -> Option<SendToastViewModel> {
+        build_send_toast_model(&self.pending_sends, &self.outbox_by_account, self.demo_mode)
+    }
+
+    pub(crate) fn primary_send_toast_outbox_key(&self) -> Option<(u32, u32)> {
+        self.active_send_toast_model()
+            .and_then(|m| m.outbox_id.map(|oid| (m.account_id, oid)))
+    }
+
+    pub(crate) fn is_active_undo_outbox(&self, account_id: u32, outbox_id: u32) -> bool {
+        self.pending_sends.iter().any(|p| {
+            p.account_id == account_id
+                && p.outbox_id == Some(outbox_id)
+                && p.scheduled_at.is_none()
+                && p.enqueue_failed.is_none()
+                && !p.sending_now
+        })
+    }
+
+    pub(crate) fn toggle_outbox_error_detail(
+        &mut self,
+        account_id: u32,
+        outbox_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (account_id, outbox_id);
+        if !self.expanded_outbox_errors.remove(&key) {
+            self.expanded_outbox_errors.insert(key);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn undo_outbox_item_from_sidebar(
+        &mut self,
+        account_id: u32,
+        outbox_id: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(token) = self
+            .pending_sends
+            .iter()
+            .find(|p| p.account_id == account_id && p.outbox_id == Some(outbox_id))
+            .map(|p| p.token)
+        {
+            self.undo_pending_send_token(token, window, cx);
+            return;
+        }
+        if let Some(ref w) = self.worker {
+            if let Err(err) = w.send_checked(MailRequest::UndoOutboxItem {
+                account_id,
+                outbox_id,
+                token: 0,
+            }) {
+                self.push_toast("sidebar-undo-fail", ToastKind::Error, err, None, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn retry_outbox_item_from_sidebar(
+        &mut self,
+        account_id: u32,
+        outbox_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::RetryOutboxItem {
+                account_id,
+                outbox_id,
+            });
+            self.push_toast(
+                format!("outbox-retry-{account_id}-{outbox_id}"),
+                ToastKind::Info,
+                "正在重新投递发件箱邮件…",
+                None,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn delete_outbox_item_from_sidebar(
+        &mut self,
+        account_id: u32,
+        outbox_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_sends
+            .retain(|p| !(p.account_id == account_id && p.outbox_id == Some(outbox_id)));
+        self.expanded_outbox_errors.remove(&(account_id, outbox_id));
+        if self.focused_outbox_item == Some((account_id, outbox_id)) {
+            self.focused_outbox_item = None;
+        }
+        if let Some(ref w) = self.worker {
+            w.send(MailRequest::DeleteOutboxItem {
+                account_id,
+                outbox_id,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_account_sync_error_detail(
+        &mut self,
+        account_id: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.expanded_account_errors.remove(&account_id) {
+            self.expanded_account_errors.insert(account_id);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_account_sync_error(&mut self, account_id: u32, cx: &mut Context<Self>) {
+        self.account_sync_errors.remove(&account_id);
+        self.expanded_account_errors.remove(&account_id);
         cx.notify();
     }
 
@@ -7179,8 +8625,14 @@ impl HylkiApp {
         self.compose_account_id = 1;
         self.right_mode = RightPaneMode::Reader;
         self.main_view = MainContentView::Mail;
-        self.error_banner = None;
-        self.status_line = SharedString::from("演示模式：已加载 10,000 封模拟邮件");
+        self.clear_transient_status_line();
+        self.push_toast(
+            "demo-entered",
+            ToastKind::Info,
+            "已切换为演示模式（模拟邮箱数据）",
+            None,
+            cx,
+        );
         cx.notify();
     }
 
@@ -7483,13 +8935,8 @@ impl HylkiApp {
         self.prefs.dark_mode = Some(self.dark_mode);
         theme::apply(self.theme_id, self.dark_mode, cx);
         if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
-            self.error_banner = Some(SharedString::from(e));
+            self.push_toast("prefs-save-fail", ToastKind::Error, e, None, cx);
         }
-        self.status_line = SharedString::from(if self.dark_mode {
-            "已切换到暗色主题"
-        } else {
-            "已切换到亮色主题"
-        });
         cx.notify();
     }
 
@@ -7632,12 +9079,17 @@ impl HylkiApp {
         }
         self.reader_position = position;
         self.prefs.reader_position = position.key().to_string();
-        let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
-        self.status_line = SharedString::from(match position {
-            ReaderPosition::Right => "阅读器已移到列表右侧",
-            ReaderPosition::Below => "阅读器已移到列表下方",
-            ReaderPosition::Hidden => "阅读器已关闭：邮件仅选中，按 Ctrl+Alt+1 重新打开",
-        });
+        if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
+            self.push_toast("prefs-save-fail", ToastKind::Error, e, None, cx);
+        } else if position == ReaderPosition::Hidden {
+            self.push_toast(
+                "reader-hidden",
+                ToastKind::Info,
+                "阅读器已隐藏，按 Ctrl+Alt+1 重新打开",
+                None,
+                cx,
+            );
+        }
         cx.notify();
     }
 
@@ -7674,12 +9126,15 @@ impl HylkiApp {
                 self.focus_saved_prefer_plain = Some(self.reader_prefer_plain);
                 self.reader_prefer_plain = true;
             }
-            self.status_line = SharedString::from("专注模式已开启（Ctrl+Shift+F 恢复）");
-        } else {
-            if let Some(prev) = self.focus_saved_prefer_plain.take() {
-                self.reader_prefer_plain = prev;
-            }
-            self.status_line = SharedString::from("专注模式已关闭");
+            self.push_toast(
+                "focus-mode",
+                ToastKind::Info,
+                "专注模式已开启（Ctrl+Shift+F 恢复）",
+                None,
+                cx,
+            );
+        } else if let Some(prev) = self.focus_saved_prefer_plain.take() {
+            self.reader_prefer_plain = prev;
         }
         cx.notify();
     }
@@ -7783,11 +9238,6 @@ impl HylkiApp {
             Some(picked_dark) => !picked_dark,
         };
         self.message_bg_picks.insert(message_id, next);
-        self.status_line = SharedString::from(if next {
-            "此邮件正文已强制暗色背景（仅本会话）"
-        } else {
-            "此邮件正文已强制亮色背景（仅本会话）"
-        });
         cx.notify();
     }
 
@@ -7976,7 +9426,13 @@ impl HylkiApp {
                 });
             }
         } else {
-            self.status_line = SharedString::from(format!("已更新标签：{tag}"));
+            self.push_toast(
+                "tags-updated",
+                ToastKind::Success,
+                format!("已更新标签：{tag}"),
+                None,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -8001,7 +9457,13 @@ impl HylkiApp {
                 });
             }
         } else {
-            self.status_line = SharedString::from("已清除邮件标签");
+            self.push_toast(
+                "tags-cleared",
+                ToastKind::Success,
+                "已清除邮件标签",
+                None,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -8028,12 +9490,19 @@ impl HylkiApp {
                     until_ts,
                 });
             }
-        }
-        self.status_line = SharedString::from(if until_ts > 0 {
-            format!("已设置稍后提醒：{label}")
         } else {
-            "已取消稍后提醒".to_string()
-        });
+            self.push_toast(
+                "msg-snooze",
+                ToastKind::Success,
+                if until_ts > 0 {
+                    format!("已设置稍后提醒：{label}")
+                } else {
+                    "已取消稍后提醒".to_string()
+                },
+                None,
+                cx,
+            );
+        }
         cx.notify();
     }
 
@@ -8047,8 +9516,13 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) {
         if self.demo_mode {
-            self.status_line =
-                SharedString::from(format!("演示模式：已模拟复制到 {target_folder_path}"));
+            self.push_toast(
+                "msg-copy-demo",
+                ToastKind::Info,
+                format!("演示模式：已模拟复制到 {target_folder_path}"),
+                None,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -8091,7 +9565,13 @@ impl HylkiApp {
             Vec::new(),
             cx,
         );
-        self.status_line = SharedString::from(format!("已将 {target_email} 添加到通讯录"));
+        self.push_toast(
+            "add-sender-contact",
+            ToastKind::Success,
+            format!("已将 {target_email} 添加到通讯录"),
+            None,
+            cx,
+        );
         cx.notify();
     }
 
@@ -8108,9 +9588,13 @@ impl HylkiApp {
         } else {
             email
         };
-        self.status_line = SharedString::from(format!(
-            "已生成过滤条件模板：发件人={addr}，主题包含「{subject}」"
-        ));
+        self.push_toast(
+            "create-filter-tpl",
+            ToastKind::Info,
+            format!("已生成过滤条件模板：发件人={addr}，主题包含「{subject}」"),
+            None,
+            cx,
+        );
         cx.notify();
     }
 
@@ -8225,10 +9709,13 @@ impl HylkiApp {
                             "发现新版本 v{}（当前 v{}）",
                             info.version, info.current_version
                         )));
-                        app.status_line = SharedString::from(format!(
-                            "发现新版本 v{}，可在「关于 Hylki」中更新",
-                            info.version
-                        ));
+                        app.push_toast(
+                            "update-available",
+                            ToastKind::Info,
+                            format!("发现新版本 v{}，可在「关于 Hylki」中更新", info.version),
+                            None,
+                            cx,
+                        );
                         app.update.info = Some(info);
                     }
                     Ok(None) => {
@@ -8297,9 +9784,13 @@ impl HylkiApp {
             .map(|a| a.display_label())
             .unwrap_or_else(|| format!("账号 #{account_id}"));
         if let Some(ref w) = self.worker {
-            self.error_banner = None;
-            self.status_line = SharedString::from(format!("正在刷新 {label}..."));
-            w.send(MailRequest::SyncAccount { account_id });
+            self.syncing_accounts.insert(account_id);
+            self.account_sync_errors.remove(&account_id);
+            self.status_line = SharedString::from(format!("正在同步 {label}..."));
+            w.send(MailRequest::SyncAccount {
+                account_id,
+                user_initiated: true,
+            });
         }
         cx.notify();
     }
@@ -8316,11 +9807,12 @@ impl HylkiApp {
             return;
         }
         if let Some(ref w) = self.worker {
-            self.status_line = SharedString::from("正在刷新文件夹...");
+            self.status_line = SharedString::from("正在同步文件夹...");
             w.send(MailRequest::SyncFolder {
                 account_id,
                 folder_id,
                 folder_path,
+                user_initiated: true,
             });
         }
         cx.notify();
@@ -8350,13 +9842,21 @@ impl HylkiApp {
                 item.unread = false;
             }
         }
-        if let Some(ref w) = self.worker {
-            self.status_line = SharedString::from("正在把文件夹全部标为已读...");
-            w.send(MailRequest::MarkFolderAllRead {
-                account_id,
-                folder_id,
-                folder_path,
-            });
+        if self.worker.is_some() {
+            self.push_toast(
+                "mark-folder-read",
+                ToastKind::Info,
+                "正在将文件夹全部标为已读...",
+                None,
+                cx,
+            );
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::MarkFolderAllRead {
+                    account_id,
+                    folder_id,
+                    folder_path,
+                });
+            }
         }
         cx.notify();
     }
@@ -8394,10 +9894,13 @@ impl HylkiApp {
                 }
             }
         }
-        self.status_line = SharedString::from(format!(
-            "正在把 {} 个账号的收件箱全部标为已读...",
-            targets.len()
-        ));
+        self.push_toast(
+            "mark-all-inboxes-read",
+            ToastKind::Info,
+            format!("正在把 {} 个账号的收件箱全部标为已读...", targets.len()),
+            None,
+            cx,
+        );
         cx.notify();
     }
 
@@ -8431,13 +9934,21 @@ impl HylkiApp {
             self.current_page.total = 0;
             self.selected_message = None;
         }
-        if let Some(ref w) = self.worker {
-            self.status_line = SharedString::from("正在清空文件夹...");
-            w.send(MailRequest::EmptyFolder {
-                account_id,
-                folder_id,
-                folder_path,
-            });
+        if self.worker.is_some() {
+            self.push_toast(
+                "empty-folder",
+                ToastKind::Info,
+                "正在清空文件夹...",
+                None,
+                cx,
+            );
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::EmptyFolder {
+                    account_id,
+                    folder_id,
+                    folder_path,
+                });
+            }
         }
         cx.notify();
     }
@@ -8545,14 +10056,32 @@ impl HylkiApp {
             .map(|a| (a.id, a.display_label()))
             .collect();
         if let Some(ref g) = self.gallery {
-            g.update(cx, |state, _cx| state.set_accounts(accounts));
+            g.update(cx, |state, _cx| {
+                state.set_demo_mode(self.demo_mode);
+                state.set_accounts(accounts);
+            });
         }
         self.request_gallery_items(cx);
         cx.notify();
     }
 
     /// 附件总览「保存」：复用现有 rfd 保存对话框 + `SaveAttachment` 流程。
-    fn save_gallery_attachment(&self, attachment_id: u32, cx: &mut Context<Self>) {
+    fn save_gallery_attachment(&mut self, attachment_id: u32, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            if let Some(ref g) = self.gallery {
+                g.update(cx, |state, cx| {
+                    state.set_item_error(attachment_id, "演示模式下不支持导出真实附件");
+                    cx.notify();
+                });
+            }
+            return;
+        }
+        if let Some(ref g) = self.gallery {
+            g.update(cx, |state, cx| {
+                state.set_saving(attachment_id, true);
+                cx.notify();
+            });
+        }
         let filename = self
             .gallery_items
             .iter()
@@ -8587,7 +10116,6 @@ impl HylkiApp {
         self.right_mode = RightPaneMode::Reader;
         if let Some((detail, true)) = self.try_load_cached_detail(message_id) {
             self.set_selected_message(detail);
-            self.error_banner = None;
             cx.notify();
             return;
         }
@@ -8652,28 +10180,57 @@ impl HylkiApp {
         let lower = url.to_ascii_lowercase();
         if one_click && lower.starts_with("https://") {
             if self.demo_mode {
-                self.status_line =
-                    SharedString::from("演示模式：已模拟发送一键退订请求（不访问网络）");
+                self.push_toast(
+                    "unsubscribe",
+                    ToastKind::Info,
+                    "演示模式：已模拟发送一键退订请求（不访问网络）",
+                    None,
+                    cx,
+                );
                 cx.notify();
                 return;
             }
-            if let Some(ref w) = self.worker {
-                self.status_line = SharedString::from("正在发送一键退订请求...");
-                w.send(MailRequest::UnsubscribeOneClick {
-                    url: url.to_string(),
-                });
+            if self.worker.is_some() {
+                self.push_toast(
+                    "unsubscribe",
+                    ToastKind::Info,
+                    "正在发送一键退订请求...",
+                    None,
+                    cx,
+                );
+                if let Some(ref w) = self.worker {
+                    w.send(MailRequest::UnsubscribeOneClick {
+                        url: url.to_string(),
+                    });
+                }
             }
         } else if lower.starts_with("http://") || lower.starts_with("https://") {
-            self.status_line = SharedString::from("已在浏览器打开退订页面");
+            self.push_toast(
+                "unsubscribe",
+                ToastKind::Info,
+                "已在浏览器打开退订页面",
+                None,
+                cx,
+            );
             self.open_link(url, cx);
         } else if lower.starts_with("mailto:") {
             // gpui open_url 经系统 shell 打开，mailto 唤起默认邮件客户端。
-            self.status_line = SharedString::from("已调用系统邮件客户端发送退订邮件");
+            self.push_toast(
+                "unsubscribe",
+                ToastKind::Info,
+                "已调用系统邮件客户端发送退订邮件",
+                None,
+                cx,
+            );
             cx.open_url(url);
         } else {
-            self.error_banner = Some(SharedString::from(
+            self.push_toast(
+                "unsubscribe",
+                ToastKind::Error,
                 "该退订地址不受支持（仅支持 http/https/mailto）",
-            ));
+                None,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -8802,7 +10359,19 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) {
         if self.demo_mode {
-            self.status_line = SharedString::from("演示模式下不支持修改联系人数据库");
+            if let Some(ref c) = self.contacts {
+                c.update(cx, |state, cx| {
+                    state.set_feedback(false, "演示模式下不支持修改联系人数据库");
+                    cx.notify();
+                });
+            }
+            self.push_toast(
+                "contacts-demo",
+                ToastKind::Info,
+                "演示模式下不支持修改联系人数据库",
+                None,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -8820,6 +10389,19 @@ impl HylkiApp {
                     groups,
                 },
             });
+            if let Some(ref c) = self.contacts {
+                c.update(cx, |state, cx| {
+                    state.set_feedback(true, "已保存联系人");
+                    cx.notify();
+                });
+            }
+            self.push_toast(
+                "contact-saved",
+                ToastKind::Success,
+                "已保存联系人",
+                None,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -8827,12 +10409,30 @@ impl HylkiApp {
     /// 删除用户联系人（仅自定义联系人可删，`contact_id` 为行 ID）。
     fn delete_user_contact(&mut self, contact_id: u32, cx: &mut Context<Self>) {
         if self.demo_mode {
-            self.status_line = SharedString::from("演示模式下不支持删除联系人");
+            if let Some(ref c) = self.contacts {
+                c.update(cx, |state, cx| {
+                    state.set_feedback(false, "演示模式下不支持删除联系人");
+                    cx.notify();
+                });
+            }
             cx.notify();
             return;
         }
         if let Some(ref w) = self.worker {
             w.send(MailRequest::DeleteUserContact { contact_id });
+            if let Some(ref c) = self.contacts {
+                c.update(cx, |state, cx| {
+                    state.set_feedback(true, "已删除联系人");
+                    cx.notify();
+                });
+            }
+            self.push_toast(
+                "contact-deleted",
+                ToastKind::Success,
+                "已删除联系人",
+                None,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -8840,7 +10440,12 @@ impl HylkiApp {
     /// 联系人导入：rfd 选择 .vcf / .csv 文件，按内容特征识别格式解析后批量入库。
     fn import_contacts_file(&mut self, cx: &mut Context<Self>) {
         if self.demo_mode {
-            self.status_line = SharedString::from("演示模式下不支持导入联系人");
+            if let Some(ref c) = self.contacts {
+                c.update(cx, |state, cx| {
+                    state.set_feedback(false, "演示模式下不支持导入联系人");
+                    cx.notify();
+                });
+            }
             cx.notify();
             return;
         }
@@ -8865,8 +10470,15 @@ impl HylkiApp {
                 let text = match std::fs::read_to_string(&path) {
                     Ok(text) => text,
                     Err(e) => {
-                        app.error_banner =
-                            Some(SharedString::from(format!("读取联系人文件失败: {e}")));
+                        let err = format!("读取联系人文件失败：{e}");
+                        if let Some(ref c) = app.contacts {
+                            let m = err.clone();
+                            c.update(cx, |state, cx| {
+                                state.set_feedback(false, m);
+                                cx.notify();
+                            });
+                        }
+                        app.push_toast("contacts-import-err", ToastKind::Error, err, None, cx);
                         cx.notify();
                         return;
                     }
@@ -8878,14 +10490,25 @@ impl HylkiApp {
                     contacts_io::parse_csv_contacts(&text)
                 };
                 if contacts.is_empty() {
-                    app.status_line =
-                        SharedString::from("未在文件中找到带邮箱的联系人（支持 vCard 与 CSV）");
+                    let msg = "未在文件中找到带邮箱的联系人（支持 vCard 与 CSV）";
+                    if let Some(ref c) = app.contacts {
+                        c.update(cx, |state, cx| {
+                            state.set_feedback(false, msg);
+                            cx.notify();
+                        });
+                    }
+                    app.push_toast("contacts-import-empty", ToastKind::Warning, msg, None, cx);
                     cx.notify();
                     return;
                 }
                 let count = contacts.len();
                 if let Some(ref w) = app.worker {
-                    app.status_line = SharedString::from(format!("正在导入 {count} 个联系人..."));
+                    if let Some(ref c) = app.contacts {
+                        c.update(cx, |state, cx| {
+                            state.set_feedback(true, format!("正在导入 {count} 个联系人..."));
+                            cx.notify();
+                        });
+                    }
                     w.send(MailRequest::ImportUserContacts { contacts });
                 }
                 cx.notify();
@@ -8946,7 +10569,12 @@ impl HylkiApp {
             ),
         };
         if items.is_empty() {
-            self.status_line = SharedString::from("暂无可导出的联系人");
+            if let Some(ref c) = self.contacts {
+                c.update(cx, |state, cx| {
+                    state.set_feedback(false, "暂无可导出的联系人");
+                    cx.notify();
+                });
+            }
             cx.notify();
             return;
         }
@@ -8973,15 +10601,26 @@ impl HylkiApp {
             let _ = this.update(cx, |app, cx| {
                 match std::fs::write(&dest, content) {
                     Ok(()) => {
-                        app.status_line = SharedString::from(format!(
-                            "已导出 {} 个联系人至 {}",
-                            count,
-                            dest.display()
-                        ));
+                        let msg = format!("已导出 {} 个联系人至 {}", count, dest.display());
+                        if let Some(ref c) = app.contacts {
+                            let m = msg.clone();
+                            c.update(cx, |state, cx| {
+                                state.set_feedback(true, m);
+                                cx.notify();
+                            });
+                        }
+                        app.push_toast("contacts-exported", ToastKind::Success, msg, None, cx);
                     }
                     Err(e) => {
-                        app.error_banner =
-                            Some(SharedString::from(format!("写入联系人文件失败: {e}")));
+                        let err = format!("写入联系人文件失败：{e}");
+                        if let Some(ref c) = app.contacts {
+                            let m = err.clone();
+                            c.update(cx, |state, cx| {
+                                state.set_feedback(false, m);
+                                cx.notify();
+                            });
+                        }
+                        app.push_toast("contacts-export-err", ToastKind::Error, err, None, cx);
                     }
                 }
                 cx.notify();
@@ -9114,6 +10753,7 @@ impl HylkiApp {
     pub(crate) fn clear_settings_window_ref(&mut self) {
         self.settings_window = None;
         self.settings_window_opening = false;
+        self.settings_toasts = WindowToastQueue::default();
     }
 
     /// 应用偏好变更并统一触发对应副作用与原子落盘。
@@ -9133,7 +10773,7 @@ impl HylkiApp {
         self.prefs.reader_zoom_percent = config::clamp_reader_zoom(self.prefs.reader_zoom_percent);
 
         if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
-            self.error_banner = Some(SharedString::from(e));
+            self.push_settings_or_main_toast("prefs-save-fail", ToastKind::Error, e, None, cx);
         }
 
         let page_size_changed = self.prefs.page_size != prev.page_size;
@@ -9207,22 +10847,12 @@ impl HylkiApp {
         if let Some(ref w) = self.worker {
             w.send(MailRequest::SetPushEnabled { enabled });
         }
-        self.status_line = SharedString::from(if enabled {
-            "已启用实时邮件推送"
-        } else {
-            "已关闭实时邮件推送"
-        });
         cx.notify();
     }
 
     pub(crate) fn set_show_accounts(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.show_accounts = visible;
         self.mutate_preferences(cx, |p| p.show_accounts = visible);
-        self.status_line = SharedString::from(if visible {
-            "已显示账号列表"
-        } else {
-            "已隐藏账号列表"
-        });
         cx.notify();
     }
 
@@ -9230,9 +10860,17 @@ impl HylkiApp {
         if self.demo_mode {
             return;
         }
-        if let Some(ref w) = self.worker {
-            self.status_line = SharedString::from("正在清理正文缓存...");
-            w.send(MailRequest::ClearBodyCaches);
+        if self.worker.is_some() {
+            self.push_settings_or_main_toast(
+                "clear-body-cache",
+                ToastKind::Info,
+                "正在清理正文缓存...",
+                None,
+                cx,
+            );
+            if let Some(ref w) = self.worker {
+                w.send(MailRequest::ClearBodyCaches);
+            }
         }
         cx.notify();
     }
@@ -9324,9 +10962,13 @@ impl HylkiApp {
             });
             w.send(MailRequest::LoadAllCached);
         }
-        self.status_line = SharedString::from(format!(
-            "已导入 {added} 个关联账号配置，正在加载本地邮件..."
-        ));
+        self.push_settings_or_main_toast(
+            "import-discovered-accounts",
+            ToastKind::Success,
+            format!("已导入 {added} 个关联账号配置，正在加载本地邮件..."),
+            None,
+            cx,
+        );
         cx.notify();
         Ok(added)
     }
@@ -9369,7 +11011,13 @@ impl HylkiApp {
             }
         }
         self.apply_preferences_snapshot(&prev, cx);
-        self.status_line = SharedString::from(format!("已导入配置备份（{count} 个账号配置）"));
+        self.push_settings_or_main_toast(
+            "import-backup",
+            ToastKind::Success,
+            format!("已导入配置备份（{count} 个账号配置）"),
+            None,
+            cx,
+        );
         Ok(count)
     }
 
@@ -9599,9 +11247,14 @@ impl HylkiApp {
             return;
         }
         if let Some(ref w) = self.worker {
-            self.error_banner = None;
+            for acc in self.accounts.iter().filter(|a| a.enabled) {
+                self.syncing_accounts.insert(acc.id);
+                self.account_sync_errors.remove(&acc.id);
+            }
             self.status_line = SharedString::from("正在独立刷新所有账号...");
-            w.send(MailRequest::SyncAllAccounts);
+            w.send(MailRequest::SyncAllAccounts {
+                user_initiated: true,
+            });
         }
         cx.notify();
     }
@@ -9619,7 +11272,9 @@ impl HylkiApp {
         let deadline = self.auto_sync_deadline.unwrap_or(now + interval);
         self.auto_sync_deadline = Some(deadline);
         if now >= deadline {
-            w.send(MailRequest::SyncAllAccounts);
+            w.send(MailRequest::SyncAllAccounts {
+                user_initiated: false,
+            });
             self.auto_sync_deadline = Some(now + interval);
         }
     }
@@ -9673,9 +11328,7 @@ impl HylkiApp {
                 }
             }
         }
-        if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
-            self.error_banner = Some(SharedString::from(e));
-        }
+        let _ = config::save_preferences_in(&config::data_dir(), &self.prefs);
     }
 
     /// 检查当前窗口焦点是否位于任意文本输入框（防止 Delete / 方向键与打字冲突；
@@ -9685,8 +11338,12 @@ impl HylkiApp {
             || self.compose_to.focus_handle(cx).is_focused(window)
             || self.compose_cc.focus_handle(cx).is_focused(window)
             || self.compose_bcc.focus_handle(cx).is_focused(window)
+            || self.compose_from.focus_handle(cx).is_focused(window)
+            || self.compose_reply_to.focus_handle(cx).is_focused(window)
             || self.compose_subject.focus_handle(cx).is_focused(window)
             || self.compose_body.focus_handle(cx).is_focused(window)
+            || self.reader_find_input.focus_handle(cx).is_focused(window)
+            || self.folder_action_input.focus_handle(cx).is_focused(window)
     }
 
     /// 键盘方向键切换中栏下一封 (`delta = 1`) / 上一封 (`delta = -1`) 邮件。
@@ -9759,6 +11416,211 @@ impl HylkiApp {
     /// - Below：侧栏 | 垂直分割列（列表上，持久化高度；阅读器下占满，上缘把手）。
     /// - Hidden：侧栏 | 列表占满（无右栏、无右栏把手）。
     /// - 欢迎页（无账号）：侧栏 | 列表 | 欢迎页（只有侧栏把手）。
+    pub(crate) fn reader_webview_bottom_clearance_px(&self) -> f32 {
+        if self.uses_reserved_feedback_strip() {
+            return toast::feedback_strip_height(self.prefs.ui_text_scale_percent);
+        }
+        let has_send = self.active_send_toast_model().is_some();
+        let visible = self.toasts.visible();
+        let details: Vec<bool> = visible.iter().map(|t| t.detail.is_some()).collect();
+        compute_overlay_webview_clearance(
+            self.prefs.ui_text_scale_percent,
+            !self.prefs.status_bar_top && !self.status_line.is_empty(),
+            has_send,
+            &details,
+        )
+    }
+
+    fn build_send_toast_element(
+        &self,
+        compact_width: bool,
+        p: &theme::HylkiPalette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        let model = self.active_send_toast_model()?;
+        let token = model.token;
+        let extra_target = model.first_extra_target;
+        let ent_undo = cx.entity();
+        let ent_now = cx.entity();
+        let ent_recover = cx.entity();
+        let ent_outbox = cx.entity();
+        Some(toast::render_send_toast(
+            &model,
+            compact_width,
+            p,
+            move |window, cx| {
+                ent_undo.update(cx, |this, cx| {
+                    this.undo_pending_send_token(token, window, cx);
+                });
+            },
+            move |_, cx| {
+                ent_now.update(cx, |this, cx| {
+                    this.commit_pending_send(token, cx);
+                });
+            },
+            move |window, cx| {
+                ent_recover.update(cx, |this, cx| {
+                    this.recover_failed_pending_send(token, window, cx);
+                });
+            },
+            move |_, cx| {
+                ent_outbox.update(cx, |this, cx| {
+                    this.outbox_expanded = true;
+                    if let Some((aid, oid)) = extra_target {
+                        this.focused_outbox_item = Some((aid, oid));
+                    }
+                    cx.notify();
+                });
+            },
+        ))
+    }
+
+    fn build_main_toast_elements(
+        &self,
+        compact_width: bool,
+        p: &theme::HylkiPalette,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui_kit::AnyElement> {
+        let visible = self.toasts.visible();
+        if visible.is_empty() {
+            return Vec::new();
+        }
+        let ent_act = cx.entity();
+        let ent_dismiss = cx.entity();
+        toast::render_toast_stack(
+            &visible,
+            compact_width,
+            p,
+            move |kind, key, window, cx| {
+                ent_act.update(cx, |this, cx| {
+                    this.handle_toast_action(kind, key, window, cx);
+                });
+            },
+            move |key, _, cx| {
+                ent_dismiss.update(cx, |this, cx| {
+                    this.dismiss_toast(&key, cx);
+                });
+            },
+        )
+    }
+
+    fn render_feedback_block(
+        &self,
+        compact_width: bool,
+        p: &theme::HylkiPalette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        let send_el = self.build_send_toast_element(compact_width, p, cx);
+        let toast_els = self.build_main_toast_elements(compact_width, p, cx);
+        if send_el.is_none() && toast_els.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .w_full()
+                .gap_1p5()
+                .children(toast_els)
+                .children(send_el)
+                .into_any_element(),
+        )
+    }
+
+    pub(crate) fn render_compose_window_toasts(
+        &self,
+        _window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        let visible = self.compose_toasts.visible();
+        if visible.is_empty() {
+            return None;
+        }
+        let p = theme::current(cx);
+        let ent_act = cx.entity();
+        let ent_dismiss = cx.entity();
+        let els = toast::render_toast_stack(
+            &visible,
+            false,
+            &p,
+            move |kind, key, window, cx| {
+                ent_act.update(cx, |this, cx| {
+                    this.handle_toast_action(kind, key, window, cx);
+                });
+            },
+            move |key, _, cx| {
+                ent_dismiss.update(cx, |this, cx| {
+                    this.dismiss_compose_toast(&key, cx);
+                });
+            },
+        );
+        Some(
+            div()
+                .absolute()
+                .bottom(px(14.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .px_4()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(480.0))
+                        .gap_1p5()
+                        .occlude()
+                        .children(els),
+                )
+                .into_any_element(),
+        )
+    }
+
+    pub(crate) fn render_settings_window_toasts(
+        &self,
+        _window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        let visible = self.settings_toasts.visible();
+        if visible.is_empty() {
+            return None;
+        }
+        let p = theme::current(cx);
+        let ent_act = cx.entity();
+        let ent_dismiss = cx.entity();
+        let els = toast::render_toast_stack(
+            &visible,
+            false,
+            &p,
+            move |kind, key, window, cx| {
+                ent_act.update(cx, |this, cx| {
+                    this.handle_toast_action(kind, key, window, cx);
+                });
+            },
+            move |key, _, cx| {
+                ent_dismiss.update(cx, |this, cx| {
+                    this.dismiss_settings_toast(&key, cx);
+                });
+            },
+        );
+        Some(
+            div()
+                .absolute()
+                .bottom(px(16.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .px_4()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(480.0))
+                        .gap_1p5()
+                        .occlude()
+                        .children(els),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_mail_body(
         &mut self,
         window: &mut Window,
@@ -10143,8 +12005,8 @@ impl HylkiApp {
                             .compact()
                             .label("发送")
                             .tooltip("发送（Ctrl+Enter）")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.send_compose(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.send_compose_with_window(window, cx);
                             })),
                     )
                     .when(pane_top, |bar| {
@@ -10159,30 +12021,6 @@ impl HylkiApp {
                         })
                     }),
             )
-            .when(detached, |el| {
-                el.when_some(self.error_banner.as_ref(), |el, err| {
-                    el.child(
-                        h_flex()
-                            .px_3()
-                            .py_1()
-                            .border_b_1()
-                            .border_color(p.border)
-                            .justify_between()
-                            .items_center()
-                            .child(div().text_xs().text_color(p.danger).child(err.clone()))
-                            .child(
-                                Button::new("compose-dismiss-err")
-                                    .ghost()
-                                    .compact()
-                                    .label("关闭")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.error_banner = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                })
-            })
             .child(compose::render(self, cx))
             .into_any_element()
     }
@@ -10191,7 +12029,7 @@ impl HylkiApp {
         &self,
         top: bool,
         p: &theme::HylkiPalette,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let border = p.border;
         let muted_fg = p.text_muted;
@@ -10213,31 +12051,6 @@ impl HylkiApp {
                     .truncate()
                     .child(self.status_line.clone()),
             )
-            .when_some(self.last_move_undo.clone(), |el, record| {
-                el.child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .gap_1()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(p.text)
-                                .child(record.action_label.clone()),
-                        )
-                        .child(
-                            Button::new("undo-last-move")
-                                .ghost()
-                                .compact()
-                                .text_size(px(11.0))
-                                .label("撤销")
-                                .tooltip("撤销最近一次移动 / 删除 / 归档（Ctrl+Z）")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.undo_last_move(cx);
-                                })),
-                        ),
-                )
-            })
             .into_any_element()
     }
 }
@@ -10285,6 +12098,8 @@ impl Render for HylkiApp {
                 && self.right_mode == RightPaneMode::Reader
                 && self.reader_position != ReaderPosition::Hidden
                 && self.active_modal == ActiveModal::None
+                && self.pending_empty_folder.is_none()
+                && self.pending_remove_account.is_none()
                 && self.print_preview.is_none()
                 && !self.reader_find_open
                 && !self.compose_split
@@ -10403,6 +12218,27 @@ impl Render for HylkiApp {
         };
 
         let status_top = self.prefs.status_bar_top;
+        let reserved_strip = self.uses_reserved_feedback_strip();
+        let overlay_feedback = if !reserved_strip {
+            self.render_feedback_block(false, &p, cx)
+        } else {
+            None
+        };
+        let reserved_send_el = if reserved_strip {
+            self.build_send_toast_element(false, &p, cx)
+        } else {
+            None
+        };
+        let reserved_toast_els = if reserved_strip {
+            self.build_main_toast_elements(false, &p, cx)
+        } else {
+            Vec::new()
+        };
+        let overlay_bottom_offset = if !status_top && !self.status_line.is_empty() {
+            36.0
+        } else {
+            14.0
+        };
         let mut root = v_flex()
             .relative()
             .size_full()
@@ -10411,180 +12247,173 @@ impl Render for HylkiApp {
             .when(status_top && !self.status_line.is_empty(), |el| {
                 el.child(self.render_status_bar(true, &p, cx))
             })
-            .when_some(self.error_banner.as_ref(), |el, err| {
+            .child(body)
+            .when_some(overlay_feedback, |el, block| {
                 el.child(
-                    h_flex()
-                        .px_3()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(border)
-                        .justify_between()
-                        .items_center()
-                        .child(div().text_xs().text_color(p.danger).child(err.clone()))
-                        .child(Button::new("dismiss-err").ghost().label("关闭").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.error_banner = None;
-                                cx.notify();
-                            }),
-                        )),
+                    div()
+                        .absolute()
+                        .bottom(px(overlay_bottom_offset))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .px_4()
+                        .child(div().w_full().max_w(px(480.0)).occlude().child(block)),
                 )
             })
-            .when_some(self.pending_send.as_ref().filter(|p| self.demo_mode || p.outbox_id.is_some() || p.enqueue_failed), |el, pending| {
-                let token = pending.token;
-                let recipient = if pending.draft.to.trim().is_empty() {
-                    "(未填写收件人)".to_string()
-                } else {
-                    pending.draft.to.trim().to_string()
-                };
-                let secs = pending.remaining_secs;
-                let failed = pending.enqueue_failed;
-                el.child(
-                    h_flex()
-                        .px_3()
-                        .py_1p5()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(border)
-                        .bg(p.accent_soft())
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(p.text)
-                                .truncate()
-                                .child(SharedString::from(if failed {
-                                    format!("发给 {recipient} 的邮件未保存，请恢复编辑")
-                                } else {
-                                    format!("正在准备发送给 {recipient}（{secs} 秒后发出）...")
-                                })),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .flex_shrink_0()
-                                .items_center()
-                                .child(
-                                    Button::new("undo-send-btn")
-                                        .primary()
-                                        .compact()
-                                        .label(if failed { "恢复邮件" } else { "撤销发送" })
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.undo_pending_send(window, cx);
-                                        })),
-                                )
-                                .when(!failed, |el| el.child(
-                                    Button::new("send-now-btn")
-                                        .outline()
-                                        .compact()
-                                        .label("立即发送")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.commit_pending_send(token, cx);
-                                        })),
-                                )),
-                        ),
-                )
-            })
-            // 「清空文件夹」二次确认条（右键 Trash / Junk 触发，Esc 取消）。
+            // 「清空文件夹」居中危险确认弹窗（右键 Trash / Junk 触发，取消优先，Esc 取消）。
             .when_some(self.pending_empty_folder.as_ref(), |el, pending| {
                 let (_, _, _, name) = pending.clone();
                 el.child(
-                    h_flex()
-                        .px_3()
-                        .py_1p5()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(border)
-                        .bg(p.danger.opacity(0.12))
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(p.danger)
-                                .truncate()
-                                .child(SharedString::from(format!(
-                                    "确认清空文件夹「{name}」？其中全部邮件将被永久删除，此操作不可撤销。"
-                                ))),
+                    div()
+                        .id("empty-folder-modal-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(black().opacity(0.42))
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.cancel_empty_folder(cx);
+                            }),
                         )
                         .child(
-                            h_flex()
-                                .gap_1p5()
-                                .flex_shrink_0()
-                                .items_center()
-                                .child(
-                                    Button::new("empty-folder-confirm")
-                                        .primary()
-                                        .compact()
-                                        .label("确认清空")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.confirm_empty_folder(cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("empty-folder-cancel")
-                                        .outline()
-                                        .compact()
-                                        .label("取消")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_empty_folder(cx);
-                                        })),
-                                ),
+                            h_flex().size_full().items_center().justify_center().child(
+                                v_flex()
+                                    .w(px(420.0))
+                                    .p_5()
+                                    .gap_3()
+                                    .bg(p.surface)
+                                    .rounded(px(12.0))
+                                    .border_1()
+                                    .border_color(border)
+                                    .shadow_xl()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| {
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                            .text_color(p.text)
+                                            .child(SharedString::from(format!(
+                                                "清空文件夹「{name}」？"
+                                            ))),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(p.text_muted)
+                                            .child("其中的全部邮件将被永久删除，且无法恢复。"),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .pt_2()
+                                            .gap_2()
+                                            .justify_end()
+                                            .child(
+                                                Button::new("empty-folder-cancel")
+                                                    .outline()
+                                                    .compact()
+                                                    .label("取消")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.cancel_empty_folder(cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("empty-folder-confirm")
+                                                    .danger()
+                                                    .compact()
+                                                    .label("确认清空")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.confirm_empty_folder(cx);
+                                                    })),
+                                            ),
+                                    ),
+                            ),
                         ),
                 )
             })
-            // 「移除账号」二次确认条（侧栏账号右键触发，Esc 取消）。
+            // 「移除账号」居中危险确认弹窗（侧栏账号右键触发，取消优先，Esc 取消）。
             .when_some(self.pending_remove_account.as_ref(), |el, pending| {
                 let (_, label) = pending.clone();
                 el.child(
-                    h_flex()
-                        .px_3()
-                        .py_1p5()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(border)
-                        .bg(p.danger.opacity(0.12))
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(p.danger)
-                                .truncate()
-                                .child(SharedString::from(format!(
-                                    "确认移除账号「{label}」？将删除本地邮件缓存、配置与凭据管理器中的密钥，不影响服务器上的邮件。"
-                                ))),
+                    div()
+                        .id("remove-account-modal-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(black().opacity(0.42))
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.cancel_remove_account(cx);
+                            }),
                         )
                         .child(
-                            h_flex()
-                                .gap_1p5()
-                                .flex_shrink_0()
-                                .items_center()
-                                .child(
-                                    Button::new("remove-account-confirm")
-                                        .danger()
-                                        .compact()
-                                        .label("确认移除")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.confirm_remove_account(cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("remove-account-cancel")
-                                        .outline()
-                                        .compact()
-                                        .label("取消")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_remove_account(cx);
-                                        })),
-                                ),
+                            h_flex().size_full().items_center().justify_center().child(
+                                v_flex()
+                                    .w(px(440.0))
+                                    .p_5()
+                                    .gap_3()
+                                    .bg(p.surface)
+                                    .rounded(px(12.0))
+                                    .border_1()
+                                    .border_color(border)
+                                    .shadow_xl()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| {
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                            .text_color(p.text)
+                                            .child(SharedString::from(format!(
+                                                "移除邮箱账号「{label}」？"
+                                            ))),
+                                    )
+                                    .child(div().text_xs().text_color(p.text_muted).child(
+                                        "将删除本地邮件缓存、配置与凭据管理器中的密钥，不影响服务器上的邮件。",
+                                    ))
+                                    .child(
+                                        h_flex()
+                                            .pt_2()
+                                            .gap_2()
+                                            .justify_end()
+                                            .child(
+                                                Button::new("remove-account-cancel")
+                                                    .outline()
+                                                    .compact()
+                                                    .label("取消")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.cancel_remove_account(cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("remove-account-confirm")
+                                                    .danger()
+                                                    .compact()
+                                                    .label("确认移除")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.confirm_remove_account(cx);
+                                                    })),
+                                            ),
+                                    ),
+                            ),
                         ),
                 )
             })
-            .child(body)
             // P3：窄窗口浮层侧栏（对齐 Linux sidebar_peek：完整侧栏从窄轨右缘
             // 滑出、盖在中栏列表 / 阅读器之上；导航选择后由各入口自动关闭）。
             // WP-01：浮层下方先铺全屏半透明遮罩（对齐 Linux OverlaySplitView 的
@@ -10632,6 +12461,42 @@ impl Render for HylkiApp {
             }))
             .when(!status_top && !self.status_line.is_empty(), |el| {
                 el.child(self.render_status_bar(false, &p, cx))
+            })
+            .when(reserved_strip, |el| {
+                let strip_h = toast::feedback_strip_height(self.prefs.ui_text_scale_percent);
+                let has_send = reserved_send_el.is_some();
+                let toast_slots = if has_send {
+                    if viewport_w >= 640.0 {
+                        1
+                    } else {
+                        0
+                    }
+                } else {
+                    2
+                };
+                el.child(
+                    h_flex()
+                        .w_full()
+                        .h(px(strip_h))
+                        .flex_shrink_0()
+                        .px_3()
+                        .py_1()
+                        .gap_2()
+                        .items_center()
+                        .justify_center()
+                        .border_t_1()
+                        .border_color(border)
+                        .bg(p.sidebar)
+                        .when_some(reserved_send_el, |row, card| {
+                            row.child(div().flex_1().min_w_0().max_w(px(520.0)).child(card))
+                        })
+                        .children(
+                            reserved_toast_els
+                                .into_iter()
+                                .take(toast_slots)
+                                .map(|card| div().flex_1().min_w_0().max_w(px(480.0)).child(card)),
+                        ),
+                )
             })
             // 全局快捷键动作（键绑定注册在 main.rs，方案文档五.3）。
             .on_action(cx.listener(|this, _: &NewCompose, window, cx| {
@@ -10681,12 +12546,12 @@ impl Render for HylkiApp {
                     this.refresh_all(cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &SendCompose, _window, cx| {
+            .on_action(cx.listener(|this, _: &SendCompose, window, cx| {
                 if this.active_modal == ActiveModal::None
                     && this.main_view == MainContentView::Mail
                     && this.right_mode == RightPaneMode::Compose
                 {
-                    this.send_compose(cx);
+                    this.send_compose_with_window(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &OpenPreferences, window, cx| {
@@ -11036,6 +12901,36 @@ impl Render for HylkiApp {
                 }
                 if this.active_modal != ActiveModal::None {
                     this.close_modal(cx);
+                    return;
+                }
+                if this.main_view == MainContentView::Gallery
+                    && this.gallery.as_ref().is_some_and(|g| {
+                        g.update(cx, |s, cx| {
+                            let closed = s.dismiss_overlay();
+                            if closed {
+                                cx.notify();
+                            }
+                            closed
+                        })
+                    })
+                {
+                    return;
+                }
+                if this.main_view == MainContentView::Contacts
+                    && this.contacts.as_ref().is_some_and(|c| {
+                        c.update(cx, |s, cx| {
+                            let closed = s.dismiss_overlay();
+                            if closed {
+                                cx.notify();
+                            }
+                            closed
+                        })
+                    })
+                {
+                    return;
+                }
+                if this.folder_action.is_some() {
+                    this.cancel_folder_action(cx);
                 } else if this.pending_empty_folder.is_some() {
                     this.cancel_empty_folder(cx);
                 } else if this.pending_remove_account.is_some() {
@@ -11044,8 +12939,11 @@ impl Render for HylkiApp {
                     && this.right_mode == RightPaneMode::Compose
                 {
                     this.request_close_compose(cx);
-                } else if this.pending_send.is_some() && !this.is_text_input_focused(window, cx) {
-                    this.undo_pending_send(window, cx);
+                } else if this.pending_sends.iter().any(|p| {
+                    p.scheduled_at.is_none() && !p.undo_requested && !p.sending_now
+                }) && !this.is_text_input_focused(window, cx)
+                {
+                    this.undo_latest_pending_send(window, cx);
                 } else if !this.selected_message_ids.is_empty() {
                     this.clear_message_selection(cx);
                 }
@@ -12052,6 +13950,117 @@ fn single_key_guard_allows(
         && right_mode == RightPaneMode::Reader
         && !text_input_focused
         && single_key_enabled
+}
+
+pub(crate) fn compute_overlay_webview_clearance(
+    ui_text_scale_percent: u32,
+    bottom_status_visible: bool,
+    has_send: bool,
+    toast_has_detail: &[bool],
+) -> f32 {
+    if !has_send && toast_has_detail.is_empty() {
+        return 0.0;
+    }
+    let scale = config::clamp_ui_text_scale(ui_text_scale_percent) as f32 / 100.0;
+    let bottom_offset = if bottom_status_visible { 36.0 } else { 14.0 };
+    let send_h = if has_send { 82.0 * scale } else { 0.0 };
+    let toast_h: f32 = toast_has_detail
+        .iter()
+        .map(|&has_detail| {
+            if has_detail {
+                72.0 * scale
+            } else {
+                52.0 * scale
+            }
+        })
+        .sum();
+    let count = toast_has_detail.len() + usize::from(has_send);
+    let gaps = if count > 1 {
+        6.0 * (count - 1) as f32
+    } else {
+        0.0
+    };
+    bottom_offset + send_h + toast_h + gaps + 8.0
+}
+
+pub(crate) fn build_send_toast_model(
+    pending_sends: &[PendingSend],
+    outbox_by_account: &BTreeMap<u32, Vec<OutboxItem>>,
+    demo_mode: bool,
+) -> Option<SendToastViewModel> {
+    let primary = pending_sends
+        .iter()
+        .find(|p| p.enqueue_failed.is_some())
+        .or_else(|| {
+            pending_sends
+                .iter()
+                .rev()
+                .find(|p| p.scheduled_at.is_none())
+        })?;
+    let stage = if let Some(ref msg) = primary.enqueue_failed {
+        SendToastStage::EnqueueFailedNeedsRecovery {
+            message: msg.clone(),
+        }
+    } else if primary.undo_requested {
+        SendToastStage::Undoing
+    } else if primary.sending_now {
+        SendToastStage::SendingNow
+    } else if let Some(deadline) = primary.deadline_utc_secs {
+        if primary.outbox_id.is_some() || demo_mode {
+            SendToastStage::Countdown {
+                deadline_utc_secs: deadline,
+                total_delay_secs: primary.total_delay_secs,
+            }
+        } else {
+            SendToastStage::Saving { cancellable: true }
+        }
+    } else {
+        SendToastStage::Saving { cancellable: true }
+    };
+
+    let mut extra_waiting_count = 0usize;
+    let mut first_extra_target = None;
+    for other in pending_sends {
+        if other.token == primary.token {
+            continue;
+        }
+        extra_waiting_count += 1;
+        if first_extra_target.is_none() {
+            if let Some(oid) = other.outbox_id {
+                first_extra_target = Some((other.account_id, oid));
+            }
+        }
+    }
+    for (&acc_id, items) in outbox_by_account {
+        for item in items {
+            let is_primary = primary.account_id == acc_id && primary.outbox_id == Some(item.id);
+            let in_pending = pending_sends
+                .iter()
+                .any(|p| p.account_id == acc_id && p.outbox_id == Some(item.id));
+            if !is_primary
+                && !in_pending
+                && matches!(
+                    item.status,
+                    hylki_mail_core::OutboxStatus::Queued | hylki_mail_core::OutboxStatus::Sending
+                )
+            {
+                extra_waiting_count += 1;
+                if first_extra_target.is_none() {
+                    first_extra_target = Some((acc_id, item.id));
+                }
+            }
+        }
+    }
+
+    Some(SendToastViewModel {
+        token: primary.token,
+        account_id: primary.account_id,
+        outbox_id: primary.outbox_id,
+        subject: SharedString::from(primary.draft.subject.clone()),
+        stage,
+        extra_waiting_count,
+        first_extra_target,
+    })
 }
 
 /// B-2：演示模式合成 .eml 内容（信头 + 正文；非严格 RFC，仅用于演示导出链路）。
@@ -13083,5 +15092,119 @@ mod tests {
             resolve_selected_list_index(&items, &selected_old_card, |_| false),
             None
         );
+    }
+
+    #[test]
+    fn send_toast_model_supports_multi_token_and_prioritizes_failed_recovery() {
+        let mk_pending = |token: u64, outbox_id: Option<u32>, subject: &str| PendingSend {
+            token,
+            account_id: 1,
+            draft: ComposeDraft {
+                to: "a@example.com".to_string(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: subject.to_string(),
+                body: "hi".to_string(),
+                in_reply_to: String::new(),
+                from_addr: String::new(),
+                reply_to: String::new(),
+                body_format: "plain".to_string(),
+                body_html: None,
+                attachment_paths: Vec::new(),
+            },
+            local_draft_id: None,
+            total_delay_secs: 5,
+            deadline_utc_secs: Some(1_700_000_005),
+            scheduled_at: None,
+            origin: SendOrigin::MainWindow,
+            outbox_id,
+            undo_requested: false,
+            commit_requested: false,
+            sending_now: false,
+            enqueue_failed: None,
+        };
+
+        // 连续两封进入倒计时：主 Toast 显示最新一封，附加等待计数为 1 且指向第一封 outbox_id。
+        let list = vec![
+            mk_pending(1, Some(10), "第一封"),
+            mk_pending(2, Some(11), "第二封"),
+        ];
+        let outbox = BTreeMap::new();
+        let vm = build_send_toast_model(&list, &outbox, false).expect("toast model");
+        assert_eq!(vm.token, 2);
+        assert_eq!(vm.extra_waiting_count, 1);
+        assert_eq!(vm.first_extra_target, Some((1, 10)));
+        assert!(matches!(vm.stage, SendToastStage::Countdown { .. }));
+
+        // 回执尚未到达时处于 Saving { cancellable: true }。
+        let pending_receipt = vec![mk_pending(3, None, "待落盘")];
+        let vm_saving = build_send_toast_model(&pending_receipt, &outbox, false).expect("saving");
+        assert!(matches!(
+            vm_saving.stage,
+            SendToastStage::Saving { cancellable: true }
+        ));
+
+        // 入队失败（无草稿兜底）时优先展示恢复入口。
+        let mut failed = mk_pending(4, None, "失败邮件");
+        failed.enqueue_failed = Some(SharedString::from("磁盘只读"));
+        let mixed = vec![failed, mk_pending(5, Some(12), "正常倒计时")];
+        let vm_fail = build_send_toast_model(&mixed, &outbox, false).expect("recovery");
+        assert_eq!(vm_fail.token, 4);
+        assert!(matches!(
+            vm_fail.stage,
+            SendToastStage::EnqueueFailedNeedsRecovery { .. }
+        ));
+    }
+
+    #[test]
+    fn persistent_worker_status_filters_one_off_completions() {
+        assert!(HylkiApp::is_persistent_worker_status(
+            "[a@b.com] 正在同步文件夹与邮件头..."
+        ));
+        assert!(HylkiApp::is_persistent_worker_status(
+            "IMAP 连接已断开，准备重连"
+        ));
+        assert!(!HylkiApp::is_persistent_worker_status(
+            "已创建文件夹「Work」"
+        ));
+        assert!(!HylkiApp::is_persistent_worker_status("正文缓存已清理"));
+        assert!(!HylkiApp::is_persistent_worker_status(
+            "[a@b.com] 已撤销：邮件已移回原文件夹"
+        ));
+    }
+
+    #[test]
+    fn settings_toast_queue_isolates_and_clears_independently_from_main() {
+        let mut main_q = WindowToastQueue::default();
+        let mut settings_q = WindowToastQueue::default();
+        main_q.push_transient("main-only", ToastKind::Info, "主窗提示", None);
+        settings_q.push_transient(
+            "clear-body-cache",
+            ToastKind::Info,
+            "正在清理正文缓存...",
+            None,
+        );
+
+        assert_eq!(main_q.visible().len(), 1);
+        assert_eq!(settings_q.visible().len(), 1);
+        assert_eq!(settings_q.visible()[0].key, "clear-body-cache");
+
+        settings_q = WindowToastQueue::default();
+        assert!(settings_q.visible().is_empty());
+        assert_eq!(main_q.visible().len(), 1);
+    }
+
+    #[test]
+    fn overlay_webview_clearance_is_zero_when_idle_and_scales_when_visible() {
+        assert_eq!(
+            compute_overlay_webview_clearance(100, false, false, &[]),
+            0.0
+        );
+        let one_toast = compute_overlay_webview_clearance(100, false, false, &[false]);
+        let with_status = compute_overlay_webview_clearance(100, true, false, &[false]);
+        let scaled = compute_overlay_webview_clearance(150, false, true, &[true]);
+        assert!(one_toast > 60.0);
+        assert!(with_status > one_toast);
+        assert!(scaled > with_status);
     }
 }

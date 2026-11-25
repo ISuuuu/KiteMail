@@ -11,7 +11,7 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{h_flex, v_flex, Disableable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, img, px, AppContext, Context, Hsla, Image, ImageFormat, InteractiveElement, IntoElement,
@@ -98,9 +98,17 @@ fn file_badge(filename: &str, mime_type: &str, accent: Hsla) -> (&'static str, H
     }
 }
 
-/// 构建底部附件抽屉元素；无附件时返回 `None`。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DrawerFeedback<'a> {
+    pub(crate) downloading_ids: Option<&'a HashSet<u32>>,
+    pub(crate) saving_all: bool,
+    pub(crate) item_errors: Option<&'a HashMap<u32, SharedString>>,
+    pub(crate) drawer_error: Option<&'a SharedString>,
+}
+
+/// 构建底部附件抽屉元素（含局部下载/保存状态与对象级错误反馈）；无附件时返回 `None`。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn render_drawer(
+pub(crate) fn render_drawer_with_feedback(
     items: &[DrawerAttachment],
     collapsed: bool,
     height: f32,
@@ -110,6 +118,7 @@ pub(crate) fn render_drawer(
     thumbs: &HashMap<u32, Arc<Image>>,
     stripping_ids: &HashSet<u32>,
     pending_strip_id: Option<u32>,
+    feedback: DrawerFeedback<'_>,
     cx: &mut Context<HylkiApp>,
 ) -> Option<gpui_kit::AnyElement> {
     if items.is_empty() {
@@ -164,6 +173,19 @@ pub(crate) fn render_drawer(
             };
             let is_stripping = stripping_ids.contains(&att_id);
             let is_confirming = pending_strip_id == Some(att_id);
+            let is_downloading = feedback
+                .downloading_ids
+                .is_some_and(|set| set.contains(&att_id));
+            let item_error = feedback
+                .item_errors
+                .and_then(|map| map.get(&att_id).cloned());
+            let save_tooltip = if demo_mode {
+                "演示模式下不支持保存附件"
+            } else if is_downloading {
+                "正在下载并保存附件…"
+            } else {
+                save_tooltip
+            };
             let (badge_label, badge_color) = file_badge(&filename, &mime_type, accent);
             let thumb = thumbs.get(&att_id).cloned();
             let is_image = image_format_for_mime(&mime_type).is_some();
@@ -171,15 +193,14 @@ pub(crate) fn render_drawer(
             if list_view {
                 let save_name = filename.clone();
                 let strip_name = filename.clone();
-                h_flex()
+                v_flex()
                     .w_full()
-                    .items_center()
-                    .gap_2()
+                    .gap_1()
                     .px_2()
                     .py_1()
                     .rounded(px(8.0))
                     .border_1()
-                    .border_color(if is_stripping {
+                    .border_color(if is_stripping || is_confirming || item_error.is_some() {
                         danger.opacity(0.45)
                     } else {
                         border
@@ -190,92 +211,108 @@ pub(crate) fn render_drawer(
                         p.canvas
                     })
                     .child(
-                        div()
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded(px(4.0))
-                            .bg(badge_color.opacity(0.16))
-                            .text_color(badge_color)
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child(badge_label),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(p.text)
-                            .truncate()
-                            .child(SharedString::from(filename.clone())),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(SharedString::from(size_label)),
-                    )
-                    .when(is_stripping, |row| {
-                        row.child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(danger)
-                                .child("正在剥离…"),
-                        )
-                    })
-                    .when(!is_stripping, |row| {
-                        row.child(
-                            Button::new(("drawer-list-save", att_id))
-                                .ghost()
-                                .compact()
-                                .icon(IconName::Download)
-                                .tooltip(save_tooltip)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.save_attachment(att_id, &save_name, cx);
-                                })),
-                        )
-                        .when(!demo_mode && !is_confirming, |r| {
-                            r.child(
-                                Button::new(("drawer-list-strip", att_id))
-                                    .ghost()
-                                    .compact()
-                                    .icon(IconName::Trash)
-                                    .tooltip("从服务器剥离附件以释放配额")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.ask_strip_attachment(att_id, cx);
-                                    })),
-                            )
-                        })
-                        .when(!demo_mode && is_confirming, |r| {
-                            let s_name = strip_name.clone();
-                            r.child(
-                                Button::new(("drawer-list-strip-confirm", att_id))
-                                    .danger()
-                                    .compact()
-                                    .label("确认剥离")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.confirm_strip_attachment(
-                                            account_id,
-                                            message_id,
-                                            att_id,
-                                            s_name.clone(),
-                                            size_bytes,
-                                            cx,
-                                        );
-                                    })),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded(px(4.0))
+                                    .bg(badge_color.opacity(0.16))
+                                    .text_color(badge_color)
+                                    .text_xs()
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .child(badge_label),
                             )
                             .child(
-                                Button::new(("drawer-list-strip-cancel", att_id))
-                                    .ghost()
-                                    .compact()
-                                    .label("取消")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.cancel_strip_attachment(cx);
-                                    })),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(p.text)
+                                    .truncate()
+                                    .child(SharedString::from(filename.clone())),
                             )
-                        })
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(SharedString::from(size_label)),
+                            )
+                            .when(is_stripping, |row| {
+                                row.child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(danger)
+                                        .child("正在剥离…"),
+                                )
+                            })
+                            .when(is_downloading && !is_stripping, |row| {
+                                row.child(div().text_xs().text_color(accent).child("保存中…"))
+                            })
+                            .when(!is_stripping, |row| {
+                                row.child(
+                                    Button::new(("drawer-list-save", att_id))
+                                        .ghost()
+                                        .compact()
+                                        .disabled(demo_mode || is_downloading)
+                                        .icon(IconName::Download)
+                                        .tooltip(save_tooltip)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.save_attachment(att_id, &save_name, cx);
+                                        })),
+                                )
+                                .when(!demo_mode && !is_confirming, |r| {
+                                    r.child(
+                                        Button::new(("drawer-list-strip", att_id))
+                                            .ghost()
+                                            .compact()
+                                            .icon(IconName::Trash)
+                                            .tooltip("从服务器剥离附件以释放配额")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.ask_strip_attachment(att_id, cx);
+                                            })),
+                                    )
+                                })
+                                .when(
+                                    !demo_mode && is_confirming,
+                                    |r| {
+                                        let s_name = strip_name.clone();
+                                        r.child(
+                                            Button::new(("drawer-list-strip-cancel", att_id))
+                                                .outline()
+                                                .compact()
+                                                .label("取消")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.cancel_strip_attachment(cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(("drawer-list-strip-confirm", att_id))
+                                                .danger()
+                                                .compact()
+                                                .label("确认剥离")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.confirm_strip_attachment(
+                                                        account_id,
+                                                        message_id,
+                                                        att_id,
+                                                        s_name.clone(),
+                                                        size_bytes,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                    },
+                                )
+                            }),
+                    )
+                    .when_some(item_error, |col, err| {
+                        col.child(div().text_xs().text_color(danger).truncate().child(err))
                     })
                     .into_any_element()
             } else {
@@ -377,6 +414,7 @@ pub(crate) fn render_drawer(
                                             Button::new(("drawer-grid-save", att_id))
                                                 .ghost()
                                                 .compact()
+                                                .disabled(demo_mode || is_downloading)
                                                 .icon(IconName::Download)
                                                 .tooltip(save_tooltip)
                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -539,14 +577,27 @@ pub(crate) fn render_drawer(
                                 Button::new("attachment-drawer-save-all")
                                     .outline()
                                     .compact()
+                                    .disabled(demo_mode || feedback.saving_all)
                                     .icon(IconName::Download)
-                                    .label("全部保存")
+                                    .label(if feedback.saving_all {
+                                        "保存中…"
+                                    } else {
+                                        "全部保存"
+                                    })
+                                    .tooltip(if demo_mode {
+                                        "演示模式下不支持导出真实附件"
+                                    } else {
+                                        "保存全部附件到指定目录"
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.save_all_attachments(all_ids.clone(), cx);
                                     })),
                             ),
                     ),
             )
+            .when_some(feedback.drawer_error.cloned(), |drawer, err| {
+                drawer.child(div().px_4().pb_1().text_xs().text_color(danger).child(err))
+            })
             .when(!collapsed, |drawer| {
                 drawer.child(
                     div()

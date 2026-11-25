@@ -2165,6 +2165,7 @@ impl CacheStore {
             in_reply_to,
             "",
             "",
+            "",
             None,
             attachment_paths,
             created_at,
@@ -2185,6 +2186,7 @@ impl CacheStore {
         in_reply_to: &str,
         from_addr: &str,
         reply_to: &str,
+        body_format: &str,
         body_html: Option<&str>,
         attachment_paths: &[String],
         created_at: i64,
@@ -2201,6 +2203,7 @@ impl CacheStore {
             in_reply_to,
             from_addr,
             reply_to,
+            body_format,
             body_html,
             attachment_paths,
             created_at,
@@ -2247,8 +2250,12 @@ impl CacheStore {
         self.global.next_queued_send_at(now)
     }
 
-    pub fn expire_queued_outbox(&mut self) -> Result<(), String> {
-        self.global.expire_queued_outbox()
+    pub fn outbox_status(
+        &self,
+        account_id: u32,
+        outbox_id: u32,
+    ) -> Result<Option<OutboxStatus>, String> {
+        self.global.load_outbox_status(account_id, outbox_id)
     }
 
     pub fn undo_queued_outbox(
@@ -2273,6 +2280,10 @@ impl CacheStore {
 
     pub fn list_drafts(&self) -> Result<Vec<LocalDraft>, String> {
         self.global.list_drafts()
+    }
+
+    pub fn load_draft(&self, draft_id: u32) -> Result<Option<LocalDraft>, String> {
+        self.global.load_draft(draft_id)
     }
 
     pub fn list_templates(&self) -> Result<Vec<MailTemplate>, String> {

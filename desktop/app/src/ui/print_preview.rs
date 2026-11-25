@@ -11,7 +11,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{h_flex, v_flex, Disableable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     black, div, hsla, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
@@ -33,7 +33,9 @@ pub(crate) struct PrintPreviewState {
     pub(crate) include_attachments: bool,
     pub(crate) wider_left_margin: bool,
     pub(crate) paper_a4: bool,
+    pub(crate) busy: bool,
     pub(crate) status_note: Option<SharedString>,
+    pub(crate) error_note: Option<SharedString>,
 }
 
 impl PrintPreviewState {
@@ -44,8 +46,48 @@ impl PrintPreviewState {
             include_attachments: true,
             wider_left_margin: false,
             paper_a4: true,
+            busy: false,
             status_note: None,
+            error_note: None,
         }
+    }
+
+    pub(crate) fn begin_export_pdf(&mut self) {
+        self.busy = true;
+        self.error_note = None;
+        self.status_note = Some(SharedString::from("正在导出 PDF…"));
+    }
+
+    pub(crate) fn begin_system_print(&mut self) {
+        self.busy = true;
+        self.error_note = None;
+        self.status_note = Some(SharedString::from("正在打开系统打印…"));
+    }
+
+    pub(crate) fn mark_pdf_exported(&mut self, msg: impl Into<SharedString>) {
+        self.busy = false;
+        self.error_note = None;
+        self.status_note = Some(msg.into());
+    }
+
+    pub(crate) fn mark_system_print_opened(&mut self) {
+        self.busy = false;
+        self.error_note = None;
+        self.status_note = Some(SharedString::from(
+            "已打开系统打印对话框，请在系统对话框中确认打印（尚未实际完成打印）",
+        ));
+    }
+
+    pub(crate) fn set_error(&mut self, err: impl Into<SharedString>) {
+        self.busy = false;
+        self.status_note = None;
+        self.error_note = Some(err.into());
+    }
+
+    pub(crate) fn clear_feedback(&mut self) {
+        self.busy = false;
+        self.status_note = None;
+        self.error_note = None;
     }
 }
 
@@ -528,6 +570,7 @@ pub(crate) fn render_modal(
                                     Button::new("print-export-pdf")
                                         .outline()
                                         .compact()
+                                        .disabled(state.busy)
                                         .icon(IconName::Download)
                                         .label("导出 PDF")
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -538,6 +581,7 @@ pub(crate) fn render_modal(
                                     Button::new("print-run-system")
                                         .primary()
                                         .compact()
+                                        .disabled(state.busy)
                                         .icon(IconName::FileText)
                                         .label("打印")
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -556,15 +600,54 @@ pub(crate) fn render_modal(
                                 ),
                         ),
                 )
-                .when_some(state.status_note.clone(), |dlg, note| {
+                .when_some(state.error_note.clone(), |dlg, err| {
                     dlg.child(
-                        div()
+                        h_flex()
                             .px_4()
                             .py_1p5()
+                            .justify_between()
+                            .items_center()
+                            .bg(p.danger.opacity(0.10))
+                            .border_b_1()
+                            .border_color(p.danger.opacity(0.4))
+                            .child(div().text_xs().text_color(p.danger).child(err))
+                            .child(
+                                Button::new("print-err-close")
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::X)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(ref mut pp) = this.print_preview {
+                                            pp.error_note = None;
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    )
+                })
+                .when_some(state.status_note.clone(), |dlg, note| {
+                    dlg.child(
+                        h_flex()
+                            .px_4()
+                            .py_1p5()
+                            .justify_between()
+                            .items_center()
                             .bg(p.accent_soft())
-                            .text_xs()
-                            .text_color(p.text)
-                            .child(note),
+                            .child(div().text_xs().text_color(p.text).child(note))
+                            .when(!state.busy, |row| {
+                                row.child(
+                                    Button::new("print-note-close")
+                                        .ghost()
+                                        .compact()
+                                        .icon(IconName::X)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(ref mut pp) = this.print_preview {
+                                                pp.status_note = None;
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                            }),
                     )
                 })
                 // 纸张预览画布。

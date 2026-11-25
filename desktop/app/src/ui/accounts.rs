@@ -3398,7 +3398,12 @@ pub(crate) fn render_editor_page(
                         .on_click(cx.listener(move |_, _, _, cx| {
                             app_for_sync.update(cx, |app, cx| {
                                 if let Some(ref w) = app.worker {
-                                    w.send(MailRequest::SyncAccount { account_id: acc_id });
+                                    app.syncing_accounts.insert(acc_id);
+                                    app.account_sync_errors.remove(&acc_id);
+                                    w.send(MailRequest::SyncAccount {
+                                        account_id: acc_id,
+                                        user_initiated: true,
+                                    });
                                     cx.notify();
                                 }
                             });

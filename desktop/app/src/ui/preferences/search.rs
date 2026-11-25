@@ -443,7 +443,7 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         tab: PrefTab::System,
         row_id: "pref-status-bar-top",
         title: "将状态栏置于窗口顶部",
-        subtitle: "把底部同步状态与快捷操作提示条移动至主内容顶部",
+        subtitle: "仅将连接与同步状态栏移动至主内容顶部（操作提示仍在底部）",
         keywords: "status bar top bottom 状态栏 顶部 底部",
     },
     PrefSearchItem {
@@ -471,7 +471,7 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         tab: PrefTab::System,
         row_id: "pref-check-updates",
         title: "启动时检查更新",
-        subtitle: "启动后读取 GitHub 最新发布并在状态栏提示可用的新版本",
+        subtitle: "启动后读取 GitHub 最新发布并在「关于 Hylki」提示可用更新",
         keywords: "update upgrade release github 更新 升级 新版本",
     },
     PrefSearchItem {

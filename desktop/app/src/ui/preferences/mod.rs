@@ -335,6 +335,9 @@ impl SettingsWindow {
                         cx.notify();
                         false
                     } else {
+                        this.app.update(cx, |app, _| {
+                            app.clear_settings_window_ref();
+                        });
                         true
                     }
                 })
@@ -2346,6 +2349,9 @@ impl Render for SettingsWindow {
         };
 
         let mail_dir_modal = self.render_mail_dir_modal(&p, cx);
+        let settings_toasts = self
+            .app
+            .update(cx, |app, cx| app.render_settings_window_toasts(window, cx));
 
         h_flex()
             .relative()
@@ -2407,6 +2413,7 @@ impl Render for SettingsWindow {
                         .child(content_area),
                 )
             })
+            .when_some(settings_toasts, |el, overlay| el.child(overlay))
             .when_some(mail_dir_modal, |el, modal| el.child(modal))
     }
 }

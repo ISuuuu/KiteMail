@@ -27,7 +27,7 @@ use gpui_kit::component::menu::{
 use gpui_kit::component::resizable::{resize_handle, HandleEdge};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
-use gpui_kit::component::{h_flex, v_flex, Selectable, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, App, AppContext, Axis, Context, Div, Entity, Global, InteractiveElement, IntoElement,
@@ -37,7 +37,7 @@ use gpui_kit::{
 use hylki_mail_core::config::{
     self, AccountConfig, AuthBackend, SidebarFolderRef, SidebarFolderRole,
 };
-use hylki_mail_core::{FolderSummary, MailRequest, OutboxItem, OutboxStatus};
+use hylki_mail_core::{FolderSummary, OutboxItem, OutboxStatus};
 
 use crate::app::{
     CurrentView, FolderActionPrompt, HylkiApp, MainContentView, ReaderPosition, SidebarDrag,
@@ -1089,6 +1089,9 @@ fn folder_action_prompt_bar(
         .when(needs_input, |el| {
             el.child(Input::new(&app.folder_action_input))
         })
+        .when_some(app.folder_action_error.as_ref(), |el, err| {
+            el.child(div().text_xs().text_color(p.danger).child(err.clone()))
+        })
         .child(
             h_flex()
                 .justify_end()
@@ -1106,7 +1109,14 @@ fn folder_action_prompt_bar(
                     Button::new("folder-action-confirm")
                         .primary()
                         .compact()
-                        .label(if is_danger { "删除" } else { "确定" })
+                        .disabled(app.folder_action_busy)
+                        .label(if app.folder_action_busy {
+                            "处理中…"
+                        } else if is_danger {
+                            "删除"
+                        } else {
+                            "确定"
+                        })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.confirm_folder_action(cx);
                         })),
@@ -1680,6 +1690,10 @@ fn account_section(
     );
     let acc_menu_entity = cx.entity();
 
+    let is_syncing = app.syncing_accounts.contains(&acc_id);
+    let sync_error = app.account_sync_errors.get(&acc_id).cloned();
+    let sync_err_expanded = app.expanded_account_errors.contains(&acc_id);
+
     v_flex()
         .gap_0p5()
         .child(
@@ -1717,7 +1731,16 @@ fn account_section(
                                 .truncate()
                                 .child(SharedString::from(primary_label)),
                         )
-                        .when(!secondary_label.is_empty(), |col| {
+                        .when(is_syncing, |col| {
+                            col.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(accent)
+                                    .truncate()
+                                    .child("正在同步…"),
+                            )
+                        })
+                        .when(!is_syncing && !secondary_label.is_empty(), |col| {
                             col.child(
                                 div()
                                     .text_xs()
@@ -1727,6 +1750,18 @@ fn account_section(
                             )
                         }),
                 )
+                .when(sync_error.is_some(), |row| {
+                    row.child(
+                        Button::new(("acc-sync-err-btn", acc_id))
+                            .ghost()
+                            .compact()
+                            .icon(IconName::TriangleAlert)
+                            .tooltip("同步异常（点击查看详情）")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_account_sync_error_detail(acc_id, cx);
+                            })),
+                    )
+                })
                 .child(
                     Icon::new(if expanded {
                         IconName::ChevronDown
@@ -1740,6 +1775,45 @@ fn account_section(
                     account_context_menu(menu, acc_menu_entity.clone(), menu_spec.clone())
                 }),
         )
+        .when(sync_err_expanded, |section| {
+            section.when_some(sync_error.clone(), |section, err| {
+                section.child(
+                    v_flex()
+                        .mx_2()
+                        .px_2()
+                        .py_1p5()
+                        .gap_1()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(p.danger.opacity(0.4))
+                        .bg(p.danger.opacity(0.08))
+                        .child(div().text_xs().text_color(p.danger).child(err))
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap_1()
+                                .child(
+                                    Button::new(("acc-sync-err-dismiss", acc_id))
+                                        .ghost()
+                                        .compact()
+                                        .label("忽略")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.dismiss_account_sync_error(acc_id, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("acc-sync-err-retry", acc_id))
+                                        .outline()
+                                        .compact()
+                                        .label("重试同步")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.sync_account(acc_id, cx);
+                                        })),
+                                ),
+                        ),
+                )
+            })
+        })
         .when(expanded, |section| {
             // WP-07：标准角色文件夹置顶（服务端顺序），随后直接平级列出
             // 自定义文件夹，并按 IMAP 分隔符构建多级树（带折叠箭头）。
@@ -1795,13 +1869,18 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
     let (sidebar_bg, border, text, muted_fg, danger) =
         (p.sidebar, p.border, p.text, p.text_muted, p.danger);
     let unified_unread = app.unified_unread_count();
+    let primary_outbox_key = app.primary_send_toast_outbox_key();
     let outbox_items: Vec<OutboxItem> = app
         .outbox_by_account
         .values()
         .flat_map(|v| v.iter().cloned())
-        // 仍在撤回倒计时中的邮件在写信器里已有倒计时提示，不再列入发件箱
-        // 面板，避免每次发信时侧边栏底部面板弹出又消失（高度跳动）。
-        .filter(|item| app.pending_send.as_ref().and_then(|p| p.outbox_id) != Some(item.id))
+        // 仅当发件箱面板未手动展开且非定位目标时隐藏主发送 Toast 正展示的那一封；
+        // 其余排队件、定时件、失败件和待确认件始终可从发件箱访问。
+        .filter(|item| {
+            app.outbox_expanded
+                || app.focused_outbox_item == Some((item.account_id, item.id))
+                || primary_outbox_key != Some((item.account_id, item.id))
+        })
         .collect();
     let outbox_pending = outbox_items
         .iter()
@@ -2203,75 +2282,234 @@ pub(crate) fn render(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gpui_kit::An
                     ))
                 })
                 .when(!outbox_items.is_empty(), |el| {
+                    let now_utc = chrono::Utc::now().timestamp();
                     el.child(
                         nav_row(
                             "nav-outbox",
                             IconName::TriangleAlert,
                             "发件箱待处理",
                             Some((outbox_pending.max(outbox_items.len() as u32), true)),
-                            false,
+                            app.outbox_expanded,
                             &p,
                         )
-                        .on_click(cx.listener(|_, _, _, _| {
-                            // 发件箱条目直接列在本行下方，行点击无操作。
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.outbox_expanded = !this.outbox_expanded;
+                            cx.notify();
                         })),
                     )
                     .children(outbox_items.iter().map(|item| {
                         let outbox_id = item.id;
                         let account_id = item.account_id;
-                        let label = match item.status {
-                            OutboxStatus::Uncertain => "发送结果待确认",
-                            OutboxStatus::Failed => "发送失败",
-                            OutboxStatus::Sending => "正在发送",
-                            OutboxStatus::Queued => "排队中",
+                        let in_active_undo = app.is_active_undo_outbox(account_id, outbox_id);
+                        let is_focused = app.focused_outbox_item == Some((account_id, outbox_id));
+                        let is_detail_open = app
+                            .expanded_outbox_errors
+                            .contains(&(account_id, outbox_id));
+                        let (label, subline) = match item.status {
+                            OutboxStatus::Uncertain => (
+                                "发送结果待确认".to_string(),
+                                Some("请先核对已发送文件夹或收件人，避免重复发送".to_string()),
+                            ),
+                            OutboxStatus::Failed => ("发送失败".to_string(), None),
+                            OutboxStatus::Sending => ("正在发送".to_string(), None),
+                            OutboxStatus::Queued => match item.send_at {
+                                Some(ts) if !in_active_undo && ts > now_utc => (
+                                    "已定时".to_string(),
+                                    Some(format!(
+                                        "计划于 {} 发送",
+                                        crate::compose_schedule::schedule_label(ts)
+                                    )),
+                                ),
+                                Some(ts) if in_active_undo && ts > now_utc => (
+                                    "等待发送".to_string(),
+                                    Some(format!("剩余 {} 秒", ts - now_utc)),
+                                ),
+                                _ => (
+                                    "等待发送".to_string(),
+                                    Some("已到投递时刻，等待后台处理".to_string()),
+                                ),
+                            },
+                        };
+                        let label_color = match item.status {
+                            OutboxStatus::Failed | OutboxStatus::Uncertain => danger,
+                            OutboxStatus::Sending => muted_fg,
+                            OutboxStatus::Queued => p.accent,
+                        };
+                        let subj_text = if item.subject.trim().is_empty() {
+                            "(无主题)".to_string()
+                        } else {
+                            item.subject.clone()
                         };
                         v_flex()
-                            .pl(px(38.0))
-                            .pr_2()
-                            .py_1()
-                            .gap_0p5()
+                            .ml(px(28.0))
+                            .mr_2()
+                            .my_0p5()
+                            .p_2()
+                            .gap_1()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(if is_focused {
+                                p.accent
+                            } else if matches!(
+                                item.status,
+                                OutboxStatus::Failed | OutboxStatus::Uncertain
+                            ) {
+                                danger.opacity(0.35)
+                            } else {
+                                p.border
+                            })
+                            .bg(if is_focused {
+                                p.accent_soft()
+                            } else {
+                                p.canvas
+                            })
                             .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_color(if item.status == OutboxStatus::Sending {
-                                        muted_fg
-                                    } else {
-                                        danger
-                                    })
-                                    .child(SharedString::from(label)),
+                                h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui_kit::FontWeight::BOLD)
+                                            .text_color(label_color)
+                                            .child(SharedString::from(label)),
+                                    )
+                                    .when(!item.last_error.is_empty(), |row| {
+                                        row.child(
+                                            Button::new(("outbox-detail-toggle", outbox_id))
+                                                .ghost()
+                                                .compact()
+                                                .text_size(px(11.0))
+                                                .label(if is_detail_open {
+                                                    "收起"
+                                                } else {
+                                                    "详情"
+                                                })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.toggle_outbox_error_detail(
+                                                        account_id, outbox_id, cx,
+                                                    );
+                                                })),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(muted_fg)
+                                    .text_color(p.text)
                                     .truncate()
-                                    .child(SharedString::from(item.subject.clone())),
+                                    .child(SharedString::from(subj_text)),
                             )
-                            .when(!item.last_error.is_empty(), |e| {
-                                e.child(
+                            .when_some(subline, |col, s| {
+                                col.child(
                                     div()
                                         .text_xs()
                                         .text_color(muted_fg)
-                                        .truncate()
+                                        .child(SharedString::from(s)),
+                                )
+                            })
+                            .when(!item.last_error.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(danger)
+                                        .when(!is_detail_open, |d| d.truncate())
                                         .child(SharedString::from(item.last_error.clone())),
                                 )
                             })
-                            .when(item.status != OutboxStatus::Sending, |e| {
-                                e.child(
-                                    Button::new(("retry-outbox", outbox_id))
-                                        .ghost()
-                                        .compact()
-                                        .label("手动重发")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Some(ref w) = this.worker {
-                                                w.send(MailRequest::RetryOutboxItem {
-                                                    account_id,
-                                                    outbox_id,
-                                                });
-                                                cx.notify();
-                                            }
-                                        })),
+                            .when(item.status == OutboxStatus::Queued, |col| {
+                                col.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .flex_wrap()
+                                        .child(
+                                            Button::new(("undo-outbox-sidebar", outbox_id))
+                                                .outline()
+                                                .compact()
+                                                .label(if in_active_undo {
+                                                    "撤销发送"
+                                                } else {
+                                                    "恢复草稿"
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.undo_outbox_item_from_sidebar(
+                                                            account_id, outbox_id, window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(("send-now-outbox-sidebar", outbox_id))
+                                                .ghost()
+                                                .compact()
+                                                .label("立即发送")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.retry_outbox_item_from_sidebar(
+                                                        account_id, outbox_id, cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                            })
+                            .when(item.status == OutboxStatus::Failed, |col| {
+                                col.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .flex_wrap()
+                                        .child(
+                                            Button::new(("retry-outbox", outbox_id))
+                                                .primary()
+                                                .compact()
+                                                .label("重试")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.retry_outbox_item_from_sidebar(
+                                                        account_id, outbox_id, cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(("discard-failed-outbox", outbox_id))
+                                                .ghost()
+                                                .compact()
+                                                .label("移除记录")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.delete_outbox_item_from_sidebar(
+                                                        account_id, outbox_id, cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                            })
+                            .when(item.status == OutboxStatus::Uncertain, |col| {
+                                col.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .flex_wrap()
+                                        .child(
+                                            Button::new(("view-sent-uncertain", outbox_id))
+                                                .outline()
+                                                .compact()
+                                                .label("核对已发送")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.select_unified_view(
+                                                        crate::app::CurrentView::Sent,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(("dismiss-uncertain-outbox", outbox_id))
+                                                .ghost()
+                                                .compact()
+                                                .label("已核对移除")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.delete_outbox_item_from_sidebar(
+                                                        account_id, outbox_id, cx,
+                                                    );
+                                                })),
+                                        ),
                                 )
                             })
                     }))

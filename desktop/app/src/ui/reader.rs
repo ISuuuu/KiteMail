@@ -1012,6 +1012,7 @@ fn render_message_card(
                 let host = app.reader_webview.as_ref().unwrap().clone();
                 let (version, _) = host.load_status();
                 let visible = !app.reader_popup_open;
+                let app_reserved_strip_px = app.reader_webview_bottom_clearance_px();
                 return card.child(
                     gpui_kit::canvas(
                         move |bounds, window, cx| {
@@ -1025,7 +1026,7 @@ fn render_message_card(
                                     .round() as i32,
                             };
                             let mask = window.content_mask().bounds;
-                            let clip = windows::Win32::Foundation::RECT {
+                            let mut clip = windows::Win32::Foundation::RECT {
                                 left: (mask.origin.x.as_f32() * scale).round() as i32,
                                 top: (mask.origin.y.as_f32() * scale).round() as i32,
                                 right: ((mask.origin.x + mask.size.width).as_f32() * scale).round()
@@ -1033,6 +1034,14 @@ fn render_message_card(
                                 bottom: ((mask.origin.y + mask.size.height).as_f32() * scale)
                                     .round() as i32,
                             };
+                            let reserved_bottom = app_reserved_strip_px;
+                            if reserved_bottom > 0.0 {
+                                let max_bottom =
+                                    ((window.viewport_size().height.as_f32() - reserved_bottom)
+                                        * scale)
+                                        .round() as i32;
+                                clip.bottom = clip.bottom.min(max_bottom);
+                            }
                             cx.defer(move |_| {
                                 if host.load_status() == (version, BodyView::Html) {
                                     host.set_clipped_bounds(rect, clip);
@@ -1588,7 +1597,7 @@ pub(crate) fn render_with_pane_top(
             );
         }
     }
-    let drawer_element = attachment_drawer::render_drawer(
+    let drawer_element = attachment_drawer::render_drawer_with_feedback(
         &drawer_items,
         app.attachment_drawer_collapsed,
         app.attachment_drawer_height,
@@ -1598,6 +1607,12 @@ pub(crate) fn render_with_pane_top(
         &app.attachment_thumb_cache,
         &app.stripping_attachment_ids,
         app.pending_strip_attachment_id,
+        attachment_drawer::DrawerFeedback {
+            downloading_ids: Some(&app.downloading_attachment_ids),
+            saving_all: app.saving_all_attachments,
+            item_errors: Some(&app.attachment_item_errors),
+            drawer_error: app.attachment_drawer_error.as_ref(),
+        },
         cx,
     );
 

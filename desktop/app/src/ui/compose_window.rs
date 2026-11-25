@@ -10,6 +10,7 @@
 //! 不自动收回主窗口。
 
 use gpui_kit::component::v_flex;
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     px, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Render, Styled,
     Window,
@@ -81,22 +82,27 @@ impl Render for ComposeWindow {
         self.focused_once = true;
         // 直接借用主应用实体的写信状态渲染；标题栏画在本窗口里，
         // 因此窗口控制按钮由它承载（`pane_top = true`）。
-        let pane = app.update(cx, |app, cx| {
+        let (pane, toasts_overlay) = app.update(cx, |app, cx| {
             if focus_body {
                 app.compose_body.focus_handle(cx).focus(window, cx);
             }
-            app.render_compose_pane(window, cx, true, true)
+            let pane = app.render_compose_pane(window, cx, true, true);
+            let overlay = app.render_compose_window_toasts(window, cx);
+            (pane, overlay)
         });
         v_flex()
+            .relative()
             .size_full()
             .bg(p.canvas)
             .text_color(p.text)
-            .on_action(cx.listener(|this, _: &SendCompose, _, cx| {
-                this.app.update(cx, |app, cx| app.send_compose(cx));
+            .on_action(cx.listener(|this, _: &SendCompose, window, cx| {
+                this.app
+                    .update(cx, |app, cx| app.send_compose_in_window(window, cx));
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, _, cx| {
                 this.app.update(cx, |app, cx| app.request_close_compose(cx));
             }))
             .child(pane)
+            .when_some(toasts_overlay, |root, overlay| root.child(overlay))
     }
 }

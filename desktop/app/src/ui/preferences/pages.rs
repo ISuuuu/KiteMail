@@ -2669,7 +2669,7 @@ fn render_composing(
                 setting_row(
                     "pref-undo-send-secs",
                     "撤销发送缓冲时间",
-                    Some("点击发送后在指定秒数内可点击状态栏「撤回」中止发出"),
+                    Some("点击发送后在指定秒数内可通过底部提示条「撤销发送」中止发出"),
                     combo_button(
                         "cb-undo-send",
                         lookup_label(UNDO_SEND_OPTIONS, &prefs.undo_send_secs, "5 秒（推荐）"),
@@ -3325,7 +3325,7 @@ fn render_system(
                 setting_row(
                     "pref-status-bar-top",
                     "将状态栏置于窗口顶部",
-                    Some("将同步状态及快速提示条从窗口底部移至顶栏下方"),
+                    Some("仅将连接与同步状态栏从窗口底部移至顶栏下方（操作提示条仍在底部显示）"),
                     bool_switch(
                         "sw-status-top",
                         prefs.status_bar_top,
@@ -3571,7 +3571,7 @@ fn render_system(
                 &app_entity,
                 "pref-check-updates",
                 "启动时检查更新",
-                Some("启动约 10 秒后读取 GitHub 最新发布；发现新版本时在状态栏提示，可在「关于 Hylki」中安装"),
+                Some("启动约 10 秒后读取 GitHub 最新发布；发现新版本时在「关于 Hylki」中提示并支持安装"),
                 prefs.check_updates,
                 false,
                 is_hit(win, "pref-check-updates"),
