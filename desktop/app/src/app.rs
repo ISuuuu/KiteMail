@@ -13010,24 +13010,29 @@ impl Render for HylkiApp {
                             }),
                         )
                         .child(
-                            h_flex().size_full().items_center().justify_center().child(
-                                v_flex()
-                                    .w(px(440.0))
-                                    .h(px(620.0))
-                                    .bg(p.surface)
-                                    .rounded(px(12.0))
-                                    .border_1()
-                                    .border_color(border)
-                                    .shadow_xl()
-                                    .overflow_hidden()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| {
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .child(about_modal(self, &p, border, cx)),
-                            ),
+                            h_flex()
+                                .size_full()
+                                .items_center()
+                                .justify_center()
+                                .p_4()
+                                .child(
+                                    v_flex()
+                                        .w(px(480.0))
+                                        .h(px(620.0))
+                                        .bg(p.surface)
+                                        .rounded(px(12.0))
+                                        .border_1()
+                                        .border_color(border)
+                                        .shadow_xl()
+                                        .overflow_hidden()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _, _, cx| {
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(about_modal(self, &p, border, cx)),
+                                ),
                         ),
                 );
             }
@@ -13321,6 +13326,113 @@ fn shortcuts_modal(p: &theme::HylkiPalette, cx: &mut Context<HylkiApp>) -> gpui_
         .into_any_element()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateNoteBlock {
+    Heading(String),
+    Bullet(String),
+    Paragraph(String),
+}
+
+/// 去掉更新说明里的成对 `**` 粗体与 `` ` `` 行内代码标记，保留完整文本内容。
+fn strip_inline_markdown_markers(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("**") {
+            if let Some(end) = after.find("**") {
+                if !after[..end].is_empty() {
+                    out.push_str(&strip_inline_markdown_markers(&after[..end]));
+                    rest = &after[end + 2..];
+                    continue;
+                }
+            }
+        }
+        if let Some(after) = rest.strip_prefix('`') {
+            if let Some(end) = after.find('`') {
+                if !after[..end].is_empty() {
+                    out.push_str(&after[..end]);
+                    rest = &after[end + 1..];
+                    continue;
+                }
+            }
+        }
+        if let Some(ch) = rest.chars().next() {
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// 将发布说明正文拆分为标题、列表项与段落块，完整保留内容而不做字数截断。
+fn parse_update_notes(raw: &str) -> Option<Vec<UpdateNoteBlock>> {
+    let normalized = raw.trim().replace("\r\n", "\n");
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut blocks: Vec<UpdateNoteBlock> = Vec::new();
+    let mut current: Option<UpdateNoteBlock> = None;
+    let flush = |current: &mut Option<UpdateNoteBlock>, blocks: &mut Vec<UpdateNoteBlock>| {
+        if let Some(block) = current.take() {
+            blocks.push(block);
+        }
+    };
+
+    for raw_line in normalized.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            flush(&mut current, &mut blocks);
+            continue;
+        }
+
+        let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+        if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+            flush(&mut current, &mut blocks);
+            let title = strip_inline_markdown_markers(trimmed[hashes + 1..].trim());
+            if !title.is_empty() {
+                blocks.push(UpdateNoteBlock::Heading(title));
+            }
+            continue;
+        }
+
+        if let Some(bullet_body) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
+            flush(&mut current, &mut blocks);
+            let text = strip_inline_markdown_markers(bullet_body.trim());
+            if !text.is_empty() {
+                current = Some(UpdateNoteBlock::Bullet(text));
+            }
+            continue;
+        }
+
+        let clean = strip_inline_markdown_markers(trimmed);
+        match current.as_mut() {
+            Some(UpdateNoteBlock::Bullet(buf)) | Some(UpdateNoteBlock::Paragraph(buf)) => {
+                if !buf.is_empty() && !clean.is_empty() {
+                    buf.push(' ');
+                }
+                buf.push_str(&clean);
+            }
+            _ => {
+                if !clean.is_empty() {
+                    current = Some(UpdateNoteBlock::Paragraph(clean));
+                }
+            }
+        }
+    }
+    flush(&mut current, &mut blocks);
+
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks)
+    }
+}
+
 /// 「关于 Hylki」弹窗内容（对齐原版 about.rs：版本、描述、协议、链接与致谢）。
 fn about_modal(
     app: &HylkiApp,
@@ -13362,17 +13474,11 @@ fn about_modal(
     } else {
         "检查更新"
     };
-    let notes = app.update.info.as_ref().and_then(|info| {
-        let notes = info.notes.trim().replace("\r\n", "\n");
-        if notes.is_empty() {
-            return None;
-        }
-        let mut short: String = notes.chars().take(280).collect();
-        if notes.chars().count() > 280 {
-            short.push('…');
-        }
-        Some(short)
-    });
+    let notes = app
+        .update
+        .info
+        .as_ref()
+        .and_then(|info| parse_update_notes(&info.notes));
     let repo = "https://github.com/ISuuuu/hylki";
     let issues = "https://github.com/ISuuuu/hylki/issues";
     let license_url = "https://www.gnu.org/licenses/agpl-3.0.html";
@@ -13400,28 +13506,10 @@ fn about_modal(
                         })),
                 )
         };
-    v_flex()
-        .flex_1()
-        .min_h_0()
-        .px_6()
-        .py_5()
+    let scroll_inner = v_flex()
+        .w_full()
+        .min_w_0()
         .gap_2()
-        .child(
-            h_flex()
-                .w_full()
-                .justify_between()
-                .items_center()
-                .child(div())
-                .child(
-                    Button::new("about-close")
-                        .ghost()
-                        .compact()
-                        .icon(IconName::X)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.close_modal(cx);
-                        })),
-                ),
-        )
         .child(
             v_flex().items_center().gap_1().child(
                 div()
@@ -13444,6 +13532,8 @@ fn about_modal(
         )
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .mt_1()
                 .text_center()
                 .text_sm()
@@ -13452,6 +13542,8 @@ fn about_modal(
         )
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .mt_1()
                 .text_center()
                 .text_xs()
@@ -13460,13 +13552,15 @@ fn about_modal(
         )
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .mt_1()
                 .text_center()
                 .text_xs()
                 .text_color(muted_fg)
                 .child("本程序基于 GNU AGPL-3.0 或更新版本授权发布，不含任何形式的担保。"),
         )
-        .child(div().mt_3().w_full().h(px(1.0)).bg(border))
+        .child(div().flex_shrink_0().mt_3().w_full().h(px(1.0)).bg(border))
         .child(
             div()
                 .mt_2()
@@ -13485,7 +13579,7 @@ fn about_modal(
                 license_url,
             ),
         ])
-        .child(div().mt_3().w_full().h(px(1.0)).bg(border))
+        .child(div().flex_shrink_0().mt_3().w_full().h(px(1.0)).bg(border))
         .child(
             div()
                 .mt_2()
@@ -13524,18 +13618,66 @@ fn about_modal(
                         })),
                 ),
         )
-        .when_some(notes, |el, notes| {
+        .when_some(notes, |el, blocks| {
             el.child(
-                div()
+                v_flex()
+                    .w_full()
+                    .min_w_0()
                     .mt_1()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child(SharedString::from(notes)),
+                    .p_3()
+                    .rounded(px(8.0))
+                    .bg(p.canvas)
+                    .border_1()
+                    .border_color(border)
+                    .gap_1p5()
+                    .children(blocks.into_iter().map(|block| {
+                        match block {
+                            UpdateNoteBlock::Heading(heading) => div()
+                                .w_full()
+                                .min_w_0()
+                                .pt_0p5()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(text)
+                                .child(SharedString::from(heading))
+                                .into_any_element(),
+                            UpdateNoteBlock::Bullet(item) => h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .items_start()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child("•"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child(SharedString::from(item)),
+                                )
+                                .into_any_element(),
+                            UpdateNoteBlock::Paragraph(para) => div()
+                                .w_full()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(SharedString::from(para))
+                                .into_any_element(),
+                        }
+                    })),
             )
         })
-        .child(div().mt_3().w_full().h(px(1.0)).bg(border))
+        .child(div().flex_shrink_0().mt_3().w_full().h(px(1.0)).bg(border))
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .mt_2()
                 .text_center()
                 .text_xs()
@@ -13544,11 +13686,46 @@ fn about_modal(
         )
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .text_center()
                 .text_xs()
                 .text_color(muted_fg)
                 .child("© 2026 Hyprlab"),
+        );
+    let body = div()
+        .id("about-scroll")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scrollbar()
+        .px_6()
+        .pb_5()
+        .child(scroll_inner);
+
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .w_full()
+                .px_6()
+                .pt_4()
+                .pb_1()
+                .justify_between()
+                .items_center()
+                .child(div())
+                .child(
+                    Button::new("about-close")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::X)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_modal(cx);
+                        })),
+                ),
         )
+        .child(body)
         .into_any_element()
 }
 
@@ -15206,5 +15383,48 @@ mod tests {
         assert!(one_toast > 60.0);
         assert!(with_status > one_toast);
         assert!(scaled > with_status);
+    }
+
+    #[test]
+    fn parse_update_notes_keeps_full_content_without_truncation() {
+        let mut long_notes = String::from(
+            "Hylki for Windows 架构升级\r\n\r\n### 存储架构与目录管理\r\n\r\n- **分账号分库存储**：每个账号独立目录，",
+        );
+        let tail_marker = "末尾校验条目：完整保留，不被 280 字符截断。";
+        for i in 0..20 {
+            long_notes.push_str(&format!(
+                "\n- **条目 {i}**：包含 `hylki.exe` 与更多更新细节说明。"
+            ));
+        }
+        long_notes.push_str("\n\n");
+        long_notes.push_str(tail_marker);
+
+        let blocks = parse_update_notes(&long_notes).expect("non-empty notes");
+        assert!(matches!(
+            &blocks[0],
+            UpdateNoteBlock::Paragraph(s) if s == "Hylki for Windows 架构升级"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            UpdateNoteBlock::Heading(s) if s == "存储架构与目录管理"
+        ));
+        assert!(matches!(
+            &blocks[2],
+            UpdateNoteBlock::Bullet(s) if s == "分账号分库存储：每个账号独立目录，"
+        ));
+        assert!(matches!(
+            blocks.last(),
+            Some(UpdateNoteBlock::Paragraph(s)) if s == tail_marker
+        ));
+        assert!(blocks.iter().any(|b| matches!(
+            b,
+            UpdateNoteBlock::Bullet(s) if s == "条目 19：包含 hylki.exe 与更多更新细节说明。"
+        )));
+    }
+
+    #[test]
+    fn parse_update_notes_returns_none_for_blank_input() {
+        assert!(parse_update_notes("").is_none());
+        assert!(parse_update_notes("  \r\n\t  ").is_none());
     }
 }
