@@ -1,145 +1,86 @@
 <p align="center">
-  <img src="data/repo/logo.png" width="120" alt="Hylki logo">
+  <img src="data/repo/logo.png" width="120" alt="KiteMail logo">
 </p>
 
-<h1 align="center">Hylki</h1>
+<h1 align="center">KiteMail</h1>
 
 <p align="center">
-  A GNOME-native email client built with Rust and libadwaita.
+  A native Windows desktop email client built with Rust, GPUI, and WebView2.
 </p>
 
 <p align="center">
-  <a href="https://hylki.hyprlab.co">Website</a> ·
-  <a href="docs/FEATURES.md">Features</a> ·
-  <a href="docs/DOCUMENTATION.md">Documentation</a> ·
-  <a href="https://github.com/hyprlab/hylki/releases">Releases</a> ·
-  <a href="https://discord.gg/YfEJ4b6PFW">Discord</a>
+  <a href="https://github.com/ISuuuu/hylki/releases">Releases</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="https://github.com/ISuuuu/hylki/issues">Issues</a> ·
+  <a href="README.zh-CN.md">简体中文</a>
   <br>
-  <img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue">
-</p>
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="data/repo/screenshot-dark.png">
-    <img src="data/repo/screenshot.png" width="900" alt="Hylki showing a unified inbox">
-  </picture>
+  <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-0078D4">
+  <img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue">
 </p>
 
 ---
 
-Hylki is an email client for the Linux desktop made to fit in with GNOME. It
-sends no telemetry or analytics. It is free software built to be
-both feature rich and beautiful ([the manifesto](docs/MANIFESTO.md)).
+**KiteMail** is a fast, privacy-focused native email client for Windows, built with Rust, GPUI (`gpui-kit`), and Microsoft Edge WebView2. It sends no telemetry or analytics.
 
 > [!NOTE]
-> **Vireo is now Hylki.** Since v1.35.0 the app once called Vireo (and Veem
-> before v1.6.0) has been renamed Hylki, with a new icon. Nothing else changed.
-> The first time Hylki starts, it copies your accounts, settings and cached
-> mail over from Vireo, and leaves Vireo alone until you remove it.
+> **Project Independence & Rename**: **KiteMail** (formerly Hylki for Windows) originally started as a fork of the Linux GNOME email client [hyprlab/hylki](https://github.com/hyprlab/hylki) and is now developed and maintained as an independent project. The Windows client lives in [`desktop/`](desktop/) with its own architecture and `0.x` release cycle, independent from the upstream Linux `1.x` series. Repository links, package/binary names (`hylki`), and data directories are scheduled to migrate to KiteMail in the next release.
 
 ## Features
 
-- Several accounts at once over IMAP, POP3 or JMAP, each synced in the
-  background, with a combined *Inboxes* view. Google and Microsoft accounts
-  sign in with OAuth.
-- The whole mailbox is synced and searchable, however large it is. The first
-  page shows up straight away and the rest is indexed in the background.
-- Messages you delete, move or flag on your phone or in another client are
-  updated here too.
-- Write in rich text, Markdown, HTML or plain text, chosen per message.
-- A message that fails to send waits in the Outbox until the connection comes
-  back, and any message can be scheduled to go out later.
-- Large files can be uploaded to your own Nextcloud, ownCloud, OpenCloud or
-  Seafile, or to OneDrive or Dropbox, and sent as a link.
-- Remote content is blocked until you allow it for a message or a sender.
-  Reader View cuts a cluttered message down to its text.
-- OpenPGP: read, sign and encrypt mail and manage keys with the GnuPG already
-  on your computer.
-- Filters with several conditions tag mail and move it to folders. Tags are
-  stored as server keywords where the server supports them.
-- Optional Gmail-style single-key shortcuts
-  ([the full list](docs/KEYBOARD_SHORTCUTS.md)).
-- An adaptive three-pane layout, five colour themes, Focus Mode, light and dark
-  styles that follow the system, and an option to keep running in the
-  background.
+- **Multi-Account & Protocols**: Manage multiple accounts with IMAP / SMTP (including IMAP IDLE push and scheduled sync) as well as Microsoft 365 / Outlook OAuth2 (Microsoft Graph). Includes built-in presets for QQ Mail, NetEase 163/126, Tencent Exmail, Aliyun Enterprise Mail, Gmail, iCloud, Yahoo, Fastmail, Proton Mail Bridge, and more.
+- **Native GPUI Interface**: Responsive three-pane layout (collapsible sidebar, message list, and reader) with configurable reader placement (right, bottom, or hidden), Focus Mode, adaptive narrow rail on half-screen windows, Light/Dark/System themes, single-instance activation, and system tray minimization.
+- **Secure WebView2 Reader**: Renders HTML messages inside WebView2 with remote images blocked by default (loadable on demand), external request headers and `Referrer` stripped, and sanitized links opened in your default browser. Supports RFC-header conversation threading, quote folding, inline images, standalone reader windows, print preview, and `Authentication-Results` verification badges.
+- **Rich Composing & Productivity**: Four editing modes (including rich HTML, Markdown, and plain text), HTML signature sanitization and import, inline reply, standalone compose windows, auto-saved drafts, scheduled send, and restart-safe Undo Send. Includes full-text search, multi-criteria filtering, an attachment gallery, contacts management (VCF/CSV import & export), Command Palette (`Ctrl+Shift+K`), and optional single-key shortcuts.
+- **Per-Account Storage & Portable Mode**: Separates global metadata (`global.db`) from per-account storage (`mail.db` index, lazy-loaded `content.db` bodies, and bucketed attachments). Supports custom mail storage directories with migration/reuse and full portable isolation via `portable.flag`.
+- **Security & In-App Updates**: Stores passwords and OAuth tokens in Windows Credential Manager. Built-in updater verifies SHA-256 checksums, honors Windows system proxy settings (WinHTTP / PAC / env) and system root certificates, supports resumable downloads, and separates Beta prereleases from the stable channel.
 
-**[All features →](docs/FEATURES.md)**
+## Installation
 
-## Installing
+Download the latest Windows x64 release from [GitHub Releases](https://github.com/ISuuuu/hylki/releases) (currently packaged under the `Hylki` name prior to the next release):
 
-The Flatpak is the recommended way to install Hylki. It works on any
-distribution, on x86_64 and aarch64, and updates come from a signed repository:
+- **Installer (`Hylki_<version>_x64-setup.exe`)**: NSIS installer targeting `%LOCALAPPDATA%\Hylki` by default. Configuration and local data are stored in `%LOCALAPPDATA%\Hylki\`, with silent in-app updates.
+- **Portable (`Hylki_v<version>_portable.zip`)**: Extract and run. Includes `portable.flag` so configuration and global state stay inside a sibling `data\` directory, with in-place updates and optional custom mail storage paths.
 
-```sh
-flatpak install --user --from https://hylki.hyprlab.co/flatpak/co.hyprlab.Hylki.flatpakref
+To preview the UI without adding a real email account, launch the executable with `--demo`.
+
+## Building from Source
+
+### Prerequisites
+
+- Windows x64
+- [Rust toolchain](https://rustup.rs/) (`x86_64-pc-windows-msvc`)
+- Microsoft Edge WebView2 Runtime (preinstalled on modern Windows 10/11)
+
+### Commands
+
+```pwsh
+git clone https://github.com/ISuuuu/hylki.git
+cd hylki
+
+# Check and run unit tests
+cargo check --manifest-path desktop/Cargo.toml --workspace --locked
+cargo test --manifest-path desktop/Cargo.toml --workspace --locked
+
+# Run in development mode
+cargo run --manifest-path desktop/Cargo.toml -p hylki --bin hylki
+
+# Build release binary
+cargo build --manifest-path desktop/Cargo.toml -p hylki --bin hylki --release --target x86_64-pc-windows-msvc --locked
 ```
 
-On Fedora you can install the RPM from its signed dnf repository instead, and
-it updates with the rest of the system:
+## Repository Layout
 
-```sh
-sudo curl -fsSLo /etc/yum.repos.d/hylki.repo https://hylki.hyprlab.co/rpm/hylki.repo
-sudo dnf install hylki
-```
+- [`desktop/`](desktop/): Windows client workspace (`hylki` desktop app and `hylki-mail-core` library)
+- [`.github/`](.github/): Windows x64 CI/CD workflow and NSIS installer script
+- [`CHANGELOG.md`](CHANGELOG.md): Windows client release history and earlier upstream changelog
+- [`src/`](src/), [`docs/`](docs/): Legacy upstream Linux (GTK 4 / libadwaita) source and reference docs
 
-The Debian and Ubuntu package, the AppImage, the Gentoo and NixOS community
-packages, direct `.flatpak` downloads and the beta channel are covered in
-[docs/INSTALLING.md](docs/INSTALLING.md). To build Hylki
-yourself, see [docs/BUILDING.md](docs/BUILDING.md).
+## Contributing & Support
 
-## Documentation
+Bug reports, feature suggestions, and pull requests are welcome on [GitHub Issues](https://github.com/ISuuuu/hylki/issues). For security vulnerabilities, please see [docs/SECURITY.md](docs/SECURITY.md).
 
-| | |
-| --- | --- |
-| [Features](docs/FEATURES.md) | The full feature list |
-| [Documentation](docs/DOCUMENTATION.md) | Accounts, OAuth, cloud attachments, Markdown, OpenPGP, GNOME Files, privacy |
-| [Keyboard shortcuts](docs/KEYBOARD_SHORTCUTS.md) | The single-key shortcuts |
-| [Installing](docs/INSTALLING.md) · [Building](docs/BUILDING.md) | Packages, the beta channel and building from source |
-| [Contributing](docs/CONTRIBUTING.md) · [Credits](docs/CREDITS.md) | How to contribute, and the people who have |
-| [Release notes](docs/RELEASE_NOTES.md) · [Changelog](CHANGELOG.md) | What changed in each release |
+## License & Acknowledgments
 
-## Privacy
-
-Remote content in messages is blocked by default, so tracking pixels cannot
-report that you opened a message. Passwords and OAuth tokens are kept in the
-system keyring rather than in files, and decrypted mail is never written to the
-cache. There is more in [Documentation](docs/DOCUMENTATION.md#privacy).
-
-## AI notice
-
-Hylki is built by a human maintainer who uses generative AI as a development
-tool. The maintainer decides what gets built, reviews the results, tests every
-release and signs off on everything that ships. The app itself contains no AI
-and makes no requests to AI services.
-
-The app icon, its symbolic version and the wordmark were drawn by
-[Yiannis Ioannides](https://github.com/yioannides). The other visual assets
-were also made by the maintainer without generative AI.
-
-Bug reports and pull requests are welcome whether or not AI tools were
-involved, and everything merged is reviewed by a person.
-
-## Contributing
-
-Hylki is maintained by Hyprlab with the help of the open source community. Bug reports, feature requests, design feedback,
-translations, packaging and code are all welcome. Everyone whose work is in the
-app is named in the About window and in [CREDITS.md](docs/CREDITS.md).
-
-Translating needs no Rust knowledge ([po/README.md](po/README.md)), and a clear bug report
-is often as useful as a patch. **[How to contribute →](docs/CONTRIBUTING.md)**
-
-## Contact & support
-
-- Website: [hylki.hyprlab.co](https://hylki.hyprlab.co)
-- Discord: [discord.gg/YfEJ4b6PFW](https://discord.gg/YfEJ4b6PFW)
-- Email: [hyprlab@proton.me](mailto:hyprlab@proton.me)
-- Security issues: see [SECURITY.md](docs/SECURITY.md)
-- [Buy me a coffee](https://buymeacoffee.com/hyprlab) ☕
-
-## License
-
-Hylki is free software, licensed under the **GNU Affero General Public License
-v3.0 or later** ([AGPL-3.0-or-later](LICENSE)). The third-party marks, logos
-and themes it bundles are listed in [docs/LICENSE.md](docs/LICENSE.md).
-
-© 2026 Hyprlab
+- Licensed under the **GNU Affero General Public License v3.0 or later** ([AGPL-3.0-or-later](LICENSE)).
+- Originally forked from [hyprlab/hylki](https://github.com/hyprlab/hylki) (© 2026 Hyprlab). App icon and wordmark by [Yiannis Ioannides](https://github.com/yioannides). See [data/CONTRIBUTORS](data/CONTRIBUTORS), [data/TRANSLATORS](data/TRANSLATORS), and [docs/CREDITS.md](docs/CREDITS.md) for upstream contributors and translators.
+- Third-party notices and bundled assets are listed in [docs/LICENSE.md](docs/LICENSE.md).
