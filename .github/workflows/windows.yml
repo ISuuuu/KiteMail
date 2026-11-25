@@ -224,5 +224,5 @@ jobs:
             exit 0
           fi
           notes=$(mktemp)
-          tools/release-notes.sh "$version" >"$notes" 2>/dev/null || printf 'Hylki %s\n' "$version" >"$notes"
-          gh release create "$tag" "${prerelease[@]}" --title "Hylki $version" --notes-file "$notes" "${assets[@]}"
+          tools/release-notes.sh "$version" >"$notes" 2>/dev/null || printf 'KiteMail %s\n' "$version" >"$notes"
+          gh release create "$tag" "${prerelease[@]}" --title "KiteMail $version" --notes-file "$notes" "${assets[@]}"

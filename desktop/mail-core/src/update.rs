@@ -17,7 +17,7 @@ use crate::proxy;
 
 /// 最新发布的更新清单（`releases/latest` 不会指向预发布版本）。
 pub const MANIFEST_URL: &str =
-    "https://github.com/ISuuuu/hylki/releases/latest/download/latest.json";
+    "https://github.com/ISuuuu/KiteMail/releases/latest/download/latest.json";
 
 /// 安装版与便携版在清单里的平台键。
 pub const TARGET_INSTALLER: &str = "windows-x86_64";

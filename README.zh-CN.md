@@ -9,9 +9,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ISuuuu/hylki/releases">Releases 下载</a> ·
+  <a href="https://github.com/ISuuuu/KiteMail/releases">Releases 下载</a> ·
   <a href="CHANGELOG.md">更新日志</a> ·
-  <a href="https://github.com/ISuuuu/hylki/issues">问题反馈</a> ·
+  <a href="https://github.com/ISuuuu/KiteMail/issues">问题反馈</a> ·
   <a href="README.md">English</a>
   <br>
   <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-0078D4">
@@ -23,7 +23,7 @@
 **KiteMail** 是一个注重性能、隐私与桌面体验的原生 Windows 电子邮件客户端，不收集任何遥测或统计数据。
 
 > [!NOTE]
-> **项目独立与更名说明**：**KiteMail**（原 Hylki for Windows）最初派生自 Linux GNOME 邮件客户端 [hyprlab/hylki](https://github.com/hyprlab/hylki)，现已作为独立项目持续演进与维护。Windows 客户端源码位于 [`desktop/`](desktop/) 工作区，采用独立的软件架构与 `0.x` 版本体系，与上游 Linux `1.x` 版本相互独立。注：仓库路径、可执行文件（`hylki`）、数据目录与安装包命名将在下个版本同步迁移为 KiteMail。
+> **项目独立与更名说明**：**KiteMail**（原 Hylki for Windows）最初派生自 Linux GNOME 邮件客户端 [hyprlab/hylki](https://github.com/hyprlab/hylki)，现已作为独立项目持续演进与维护。Windows 客户端源码位于 [`desktop/`](desktop/) 工作区，采用独立的软件架构与 `0.x` 版本体系，与上游 Linux `1.x` 版本相互独立。注：可执行文件（`hylki`）、数据目录与安装包命名将在下个版本同步迁移为 KiteMail。
 
 ## 核心特性
 
@@ -36,7 +36,7 @@
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/ISuuuu/hylki/releases) 下载最新 Windows x64 构建产物（当前版本仍沿用 `Hylki` 包名，将在下个版本统一更名）：
+前往 [GitHub Releases](https://github.com/ISuuuu/KiteMail/releases) 下载最新 Windows x64 构建产物（当前版本仍沿用 `Hylki` 包名，将在下个版本统一更名）：
 
 - **安装版（`Hylki_<version>_x64-setup.exe`）**：NSIS 安装包，默认安装至 `%LOCALAPPDATA%\Hylki`，配置与本地数据存放于 `%LOCALAPPDATA%\Hylki\`，支持应用内静默更新。
 - **便携版（`Hylki_v<version>_portable.zip`）**：解压即用，内置 `portable.flag` 标记，配置与全局索引写入程序同级 `data\` 目录，支持应用内就地更新与自定义共享邮件目录。
@@ -54,8 +54,8 @@
 ### 编译与测试
 
 ```pwsh
-git clone https://github.com/ISuuuu/hylki.git
-cd hylki
+git clone https://github.com/ISuuuu/KiteMail.git
+cd KiteMail
 
 # 代码检查与单元测试
 cargo check --manifest-path desktop/Cargo.toml --workspace --locked
@@ -77,7 +77,7 @@ cargo build --manifest-path desktop/Cargo.toml -p hylki --bin hylki --release --
 
 ## 参与贡献与反馈
 
-欢迎在 [GitHub Issues](https://github.com/ISuuuu/hylki/issues) 提交缺陷反馈、功能建议或 Pull Request。安全相关问题请参考 [docs/SECURITY.md](docs/SECURITY.md)。
+欢迎在 [GitHub Issues](https://github.com/ISuuuu/KiteMail/issues) 提交缺陷反馈、功能建议或 Pull Request。安全相关问题请参考 [docs/SECURITY.md](docs/SECURITY.md)。
 
 ## 许可证与致谢
 

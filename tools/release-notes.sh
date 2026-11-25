@@ -23,7 +23,7 @@ if [ "${1:-}" = "--base" ]; then
   shift
 fi
 ver="${1:?usage: release-notes.sh [--base] X.Y.Z (no leading v)}"
-repo="hyprlab/hylki"
+repo="${GITHUB_REPOSITORY:-ISuuuu/KiteMail}"
 
 # The newest stable tag on GitHub that sorts before the one given. Local tags
 # are no use here, as a clone keeps the tags GitHub has since dropped.
@@ -109,14 +109,14 @@ for line in sys.stdin:
 '
 }
 
-# "## What's new in X.Y.Z" (newest) or "## In X.Y.Z" (older), with optional
-# suffixes like " — security release".
-notes=$(section docs/RELEASE_NOTES.md \
-  "^## (What.s new in|In) ${ver}($| )" \
-  "^## ")
+# Prefer CHANGELOG.md for independent 0.x releases; fall back to legacy docs/RELEASE_NOTES.md.
+# "## X.Y.Z — <date>"
+notes=$(section CHANGELOG.md "^## ${ver}($| )" "^## ")
 if [ -z "${notes//[[:space:]]/}" ]; then
-  # "## X.Y.Z — <date>"
-  notes=$(section CHANGELOG.md "^## ${ver} " "^## ")
+  # "## What's new in X.Y.Z" (newest) or "## In X.Y.Z" (older)
+  notes=$(section docs/RELEASE_NOTES.md \
+    "^## (What.s new in|In) ${ver}($| )" \
+    "^## ")
 fi
 if [ -z "${notes//[[:space:]]/}" ]; then
   echo "no notes found for ${ver} in docs/RELEASE_NOTES.md or CHANGELOG.md" >&2

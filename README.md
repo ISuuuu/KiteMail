@@ -9,9 +9,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ISuuuu/hylki/releases">Releases</a> ·
+  <a href="https://github.com/ISuuuu/KiteMail/releases">Releases</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
-  <a href="https://github.com/ISuuuu/hylki/issues">Issues</a> ·
+  <a href="https://github.com/ISuuuu/KiteMail/issues">Issues</a> ·
   <a href="README.zh-CN.md">简体中文</a>
   <br>
   <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-0078D4">
@@ -23,7 +23,7 @@
 **KiteMail** is a fast, privacy-focused native email client for Windows, built with Rust, GPUI (`gpui-kit`), and Microsoft Edge WebView2. It sends no telemetry or analytics.
 
 > [!NOTE]
-> **Project Independence & Rename**: **KiteMail** (formerly Hylki for Windows) originally started as a fork of the Linux GNOME email client [hyprlab/hylki](https://github.com/hyprlab/hylki) and is now developed and maintained as an independent project. The Windows client lives in [`desktop/`](desktop/) with its own architecture and `0.x` release cycle, independent from the upstream Linux `1.x` series. Repository links, package/binary names (`hylki`), and data directories are scheduled to migrate to KiteMail in the next release.
+> **Project Independence & Rename**: **KiteMail** (formerly Hylki for Windows) originally started as a fork of the Linux GNOME email client [hyprlab/hylki](https://github.com/hyprlab/hylki) and is now developed and maintained as an independent project. The Windows client lives in [`desktop/`](desktop/) with its own architecture and `0.x` release cycle, independent from the upstream Linux `1.x` series. Package/binary names (`hylki`) and data directories are scheduled to migrate to KiteMail in the next release.
 
 ## Features
 
@@ -36,7 +36,7 @@
 
 ## Installation
 
-Download the latest Windows x64 release from [GitHub Releases](https://github.com/ISuuuu/hylki/releases) (currently packaged under the `Hylki` name prior to the next release):
+Download the latest Windows x64 release from [GitHub Releases](https://github.com/ISuuuu/KiteMail/releases) (currently packaged under the `Hylki` name prior to the next release):
 
 - **Installer (`Hylki_<version>_x64-setup.exe`)**: NSIS installer targeting `%LOCALAPPDATA%\Hylki` by default. Configuration and local data are stored in `%LOCALAPPDATA%\Hylki\`, with silent in-app updates.
 - **Portable (`Hylki_v<version>_portable.zip`)**: Extract and run. Includes `portable.flag` so configuration and global state stay inside a sibling `data\` directory, with in-place updates and optional custom mail storage paths.
@@ -54,8 +54,8 @@ To preview the UI without adding a real email account, launch the executable wit
 ### Commands
 
 ```pwsh
-git clone https://github.com/ISuuuu/hylki.git
-cd hylki
+git clone https://github.com/ISuuuu/KiteMail.git
+cd KiteMail
 
 # Check and run unit tests
 cargo check --manifest-path desktop/Cargo.toml --workspace --locked
@@ -77,7 +77,7 @@ cargo build --manifest-path desktop/Cargo.toml -p hylki --bin hylki --release --
 
 ## Contributing & Support
 
-Bug reports, feature suggestions, and pull requests are welcome on [GitHub Issues](https://github.com/ISuuuu/hylki/issues). For security vulnerabilities, please see [docs/SECURITY.md](docs/SECURITY.md).
+Bug reports, feature suggestions, and pull requests are welcome on [GitHub Issues](https://github.com/ISuuuu/KiteMail/issues). For security vulnerabilities, please see [docs/SECURITY.md](docs/SECURITY.md).
 
 ## License & Acknowledgments
 

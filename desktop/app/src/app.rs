@@ -13533,8 +13533,8 @@ fn about_modal(
         .info
         .as_ref()
         .and_then(|info| parse_update_notes(&info.notes));
-    let repo = "https://github.com/ISuuuu/hylki";
-    let issues = "https://github.com/ISuuuu/hylki/issues";
+    let repo = "https://github.com/ISuuuu/KiteMail";
+    let issues = "https://github.com/ISuuuu/KiteMail/issues";
     let license_url = "https://www.gnu.org/licenses/agpl-3.0.html";
     let link_row =
         |cx: &mut Context<HylkiApp>, id: &'static str, label: &'static str, url: &'static str| {
@@ -13570,7 +13570,7 @@ fn about_modal(
                     .text_2xl()
                     .font_weight(gpui_kit::FontWeight::BOLD)
                     .text_color(text)
-                    .child("Hylki"),
+                    .child("KiteMail"),
             ),
         )
         .child(
@@ -13592,7 +13592,7 @@ fn about_modal(
                 .text_center()
                 .text_sm()
                 .text_color(muted_fg)
-                .child("一个快速、原生的电子邮件客户端"),
+                .child("快速、注重隐私的原生 Windows 桌面邮件客户端"),
         )
         .child(
             div()
@@ -13602,7 +13602,7 @@ fn about_modal(
                 .text_center()
                 .text_xs()
                 .text_color(muted_fg)
-                .child("Windows 版：GPUI 原生界面，共享邮件内核。"),
+                .child("基于 Rust、GPUI 与 WebView2 构建（原 Hylki for Windows），独立派生自上游 Hylki。"),
         )
         .child(
             div()
@@ -13736,7 +13736,7 @@ fn about_modal(
                 .text_center()
                 .text_xs()
                 .text_color(muted_fg)
-                .child("感谢所有贡献者与翻译者（详见仓库 data/CONTRIBUTORS 与 data/TRANSLATORS）"),
+                .child("感谢上游 Hylki 及所有贡献者与翻译者（详见仓库 data/CONTRIBUTORS 与 data/TRANSLATORS）"),
         )
         .child(
             div()
@@ -13745,7 +13745,7 @@ fn about_modal(
                 .text_center()
                 .text_xs()
                 .text_color(muted_fg)
-                .child("© 2026 Hyprlab"),
+                .child("Upstream © 2026 Hyprlab · AGPL-3.0-or-later"),
         );
     let body = div()
         .id("about-scroll")
