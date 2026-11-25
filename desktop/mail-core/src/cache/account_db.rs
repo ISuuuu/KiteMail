@@ -46,6 +46,83 @@ pub(crate) struct MergedMessageCandidate {
     pub(crate) folder_priority: u8,
 }
 
+const MAX_THREAD_BFS_HOPS: usize = 8;
+const MAX_THREAD_BFS_ROWS: usize = 200;
+const MAX_THREAD_SUBJECT_ROWS: usize = 60;
+const MAX_THREAD_MESSAGES: usize = 40;
+
+struct AnchorThreadMeta {
+    id: u32,
+    folder_id: u32,
+    rfc_message_id: String,
+    in_reply_to: String,
+    references_header: String,
+    sender: String,
+    date_ts: i64,
+    thread_subject: String,
+}
+
+#[derive(Clone)]
+struct ThreadCountRow {
+    id: u32,
+    folder_id: u32,
+    rfc_message_id: String,
+    sender: String,
+    date_ts: i64,
+}
+
+fn collect_anchor_rfc_seeds(
+    rfc_message_id: &str,
+    in_reply_to: &str,
+    references_header: &str,
+) -> (HashSet<String>, bool) {
+    let mut seed_ids: HashSet<String> = HashSet::new();
+    for tok in extract_rfc_message_ids(rfc_message_id) {
+        seed_ids.insert(tok);
+    }
+    let irt_ids = extract_rfc_message_ids(in_reply_to);
+    let ref_ids = extract_rfc_message_ids(references_header);
+    let anchor_has_reply_headers = !irt_ids.is_empty() || !ref_ids.is_empty();
+    for tok in irt_ids.into_iter().chain(ref_ids) {
+        seed_ids.insert(tok);
+    }
+    (seed_ids, anchor_has_reply_headers)
+}
+
+fn count_distinct_thread_rows(
+    rows: &[ThreadCountRow],
+    extra_anchor: Option<&ThreadCountRow>,
+    local_anchor_id: u32,
+    anchor_in_trash_or_junk: bool,
+    trash_or_junk_folders: &HashMap<u32, bool>,
+) -> u32 {
+    let mut distinct: u32 = 0;
+    let mut seen_keys: HashSet<(String, String, i64)> = HashSet::new();
+    for row in rows.iter().chain(extra_anchor) {
+        if !anchor_in_trash_or_junk
+            && !(local_anchor_id != 0 && row.id == local_anchor_id)
+            && trash_or_junk_folders
+                .get(&row.folder_id)
+                .copied()
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let norm_mid = extract_rfc_message_ids(&row.rfc_message_id)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        if !norm_mid.is_empty() && !seen_keys.insert((norm_mid, row.sender.clone(), row.date_ts)) {
+            continue;
+        }
+        distinct += 1;
+        if distinct as usize >= MAX_THREAD_MESSAGES {
+            return MAX_THREAD_MESSAGES as u32;
+        }
+    }
+    distinct.max(1)
+}
+
 impl AccountDb {
     pub(crate) fn mail_db_path_in(dir: &Path) -> PathBuf {
         dir.join("mail.db")
@@ -433,6 +510,9 @@ impl AccountDb {
         &mut self,
         remote_folders: &[(RemoteFolder, bool)],
     ) -> Result<Vec<FolderSummary>, String> {
+        if remote_folders.is_empty() {
+            return self.list_folders();
+        }
         let tx = self
             .mail_conn
             .transaction()
@@ -460,8 +540,59 @@ impl AccountDb {
             .map_err(|e| format!("写入文件夹失败 ({}): {e}", folder.path))?;
         }
 
+        let live_paths: HashSet<&str> = remote_folders
+            .iter()
+            .map(|(f, _)| f.path.as_str())
+            .collect();
+        let stale_ids: Vec<u32> = {
+            let mut stmt = tx
+                .prepare("SELECT id, path FROM folders")
+                .map_err(|e| format!("查询本地文件夹失败: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("遍历本地文件夹失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("收集本地文件夹失败: {e}"))?;
+            rows.into_iter()
+                .filter_map(|(id, path)| (!live_paths.contains(path.as_str())).then_some(id))
+                .collect()
+        };
+
+        let mut deleted_msg_ids: Vec<u32> = Vec::new();
+        let mut old_attachment_paths: Vec<String> = Vec::new();
+        for stale_id in stale_ids {
+            let mut stmt = tx
+                .prepare("SELECT id FROM messages WHERE folder_id = ?1")
+                .map_err(|e| format!("查询待清理文件夹邮件失败: {e}"))?;
+            let ids = stmt
+                .query_map(params![stale_id], |r| r.get::<_, u32>(0))
+                .map_err(|e| format!("遍历待清理文件夹邮件失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("收集待清理文件夹邮件失败: {e}"))?;
+            drop(stmt);
+            deleted_msg_ids.extend(ids);
+            old_attachment_paths.extend(collect_attachment_paths(
+                &tx,
+                "SELECT a.storage_path FROM attachments a
+                 JOIN messages m ON m.id = a.message_id
+                 WHERE m.folder_id = ?1 AND a.storage_path != ''",
+                params![stale_id],
+            )?);
+            tx.execute("DELETE FROM folders WHERE id = ?1", params![stale_id])
+                .map_err(|e| format!("清理已删除远端文件夹缓存失败: {e}"))?;
+        }
+
         tx.commit()
             .map_err(|e| format!("提交文件夹事务失败: {e}"))?;
+
+        if !deleted_msg_ids.is_empty() {
+            self.delete_content_bodies_for_ids(&deleted_msg_ids);
+        }
+        if !old_attachment_paths.is_empty() {
+            delete_attachment_files(self.attachments_dir.as_deref(), &old_attachment_paths);
+        }
         self.list_folders()
     }
 
@@ -1478,26 +1609,350 @@ impl AccountDb {
         Ok(rows)
     }
 
+    fn load_trash_or_junk_folders(&self) -> Result<HashMap<u32, bool>, String> {
+        let mut stmt = self
+            .mail_conn
+            .prepare("SELECT id, name, path FROM folders")
+            .map_err(|e| format!("查询文件夹属性失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: u32 = row.get(0)?;
+                let name: String = row.get(1)?;
+                let path: String = row.get(2)?;
+                Ok((
+                    id,
+                    is_trash_folder(&name, &path) || is_junk_folder(&name, &path),
+                ))
+            })
+            .map_err(|e| format!("读取文件夹属性失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("解析文件夹属性失败: {e}"))?;
+        Ok(rows.into_iter().collect())
+    }
+
+    fn load_thread_count_rows(&self, local_ids: &[u32]) -> Result<Vec<ThreadCountRow>, String> {
+        let mut out = Vec::new();
+        for chunk in local_ids.chunks(200) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT id, folder_id, message_id, sender, date_ts
+                 FROM messages
+                 WHERE id IN ({placeholders})"
+            );
+            let args: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|&id| i64::from(id).into()).collect();
+            let mut stmt = self
+                .mail_conn
+                .prepare(&sql)
+                .map_err(|e| format!("准备会话计数行查询失败: {e}"))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                    Ok(ThreadCountRow {
+                        id: row.get(0)?,
+                        folder_id: row.get(1)?,
+                        rfc_message_id: row.get(2)?,
+                        sender: row.get(3)?,
+                        date_ts: row.get(4)?,
+                    })
+                })
+                .map_err(|e| format!("读取会话计数行失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析会话计数行失败: {e}"))?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
+    fn bfs_rfc_thread_ids(
+        &self,
+        local_anchor_id: u32,
+        anchor_exists: bool,
+        seed_ids: HashSet<String>,
+    ) -> Result<(HashSet<u32>, bool), String> {
+        let mut matched_ids: HashSet<u32> = HashSet::new();
+        let mut complete = true;
+        if !seed_ids.is_empty() {
+            let mut frontier: Vec<String> = seed_ids.iter().cloned().collect();
+            let mut seen_tokens: HashSet<String> = seed_ids;
+
+            for hop in 0..MAX_THREAD_BFS_HOPS {
+                if frontier.is_empty() || matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                    if matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                        complete = false;
+                    }
+                    break;
+                }
+                let mut new_rows: Vec<u32> = Vec::new();
+                for chunk in frontier.chunks(200) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let sql = format!(
+                        "SELECT DISTINCT message_row_id
+                         FROM message_rfc_refs
+                         WHERE token IN ({placeholders})"
+                    );
+                    let args: Vec<rusqlite::types::Value> =
+                        chunk.iter().map(|tok| tok.clone().into()).collect();
+                    let mut stmt = self
+                        .mail_conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("准备 RFC 会话索引查询失败: {e}"))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                            row.get::<_, u32>(0)
+                        })
+                        .map_err(|e| format!("执行 RFC 会话索引查询失败: {e}"))?;
+                    for row_res in rows {
+                        let rid = row_res.map_err(|e| format!("解析 RFC 会话索引失败: {e}"))?;
+                        if matched_ids.insert(rid) {
+                            new_rows.push(rid);
+                            if matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                        complete = false;
+                        break;
+                    }
+                }
+                if new_rows.is_empty() || matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                    if matched_ids.len() >= MAX_THREAD_BFS_ROWS {
+                        complete = false;
+                    }
+                    break;
+                }
+                let mut next_frontier: Vec<String> = Vec::new();
+                for chunk in new_rows.chunks(200) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let sql = format!(
+                        "SELECT token FROM message_rfc_refs WHERE message_row_id IN ({placeholders})"
+                    );
+                    let args: Vec<rusqlite::types::Value> =
+                        chunk.iter().map(|&id| i64::from(id).into()).collect();
+                    let mut stmt = self
+                        .mail_conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("准备 RFC 会话关联查询失败: {e}"))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(|e| format!("执行 RFC 会话关联查询失败: {e}"))?;
+                    for tok_res in rows {
+                        let tok = tok_res.map_err(|e| format!("解析 RFC 会话关联失败: {e}"))?;
+                        if seen_tokens.insert(tok.clone()) {
+                            next_frontier.push(tok);
+                        }
+                    }
+                }
+                frontier = next_frontier;
+                if hop + 1 == MAX_THREAD_BFS_HOPS && !frontier.is_empty() {
+                    complete = false;
+                }
+            }
+            if local_anchor_id != 0 && anchor_exists {
+                matched_ids.insert(local_anchor_id);
+            }
+        }
+        Ok((matched_ids, complete))
+    }
+
     pub(crate) fn fill_thread_counts(&self, items: &mut [MessageSummary]) {
         if items.is_empty() {
             return;
         }
-        let mut subjects: Vec<String> = items.iter().map(|m| m.subject.to_lowercase()).collect();
-        subjects.sort_unstable();
-        subjects.dedup();
+        for m in items.iter_mut() {
+            m.thread_count = 1;
+        }
 
-        let mut counts: HashMap<String, u32> = HashMap::new();
-        for chunk in subjects.chunks(200) {
+        let item_local_ids: Vec<Option<u32>> = items
+            .iter()
+            .map(|m| decode_scoped_id(m.id).map(|(_, lid)| lid))
+            .collect();
+        let mut local_ids: Vec<u32> = item_local_ids.iter().flatten().copied().collect();
+        if local_ids.is_empty() {
+            return;
+        }
+        local_ids.sort_unstable();
+        local_ids.dedup();
+
+        let Ok(trash_or_junk_folders) = self.load_trash_or_junk_folders() else {
+            return;
+        };
+
+        let mut anchors: HashMap<u32, AnchorThreadMeta> = HashMap::with_capacity(local_ids.len());
+        for chunk in local_ids.chunks(200) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let sql = format!(
-                "
-                SELECT subject, COUNT(*) FROM messages
-                WHERE LOWER(subject) IN ({placeholders})
-                GROUP BY subject
-                "
+                "SELECT id, folder_id, message_id, in_reply_to, references_header, sender, date_ts, thread_subject
+                 FROM messages
+                 WHERE id IN ({placeholders})"
             );
             let args: Vec<rusqlite::types::Value> =
-                chunk.iter().map(|s| s.clone().into()).collect();
+                chunk.iter().map(|&id| i64::from(id).into()).collect();
+            let Ok(mut stmt) = self.mail_conn.prepare(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt
+                .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                    Ok(AnchorThreadMeta {
+                        id: row.get(0)?,
+                        folder_id: row.get(1)?,
+                        rfc_message_id: row.get(2)?,
+                        in_reply_to: row.get(3)?,
+                        references_header: row.get(4)?,
+                        sender: row.get(5)?,
+                        date_ts: row.get(6)?,
+                        thread_subject: row.get(7)?,
+                    })
+                })
+                .map(|iter| iter.collect::<Result<Vec<_>, _>>())
+            else {
+                continue;
+            };
+            if let Ok(rows) = rows {
+                for meta in rows {
+                    anchors.insert(meta.id, meta);
+                }
+            }
+        }
+        if anchors.is_empty() {
+            return;
+        }
+
+        let mut anchor_seeds: HashMap<u32, (HashSet<String>, bool)> =
+            HashMap::with_capacity(anchors.len());
+        let mut all_tokens_set: HashSet<String> = HashSet::new();
+        for (&local_id, meta) in &anchors {
+            let (seeds, has_reply) = collect_anchor_rfc_seeds(
+                &meta.rfc_message_id,
+                &meta.in_reply_to,
+                &meta.references_header,
+            );
+            for tok in &seeds {
+                all_tokens_set.insert(tok.clone());
+            }
+            anchor_seeds.insert(local_id, (seeds, has_reply));
+        }
+
+        let mut token_to_rows: HashMap<String, Vec<u32>> = HashMap::new();
+        if !all_tokens_set.is_empty() {
+            let all_tokens: Vec<String> = all_tokens_set.into_iter().collect();
+            for chunk in all_tokens.chunks(200) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT token, message_row_id
+                     FROM message_rfc_refs
+                     WHERE token IN ({placeholders})"
+                );
+                let args: Vec<rusqlite::types::Value> =
+                    chunk.iter().map(|tok| tok.clone().into()).collect();
+                let Ok(mut stmt) = self.mail_conn.prepare(&sql) else {
+                    continue;
+                };
+                let Ok(rows) = stmt
+                    .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+                    })
+                    .map(|iter| iter.collect::<Result<Vec<_>, _>>())
+                else {
+                    continue;
+                };
+                if let Ok(rows) = rows {
+                    for (tok, rid) in rows {
+                        token_to_rows.entry(tok).or_default().push(rid);
+                    }
+                }
+            }
+        }
+
+        let mut rfc_count_cache: HashMap<(u32, bool), u32> = HashMap::new();
+        let mut subject_fallback_items: HashMap<String, Vec<(usize, u32, bool)>> = HashMap::new();
+
+        for (idx, item) in items.iter_mut().enumerate() {
+            let Some(local_id) = item_local_ids[idx] else {
+                continue;
+            };
+            let Some(meta) = anchors.get(&local_id) else {
+                continue;
+            };
+            let anchor_in_trash_or_junk = trash_or_junk_folders
+                .get(&meta.folder_id)
+                .copied()
+                .unwrap_or(false);
+            let Some((seeds, anchor_has_reply_headers)) = anchor_seeds.get(&local_id) else {
+                continue;
+            };
+            let has_rfc_peer = seeds.iter().any(|tok| {
+                token_to_rows
+                    .get(tok)
+                    .is_some_and(|rows| rows.iter().any(|&rid| rid != local_id))
+            });
+
+            if has_rfc_peer {
+                if let Some(&cached) = rfc_count_cache.get(&(local_id, anchor_in_trash_or_junk)) {
+                    item.thread_count = cached;
+                    continue;
+                }
+                if let Ok((matched_ids, complete)) =
+                    self.bfs_rfc_thread_ids(local_id, true, seeds.clone())
+                {
+                    let ids_vec: Vec<u32> = matched_ids.into_iter().collect();
+                    if let Ok(rows) = self.load_thread_count_rows(&ids_vec) {
+                        let count = count_distinct_thread_rows(
+                            &rows,
+                            None,
+                            local_id,
+                            anchor_in_trash_or_junk,
+                            &trash_or_junk_folders,
+                        );
+                        item.thread_count = count;
+                        rfc_count_cache.insert((local_id, anchor_in_trash_or_junk), count);
+                        if complete {
+                            for r in &rows {
+                                let r_in_trash_or_junk = trash_or_junk_folders
+                                    .get(&r.folder_id)
+                                    .copied()
+                                    .unwrap_or(false);
+                                if r_in_trash_or_junk == anchor_in_trash_or_junk {
+                                    rfc_count_cache.insert((r.id, anchor_in_trash_or_junk), count);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if *anchor_has_reply_headers {
+                item.thread_count = 1;
+            } else {
+                let key = normalize_thread_subject(&item.subject);
+                if key.is_empty() {
+                    continue;
+                }
+                subject_fallback_items.entry(key).or_default().push((
+                    idx,
+                    local_id,
+                    anchor_in_trash_or_junk,
+                ));
+            }
+        }
+
+        if subject_fallback_items.is_empty() {
+            return;
+        }
+
+        let keys: Vec<String> = subject_fallback_items.keys().cloned().collect();
+        let mut multi_keys: HashSet<String> = HashSet::new();
+        for chunk in keys.chunks(200) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT thread_subject, COUNT(*)
+                 FROM messages
+                 WHERE thread_subject IN ({placeholders})
+                 GROUP BY thread_subject"
+            );
+            let args: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|k| k.clone().into()).collect();
             let Ok(mut stmt) = self.mail_conn.prepare(&sql) else {
                 continue;
             };
@@ -1510,16 +1965,84 @@ impl AccountDb {
                 continue;
             };
             if let Ok(rows) = rows {
-                for (subject, count) in rows {
-                    let key = normalize_thread_subject(&subject);
-                    *counts.entry(key).or_insert(0) += count.max(0) as u32;
+                for (key, count) in rows {
+                    if count > 1 {
+                        multi_keys.insert(key);
+                    }
                 }
             }
         }
 
-        for m in items.iter_mut() {
-            let key = normalize_thread_subject(&m.subject);
-            m.thread_count = counts.get(&key).copied().unwrap_or(1).max(1);
+        let Ok(mut subj_stmt) = self.mail_conn.prepare(&format!(
+            "SELECT id, folder_id, message_id, sender, date_ts
+             FROM messages
+             WHERE thread_subject = ?1
+             ORDER BY date_ts DESC, uid DESC
+             LIMIT {MAX_THREAD_SUBJECT_ROWS}"
+        )) else {
+            return;
+        };
+
+        for (key, entries) in subject_fallback_items {
+            if !multi_keys.contains(&key) {
+                continue;
+            }
+            let Ok(rows) = subj_stmt
+                .query_map(params![&key], |row| {
+                    Ok(ThreadCountRow {
+                        id: row.get(0)?,
+                        folder_id: row.get(1)?,
+                        rfc_message_id: row.get(2)?,
+                        sender: row.get(3)?,
+                        date_ts: row.get(4)?,
+                    })
+                })
+                .map(|iter| iter.collect::<Result<Vec<_>, _>>())
+            else {
+                continue;
+            };
+            let Ok(rows) = rows else {
+                continue;
+            };
+            let mut key_cache: [Option<u32>; 2] = [None, None];
+            for (idx, local_id, anchor_in_trash_or_junk) in entries {
+                let anchor_in_rows = rows.iter().any(|r| r.id == local_id);
+                if anchor_in_rows {
+                    let cache_slot = anchor_in_trash_or_junk as usize;
+                    let count = match key_cache[cache_slot] {
+                        Some(c) => c,
+                        None => {
+                            let c = count_distinct_thread_rows(
+                                &rows,
+                                None,
+                                local_id,
+                                anchor_in_trash_or_junk,
+                                &trash_or_junk_folders,
+                            );
+                            key_cache[cache_slot] = Some(c);
+                            c
+                        }
+                    };
+                    items[idx].thread_count = count;
+                } else {
+                    let extra_anchor = anchors.get(&local_id).and_then(|meta| {
+                        (meta.thread_subject == key).then(|| ThreadCountRow {
+                            id: meta.id,
+                            folder_id: meta.folder_id,
+                            rfc_message_id: meta.rfc_message_id.clone(),
+                            sender: meta.sender.clone(),
+                            date_ts: meta.date_ts,
+                        })
+                    });
+                    items[idx].thread_count = count_distinct_thread_rows(
+                        &rows,
+                        extra_anchor.as_ref(),
+                        local_id,
+                        anchor_in_trash_or_junk,
+                        &trash_or_junk_folders,
+                    );
+                }
+            }
         }
     }
 
@@ -1798,21 +2321,10 @@ impl AccountDb {
         };
 
         let anchor_folder_id = anchor_info.as_ref().map(|(fid, _, _, _)| *fid);
-        let mut seed_ids: HashSet<String> = HashSet::new();
-        let mut anchor_has_reply_headers = false;
-        if let Some((_, ref mid, ref irt, ref refs)) = anchor_info {
-            for tok in extract_rfc_message_ids(mid) {
-                seed_ids.insert(tok);
-            }
-            let irt_ids = extract_rfc_message_ids(irt);
-            let ref_ids = extract_rfc_message_ids(refs);
-            if !irt_ids.is_empty() || !ref_ids.is_empty() {
-                anchor_has_reply_headers = true;
-            }
-            for tok in irt_ids.into_iter().chain(ref_ids) {
-                seed_ids.insert(tok);
-            }
-        }
+        let (seed_ids, anchor_has_reply_headers) = match anchor_info {
+            Some((_, ref mid, ref irt, ref refs)) => collect_anchor_rfc_seeds(mid, irt, refs),
+            None => (HashSet::new(), false),
+        };
 
         let map_raw_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<RawRow> {
             Ok(RawRow {
@@ -1837,81 +2349,8 @@ impl AccountDb {
             })
         };
 
-        const MAX_THREAD_BFS_ROWS: usize = 200;
-        let mut matched_ids: HashSet<u32> = HashSet::new();
-        if !seed_ids.is_empty() {
-            let mut frontier: Vec<String> = seed_ids.iter().cloned().collect();
-            let mut seen_tokens: HashSet<String> = seed_ids;
-
-            for _ in 0..8 {
-                if frontier.is_empty() || matched_ids.len() >= MAX_THREAD_BFS_ROWS {
-                    break;
-                }
-                let mut new_rows: Vec<u32> = Vec::new();
-                for chunk in frontier.chunks(200) {
-                    let placeholders = vec!["?"; chunk.len()].join(", ");
-                    let sql = format!(
-                        "SELECT DISTINCT message_row_id
-                         FROM message_rfc_refs
-                         WHERE token IN ({placeholders})"
-                    );
-                    let args: Vec<rusqlite::types::Value> =
-                        chunk.iter().map(|tok| tok.clone().into()).collect();
-                    let mut stmt = self
-                        .mail_conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("准备 RFC 会话索引查询失败: {e}"))?;
-                    let rows = stmt
-                        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
-                            row.get::<_, u32>(0)
-                        })
-                        .map_err(|e| format!("执行 RFC 会话索引查询失败: {e}"))?;
-                    for row_res in rows {
-                        let rid = row_res.map_err(|e| format!("解析 RFC 会话索引失败: {e}"))?;
-                        if matched_ids.insert(rid) {
-                            new_rows.push(rid);
-                            if matched_ids.len() >= MAX_THREAD_BFS_ROWS {
-                                break;
-                            }
-                        }
-                    }
-                    if matched_ids.len() >= MAX_THREAD_BFS_ROWS {
-                        break;
-                    }
-                }
-                if new_rows.is_empty() || matched_ids.len() >= MAX_THREAD_BFS_ROWS {
-                    break;
-                }
-                let mut next_frontier: Vec<String> = Vec::new();
-                for chunk in new_rows.chunks(200) {
-                    let placeholders = vec!["?"; chunk.len()].join(", ");
-                    let sql = format!(
-                        "SELECT token FROM message_rfc_refs WHERE message_row_id IN ({placeholders})"
-                    );
-                    let args: Vec<rusqlite::types::Value> =
-                        chunk.iter().map(|&id| i64::from(id).into()).collect();
-                    let mut stmt = self
-                        .mail_conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("准备 RFC 会话关联查询失败: {e}"))?;
-                    let rows = stmt
-                        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
-                            row.get::<_, String>(0)
-                        })
-                        .map_err(|e| format!("执行 RFC 会话关联查询失败: {e}"))?;
-                    for tok_res in rows {
-                        let tok = tok_res.map_err(|e| format!("解析 RFC 会话关联失败: {e}"))?;
-                        if seen_tokens.insert(tok.clone()) {
-                            next_frontier.push(tok);
-                        }
-                    }
-                }
-                frontier = next_frontier;
-            }
-            if local_anchor_id != 0 && anchor_info.is_some() {
-                matched_ids.insert(local_anchor_id);
-            }
-        }
+        let (matched_ids, _) =
+            self.bfs_rfc_thread_ids(local_anchor_id, anchor_info.is_some(), seed_ids)?;
 
         let use_rfc =
             matched_ids.len() >= 2 || (anchor_has_reply_headers && !matched_ids.is_empty());
@@ -1970,7 +2409,7 @@ impl AccountDb {
                     JOIN folders f ON f.id = m.folder_id
                     WHERE m.thread_subject = ?1
                     ORDER BY {order_sql}
-                    LIMIT 60
+                    LIMIT {MAX_THREAD_SUBJECT_ROWS}
                     "
                 ))
                 .map_err(|e| format!("准备会话查询失败: {e}"))?;
@@ -2079,21 +2518,21 @@ impl AccountDb {
                     .then_with(|| a.id.cmp(&b.id))
             });
         }
-        if deduped.len() > 40 {
+        if deduped.len() > MAX_THREAD_MESSAGES {
             if local_anchor_id != 0 {
                 if let Some(anchor_pos) = deduped.iter().position(|r| r.id == local_anchor_id) {
-                    if anchor_pos >= 40 {
+                    if anchor_pos >= MAX_THREAD_MESSAGES {
                         let anchor = deduped.remove(anchor_pos);
-                        deduped.truncate(39);
+                        deduped.truncate(MAX_THREAD_MESSAGES - 1);
                         deduped.push(anchor);
                     } else {
-                        deduped.truncate(40);
+                        deduped.truncate(MAX_THREAD_MESSAGES);
                     }
                 } else {
-                    deduped.truncate(40);
+                    deduped.truncate(MAX_THREAD_MESSAGES);
                 }
             } else {
-                deduped.truncate(40);
+                deduped.truncate(MAX_THREAD_MESSAGES);
             }
         }
 

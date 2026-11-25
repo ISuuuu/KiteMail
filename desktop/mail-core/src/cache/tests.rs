@@ -3809,3 +3809,388 @@ fn inspect_with_app_dir_discovers_external_accounts_and_current_mail_data() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn fill_thread_counts_matches_list_thread_messages_across_edge_cases() {
+    let mut cache = CacheStore::open_in_memory().unwrap();
+    let folders = cache
+        .sync_folders(
+            1,
+            &[
+                folder("收件箱", "INBOX"),
+                folder("已发送", "Sent"),
+                folder("所有邮件", "[Gmail]/All Mail"),
+                folder("已删除", "Trash"),
+                folder("垃圾邮件", "Junk"),
+            ],
+        )
+        .unwrap();
+    let inbox = folders.iter().find(|f| f.path == "INBOX").unwrap().id;
+    let sent = folders.iter().find(|f| f.path == "Sent").unwrap().id;
+    let all_mail = folders
+        .iter()
+        .find(|f| f.path == "[Gmail]/All Mail")
+        .unwrap()
+        .id;
+    let trash = folders.iter().find(|f| f.path == "Trash").unwrap().id;
+    let junk = folders.iter().find(|f| f.path == "Junk").unwrap().id;
+
+    // 1. Graph conversationId 隔离同主题独立邮件（核心复现：11 封同主题独立通知 + 2 封共享会话）
+    let mut inbox_headers = Vec::new();
+    for i in 1..=11u32 {
+        let mut h = sample_header(i, "登录验证码");
+        h.message_id = format!("<otp-{i}@graph.example>");
+        h.references_header = format!("conv-otp-{i}");
+        h.date_ts = 1_700_001_000 + i as i64;
+        inbox_headers.push(h);
+    }
+    let mut conv_a = sample_header(20, "项目报价单");
+    conv_a.message_id = "<conv-a-1@graph.example>".to_string();
+    conv_a.references_header = "conv-shared-quote".to_string();
+    conv_a.date_ts = 1_700_002_000;
+    let mut conv_b = sample_header(21, "完全不同的跟进标题");
+    conv_b.message_id = "<conv-a-2@graph.example>".to_string();
+    conv_b.references_header = "conv-shared-quote".to_string();
+    conv_b.date_ts = 1_700_002_100;
+    inbox_headers.push(conv_a);
+    inbox_headers.push(conv_b);
+
+    // 2. IMAP 孤立 In-Reply-To 邮件（父邮件未缓存，但同主题有其他通知邮件）
+    let mut orphan_reply = sample_header(30, "Re: 系统告警");
+    orphan_reply.message_id = "<orphan-reply@imap.example>".to_string();
+    orphan_reply.in_reply_to = "<missing-parent@imap.example>".to_string();
+    orphan_reply.date_ts = 1_700_003_000;
+    let mut plain_alert = sample_header(31, "系统告警");
+    plain_alert.message_id = "<plain-alert@imap.example>".to_string();
+    plain_alert.date_ts = 1_700_003_100;
+    inbox_headers.push(orphan_reply);
+    inbox_headers.push(plain_alert);
+
+    // 3. 回收站 / 垃圾邮件排除（纯主题回退 + RFC 关联）
+    let mut trash_subj_keep = sample_header(40, "账单提醒");
+    trash_subj_keep.message_id = "<bill-keep@example.com>".to_string();
+    trash_subj_keep.date_ts = 1_700_004_000;
+    let mut trash_rfc_keep = sample_header(41, "审批通知");
+    trash_rfc_keep.message_id = "<approve-root@example.com>".to_string();
+    trash_rfc_keep.date_ts = 1_700_004_100;
+    inbox_headers.push(trash_subj_keep);
+    inbox_headers.push(trash_rfc_keep);
+
+    // 4. 跨文件夹重复副本去重（INBOX + All Mail 同 message_id / sender / date_ts）
+    let mut dup_inbox = sample_header(50, "跨文件夹副本");
+    dup_inbox.message_id = "<dup-copy@example.com>".to_string();
+    dup_inbox.sender = "Carol <carol@example.com>".to_string();
+    dup_inbox.date_ts = 1_700_005_000;
+    inbox_headers.push(dup_inbox.clone());
+
+    // 5. 跨前缀归一化主题（仅原主题在 INBOX，Re: 在 Sent）+ 空归一化主题
+    let mut prefix_inbox = sample_header(60, "季度复盘");
+    prefix_inbox.message_id = "<review-root@example.com>".to_string();
+    prefix_inbox.date_ts = 1_700_006_000;
+    let mut empty_subj_1 = sample_header(61, "");
+    empty_subj_1.message_id = "<empty-1@example.com>".to_string();
+    empty_subj_1.date_ts = 1_700_006_100;
+    let mut empty_subj_2 = sample_header(62, "Re: ");
+    empty_subj_2.message_id = "<empty-2@example.com>".to_string();
+    empty_subj_2.date_ts = 1_700_006_200;
+    inbox_headers.push(prefix_inbox);
+    inbox_headers.push(empty_subj_1);
+    inbox_headers.push(empty_subj_2);
+
+    cache
+        .commit_folder_headers(1, inbox, 1, &inbox_headers, None)
+        .unwrap();
+
+    let mut prefix_sent = sample_header(100, "Re: 季度复盘");
+    prefix_sent.message_id = "<review-reply@example.com>".to_string();
+    prefix_sent.date_ts = 1_700_006_300;
+    cache
+        .commit_folder_headers(1, sent, 2, &[prefix_sent], None)
+        .unwrap();
+
+    cache
+        .commit_folder_headers(1, all_mail, 3, &[dup_inbox], None)
+        .unwrap();
+
+    let mut trash_headers = Vec::new();
+    for i in 1..=8u32 {
+        let mut h = sample_header(200 + i, "账单提醒");
+        h.message_id = format!("<bill-trash-{i}@example.com>");
+        h.date_ts = 1_700_004_200 + i as i64;
+        trash_headers.push(h);
+    }
+    let mut trash_rfc_reply = sample_header(220, "Re: 审批通知");
+    trash_rfc_reply.message_id = "<approve-trash-reply@example.com>".to_string();
+    trash_rfc_reply.in_reply_to = "<approve-root@example.com>".to_string();
+    trash_rfc_reply.references_header = "<approve-root@example.com>".to_string();
+    trash_rfc_reply.date_ts = 1_700_004_300;
+    trash_headers.push(trash_rfc_reply);
+    cache
+        .commit_folder_headers(1, trash, 4, &trash_headers, None)
+        .unwrap();
+
+    let mut junk_headers = Vec::new();
+    for i in 1..=2u32 {
+        let mut h = sample_header(300 + i, "账单提醒");
+        h.message_id = format!("<bill-junk-{i}@example.com>");
+        h.date_ts = 1_700_004_400 + i as i64;
+        junk_headers.push(h);
+    }
+    cache
+        .commit_folder_headers(1, junk, 5, &junk_headers, None)
+        .unwrap();
+
+    let inbox_page = cache.list_messages_page(inbox, "", 0, 100).unwrap();
+    for item in &inbox_page.items {
+        let reader_count = cache
+            .list_thread_messages(1, item.id, &item.subject, true)
+            .unwrap()
+            .len()
+            .max(1) as u32;
+        assert_eq!(
+            item.thread_count, reader_count,
+            "INBOX uid={} subject={:?} thread_count mismatch",
+            item.uid, item.subject
+        );
+    }
+    let by_uid = |uid: u32| {
+        inbox_page
+            .items
+            .iter()
+            .find(|m| m.uid == uid)
+            .unwrap()
+            .thread_count
+    };
+    for uid in 1..=11 {
+        assert_eq!(by_uid(uid), 1);
+    }
+    assert_eq!(by_uid(20), 2);
+    assert_eq!(by_uid(21), 2);
+    assert_eq!(by_uid(30), 1);
+    // uid 31 自身无回复头且无 RFC 引用，与 list_thread_messages 一样回退到 thread_subject 聚合（命中 30 与 31）
+    assert_eq!(by_uid(31), 2);
+    assert_eq!(by_uid(40), 1);
+    assert_eq!(by_uid(41), 1);
+    assert_eq!(by_uid(50), 1);
+    assert_eq!(by_uid(60), 2);
+    assert_eq!(by_uid(61), 1);
+    assert_eq!(by_uid(62), 1);
+
+    // 切到回收站视图时应与 list_thread_messages（包含回收站/垃圾邮件同会话）一致
+    let trash_page = cache.list_messages_page(trash, "", 0, 50).unwrap();
+    for item in &trash_page.items {
+        let reader_count = cache
+            .list_thread_messages(1, item.id, &item.subject, true)
+            .unwrap()
+            .len()
+            .max(1) as u32;
+        assert_eq!(
+            item.thread_count, reader_count,
+            "Trash uid={} subject={:?} thread_count mismatch",
+            item.uid, item.subject
+        );
+    }
+    assert_eq!(
+        trash_page
+            .items
+            .iter()
+            .find(|m| m.uid == 201)
+            .unwrap()
+            .thread_count,
+        11
+    );
+    assert_eq!(
+        trash_page
+            .items
+            .iter()
+            .find(|m| m.uid == 220)
+            .unwrap()
+            .thread_count,
+        2
+    );
+}
+
+#[test]
+fn fill_thread_counts_covers_rfc_renamed_threads_forty_cap_and_unified_inbox() {
+    let mut cache = CacheStore::open_in_memory().unwrap();
+    let folders_1 = cache
+        .sync_folders(1, &[folder("收件箱", "INBOX"), folder("已发送", "Sent")])
+        .unwrap();
+    let inbox_1 = folders_1[0].id;
+    let sent_1 = folders_1[1].id;
+    let folders_2 = cache.sync_folders(2, &[folder("收件箱", "INBOX")]).unwrap();
+    let inbox_2 = folders_2[0].id;
+
+    // 1. RFC 改标题跨文件夹 3 封会话
+    let mut root = sample_header(1, "原始需求讨论");
+    root.message_id = "<rfc-root@example.com>".to_string();
+    root.date_ts = 1_700_010_000;
+    let mut reply2 = sample_header(2, "全新主题名（依然同线程）");
+    reply2.message_id = "<rfc-reply2@example.com>".to_string();
+    reply2.in_reply_to = "<rfc-reply1@example.com>".to_string();
+    reply2.references_header = "<rfc-root@example.com> <rfc-reply1@example.com>".to_string();
+    reply2.date_ts = 1_700_010_200;
+    let mut reply1 = sample_header(10, "改过标题的回复");
+    reply1.message_id = "<rfc-reply1@example.com>".to_string();
+    reply1.in_reply_to = "<rfc-root@example.com>".to_string();
+    reply1.references_header = "<rfc-root@example.com>".to_string();
+    reply1.date_ts = 1_700_010_100;
+
+    // 2. 65 封无 RFC 回复头的同主题邮件（应按 40 上限截断，且第 1 封超出 top 60 仍准确计数）
+    let mut long_batch = vec![root, reply2];
+    for i in 1..=65u32 {
+        let mut h = sample_header(100 + i, "Re: 长对话计数上限");
+        h.message_id = String::new();
+        h.date_ts = 1_700_020_000 + i as i64;
+        long_batch.push(h);
+    }
+    cache
+        .commit_folder_headers(1, inbox_1, 1, &long_batch, None)
+        .unwrap();
+    cache
+        .commit_folder_headers(1, sent_1, 2, &[reply1], None)
+        .unwrap();
+
+    // 账号 2 的统一收件箱独立测试（含 Graph conversationId 隔离）
+    let mut acc2_a = sample_header(1, "周报");
+    acc2_a.message_id = "<acc2-1@graph.example>".to_string();
+    acc2_a.references_header = "acc2-conv-1".to_string();
+    acc2_a.date_ts = 1_700_030_000;
+    let mut acc2_b = sample_header(2, "周报");
+    acc2_b.message_id = "<acc2-2@graph.example>".to_string();
+    acc2_b.references_header = "acc2-conv-2".to_string();
+    acc2_b.date_ts = 1_700_030_100;
+    cache
+        .commit_folder_headers(2, inbox_2, 1, &[acc2_a, acc2_b], None)
+        .unwrap();
+
+    let page_1 = cache.list_messages_page(inbox_1, "", 0, 100).unwrap();
+    let rfc_root = page_1.items.iter().find(|m| m.uid == 1).unwrap();
+    let rfc_reply2 = page_1.items.iter().find(|m| m.uid == 2).unwrap();
+    assert_eq!(rfc_root.thread_count, 3);
+    assert_eq!(rfc_reply2.thread_count, 3);
+
+    let long_first = page_1.items.iter().find(|m| m.uid == 101).unwrap();
+    let long_last = page_1.items.iter().find(|m| m.uid == 165).unwrap();
+    assert_eq!(long_first.thread_count, 40);
+    assert_eq!(long_last.thread_count, 40);
+    assert_eq!(
+        cache
+            .list_thread_messages(1, long_first.id, &long_first.subject, true)
+            .unwrap()
+            .len(),
+        40
+    );
+
+    // 统一收件箱（经 fill_thread_counts_for_mixed）
+    let unified = cache.list_unified_inbox("", 0, 100).unwrap();
+    for item in &unified.items {
+        let reader_count = cache
+            .list_thread_messages(item.account_id, item.id, &item.subject, true)
+            .unwrap()
+            .len()
+            .max(1) as u32;
+        assert_eq!(
+            item.thread_count, reader_count,
+            "Unified account={} uid={} subject={:?} thread_count mismatch",
+            item.account_id, item.uid, item.subject
+        );
+    }
+    let acc2_items: Vec<_> = unified.items.iter().filter(|m| m.account_id == 2).collect();
+    assert_eq!(acc2_items.len(), 2);
+    assert!(acc2_items.iter().all(|m| m.thread_count == 1));
+}
+
+#[test]
+fn sync_folders_prunes_remotely_deleted_folders_and_cleans_bodies_and_attachments() {
+    let dir = temp_cache_dir("prune-stale-folders");
+    let mut cache = CacheStore::open_for_data_dir(&dir).unwrap();
+
+    let folders = cache
+        .sync_folders(
+            1,
+            &[
+                folder("收件箱", "INBOX"),
+                folder("Trash", "custom-trash"),
+                folder("已删除", "deleteditems"),
+            ],
+        )
+        .unwrap();
+    let inbox_id = folders.iter().find(|f| f.path == "INBOX").unwrap().id;
+    let trash_id = folders
+        .iter()
+        .find(|f| f.path == "custom-trash")
+        .unwrap()
+        .id;
+    let deleted_id = folders
+        .iter()
+        .find(|f| f.path == "deleteditems")
+        .unwrap()
+        .id;
+
+    cache
+        .commit_folder_headers(1, inbox_id, 1, &[sample_header(1, "收件箱保留")], None)
+        .unwrap();
+    cache
+        .commit_folder_headers(
+            1,
+            trash_id,
+            1,
+            &[sample_header(1, "待清理文件夹邮件")],
+            None,
+        )
+        .unwrap();
+    let trash_msg_id = cache.list_messages_page(trash_id, "", 0, 10).unwrap().items[0].id;
+
+    cache
+        .store_message_body(
+            trash_msg_id,
+            "旧 Trash 正文",
+            &[CachedAttachmentInput::downloaded(
+                "old.bin",
+                "application/octet-stream",
+                b"stale-attachment-bytes".to_vec(),
+            )],
+        )
+        .unwrap();
+    let (detail, _, _) = cache.get_message_detail(trash_msg_id).unwrap().unwrap();
+    let att_id = detail.attachments[0].id;
+    let (_, local_att_id) = decode_scoped_id(att_id).unwrap();
+    let att_file = cache
+        .account_dir_for(1)
+        .unwrap()
+        .join("attachments")
+        .join(format!("{:02x}/{local_att_id}.bin", local_att_id & 0xff));
+    assert!(att_file.exists());
+
+    // 空列表保护：不会误删本地任何文件夹。
+    let after_empty = cache.sync_folders(1, &[]).unwrap();
+    assert_eq!(after_empty.len(), 3);
+    assert!(cache.get_message_detail(trash_msg_id).unwrap().is_some());
+
+    // 远端删除 custom-trash 后，仅保留收件箱与系统已删除，原 id 不变。
+    let pruned = cache
+        .sync_folders(
+            1,
+            &[folder("收件箱", "INBOX"), folder("已删除", "deleteditems")],
+        )
+        .unwrap();
+    assert_eq!(pruned.len(), 2);
+    assert_eq!(
+        pruned
+            .iter()
+            .map(|f| (f.id, f.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(inbox_id, "INBOX"), (deleted_id, "deleteditems")]
+    );
+    assert_eq!(cache.list_folders(1).unwrap().len(), 2);
+    assert_eq!(
+        cache.list_messages_page(inbox_id, "", 0, 10).unwrap().total,
+        1
+    );
+    assert!(cache.get_message_detail(trash_msg_id).unwrap().is_none());
+    assert!(!att_file.exists());
+
+    drop(cache);
+    let _ = std::fs::remove_dir_all(&dir);
+}

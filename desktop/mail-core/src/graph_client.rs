@@ -150,21 +150,20 @@ fn resolve_graph_folder_name(
     (raw_name.to_string(), false)
 }
 
-fn parse_graph_folders_json(
-    json: &serde_json::Value,
+const MAX_GRAPH_FOLDER_PAGES: usize = 20;
+
+fn parse_graph_folder_items(
+    items: &[serde_json::Value],
     well_known_by_id: &HashMap<String, GraphWellKnownRole>,
 ) -> Vec<(RemoteFolder, bool)> {
-    let Some(arr) = json["value"].as_array() else {
-        return Vec::new();
-    };
-    let present_roles: HashSet<GraphWellKnownRole> = arr
+    let present_roles: HashSet<GraphWellKnownRole> = items
         .iter()
         .filter_map(|item| item["id"].as_str())
         .filter_map(|id| well_known_by_id.get(id).copied())
         .collect();
 
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
         let Some(id) = item["id"].as_str() else {
             continue;
         };
@@ -186,22 +185,57 @@ fn parse_graph_folders_json(
     out
 }
 
-/// Fetch mail folders via Microsoft Graph.
-pub fn fetch_folders(access_token: &str) -> Result<Vec<(RemoteFolder, bool)>, String> {
-    let url = format!(
-        "{GRAPH_BASE}/mailFolders?$top=50&$select=id,displayName,unreadItemCount,totalItemCount"
-    );
-    let resp = ureq::get(&url)
-        .set("Authorization", &format!("Bearer {access_token}"))
-        .call()
-        .map_err(format_graph_error)?;
+#[cfg(test)]
+fn parse_graph_folders_json(
+    json: &serde_json::Value,
+    well_known_by_id: &HashMap<String, GraphWellKnownRole>,
+) -> Vec<(RemoteFolder, bool)> {
+    let Some(arr) = json["value"].as_array() else {
+        return Vec::new();
+    };
+    parse_graph_folder_items(arr, well_known_by_id)
+}
 
-    let json: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| format!("解析 Graph 文件夹响应失败: {e}"))?;
+/// Fetch mail folders via Microsoft Graph (following `@odata.nextLink` up to
+/// [`MAX_GRAPH_FOLDER_PAGES`] pages so large mailboxes are never truncated).
+pub fn fetch_folders(access_token: &str) -> Result<Vec<(RemoteFolder, bool)>, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let auth = format!("Bearer {access_token}");
+    let mut next_url = Some(format!(
+        "{GRAPH_BASE}/mailFolders?$top=100&$select=id,displayName,unreadItemCount,totalItemCount"
+    ));
+    let mut seen_urls = HashSet::new();
+    let mut all_items = Vec::new();
+
+    for _ in 0..MAX_GRAPH_FOLDER_PAGES {
+        let Some(url) = next_url.take() else {
+            break;
+        };
+        if !seen_urls.insert(url.clone()) {
+            break;
+        }
+        let resp = agent
+            .get(&url)
+            .set("Authorization", &auth)
+            .call()
+            .map_err(format_graph_error)?;
+        let json: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| format!("解析 Graph 文件夹响应失败: {e}"))?;
+        if let Some(arr) = json["value"].as_array() {
+            all_items.extend(arr.iter().cloned());
+        }
+        next_url = json["@odata.nextLink"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+    }
 
     let well_known = fetch_well_known_roles(access_token);
-    Ok(parse_graph_folders_json(&json, &well_known))
+    Ok(parse_graph_folder_items(&all_items, &well_known))
 }
 
 /// Fetch inbox unread/total counts via a single lightweight Graph well-known query.

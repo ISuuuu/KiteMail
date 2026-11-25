@@ -4054,6 +4054,10 @@ fn pref_thread_newest_first(data_dir: &PathBuf) -> bool {
         .unwrap_or(true)
 }
 
+fn is_graph_not_found_error(err: &str) -> bool {
+    err.contains("HTTP 404")
+}
+
 async fn sync_folder_inner(
     cache: &mut CacheStore,
     tokens: &SharedTokenCache,
@@ -4081,9 +4085,10 @@ async fn sync_folder_inner(
                 .flatten()
                 .map(|(_, _, _, _, _, cnt)| cnt)
                 .unwrap_or(0);
+            let token_for_headers = token.clone();
             let fp = folder_path.to_string();
             let fetched = tokio::task::spawn_blocking(move || {
-                graph_client::fetch_folder_headers(&token, &fp)
+                graph_client::fetch_folder_headers(&token_for_headers, &fp)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Graph 拉取邮件头任务异常: {e}")));
@@ -4100,6 +4105,34 @@ async fn sync_folder_inner(
                         );
                     }
                     commit_res
+                }
+                Err(e) if is_graph_not_found_error(&e) => {
+                    if let Ok(Ok(remote_list)) =
+                        tokio::task::spawn_blocking(move || graph_client::fetch_folders(&token))
+                            .await
+                    {
+                        if !remote_list.is_empty()
+                            && !remote_list.iter().any(|(f, _)| f.path == folder_path)
+                        {
+                            if let Ok(updated_folders) =
+                                cache.sync_folders_with_flags(account.id, &remote_list)
+                            {
+                                let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                                    account_id: account.id,
+                                    folders: updated_folders,
+                                });
+                                let _ = evt_tx.send(WorkerEvent::Status {
+                                    account_id: Some(account.id),
+                                    text: format!(
+                                        "[{}] 该文件夹已在服务器删除，已从本地列表移除",
+                                        account.email
+                                    ),
+                                });
+                                return;
+                            }
+                        }
+                    }
+                    Err(e)
                 }
                 Err(e) => Err(e),
             }
@@ -5858,5 +5891,15 @@ mod tests {
         }
         drop(worker);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn graph_not_found_error_detector_matches_only_http_404() {
+        assert!(is_graph_not_found_error(
+            "Graph API 错误 (HTTP 404): {\"error\":{\"code\":\"ErrorItemNotFound\"}}"
+        ));
+        assert!(!is_graph_not_found_error("Graph API 错误 (HTTP 500): ..."));
+        assert!(!is_graph_not_found_error("Graph API 错误 (HTTP 401): ..."));
+        assert!(!is_graph_not_found_error("Graph API 网络错误: timeout"));
     }
 }

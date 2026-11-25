@@ -1933,7 +1933,20 @@ impl HylkiApp {
                         total_new_unread = total_new_unread.saturating_add(delta);
                         notify_account_id = Some(account_id);
                     }
+                    let selected_removed = folder_selection_removed(
+                        self.current_view,
+                        self.selected_folder_id,
+                        self.folders_by_account.get(&account_id).map(Vec::as_slice),
+                        &folders,
+                    );
                     self.folders_by_account.insert(account_id, folders);
+                    if selected_removed {
+                        self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
+                        self.current_view = CurrentView::UnifiedInbox;
+                        self.selected_message = None;
+                        self.reset_list_pagination();
+                        self.reload_current_page(cx);
+                    }
                     folders_updated = true;
                     // 任务四：新文件夹可能出现（首次同步 / 新账号），重新允许
                     // 后台历史索引探测；实际续排仍由下一个事件驱动点执行。
@@ -11354,6 +11367,19 @@ pub(crate) fn detect_new_unread(
     delta
 }
 
+/// 当当前浏览的具体文件夹原属于该账号、但新的远端文件夹列表不再包含它时返回 `true`。
+/// 通过校验旧列表归属，避免多账号场景下其他账号的 `FoldersLoaded` 误切当前视图。
+fn folder_selection_removed(
+    current_view: CurrentView,
+    selected_folder_id: u32,
+    old_folders: Option<&[FolderSummary]>,
+    new_folders: &[FolderSummary],
+) -> bool {
+    current_view == CurrentView::AccountFolder
+        && old_folders.is_some_and(|old| old.iter().any(|f| f.id == selected_folder_id))
+        && !new_folders.iter().any(|f| f.id == selected_folder_id)
+}
+
 /// 账号是否在统一视图范围内：已启用且加入统一收件箱（任务四）。
 /// 与 worker 端 `unified_account_ids` 语义一致；本地未知的账号按范围外处理。
 pub(crate) fn account_in_unified_scope(accounts: &[AccountConfig], account_id: u32) -> bool {
@@ -12519,5 +12545,50 @@ mod tests {
         assert_eq!(popout_cascade_offset(1), 28.0);
         assert_eq!(popout_cascade_offset(7), 196.0);
         assert_eq!(popout_cascade_offset(8), 0.0);
+    }
+
+    #[test]
+    fn folder_selection_removed_only_fires_for_owning_account_missing_folder() {
+        let mk = |id: u32, path: &str| FolderSummary {
+            id,
+            account_id: 1,
+            name: path.into(),
+            path: path.into(),
+            unread_count: 0,
+            total_count: 0,
+            has_more_remote: false,
+        };
+        let old = vec![mk(11, "INBOX"), mk(12, "Trash")];
+        let after_delete = vec![mk(11, "INBOX")];
+        assert!(folder_selection_removed(
+            CurrentView::AccountFolder,
+            12,
+            Some(&old),
+            &after_delete
+        ));
+        assert!(!folder_selection_removed(
+            CurrentView::AccountFolder,
+            11,
+            Some(&old),
+            &after_delete
+        ));
+        assert!(!folder_selection_removed(
+            CurrentView::AccountFolder,
+            99,
+            Some(&old),
+            &after_delete
+        ));
+        assert!(!folder_selection_removed(
+            CurrentView::AccountFolder,
+            12,
+            None,
+            &after_delete
+        ));
+        assert!(!folder_selection_removed(
+            CurrentView::UnifiedInbox,
+            12,
+            Some(&old),
+            &after_delete
+        ));
     }
 }
