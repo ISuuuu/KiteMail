@@ -123,6 +123,113 @@ fn count_distinct_thread_rows(
     distinct.max(1)
 }
 
+/// 账号内全库 `message_rfc_refs` 连通分量并查集：把共享任意 RFC token
+/// （`Message-ID` / `In-Reply-To` / `References` / Graph `conversationId`）
+/// 的邮件行归入同一连通分量（包含通过 Sent 等其它文件夹桥接的收件箱邮件）。
+struct RfcThreadDsu {
+    parent: HashMap<u32, u32>,
+}
+
+impl RfcThreadDsu {
+    fn load(conn: &Connection) -> Result<Self, String> {
+        let mut dsu = Self {
+            parent: HashMap::new(),
+        };
+        let mut stmt = conn
+            .prepare("SELECT token, message_row_id FROM message_rfc_refs ORDER BY token")
+            .map_err(|e| format!("查询 RFC 会话引用索引失败: {e}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("读取 RFC 会话引用索引失败: {e}"))?;
+        let mut prev_token = String::new();
+        let mut prev_row_id: Option<u32> = None;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("遍历 RFC 会话引用索引失败: {e}"))?
+        {
+            let token = row
+                .get_ref(0)
+                .map_err(|e| format!("读取 RFC token 失败: {e}"))?
+                .as_str()
+                .map_err(|e| format!("解析 RFC token 失败: {e}"))?;
+            let row_id: u32 = row
+                .get(1)
+                .map_err(|e| format!("读取 RFC message_row_id 失败: {e}"))?;
+            if let Some(first) = prev_row_id.filter(|_| token == prev_token) {
+                if first != row_id {
+                    dsu.union(first, row_id);
+                }
+            } else {
+                prev_token.clear();
+                prev_token.push_str(token);
+                prev_row_id = Some(row_id);
+            }
+        }
+        Ok(dsu)
+    }
+
+    fn find(&mut self, id: u32) -> Option<u32> {
+        if !self.parent.contains_key(&id) {
+            return None;
+        }
+        let mut cur = id;
+        while let Some(&p) = self.parent.get(&cur) {
+            if p == cur {
+                break;
+            }
+            cur = p;
+        }
+        let root = cur;
+        let mut node = id;
+        while let Some(&p) = self.parent.get(&node) {
+            if p == root {
+                break;
+            }
+            self.parent.insert(node, root);
+            node = p;
+        }
+        Some(root)
+    }
+
+    fn union(&mut self, a: u32, b: u32) {
+        self.parent.entry(a).or_insert(a);
+        self.parent.entry(b).or_insert(b);
+        let ra = self.find(a).unwrap_or(a);
+        let rb = self.find(b).unwrap_or(b);
+        if ra != rb {
+            if ra < rb {
+                self.parent.insert(rb, ra);
+            } else {
+                self.parent.insert(ra, rb);
+            }
+        }
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+enum ListThreadKey {
+    Rfc(u32),
+    Subject(String),
+    Singleton(u32),
+}
+
+struct CollapsedThreadEntry {
+    rep_local_id: u32,
+    unread: bool,
+    flagged: bool,
+    has_attachment: bool,
+    importance: i8,
+    tags: Vec<String>,
+}
+
+fn parse_tags_csv(tags_raw: &str) -> Vec<String> {
+    tags_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 impl AccountDb {
     pub(crate) fn mail_db_path_in(dir: &Path) -> PathBuf {
         dir.join("mail.db")
@@ -1364,6 +1471,193 @@ impl AccountDb {
         Ok(())
     }
 
+    fn folder_is_inbox(&self, local_folder_id: u32) -> Result<bool, String> {
+        self.mail_conn
+            .query_row(
+                "SELECT (UPPER(path) = 'INBOX' OR is_inbox = 1) FROM folders WHERE id = ?1",
+                params![local_folder_id],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .optional()
+            .map_err(|e| format!("查询文件夹收件箱属性失败: {e}"))
+            .map(|opt| opt.unwrap_or(false))
+    }
+
+    fn query_collapsed_thread_page(
+        &self,
+        where_sql: &str,
+        args: &[rusqlite::types::Value],
+        order_sql: &str,
+        label: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(usize, Vec<MessageSummary>), String> {
+        let mut dsu = RfcThreadDsu::load(&self.mail_conn)?;
+        let mut stmt = self
+            .mail_conn
+            .prepare(&format!(
+                "
+                SELECT m.id, m.in_reply_to, m.references_header, m.thread_subject, m.subject,
+                       m.unread, m.flagged, m.has_attachment, m.importance, m.tags
+                FROM messages m
+                JOIN folders f ON f.id = m.folder_id
+                WHERE {where_sql}
+                ORDER BY {order_sql}
+                "
+            ))
+            .map_err(|e| format!("准备{label}会话折叠查询失败: {e}"))?;
+
+        let mut entries: Vec<CollapsedThreadEntry> = Vec::new();
+        let mut index_by_key: HashMap<ListThreadKey, usize> = HashMap::new();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(args.iter()))
+            .map_err(|e| format!("执行{label}会话折叠查询失败: {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("遍历{label}会话折叠行失败: {e}"))?
+        {
+            let local_id: u32 = row
+                .get(0)
+                .map_err(|e| format!("读取{label}邮件 ID 失败: {e}"))?;
+            let in_reply_to: String = row
+                .get(1)
+                .map_err(|e| format!("读取{label}回复头失败: {e}"))?;
+            let references_header: String = row
+                .get(2)
+                .map_err(|e| format!("读取{label}引用头失败: {e}"))?;
+            let thread_subject: String = row
+                .get(3)
+                .map_err(|e| format!("读取{label}归并主题失败: {e}"))?;
+            let subject: String = row
+                .get(4)
+                .map_err(|e| format!("读取{label}主题失败: {e}"))?;
+            let unread = row
+                .get::<_, i32>(5)
+                .map_err(|e| format!("读取{label}未读态失败: {e}"))?
+                != 0;
+            let flagged = row
+                .get::<_, i32>(6)
+                .map_err(|e| format!("读取{label}星标态失败: {e}"))?
+                != 0;
+            let has_attachment = row
+                .get::<_, i32>(7)
+                .map_err(|e| format!("读取{label}附件态失败: {e}"))?
+                != 0;
+            let importance = row
+                .get::<_, i32>(8)
+                .map_err(|e| format!("读取{label}重要性失败: {e}"))?
+                .clamp(-1, 1) as i8;
+            let tags_raw: String = row
+                .get(9)
+                .map_err(|e| format!("读取{label}标签失败: {e}"))?;
+
+            let key = if let Some(root) = dsu.find(local_id) {
+                ListThreadKey::Rfc(root)
+            } else {
+                let has_reply_headers = (!in_reply_to.trim().is_empty()
+                    && !extract_rfc_message_ids(&in_reply_to).is_empty())
+                    || (!references_header.trim().is_empty()
+                        && !extract_rfc_message_ids(&references_header).is_empty());
+                if has_reply_headers {
+                    ListThreadKey::Singleton(local_id)
+                } else {
+                    let norm = if !thread_subject.is_empty() {
+                        thread_subject
+                    } else {
+                        normalize_thread_subject(&subject)
+                    };
+                    if norm.is_empty() {
+                        ListThreadKey::Singleton(local_id)
+                    } else {
+                        ListThreadKey::Subject(norm)
+                    }
+                }
+            };
+
+            if let Some(&idx) = index_by_key.get(&key) {
+                let entry = &mut entries[idx];
+                entry.unread |= unread;
+                entry.flagged |= flagged;
+                entry.has_attachment |= has_attachment;
+                entry.importance = entry.importance.max(importance);
+                for tag in parse_tags_csv(&tags_raw) {
+                    if !entry.tags.contains(&tag) {
+                        entry.tags.push(tag);
+                    }
+                }
+            } else {
+                let idx = entries.len();
+                index_by_key.insert(key, idx);
+                entries.push(CollapsedThreadEntry {
+                    rep_local_id: local_id,
+                    unread,
+                    flagged,
+                    has_attachment,
+                    importance,
+                    tags: parse_tags_csv(&tags_raw),
+                });
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        let total = entries.len();
+        let start = offset.min(total);
+        let end = offset.saturating_add(limit).min(total);
+        let page_entries = &entries[start..end];
+        if page_entries.is_empty() {
+            return Ok((total, Vec::new()));
+        }
+
+        let mut summary_by_local_id: HashMap<u32, MessageSummary> =
+            HashMap::with_capacity(page_entries.len());
+        let rep_ids: Vec<u32> = page_entries.iter().map(|e| e.rep_local_id).collect();
+        for chunk in rep_ids.chunks(200) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "
+                SELECT m.id, m.folder_id, f.path, m.uid, m.sender, m.subject,
+                       m.preview, m.date_ts, m.date_display, m.unread, m.flagged, m.has_attachment,
+                       m.recipients, m.importance, m.tags, m.answered, m.forwarded, m.snoozed_until_ts
+                FROM messages m
+                JOIN folders f ON f.id = m.folder_id
+                WHERE m.id IN ({placeholders})
+                "
+            );
+            let id_args: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|&id| i64::from(id).into()).collect();
+            let mut detail_stmt = self
+                .mail_conn
+                .prepare(&sql)
+                .map_err(|e| format!("准备{label}折叠会话详情查询失败: {e}"))?;
+            let rows = detail_stmt
+                .query_map(rusqlite::params_from_iter(id_args.iter()), |row| {
+                    let local_id: u32 = row.get(0)?;
+                    let summary = self.map_local_summary_row(row)?;
+                    Ok((local_id, summary))
+                })
+                .map_err(|e| format!("执行{label}折叠会话详情查询失败: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析{label}折叠会话详情失败: {e}"))?;
+            for (local_id, summary) in rows {
+                summary_by_local_id.insert(local_id, summary);
+            }
+        }
+
+        let mut items = Vec::with_capacity(page_entries.len());
+        for entry in page_entries {
+            if let Some(mut summary) = summary_by_local_id.remove(&entry.rep_local_id) {
+                summary.unread = entry.unread;
+                summary.flagged = entry.flagged;
+                summary.has_attachment = entry.has_attachment;
+                summary.importance = entry.importance;
+                summary.tags = entry.tags.clone();
+                items.push(summary);
+            }
+        }
+        Ok((total, items))
+    }
+
     pub(crate) fn list_messages_page_with_options(
         &self,
         local_folder_id: u32,
@@ -1390,6 +1684,24 @@ impl AccountDb {
         )?;
         let where_sql = clauses.join(" AND ");
         let order_sql = Self::sort_sql_prefixed(sort);
+
+        if self.folder_is_inbox(local_folder_id)? {
+            let (total, mut items) = self.query_collapsed_thread_page(
+                &where_sql,
+                &args,
+                order_sql,
+                "收件箱",
+                offset,
+                limit,
+            )?;
+            self.fill_thread_counts(&mut items);
+            return Ok(MailPage {
+                folder_id: external_folder_id,
+                offset,
+                total,
+                items,
+            });
+        }
 
         let total: i64 = self
             .mail_conn
@@ -1455,6 +1767,7 @@ impl AccountDb {
         own_emails: &[String],
         contact_emails_lower: &[String],
         fetch_limit: usize,
+        collapse_threads: bool,
     ) -> Result<(usize, Vec<MessageSummary>), String> {
         let parsed = SearchQuery::parse(query);
         let mut clauses = vec![predicate.to_string()];
@@ -1470,6 +1783,17 @@ impl AccountDb {
         )?;
         let where_sql = clauses.join(" AND ");
         let order_sql = Self::sort_sql_prefixed(sort);
+
+        if collapse_threads {
+            return self.query_collapsed_thread_page(
+                &where_sql,
+                &args,
+                order_sql,
+                label,
+                0,
+                fetch_limit,
+            );
+        }
 
         let total: i64 = self
             .mail_conn
@@ -4035,11 +4359,7 @@ impl AccountDb {
         let local_id: u32 = row.get(0)?;
         let local_folder_id: u32 = row.get(1)?;
         let tags_raw: String = row.get(14)?;
-        let tags = tags_raw
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let tags = parse_tags_csv(&tags_raw);
         let ext_id = encode_scoped_id(self.slot, local_id).map_err(|e| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e)))
         })?;

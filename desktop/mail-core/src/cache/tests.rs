@@ -1778,8 +1778,12 @@ fn rfc_threading_links_different_subjects_and_dedupes_cross_folder_copies() {
         .unwrap();
 
     let inbox_page = cache.list_messages_page(inbox, "", 0, 10).unwrap();
-    let reply2_id = inbox_page.items.iter().find(|m| m.uid == 12).unwrap().id;
-    let root_inbox_id = inbox_page.items.iter().find(|m| m.uid == 10).unwrap().id;
+    assert_eq!(inbox_page.total, 1);
+    assert_eq!(inbox_page.items.len(), 1);
+    assert_eq!(inbox_page.items[0].uid, 12);
+    assert_eq!(inbox_page.items[0].thread_count, 3);
+    let reply2_id = inbox_page.items[0].id;
+    let root_inbox_id = cache.list_summaries_by_uids(inbox, &[10]).unwrap()[0].id;
 
     let desc = cache
         .list_thread_messages(1, reply2_id, "全新主题名（依然同线程）", true)
@@ -2512,19 +2516,26 @@ fn list_page_fills_thread_counts_by_normalized_subject() {
         .unwrap();
 
     let page = cache.list_messages_page(inbox_id, "", 0, 10).unwrap();
+    assert_eq!(page.total, 2);
+    assert_eq!(page.items.len(), 2);
     let by_subject: HashMap<String, u32> = page
         .items
         .iter()
         .map(|m| (m.subject.clone(), m.thread_count))
         .collect();
-    assert_eq!(by_subject["项目排期讨论"], 4);
-    assert_eq!(by_subject["Re: 项目排期讨论"], 4);
     assert_eq!(by_subject["Fwd: 项目排期讨论"], 4);
     assert_eq!(by_subject["独立主题邮件"], 1);
-    let with_recipients = page
+    let rep = page
         .items
         .iter()
-        .find(|m| m.subject == "Re: 项目排期讨论")
+        .find(|m| m.subject == "Fwd: 项目排期讨论")
+        .unwrap();
+    let children = cache
+        .list_thread_summaries(1, rep.id, &rep.subject)
+        .unwrap();
+    let with_recipients = children
+        .iter()
+        .find(|m| m.folder_id == inbox_id && m.subject == "Re: 项目排期讨论")
         .unwrap();
     assert_eq!(with_recipients.recipients, "team@example.com");
 }
@@ -3192,14 +3203,11 @@ fn thread_index_preserves_anchor_beyond_forty_messages_and_read_only_works() {
         .commit_folder_headers(1, inbox, 1, &batch, None)
         .unwrap();
 
-    let anchor_id = cache
-        .list_messages_page(inbox, "", 0, 50)
-        .unwrap()
-        .items
-        .into_iter()
-        .find(|m| m.uid == 1)
-        .unwrap()
-        .id;
+    let page = cache.list_messages_page(inbox, "", 0, 50).unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].uid, 45);
+    let anchor_id = cache.list_summaries_by_uids(inbox, &[1]).unwrap()[0].id;
     cache
         .store_message_body(anchor_id, "锚点正文已加载", &[])
         .unwrap();
@@ -3964,7 +3972,7 @@ fn fill_thread_counts_matches_list_thread_messages_across_edge_cases() {
     for uid in 1..=11 {
         assert_eq!(by_uid(uid), 1);
     }
-    assert_eq!(by_uid(20), 2);
+    assert!(!inbox_page.items.iter().any(|m| m.uid == 20));
     assert_eq!(by_uid(21), 2);
     assert_eq!(by_uid(30), 1);
     // uid 31 自身无回复头且无 RFC 引用，与 list_thread_messages 一样回退到 thread_subject 聚合（命中 30 与 31）
@@ -4065,15 +4073,18 @@ fn fill_thread_counts_covers_rfc_renamed_threads_forty_cap_and_unified_inbox() {
         .unwrap();
 
     let page_1 = cache.list_messages_page(inbox_1, "", 0, 100).unwrap();
-    let rfc_root = page_1.items.iter().find(|m| m.uid == 1).unwrap();
+    assert_eq!(page_1.total, 2);
+    assert_eq!(page_1.items.len(), 2);
     let rfc_reply2 = page_1.items.iter().find(|m| m.uid == 2).unwrap();
-    assert_eq!(rfc_root.thread_count, 3);
     assert_eq!(rfc_reply2.thread_count, 3);
-
-    let long_first = page_1.items.iter().find(|m| m.uid == 101).unwrap();
     let long_last = page_1.items.iter().find(|m| m.uid == 165).unwrap();
-    assert_eq!(long_first.thread_count, 40);
     assert_eq!(long_last.thread_count, 40);
+
+    let older_members = cache.list_summaries_by_uids(inbox_1, &[1, 101]).unwrap();
+    let rfc_root = older_members.iter().find(|m| m.uid == 1).unwrap();
+    let long_first = older_members.iter().find(|m| m.uid == 101).unwrap();
+    assert_eq!(rfc_root.thread_count, 3);
+    assert_eq!(long_first.thread_count, 40);
     assert_eq!(
         cache
             .list_thread_messages(1, long_first.id, &long_first.subject, true)
@@ -4084,6 +4095,8 @@ fn fill_thread_counts_covers_rfc_renamed_threads_forty_cap_and_unified_inbox() {
 
     // 统一收件箱（经 fill_thread_counts_for_mixed）
     let unified = cache.list_unified_inbox("", 0, 100).unwrap();
+    assert_eq!(unified.total, 4);
+    assert_eq!(unified.items.len(), 4);
     for item in &unified.items {
         let reader_count = cache
             .list_thread_messages(item.account_id, item.id, &item.subject, true)
@@ -4193,4 +4206,182 @@ fn sync_folders_prunes_remotely_deleted_folders_and_cleans_bodies_and_attachment
 
     drop(cache);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn inbox_collapses_threads_and_aggregates_flags_across_single_and_unified_inbox() {
+    let mut cache = CacheStore::open_in_memory().unwrap();
+    let f1 = cache
+        .sync_folders(
+            1,
+            &[
+                folder("收件箱", "INBOX"),
+                folder("已发送", "Sent"),
+                folder("归档", "Archive"),
+            ],
+        )
+        .unwrap();
+    let inbox_1 = f1.iter().find(|f| f.path == "INBOX").unwrap().id;
+    let sent_1 = f1.iter().find(|f| f.path == "Sent").unwrap().id;
+    let archive_1 = f1.iter().find(|f| f.path == "Archive").unwrap().id;
+
+    let f2 = cache.sync_folders(2, &[folder("收件箱", "INBOX")]).unwrap();
+    let inbox_2 = f2[0].id;
+
+    // 1. RFC 跨文件夹桥接会话：旧收件箱成员未读+加星+带标签，最新收件箱成员已读+带附件+带另一标签
+    let mut rfc_old = sample_header(1, "项目审批");
+    rfc_old.message_id = "<proj-root@a1>".to_string();
+    rfc_old.date_ts = 1_700_100_000;
+    rfc_old.unread = true;
+    rfc_old.flagged = true;
+    rfc_old.has_attachment = false;
+
+    let mut rfc_sent = sample_header(2, "Re: 项目审批");
+    rfc_sent.message_id = "<proj-reply1@a1>".to_string();
+    rfc_sent.in_reply_to = "<proj-root@a1>".to_string();
+    rfc_sent.references_header = "<proj-root@a1>".to_string();
+    rfc_sent.date_ts = 1_700_200_000;
+    rfc_sent.unread = false;
+
+    let mut rfc_new = sample_header(3, "审批更新");
+    rfc_new.message_id = "<proj-reply2@a1>".to_string();
+    rfc_new.in_reply_to = "<proj-reply1@a1>".to_string();
+    rfc_new.references_header = "<proj-root@a1> <proj-reply1@a1>".to_string();
+    rfc_new.date_ts = 1_700_300_000;
+    rfc_new.unread = false;
+    rfc_new.flagged = false;
+    rfc_new.has_attachment = true;
+
+    // 2. 纯归一化主题会话：两条均未读，验证 unread filter 下也会折叠成一条
+    let mut subj_old = sample_header(10, "周报同步");
+    subj_old.message_id = String::new();
+    subj_old.date_ts = 1_700_400_000;
+    subj_old.unread = true;
+
+    let mut subj_new = sample_header(11, "Re: 周报同步");
+    subj_new.message_id = String::new();
+    subj_new.date_ts = 1_700_500_000;
+    subj_new.unread = true;
+
+    cache
+        .commit_folder_headers(1, inbox_1, 1, &[rfc_old, rfc_new, subj_old, subj_new], None)
+        .unwrap();
+    cache
+        .commit_folder_headers(1, sent_1, 2, &[rfc_sent], None)
+        .unwrap();
+
+    // 同步合并 tags / importance 到成员行
+    let members = cache.list_summaries_by_uids(inbox_1, &[1, 3]).unwrap();
+    let old_id = members.iter().find(|m| m.uid == 1).unwrap().id;
+    let new_id = members.iter().find(|m| m.uid == 3).unwrap().id;
+    cache
+        .set_message_tags(old_id, &["重要".to_string()])
+        .unwrap();
+    cache
+        .set_message_tags(new_id, &["项目".to_string()])
+        .unwrap();
+    let (_, old_local) = decode_scoped_id(old_id).unwrap();
+    cache.with_account_mail_conn(1, |conn| {
+        conn.execute(
+            "UPDATE messages SET importance = 1 WHERE id = ?1",
+            params![old_local],
+        )
+        .unwrap();
+    });
+
+    // 非收件箱文件夹（归档）保持平铺不折叠
+    let mut arc_1 = sample_header(20, "历史归档");
+    arc_1.message_id = String::new();
+    arc_1.date_ts = 1_700_600_000;
+    let mut arc_2 = sample_header(21, "Re: 历史归档");
+    arc_2.message_id = String::new();
+    arc_2.date_ts = 1_700_700_000;
+    cache
+        .commit_folder_headers(1, archive_1, 3, &[arc_1, arc_2], None)
+        .unwrap();
+
+    // 账号 2 收件箱独立邮件
+    let mut acc2_msg = sample_header(1, "跨账号通知");
+    acc2_msg.message_id = "<acc2@a2>".to_string();
+    acc2_msg.date_ts = 1_700_350_000;
+    acc2_msg.unread = false;
+    cache
+        .commit_folder_headers(2, inbox_2, 1, &[acc2_msg], None)
+        .unwrap();
+
+    // 单账号收件箱折叠 + 状态聚合
+    let inbox_page = cache.list_messages_page(inbox_1, "", 0, 10).unwrap();
+    assert_eq!(inbox_page.total, 2);
+    assert_eq!(inbox_page.items.len(), 2);
+    assert_eq!(inbox_page.items[0].uid, 11);
+    assert_eq!(inbox_page.items[0].thread_count, 2);
+    let rep_rfc = &inbox_page.items[1];
+    assert_eq!(rep_rfc.uid, 3);
+    assert_eq!(rep_rfc.thread_count, 3);
+    assert!(rep_rfc.unread);
+    assert!(rep_rfc.flagged);
+    assert!(rep_rfc.has_attachment);
+    assert_eq!(rep_rfc.importance, 1);
+    assert!(rep_rfc.tags.contains(&"项目".to_string()));
+    assert!(rep_rfc.tags.contains(&"重要".to_string()));
+
+    // 分页按折叠后的会话数切片
+    let paged = cache.list_messages_page(inbox_1, "", 1, 1).unwrap();
+    assert_eq!(paged.total, 2);
+    assert_eq!(paged.items.len(), 1);
+    assert_eq!(paged.items[0].uid, 3);
+
+    // 展开子邮件仍包含同会话全部被折叠成员
+    let children = cache
+        .list_thread_summaries(1, rep_rfc.id, &rep_rfc.subject)
+        .unwrap();
+    assert_eq!(children.len(), 2);
+    assert!(children
+        .iter()
+        .any(|c| c.uid == 1 && c.folder_path == "INBOX"));
+    assert!(children
+        .iter()
+        .any(|c| c.uid == 2 && c.folder_path == "Sent"));
+
+    // 未读快捷筛选下同会话仍去重，且旧未读成员可命中会话
+    let mut unread_filter = crate::QuickFilterSet::default();
+    unread_filter.unread = true;
+    let unread_inbox = cache
+        .list_messages_page_with_options(
+            inbox_1,
+            "",
+            unread_filter,
+            crate::MessageSort::DateNewest,
+            0,
+            10,
+        )
+        .unwrap();
+    assert_eq!(unread_inbox.total, 2);
+    assert_eq!(
+        unread_inbox.items.iter().map(|m| m.uid).collect::<Vec<_>>(),
+        vec![11, 1]
+    );
+
+    // 非收件箱文件夹（归档）保持逐封展示
+    let archive_page = cache.list_messages_page(archive_1, "", 0, 10).unwrap();
+    assert_eq!(archive_page.total, 2);
+    assert_eq!(archive_page.items.len(), 2);
+
+    // 统一收件箱同样折叠并保留聚合属性
+    let unified = cache.list_unified_inbox("", 0, 10).unwrap();
+    assert_eq!(unified.total, 3);
+    assert_eq!(unified.items.len(), 3);
+    assert_eq!(
+        unified
+            .items
+            .iter()
+            .map(|m| (m.account_id, m.uid))
+            .collect::<Vec<_>>(),
+        vec![(1, 11), (2, 1), (1, 3)]
+    );
+    let unified_rfc = &unified.items[2];
+    assert!(unified_rfc.unread);
+    assert!(unified_rfc.flagged);
+    assert_eq!(unified_rfc.importance, 1);
+    assert!(unified_rfc.tags.contains(&"重要".to_string()));
 }

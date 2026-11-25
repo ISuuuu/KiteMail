@@ -1141,6 +1141,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            true,
         )
     }
 
@@ -1163,6 +1164,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            true,
         )
     }
 
@@ -1207,6 +1209,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1231,6 +1234,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1253,6 +1257,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1297,6 +1302,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1319,6 +1325,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1363,6 +1370,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1385,6 +1393,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1407,6 +1416,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1429,6 +1439,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1451,6 +1462,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            false,
         )
     }
 
@@ -1464,6 +1476,7 @@ impl CacheStore {
         sort: MessageSort,
         offset: usize,
         limit: usize,
+        collapse_threads: bool,
     ) -> Result<MailPage, String> {
         self.list_role_messages_with_options_for_accounts(
             predicate,
@@ -1474,6 +1487,7 @@ impl CacheStore {
             sort,
             offset,
             limit,
+            collapse_threads,
         )
     }
 
@@ -1488,6 +1502,7 @@ impl CacheStore {
         sort: MessageSort,
         offset: usize,
         limit: usize,
+        collapse_threads: bool,
     ) -> Result<MailPage, String> {
         let target_ids = self.resolve_target_account_ids(allowed_account_ids);
         if target_ids.is_empty() {
@@ -1518,6 +1533,7 @@ impl CacheStore {
                     &self.own_emails,
                     &contact_emails,
                     fetch_limit,
+                    collapse_threads,
                 )?;
                 total = total.saturating_add(acc_total);
                 candidates.extend(acc_items);

@@ -1594,8 +1594,13 @@ pub(crate) fn render(
             if group_collapsed {
                 continue;
             }
-            let is_selected =
-                selected_id == Some(msg.id) || app.selected_message_ids.contains(&msg.id);
+            let is_selected = selected_id == Some(msg.id)
+                || app.selected_message_ids.contains(&msg.id)
+                || (app.is_collapsed_thread_head(msg.id)
+                    && app
+                        .selected_message
+                        .as_ref()
+                        .is_some_and(|sel| sel.thread_messages.iter().any(|tm| tm.id == msg.id)));
             // P3：键盘游标行（j/k、方向键移动，点击行后清除）。
             let kbd_cursor = app.kbd_cursor_message_id == Some(msg.id);
             filtered_rows.push(

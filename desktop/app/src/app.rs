@@ -786,6 +786,8 @@ pub(crate) struct HylkiApp {
     pub(crate) selected_message_is_placeholder: bool,
     /// 正在等待远端正文的邮件 ID：用于立即占位显示并丢弃过期正文回包。
     pub(crate) pending_body_message_id: Option<u32>,
+    /// 选中未读的折叠会话代表行且本地暂无线程元数据时，待正文加载后补标同文件夹会话成员已读。
+    pub(crate) pending_mark_thread_seen: Option<u32>,
     /// Ctrl+点击多选的邮件 ID 集合。
     pub(crate) selected_message_ids: HashSet<u32>,
     pub(crate) drafts: Vec<LocalDraft>,
@@ -1361,6 +1363,7 @@ impl HylkiApp {
                 selected_message,
                 selected_message_is_placeholder: false,
                 pending_body_message_id: None,
+                pending_mark_thread_seen: None,
                 selected_message_ids: HashSet::new(),
                 drafts: Vec::new(),
                 templates: Vec::new(),
@@ -1608,6 +1611,7 @@ impl HylkiApp {
             selected_message: None,
             selected_message_is_placeholder: false,
             pending_body_message_id: None,
+            pending_mark_thread_seen: None,
             selected_message_ids: HashSet::new(),
             drafts: Vec::new(),
             templates: Vec::new(),
@@ -2044,7 +2048,11 @@ impl HylkiApp {
                         continue;
                     }
                     let pending = self.pending_row_action.take();
+                    let mark_thread_seen = self.pending_mark_thread_seen.take() == Some(detail.id);
                     self.set_selected_message(detail.clone());
+                    if mark_thread_seen && self.is_collapsed_thread_head(detail.id) {
+                        self.mark_thread_same_folder_unread_seen(&detail);
+                    }
                     self.error_banner = None;
                     // B-2：行菜单挂起的动作（回复 / 复制正文 / 查看原文）在正文就绪后执行。
                     if let Some((msg_id, action)) = pending {
@@ -2281,6 +2289,7 @@ impl HylkiApp {
                     self.pending_eml_export = None;
                     // 正文拉取失败：解除占位态，让阅读器重新出现「加载完整正文」入口。
                     self.pending_body_message_id = None;
+                    self.pending_mark_thread_seen = None;
                     self.pending_popout_message_ids.clear();
                     self.with_settings_window(cx, |win, _, cx| win.on_account_save_failed(cx));
                     self.error_banner = Some(SharedString::from(message.clone()));
@@ -2609,6 +2618,7 @@ impl HylkiApp {
                         self.selected_message_is_placeholder = false;
                         self.selected_message_ids.clear();
                         self.pending_body_message_id = None;
+                        self.pending_mark_thread_seen = None;
                         self.pending_popout_message_ids.clear();
                         self.pending_row_action = None;
                         self.attachment_thumb_cache.clear();
@@ -2698,7 +2708,14 @@ impl HylkiApp {
             }
             self.current_page.total = page.total;
         } else {
+            let prev_counts: HashMap<u32, u32> = self
+                .current_page
+                .items
+                .iter()
+                .map(|m| (m.id, m.thread_count))
+                .collect();
             self.current_page = page;
+            self.refresh_expanded_threads_after_reload(&prev_counts);
             // 若后台同步推回了默认首屏（如 100 条），而用户此前已向下滚动加载了更多条，
             // 则按当前 loaded_limit 补刷一次以保持已展开列表不回弹。
             if self.loaded_limit > self.prefs.page_size
@@ -2714,8 +2731,9 @@ impl HylkiApp {
                 let mark_now = first.unread
                     && self.reader_position != ReaderPosition::Hidden
                     && self.prefs.read_mark_mode == "shown";
+                let is_collapsed_head = self.is_collapsed_thread_head(first.id);
                 if let Some((detail, true)) = self.try_load_cached_detail(first.id) {
-                    self.set_selected_message(detail);
+                    self.set_selected_message(detail.clone());
                     self.error_banner = None;
                     if mark_now {
                         self.mark_message_seen_now(
@@ -2724,6 +2742,9 @@ impl HylkiApp {
                             first.uid,
                             &first.folder_path,
                         );
+                        if is_collapsed_head {
+                            self.mark_thread_same_folder_unread_seen(&detail);
+                        }
                     }
                 } else {
                     self.show_message_loading(first.id);
@@ -2734,7 +2755,51 @@ impl HylkiApp {
                         mark_now,
                         &first.folder_path,
                     );
+                    if mark_now && is_collapsed_head {
+                        if let Some((cached_meta, _)) = self.try_load_cached_detail(first.id) {
+                            self.mark_thread_same_folder_unread_seen(&cached_meta);
+                        } else {
+                            self.pending_mark_thread_seen = Some(first.id);
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    fn refresh_expanded_threads_after_reload(&mut self, prev_counts: &HashMap<u32, u32>) {
+        self.expanded_threads.retain(|id| {
+            self.current_page
+                .items
+                .iter()
+                .any(|m| m.id == *id && m.thread_count > 1)
+        });
+        self.thread_children_cache.retain(|id, _| {
+            self.current_page.items.iter().any(|m| {
+                m.id == *id && m.thread_count > 1 && prev_counts.get(id) == Some(&m.thread_count)
+            })
+        });
+        let to_refresh: Vec<(u32, u32, String)> = self
+            .current_page
+            .items
+            .iter()
+            .filter(|m| {
+                m.thread_count > 1
+                    && self.expanded_threads.contains(&m.id)
+                    && !self.thread_children_cache.contains_key(&m.id)
+            })
+            .map(|m| (m.account_id, m.id, m.subject.clone()))
+            .collect();
+        for (account_id, msg_id, subject) in to_refresh {
+            if self.demo_mode {
+                let children = self.demo_store.list_thread_summaries(msg_id);
+                self.thread_children_cache.insert(msg_id, children);
+            } else if let Some(ref w) = self.worker {
+                w.send(MailRequest::LoadThreadChildren {
+                    account_id,
+                    message_id: msg_id,
+                    subject,
+                });
             }
         }
     }
@@ -3025,6 +3090,9 @@ impl HylkiApp {
         self.current_view = view;
         self.reset_list_pagination();
         self.selected_message = None;
+        self.pending_mark_thread_seen = None;
+        self.expanded_threads.clear();
+        self.thread_children_cache.clear();
         self.right_mode = RightPaneMode::Reader;
         self.main_view = MainContentView::Mail;
         if self.demo_mode {
@@ -3065,6 +3133,9 @@ impl HylkiApp {
             .update(cx, |s, cx| s.set_value(query, window, cx));
         self.reset_list_pagination();
         self.selected_message = None;
+        self.pending_mark_thread_seen = None;
+        self.expanded_threads.clear();
+        self.thread_children_cache.clear();
         self.reload_current_page(cx);
         cx.notify();
     }
@@ -3205,6 +3276,9 @@ impl HylkiApp {
         self.current_view = CurrentView::AccountFolder;
         self.reset_list_pagination();
         self.selected_message = None;
+        self.pending_mark_thread_seen = None;
+        self.expanded_threads.clear();
+        self.thread_children_cache.clear();
         self.right_mode = RightPaneMode::Reader;
         self.main_view = MainContentView::Mail;
 
@@ -3315,6 +3389,7 @@ impl HylkiApp {
         // P3：选中邮件即导航完成，收起浮层侧栏（浮层打开时列表仍可点选）。
         self.close_sidebar_peek();
         self.right_mode = RightPaneMode::Reader;
+        self.pending_mark_thread_seen = None;
         self.read_mark_generation = self.read_mark_generation.wrapping_add(1);
         let gen = self.read_mark_generation;
 
@@ -3329,6 +3404,7 @@ impl HylkiApp {
         let mark_mode = self.prefs.read_mark_mode.as_str();
         let should_mark_now = unread && !reader_hidden && mark_mode == "shown";
         let should_mark_delay = unread && !reader_hidden && mark_mode == "delay";
+        let is_collapsed_head = self.is_collapsed_thread_head(message_id);
 
         if self.demo_mode {
             if let Some(detail) = self.demo_message_detail(message_id) {
@@ -3352,10 +3428,13 @@ impl HylkiApp {
             return;
         }
         if let Some((detail, true)) = self.try_load_cached_detail(message_id) {
-            self.set_selected_message(detail);
+            self.set_selected_message(detail.clone());
             self.error_banner = None;
             if should_mark_now {
                 self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+                if is_collapsed_head {
+                    self.mark_thread_same_folder_unread_seen(&detail);
+                }
             } else if should_mark_delay {
                 self.schedule_delayed_read_mark(
                     gen,
@@ -3371,6 +3450,13 @@ impl HylkiApp {
         }
         self.show_message_loading(message_id);
         self.request_message_detail(account_id, message_id, uid, should_mark_now, folder_path);
+        if should_mark_now && is_collapsed_head {
+            if let Some((cached_meta, _)) = self.try_load_cached_detail(message_id) {
+                self.mark_thread_same_folder_unread_seen(&cached_meta);
+            } else {
+                self.pending_mark_thread_seen = Some(message_id);
+            }
+        }
         if should_mark_delay {
             self.schedule_delayed_read_mark(
                 gen,
@@ -3403,11 +3489,129 @@ impl HylkiApp {
                         .is_some_and(|m| m.id == message_id)
                 {
                     app.mark_message_seen_now(account_id, message_id, uid, &folder_path);
+                    if app.is_collapsed_thread_head(message_id) {
+                        if let Some(detail) = app
+                            .selected_message
+                            .as_ref()
+                            .filter(|m| m.id == message_id && !app.selected_message_is_placeholder)
+                            .cloned()
+                        {
+                            app.mark_thread_same_folder_unread_seen(&detail);
+                        } else if let Some((cached_meta, _)) =
+                            app.try_load_cached_detail(message_id)
+                        {
+                            app.mark_thread_same_folder_unread_seen(&cached_meta);
+                        } else {
+                            app.pending_mark_thread_seen = Some(message_id);
+                        }
+                    }
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    pub(crate) fn current_list_collapses_threads(&self) -> bool {
+        if self.demo_mode {
+            return false;
+        }
+        if !self.search_query.trim().is_empty() && self.search_scope == SearchScope::AllFolders {
+            return false;
+        }
+        match self.current_view {
+            CurrentView::UnifiedInbox => true,
+            CurrentView::AccountFolder => self
+                .folders_by_account
+                .values()
+                .flatten()
+                .find(|f| f.id == self.selected_folder_id)
+                .is_some_and(|f| is_inbox_folder(&f.name, &f.path)),
+            CurrentView::Unread
+            | CurrentView::Starred
+            | CurrentView::Sent
+            | CurrentView::Drafts
+            | CurrentView::Archive
+            | CurrentView::Junk
+            | CurrentView::Trash
+            | CurrentView::Snoozed => false,
+        }
+    }
+
+    pub(crate) fn is_collapsed_thread_head(&self, message_id: u32) -> bool {
+        self.current_list_collapses_threads()
+            && !self.expanded_threads.contains(&message_id)
+            && self
+                .current_page
+                .items
+                .iter()
+                .any(|m| m.id == message_id && m.thread_count > 1)
+    }
+
+    fn mark_thread_same_folder_unread_seen(&mut self, detail: &MessageDetail) {
+        for (tm_id, tm_uid, tm_folder_path) in collect_same_folder_unread_thread_targets(detail) {
+            self.mark_message_seen_now(detail.account_id, tm_id, tm_uid, &tm_folder_path);
+        }
+    }
+
+    fn find_list_summary(&self, message_id: u32) -> Option<&MessageSummary> {
+        self.current_page
+            .items
+            .iter()
+            .find(|m| m.id == message_id)
+            .or_else(|| {
+                self.thread_children_cache
+                    .values()
+                    .flatten()
+                    .find(|m| m.id == message_id)
+            })
+    }
+
+    fn sync_local_seen_state(&mut self, message_id: u32, seen: bool) {
+        for item in &mut self.current_page.items {
+            if item.id == message_id {
+                item.unread = !seen;
+            }
+        }
+        for children in self.thread_children_cache.values_mut() {
+            for child in children {
+                if child.id == message_id {
+                    child.unread = !seen;
+                }
+            }
+        }
+        if let Some(sel) = self.selected_message.as_mut() {
+            for tm in &mut sel.thread_messages {
+                if tm.id == message_id {
+                    tm.unread = !seen;
+                }
+            }
+        }
+    }
+
+    fn sync_local_flagged_state(&mut self, message_id: u32, flagged: bool) {
+        for item in &mut self.current_page.items {
+            if item.id == message_id {
+                item.flagged = flagged;
+            }
+        }
+        for children in self.thread_children_cache.values_mut() {
+            for child in children {
+                if child.id == message_id {
+                    child.flagged = flagged;
+                }
+            }
+        }
+        if let Some(sel) = self.selected_message.as_mut() {
+            if sel.id == message_id {
+                sel.flagged = flagged;
+            }
+            for tm in &mut sel.thread_messages {
+                if tm.id == message_id {
+                    tm.flagged = flagged;
+                }
+            }
+        }
     }
 
     fn mark_message_seen_now(
@@ -3428,14 +3632,7 @@ impl HylkiApp {
                 });
             }
         }
-        if let Some(item) = self
-            .current_page
-            .items
-            .iter_mut()
-            .find(|m| m.id == message_id)
-        {
-            item.unread = false;
-        }
+        self.sync_local_seen_state(message_id, true);
     }
 
     fn request_message_detail(
@@ -3463,11 +3660,15 @@ impl HylkiApp {
         let Some(detail) = self.selected_message.as_ref() else {
             return false;
         };
-        self.current_page
-            .items
-            .iter()
-            .find(|m| m.id == detail.id)
+        self.find_list_summary(detail.id)
             .map(|m| m.unread)
+            .or_else(|| {
+                detail
+                    .thread_messages
+                    .iter()
+                    .find(|tm| tm.id == detail.id)
+                    .map(|tm| tm.unread)
+            })
             .unwrap_or(false)
     }
 
@@ -3478,14 +3679,7 @@ impl HylkiApp {
         };
         // 当前未读则标为已读（seen = true），当前已读则标为未读（seen = false）。
         let next_seen = self.selected_message_unread();
-        if let Some(item) = self
-            .current_page
-            .items
-            .iter_mut()
-            .find(|m| m.id == detail.id)
-        {
-            item.unread = !next_seen;
-        }
+        self.sync_local_seen_state(detail.id, next_seen);
         if !self.demo_mode {
             if let Some(ref w) = self.worker {
                 w.send(MailRequest::SetSeen {
@@ -3495,6 +3689,9 @@ impl HylkiApp {
                     uid: detail.uid,
                     seen: next_seen,
                 });
+            }
+            if next_seen && self.is_collapsed_thread_head(detail.id) {
+                self.mark_thread_same_folder_unread_seen(&detail);
             }
         }
         self.status_line = SharedString::from(if next_seen {
@@ -3549,11 +3746,10 @@ impl HylkiApp {
         {
             return;
         }
-        let Some(msg) = self.current_page.items.iter().find(|m| m.id == message_id) else {
+        let Some(msg) = self.find_list_summary(message_id) else {
             return;
         };
-        self.selected_message_is_placeholder = true;
-        self.selected_message = Some(MessageDetail {
+        let placeholder = MessageDetail {
             id: msg.id,
             account_id: msg.account_id,
             folder_id: msg.folder_id,
@@ -3574,7 +3770,9 @@ impl HylkiApp {
             unsubscribe_url: None,
             unsubscribe_one_click: false,
             auth_results: None,
-        });
+        };
+        self.selected_message_is_placeholder = true;
+        self.selected_message = Some(placeholder);
     }
 
     /// 更新当前选中邮件详情并初始化会话卡片折叠态 / 原文态。
@@ -3696,17 +3894,7 @@ impl HylkiApp {
 
     pub(crate) fn toggle_flagged(&mut self, detail: &MessageDetail, cx: &mut Context<Self>) {
         let next_flagged = !detail.flagged;
-        if let Some(item) = self
-            .current_page
-            .items
-            .iter_mut()
-            .find(|m| m.id == detail.id)
-        {
-            item.flagged = next_flagged;
-        }
-        if let Some(sel) = self.selected_message.as_mut() {
-            sel.flagged = next_flagged;
-        }
+        self.sync_local_flagged_state(detail.id, next_flagged);
         if !self.demo_mode {
             if let Some(ref w) = self.worker {
                 w.send(MailRequest::SetFlagged {
@@ -3883,10 +4071,8 @@ impl HylkiApp {
         action_label: &str,
     ) -> Option<PendingUndo> {
         let msg = self
-            .current_page
-            .items
-            .iter()
-            .find(|m| m.id == message_id && m.account_id == account_id)?;
+            .find_list_summary(message_id)
+            .filter(|m| m.account_id == account_id)?;
         Some(PendingUndo {
             account_id,
             message_id: msg.id,
@@ -4174,9 +4360,7 @@ impl HylkiApp {
             return;
         }
         for msg in &targets {
-            if let Some(item) = self.current_page.items.iter_mut().find(|m| m.id == msg.id) {
-                item.unread = false;
-            }
+            self.sync_local_seen_state(msg.id, true);
             if !self.demo_mode {
                 if let Some(ref w) = self.worker {
                     w.send(MailRequest::SetSeen {
@@ -4186,6 +4370,11 @@ impl HylkiApp {
                         uid: msg.uid,
                         seen: true,
                     });
+                }
+                if self.is_collapsed_thread_head(msg.id) {
+                    if let Some((cached_meta, _)) = self.try_load_cached_detail(msg.id) {
+                        self.mark_thread_same_folder_unread_seen(&cached_meta);
+                    }
                 }
             }
         }
@@ -4303,14 +4492,7 @@ impl HylkiApp {
         seen: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(item) = self
-            .current_page
-            .items
-            .iter_mut()
-            .find(|m| m.id == message_id)
-        {
-            item.unread = !seen;
-        }
+        self.sync_local_seen_state(message_id, seen);
         if self.demo_mode {
             cx.notify();
             return;
@@ -4323,6 +4505,17 @@ impl HylkiApp {
                 uid,
                 seen,
             });
+        }
+        if seen && self.is_collapsed_thread_head(message_id) {
+            let detail = self
+                .selected_message
+                .as_ref()
+                .filter(|d| d.id == message_id && !self.selected_message_is_placeholder)
+                .cloned()
+                .or_else(|| self.try_load_cached_detail(message_id).map(|(d, _)| d));
+            if let Some(detail) = detail {
+                self.mark_thread_same_folder_unread_seen(&detail);
+            }
         }
         cx.notify();
     }
@@ -4337,19 +4530,7 @@ impl HylkiApp {
         flagged: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(item) = self
-            .current_page
-            .items
-            .iter_mut()
-            .find(|m| m.id == message_id)
-        {
-            item.flagged = flagged;
-        }
-        if let Some(sel) = self.selected_message.as_mut() {
-            if sel.id == message_id {
-                sel.flagged = flagged;
-            }
-        }
+        self.sync_local_flagged_state(message_id, flagged);
         if self.demo_mode {
             cx.notify();
             return;
@@ -6374,8 +6555,10 @@ impl HylkiApp {
             });
             return;
         }
+        let mark_shown = unread && self.prefs.read_mark_mode == "shown";
+        let is_collapsed_head = self.is_collapsed_thread_head(message_id);
         if self.demo_mode {
-            if unread && self.prefs.read_mark_mode == "shown" {
+            if mark_shown {
                 self.mark_message_seen_now(account_id, message_id, uid, folder_path);
             }
             if let Some(detail) = self.demo_message_detail(message_id) {
@@ -6386,24 +6569,35 @@ impl HylkiApp {
         }
         if self.is_selected_message_ready_for_popout(message_id) {
             if let Some(detail) = self.selected_message.clone() {
-                if unread && self.prefs.read_mark_mode == "shown" {
+                if mark_shown {
                     self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+                    if is_collapsed_head {
+                        self.mark_thread_same_folder_unread_seen(&detail);
+                    }
                 }
                 self.pop_out_message_window(detail, cx);
             }
             return;
         }
         if let Some((detail, true)) = self.try_load_cached_detail(message_id) {
-            if unread && self.prefs.read_mark_mode == "shown" {
+            if mark_shown {
                 self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+                if is_collapsed_head {
+                    self.mark_thread_same_folder_unread_seen(&detail);
+                }
             }
             self.pop_out_message_window(detail, cx);
             cx.notify();
             return;
         }
         self.pending_popout_message_ids.insert(message_id);
-        if unread && self.prefs.read_mark_mode == "shown" {
+        if mark_shown {
             self.mark_message_seen_now(account_id, message_id, uid, folder_path);
+            if is_collapsed_head {
+                if let Some((cached_meta, _)) = self.try_load_cached_detail(message_id) {
+                    self.mark_thread_same_folder_unread_seen(&cached_meta);
+                }
+            }
         }
         if self.pending_body_message_id != Some(message_id) {
             if let Some(ref w) = self.worker {
@@ -9444,10 +9638,9 @@ impl HylkiApp {
             return;
         }
         let items = &self.current_page.items;
-        let current_idx = self
-            .selected_message
-            .as_ref()
-            .and_then(|sel| items.iter().position(|m| m.id == sel.id));
+        let current_idx = self.selected_message.as_ref().and_then(|sel| {
+            resolve_selected_list_index(items, sel, |id| self.is_collapsed_thread_head(id))
+        });
         let Some(next_idx) = next_adjacent_index(current_idx, items.len(), delta) else {
             return;
         };
@@ -11697,6 +11890,43 @@ pub(crate) fn is_sent_folder(name: &str, path: &str) -> bool {
     name == "已发送" || path.to_ascii_uppercase().contains("SENT")
 }
 
+/// 判定文件夹是否为收件箱（兼容 IMAP `INBOX` 与 Graph 显示名「收件箱」）。
+pub(crate) fn is_inbox_folder(name: &str, path: &str) -> bool {
+    path.eq_ignore_ascii_case("INBOX") || name.eq_ignore_ascii_case("INBOX") || name == "收件箱"
+}
+
+/// 收集折叠会话中同文件夹内的其它未读成员 `(id, uid, folder_path)`，
+/// 供点击/快捷键将整组收件箱代表行标为已读时一并同步。
+fn collect_same_folder_unread_thread_targets(detail: &MessageDetail) -> Vec<(u32, u32, String)> {
+    if detail.folder_path.is_empty() {
+        return Vec::new();
+    }
+    detail
+        .thread_messages
+        .iter()
+        .filter(|tm| {
+            tm.id != detail.id
+                && tm.unread
+                && tm.folder_path.eq_ignore_ascii_case(&detail.folder_path)
+        })
+        .map(|tm| (tm.id, tm.uid, tm.folder_path.clone()))
+        .collect()
+}
+
+/// 在列表页中定位当前选中详情对应的行下标；若停留在折叠会话的旧卡片上，
+/// 则回退到所属折叠会话的代表行。
+fn resolve_selected_list_index(
+    items: &[MessageSummary],
+    selected: &MessageDetail,
+    collapsed_head_pred: impl Fn(u32) -> bool,
+) -> Option<usize> {
+    items.iter().position(|m| m.id == selected.id).or_else(|| {
+        items.iter().position(|m| {
+            collapsed_head_pred(m.id) && selected.thread_messages.iter().any(|tm| tm.id == m.id)
+        })
+    })
+}
+
 /// F-1：单键快捷键动作的共用守卫（纯函数，便于单测）。
 ///
 /// 条件对齐 `DeleteSelectedMessage` 的既有守卫（Mail 阅读态 + 无浮层 +
@@ -12590,5 +12820,160 @@ mod tests {
             Some(&old),
             &after_delete
         ));
+    }
+
+    #[test]
+    fn inbox_folder_detection_handles_imap_and_graph_names() {
+        assert!(is_inbox_folder("收件箱", "INBOX"));
+        assert!(is_inbox_folder("", "inbox"));
+        assert!(is_inbox_folder("Inbox", "custom-graph-id"));
+        assert!(is_inbox_folder("收件箱", "AAMkGraphInboxId"));
+        assert!(!is_inbox_folder("已发送", "Sent"));
+        assert!(!is_inbox_folder("已删除", "Trash"));
+        assert!(!is_inbox_folder("Sub", "INBOX/Sub"));
+    }
+
+    #[test]
+    fn same_folder_unread_thread_targets_filters_self_read_and_other_folders() {
+        let mk_thread_msg =
+            |id: u32, uid: u32, folder_path: &str, unread: bool| hylki_mail_core::ThreadMessage {
+                id,
+                rfc_message_id: format!("<m-{id}@example.com>"),
+                subject: "项目讨论".to_string(),
+                sender: "alice@example.com".to_string(),
+                recipients: "me@example.com".to_string(),
+                cc: String::new(),
+                date_ts: i64::from(id) * 100,
+                date_display: "10:00".to_string(),
+                body_text: String::new(),
+                body_html: None,
+                body_loaded: false,
+                unread,
+                flagged: false,
+                attachments: Vec::new(),
+                uid,
+                folder_path: folder_path.to_string(),
+            };
+        let detail = MessageDetail {
+            id: 30,
+            account_id: 1,
+            folder_id: 1,
+            folder_path: "INBOX".to_string(),
+            uid: 300,
+            rfc_message_id: "<m-30@example.com>".to_string(),
+            sender: "alice@example.com".to_string(),
+            recipients: "me@example.com".to_string(),
+            cc: String::new(),
+            subject: "Re: 项目讨论".to_string(),
+            date_ts: 3000,
+            date_display: "12:00".to_string(),
+            body_text: "body".to_string(),
+            body_html: None,
+            flagged: false,
+            attachments: Vec::new(),
+            thread_messages: vec![
+                mk_thread_msg(30, 300, "INBOX", true),
+                mk_thread_msg(10, 100, "INBOX", true),
+                mk_thread_msg(11, 101, "inbox", true),
+                mk_thread_msg(12, 102, "INBOX", false),
+                mk_thread_msg(20, 200, "Sent", true),
+                mk_thread_msg(21, 201, "Archive", true),
+            ],
+            unsubscribe_url: None,
+            unsubscribe_one_click: false,
+            auth_results: None,
+        };
+        let targets = collect_same_folder_unread_thread_targets(&detail);
+        assert_eq!(
+            targets,
+            vec![
+                (10, 100, "INBOX".to_string()),
+                (11, 101, "inbox".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_selected_list_index_falls_back_to_collapsed_thread_head() {
+        let mk_summary = |id: u32, thread_count: u32| MessageSummary {
+            id,
+            account_id: 1,
+            folder_id: 1,
+            folder_path: "INBOX".to_string(),
+            uid: id,
+            sender: "alice@example.com".to_string(),
+            subject: "主题".to_string(),
+            preview: String::new(),
+            date_ts: i64::from(id),
+            date_display: "10:00".to_string(),
+            unread: false,
+            flagged: false,
+            has_attachment: false,
+            recipients: String::new(),
+            thread_count,
+            importance: 0,
+            tags: Vec::new(),
+            answered: false,
+            forwarded: false,
+            snoozed_until_ts: 0,
+        };
+        let mk_card = |id: u32| hylki_mail_core::ThreadMessage {
+            id,
+            rfc_message_id: String::new(),
+            subject: "主题".to_string(),
+            sender: "alice@example.com".to_string(),
+            recipients: String::new(),
+            cc: String::new(),
+            date_ts: i64::from(id),
+            date_display: "10:00".to_string(),
+            body_text: String::new(),
+            body_html: None,
+            body_loaded: false,
+            unread: false,
+            flagged: false,
+            attachments: Vec::new(),
+            uid: id,
+            folder_path: "INBOX".to_string(),
+        };
+        let items = vec![mk_summary(100, 1), mk_summary(200, 3), mk_summary(300, 1)];
+        let selected_old_card = MessageDetail {
+            id: 150,
+            account_id: 1,
+            folder_id: 1,
+            folder_path: "INBOX".to_string(),
+            uid: 150,
+            rfc_message_id: String::new(),
+            sender: "alice@example.com".to_string(),
+            recipients: String::new(),
+            cc: String::new(),
+            subject: "主题".to_string(),
+            date_ts: 150,
+            date_display: "10:00".to_string(),
+            body_text: String::new(),
+            body_html: None,
+            flagged: false,
+            attachments: Vec::new(),
+            thread_messages: vec![mk_card(200), mk_card(150), mk_card(120)],
+            unsubscribe_url: None,
+            unsubscribe_one_click: false,
+            auth_results: None,
+        };
+        let selected_direct = MessageDetail {
+            id: 300,
+            ..selected_old_card.clone()
+        };
+
+        assert_eq!(
+            resolve_selected_list_index(&items, &selected_direct, |id| id == 200),
+            Some(2)
+        );
+        assert_eq!(
+            resolve_selected_list_index(&items, &selected_old_card, |id| id == 200),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_selected_list_index(&items, &selected_old_card, |_| false),
+            None
+        );
     }
 }
