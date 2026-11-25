@@ -11,9 +11,9 @@
 //!   旋转小箭头，点击展开各账号对应文件夹的子行（账号彩色圆点 + 未读数）。
 //! - 收藏分区（WP-07 Favorites）：收藏的文件夹列表，右键「收藏」添加。
 //! - 账号折叠分组：彩色头像（角上未读小蓝圈）+ 账号名 + 邮箱小字 +
-//!   右侧单账号刷新按钮 + 折叠箭头；展开先列标准角色文件夹，自定义文件夹
-//!   归入可折叠「文件夹」分组并按 IMAP 分隔符构建多级树（WP-07），每行带
-//!   完整右键菜单。
+//!   右侧单账号刷新按钮 + 折叠箭头；展开先列标准角色文件夹，随后直接平级
+//!   列出自定义文件夹并按 IMAP 分隔符构建多级树（WP-07），每行带完整右键
+//!   菜单。
 //! - 底部固定区：联系人、附件入口。
 
 use std::collections::HashSet;
@@ -355,8 +355,6 @@ pub(crate) struct SidebarUiState {
     smart_collapsed: bool,
     /// 标签分区是否折叠（默认展开）。
     tags_collapsed: bool,
-    /// 折叠的「文件夹」自定义分组（账号 id；默认展开）。
-    folders_group_collapsed: HashSet<u32>,
     /// 折叠的自定义文件夹树节点（账号 id, IMAP 路径；默认展开）。
     tree_collapsed: HashSet<(u32, String)>,
 }
@@ -1116,6 +1114,11 @@ fn folder_action_prompt_bar(
         )
 }
 
+/// 树折叠箭头槽宽度（与 `tree_chevron` 保持一致）。
+const TREE_CHEVRON_WIDTH: f32 = 18.0;
+/// 带折叠箭头行中箭头与文件夹行本体的水平间距。
+const TREE_CHEVRON_GAP: f32 = 2.0;
+
 /// 自定义文件夹树节点的折叠箭头（独立点击目标；行本体负责选中）。
 fn tree_chevron(
     acc_id: u32,
@@ -1132,7 +1135,7 @@ fn tree_chevron(
             "tree-chev-{acc_id}-{}",
             folder.id
         )))
-        .w(px(18.0))
+        .w(px(TREE_CHEVRON_WIDTH))
         .h(px(NAV_ROW_HEIGHT))
         .flex_shrink_0()
         .flex()
@@ -1158,78 +1161,6 @@ fn tree_chevron(
             });
             cx.notify();
         }))
-}
-
-/// 自定义文件夹分组头（可折叠；有隐藏文件夹时右键可整体恢复显示）。
-fn folders_group_header(
-    acc_id: u32,
-    custom_count: usize,
-    hidden_count: usize,
-    collapsed: bool,
-    demo_mode: bool,
-    p: &theme::HylkiPalette,
-    cx: &mut Context<HylkiApp>,
-) -> ContextMenu<Stateful<Div>> {
-    let (muted, soft) = (p.text_muted, p.accent_soft());
-    let entity = cx.entity();
-    h_flex()
-        .id(SharedString::from(format!("folders-group-{acc_id}")))
-        .h(px(NAV_ROW_HEIGHT))
-        .pl(px(12.0))
-        .pr_2()
-        .gap_2()
-        .items_center()
-        .rounded(px(8.0))
-        .cursor_pointer()
-        .hover(move |s| s.bg(soft))
-        .on_click(cx.listener(move |_, _, _, cx| {
-            mutate_sidebar_ui_state(cx, |s| {
-                if !s.folders_group_collapsed.remove(&acc_id) {
-                    s.folders_group_collapsed.insert(acc_id);
-                }
-            });
-            cx.notify();
-        }))
-        .child(
-            Icon::new(if collapsed {
-                IconName::ChevronRight
-            } else {
-                IconName::ChevronDown
-            })
-            .with_size(px(13.0))
-            .text_color(muted),
-        )
-        .child(
-            Icon::new(IconName::FolderOpen)
-                .with_size(px(15.0))
-                .text_color(muted),
-        )
-        .child(div().flex_1().text_sm().text_color(muted).child("文件夹"))
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(SharedString::from(custom_count.to_string())),
-        )
-        .context_menu(move |menu, _, _| {
-            let entity = entity.clone();
-            if hidden_count == 0 || demo_mode {
-                return menu;
-            }
-            menu.item(
-                PopupMenuItem::new(format!("显示全部隐藏文件夹 ({hidden_count})")).on_click(
-                    move |_, _, cx| {
-                        entity.update(cx, |this, cx| {
-                            this.mutate_preferences(cx, |prefs| {
-                                prefs
-                                    .sidebar_hidden_folders
-                                    .retain(|h| h.account_id != acc_id);
-                            });
-                        });
-                    },
-                ),
-            )
-        })
 }
 
 /// 文件夹右键菜单（对齐 Linux `folder_menu_items` 的 Windows 可用集）：
@@ -1448,9 +1379,26 @@ fn folder_context_menu(
     menu
 }
 
+/// 文件夹行本体左侧内边距（保证有无折叠箭头时图标左起点严格对齐）。
+fn folder_row_left_padding(depth: usize, has_leading_chevron: bool) -> f32 {
+    if has_leading_chevron {
+        4.0
+    } else {
+        28.0 + depth as f32 * 16.0
+    }
+}
+
+/// 带前置折叠箭头父级行外层容器的左侧内边距：
+/// `tree_parent_row_left_padding(d) + TREE_CHEVRON_WIDTH + TREE_CHEVRON_GAP + folder_row_left_padding(d, true)`
+/// 与无箭头行的 `folder_row_left_padding(d, false)` 完全相等。
+fn tree_parent_row_left_padding(depth: usize) -> f32 {
+    4.0 + depth as f32 * 16.0
+}
+
 /// 账号内文件夹行（角色与自定义共用）：图标 + 名称 + 计数 + 完整右键菜单。
 /// `role` 为 `Some` 时按角色图标渲染（含右键「指定特殊角色」指派的角色）；
-/// `depth` 为多级树缩进层级（自定义文件夹）。
+/// `depth` 为多级树缩进层级（自定义文件夹）；`has_leading_chevron` 表示行前是否
+/// 挂有 `tree_chevron` 折叠箭头（此时由外层容器承担深度缩进）。
 #[allow(clippy::too_many_arguments)]
 fn account_folder_row(
     app: &HylkiApp,
@@ -1458,6 +1406,7 @@ fn account_folder_row(
     folder: &FolderSummary,
     role: Option<FolderRole>,
     depth: usize,
+    has_leading_chevron: bool,
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
 ) -> ContextMenu<Stateful<Div>> {
@@ -1506,7 +1455,7 @@ fn account_folder_row(
     h_flex()
         .id(("folder", folder_id))
         .h(px(NAV_ROW_HEIGHT))
-        .pl(px(28.0 + depth as f32 * 16.0))
+        .pl(px(folder_row_left_padding(depth, has_leading_chevron)))
         .pr_2()
         .gap_2()
         .items_center()
@@ -1594,6 +1543,13 @@ fn account_section(
         .map(|f| f.unread_count)
         .sum();
     let demo_mode = app.demo_mode;
+    let hidden_count = app
+        .prefs
+        .sidebar_hidden_folders
+        .iter()
+        .filter(|h| h.account_id == acc_id)
+        .count();
+    let acc_menu_entity = cx.entity();
 
     v_flex()
         .gap_0p5()
@@ -1675,25 +1631,38 @@ fn account_section(
                     })
                     .with_size(px(14.0))
                     .text_color(muted_fg),
-                ),
+                )
+                .context_menu(move |menu, _, _| {
+                    let entity = acc_menu_entity.clone();
+                    if hidden_count == 0 || demo_mode {
+                        return menu;
+                    }
+                    menu.item(
+                        PopupMenuItem::new(format!("显示全部隐藏文件夹 ({hidden_count})"))
+                            .on_click(move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.mutate_preferences(cx, |prefs| {
+                                        prefs
+                                            .sidebar_hidden_folders
+                                            .retain(|h| h.account_id != acc_id);
+                                    });
+                                });
+                            }),
+                    )
+                }),
         )
         .when(expanded, |section| {
-            // WP-07：标准角色文件夹置顶（服务端顺序），自定义文件夹归入可折叠
-            // 「文件夹」分组，并按 IMAP 分隔符构建多级树（带折叠箭头）。
+            // WP-07：标准角色文件夹置顶（服务端顺序），随后直接平级列出
+            // 自定义文件夹，并按 IMAP 分隔符构建多级树（带折叠箭头）。
             let (roles, customs) = partition_folders(
                 acc_id,
                 folders,
                 &app.prefs.sidebar_special_roles,
                 &app.prefs.sidebar_hidden_folders,
             );
-            let hidden_count = app
-                .prefs
-                .sidebar_hidden_folders
-                .iter()
-                .filter(|h| h.account_id == acc_id)
-                .count();
             let mut section = section.children(roles.iter().map(|(folder, role)| {
-                account_folder_row(app, acc_id, folder, Some(*role), 0, p, cx).into_any_element()
+                account_folder_row(app, acc_id, folder, Some(*role), 0, false, p, cx)
+                    .into_any_element()
             }));
             let paths: Vec<&str> = customs.iter().map(|f| f.path.as_str()).collect();
             let delim = detect_delimiter(&paths);
@@ -1704,40 +1673,28 @@ fn account_section(
                     !hidden_by_collapsed_ancestors(acc_id, path, &paths, delim, &ui.tree_collapsed)
                 })
                 .collect();
-            if !customs.is_empty() || hidden_count > 0 {
-                let group_collapsed = ui.folders_group_collapsed.contains(&acc_id);
-                section = section.child(folders_group_header(
-                    acc_id,
-                    customs.len(),
-                    hidden_count,
-                    group_collapsed,
-                    demo_mode,
-                    p,
-                    cx,
-                ));
-                if !group_collapsed {
-                    section = section.children(visible.iter().map(|path| {
-                        let folder = customs
-                            .iter()
-                            .find(|f| &f.path == *path)
-                            .expect("树序路径必然来自自定义文件夹集合");
-                        let depth = folder_depth(path, &paths, delim);
-                        let has_children = has_listed_children(path, &paths, delim);
-                        let children_expanded =
-                            !ui.tree_collapsed.contains(&(acc_id, (*path).clone()));
-                        let row = account_folder_row(app, acc_id, folder, None, depth, p, cx);
-                        h_flex()
-                            .gap_0p5()
-                            .items_center()
-                            .when(has_children, |el| {
-                                el.child(tree_chevron(acc_id, folder, children_expanded, p, cx))
-                            })
-                            .when(!has_children, |el| el.child(expander_spacer()))
-                            .child(row.flex_1())
-                            .into_any_element()
-                    }));
+            section = section.children(visible.iter().map(|path| {
+                let folder = customs
+                    .iter()
+                    .find(|f| &f.path == *path)
+                    .expect("树序路径必然来自自定义文件夹集合");
+                let depth = folder_depth(path, &paths, delim);
+                let has_children = has_listed_children(path, &paths, delim);
+                if has_children {
+                    let children_expanded = !ui.tree_collapsed.contains(&(acc_id, (*path).clone()));
+                    let row = account_folder_row(app, acc_id, folder, None, depth, true, p, cx);
+                    h_flex()
+                        .pl(px(tree_parent_row_left_padding(depth)))
+                        .gap(px(TREE_CHEVRON_GAP))
+                        .items_center()
+                        .child(tree_chevron(acc_id, folder, children_expanded, p, cx))
+                        .child(row.flex_1())
+                        .into_any_element()
+                } else {
+                    account_folder_row(app, acc_id, folder, None, depth, false, p, cx)
+                        .into_any_element()
                 }
-            }
+            }));
             section
         })
         .into_any_element()
@@ -2925,5 +2882,21 @@ mod tests {
             Some('/'),
             &other
         ));
+    }
+
+    #[test]
+    fn folder_row_padding_aligns_icons_with_and_without_chevron() {
+        assert_eq!(folder_row_left_padding(0, false), 28.0);
+        for depth in 0..=2 {
+            let plain_icon_x = folder_row_left_padding(depth, false);
+            let parent_icon_x = tree_parent_row_left_padding(depth)
+                + TREE_CHEVRON_WIDTH
+                + TREE_CHEVRON_GAP
+                + folder_row_left_padding(depth, true);
+            assert_eq!(
+                parent_icon_x, plain_icon_x,
+                "depth={depth} 时带折叠箭头与普通文件夹行的图标左起点必须对齐"
+            );
+        }
     }
 }
