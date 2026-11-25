@@ -1,0 +1,23 @@
+[package]
+name = "kitemail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Windows GPUI client for KiteMail"
+
+[dependencies]
+chrono = { workspace = true }
+data-url = "0.3"
+futures = { workspace = true }
+gpui-kit = { workspace = true }
+kitemail-mail-core = { path = "../mail-core" }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+rfd = { workspace = true }
+winreg = "0.55"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+url = { workspace = true }
+webview2-com = "0.38.2"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

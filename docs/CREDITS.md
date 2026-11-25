@@ -1,10 +1,13 @@
 # Credits
 
-Hylki is maintained by [Hyprlab](https://github.com/hyprlab). This page says
-what each contributor's work was; the names alone live in
-[`data/CONTRIBUTORS`](../data/CONTRIBUTORS) and
-[`data/TRANSLATORS`](../data/TRANSLATORS), which is what the app's About window
-shows. Want to join them? See [CONTRIBUTING.md](CONTRIBUTING.md).
+**KiteMail** originally started as a fork of [Hylki](https://github.com/hyprlab/hylki)
+(maintained by [Hyprlab](https://github.com/hyprlab)) and is now developed at
+[ISuuuu/KiteMail](https://github.com/ISuuuu/KiteMail). This page records the
+upstream contributors, translators, and packagers whose work is carried forward;
+the names alone live in [`data/CONTRIBUTORS`](../data/CONTRIBUTORS) and
+[`data/TRANSLATORS`](../data/TRANSLATORS). Want to contribute to KiteMail?
+Open an issue or pull request on
+[GitHub](https://github.com/ISuuuu/KiteMail/issues).
 
 ## Code
 
@@ -230,7 +233,7 @@ report, all in 1.38; and to everyone who files issues and ideas.
 
 ## Translations
 
-Every language Hylki speaks was given to it by somebody:
+Every upstream translation in Hylki was given to it by somebody:
 
 - **Catalan:** [jolupa](https://github.com/jolupa)
 - **French:** [frenchy82](https://github.com/frenchy82)
@@ -246,9 +249,10 @@ Every language Hylki speaks was given to it by somebody:
   [FLASH911](https://github.com/FLASH911)
 - **Spanish:** [Daniel Miguel](https://github.com/danielmigueltejedor)
 
-Adding or updating one is the easiest way in: see [po/README.md](../po/README.md).
+Want to help localize KiteMail? Open an issue or pull request on
+[GitHub](https://github.com/ISuuuu/KiteMail/issues).
 
-## Packaging
+## Upstream packaging
 
 - [**bennypowers**](https://github.com/bennypowers): the Gentoo ebuild, in
   [his overlay](https://github.com/bennypowers/gentoo-overlay).
@@ -257,6 +261,5 @@ Adding or updating one is the easiest way in: see [po/README.md](../po/README.md
 
 ## Third-party work
 
-The brand marks, sender logos, new-mail sounds and appearance themes Hylki
-bundles are listed with their sources and licences in
-[LICENSE.md](LICENSE.md).
+The brand marks, sender logos and appearance themes used in KiteMail are
+listed with their sources and licences in [LICENSE.md](LICENSE.md).

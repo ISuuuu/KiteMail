@@ -4,9 +4,7 @@
 #
 # The body is two parts:
 #
-#   Notes            the version's section of docs/RELEASE_NOTES.md: New
-#                    features, Fixes and Translations, one short line each
-#                    (see docs/RELEASING.md), or of CHANGELOG.md when it has none.
+#   Notes            the version's section of CHANGELOG.md.
 #   Full changelog   the compare link from a tag that outlasts this page.
 #
 # GitHub's generated "What's changed" list is left out on purpose: at the rate
@@ -109,17 +107,10 @@ for line in sys.stdin:
 '
 }
 
-# Prefer CHANGELOG.md for independent 0.x releases; fall back to legacy docs/RELEASE_NOTES.md.
-# "## X.Y.Z — <date>"
+# Extract "## X.Y.Z — <date>" (or "## X.Y.Z") from CHANGELOG.md.
 notes=$(section CHANGELOG.md "^## ${ver}($| )" "^## ")
 if [ -z "${notes//[[:space:]]/}" ]; then
-  # "## What's new in X.Y.Z" (newest) or "## In X.Y.Z" (older)
-  notes=$(section docs/RELEASE_NOTES.md \
-    "^## (What.s new in|In) ${ver}($| )" \
-    "^## ")
-fi
-if [ -z "${notes//[[:space:]]/}" ]; then
-  echo "no notes found for ${ver} in docs/RELEASE_NOTES.md or CHANGELOG.md" >&2
+  echo "no notes found for ${ver} in CHANGELOG.md" >&2
   exit 1
 fi
 

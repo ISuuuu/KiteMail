@@ -1,6 +1,6 @@
 name: Windows x64
 
-# Checks run on every desktop change; the exe is built only for a release tag.
+# Checks run on every Rust workspace change; the exe is built only for a release tag.
 # Nothing is published from here except the release's assets and update
 # manifest.
 on:
@@ -8,12 +8,16 @@ on:
     branches: [main]
     tags: ['v*']
     paths:
-      - "desktop/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
       - ".github/nsis/**"
       - ".github/workflows/windows.yml"
   pull_request:
     paths:
-      - "desktop/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
       - ".github/nsis/**"
       - ".github/workflows/windows.yml"
   workflow_dispatch:
@@ -57,22 +61,22 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            desktop/target/
-          key: ${{ runner.os }}-desktop-cargo-check-v2-${{ hashFiles('desktop/Cargo.lock') }}
+            target/
+          key: ${{ runner.os }}-cargo-check-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-desktop-cargo-check-v2-
+            ${{ runner.os }}-cargo-check-v2-
 
       - name: Check formatting
-        run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Check workspace
-        run: cargo check --manifest-path desktop/Cargo.toml --workspace --target x86_64-pc-windows-msvc --locked
+        run: cargo check --workspace --target x86_64-pc-windows-msvc --locked
 
       - name: Verify release binary target
-        run: cargo check --manifest-path desktop/Cargo.toml -p hylki --bin hylki --target x86_64-pc-windows-msvc --locked
+        run: cargo check -p kitemail --bin kitemail --target x86_64-pc-windows-msvc --locked
 
       - name: Run unit tests
-        run: cargo test --manifest-path desktop/Cargo.toml --workspace --target x86_64-pc-windows-msvc --locked
+        run: cargo test --workspace --target x86_64-pc-windows-msvc --locked
 
   build-windows-x64:
     name: Build Windows x64
@@ -100,10 +104,10 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            desktop/target/
-          key: ${{ runner.os }}-desktop-cargo-release-v2-${{ hashFiles('desktop/Cargo.lock') }}
+            target/
+          key: ${{ runner.os }}-cargo-release-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-desktop-cargo-release-v2-
+            ${{ runner.os }}-cargo-release-v2-
 
       - name: Resolve version
         id: version
@@ -133,11 +137,11 @@ jobs:
         shell: pwsh
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
-          HYLKI_VERSION: ${{ steps.version.outputs.version }}
+          KITEMAIL_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $exe = 'desktop/target/x86_64-pc-windows-msvc/release/hylki.exe'
+          $exe = 'target/x86_64-pc-windows-msvc/release/kitemail.exe'
           Remove-Item -Force -ErrorAction SilentlyContinue $exe
-          cargo build --manifest-path desktop/Cargo.toml -p hylki --bin hylki --release --target x86_64-pc-windows-msvc --locked
+          cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path $exe)) { throw "Expected release binary was not produced: $exe" }
 
@@ -148,20 +152,20 @@ jobs:
           # VIProductVersion 只接受四段纯数字，去掉预发布后缀。
           $vi = ($version -split '-')[0] + '.0'
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          makensis /DVERSION=$version /DVI_VERSION=$vi .github/nsis/hylki.nsi
-          $setup = "dist/Hylki_${version}_x64-setup.exe"
+          makensis /DVERSION=$version /DVI_VERSION=$vi .github/nsis/kitemail.nsi
+          $setup = "dist/KiteMail_${version}_x64-setup.exe"
           if (-not (Test-Path $setup)) { throw "Installer was not produced: $setup" }
 
       - name: Package portable ZIP
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $stage = "dist/Hylki_v${version}_portable"
+          $stage = "dist/KiteMail_v${version}_portable"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/hylki.exe" $stage
+          Copy-Item "target/x86_64-pc-windows-msvc/release/kitemail.exe" $stage
           # 便携版标记：客户端据此选择 zip 就地更新，而不是运行安装包。
           New-Item -ItemType File -Path "$stage/portable.flag" | Out-Null
-          Compress-Archive -Path "$stage/*" -DestinationPath "dist/Hylki_v${version}_portable.zip" -Force
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/KiteMail_v${version}_portable.zip" -Force
 
       - name: Generate update manifest
         shell: pwsh
@@ -171,8 +175,8 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $tag = "${{ steps.version.outputs.tag }}"
           $base = "https://github.com/${{ github.repository }}/releases/download/$tag"
-          $setup = "Hylki_${version}_x64-setup.exe"
-          $portable = "Hylki_v${version}_portable.zip"
+          $setup = "KiteMail_${version}_x64-setup.exe"
+          $portable = "KiteMail_v${version}_portable.zip"
           $notes = ''
           if (Test-Path 'tools/release-notes.sh') {
             $notes = (bash tools/release-notes.sh $version 2>$null) -join "`n"
@@ -197,10 +201,10 @@ jobs:
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: hylki-windows-x64
+          name: kitemail-windows-x64
           path: |
-            dist/Hylki_*_x64-setup.exe
-            dist/Hylki_v*_portable.zip
+            dist/KiteMail_*_x64-setup.exe
+            dist/KiteMail_v*_portable.zip
             dist/latest.json
           if-no-files-found: error
 
@@ -215,7 +219,7 @@ jobs:
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
           version="${tag#v}"
-          assets=(dist/Hylki_*_x64-setup.exe dist/Hylki_v*_portable.zip dist/latest.json)
+          assets=(dist/KiteMail_*_x64-setup.exe dist/KiteMail_v*_portable.zip dist/latest.json)
           prerelease=()
           if [[ "$version" == *-beta.* ]]; then prerelease+=(--prerelease); fi
           if gh release view "$tag" >/dev/null 2>&1; then

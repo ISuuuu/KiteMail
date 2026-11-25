@@ -23,7 +23,7 @@
 **KiteMail** 是一个注重性能、隐私与桌面体验的原生 Windows 电子邮件客户端，不收集任何遥测或统计数据。
 
 > [!NOTE]
-> **项目独立与更名说明**：**KiteMail**（原 Hylki for Windows）最初派生自 Linux GNOME 邮件客户端 [hyprlab/hylki](https://github.com/hyprlab/hylki)，现已作为独立项目持续演进与维护。Windows 客户端源码位于 [`desktop/`](desktop/) 工作区，采用独立的软件架构与 `0.x` 版本体系，与上游 Linux `1.x` 版本相互独立。注：可执行文件（`hylki`）、数据目录与安装包命名将在下个版本同步迁移为 KiteMail。
+> **项目独立说明**：**KiteMail** 最初派生自 Linux GNOME 邮件客户端 [hyprlab/hylki](https://github.com/hyprlab/hylki)，现已作为独立原生 Windows 邮件客户端持续演进与维护。源码位于 [`crates/`](crates/) 工作区，采用独立的软件架构与 `0.x` 版本体系，与上游 Linux `1.x` 版本相互独立。
 
 ## 核心特性
 
@@ -36,10 +36,10 @@
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/ISuuuu/KiteMail/releases) 下载最新 Windows x64 构建产物（当前版本仍沿用 `Hylki` 包名，将在下个版本统一更名）：
+前往 [GitHub Releases](https://github.com/ISuuuu/KiteMail/releases) 下载最新 Windows x64 构建产物：
 
-- **安装版（`Hylki_<version>_x64-setup.exe`）**：NSIS 安装包，默认安装至 `%LOCALAPPDATA%\Hylki`，配置与本地数据存放于 `%LOCALAPPDATA%\Hylki\`，支持应用内静默更新。
-- **便携版（`Hylki_v<version>_portable.zip`）**：解压即用，内置 `portable.flag` 标记，配置与全局索引写入程序同级 `data\` 目录，支持应用内就地更新与自定义共享邮件目录。
+- **安装版（`KiteMail_<version>_x64-setup.exe`）**：NSIS 安装包，默认安装至 `%LOCALAPPDATA%\KiteMail`，配置与本地数据存放于 `%LOCALAPPDATA%\KiteMail\`，支持应用内静默更新。
+- **便携版（`KiteMail_v<version>_portable.zip`）**：解压即用，内置 `portable.flag` 标记，配置与全局索引写入程序同级 `data\` 目录，支持应用内就地更新与自定义共享邮件目录。
 
 如需在未配置真实账号时快速体验界面，可通过 `--demo` 参数启动演示模式。
 
@@ -58,22 +58,24 @@ git clone https://github.com/ISuuuu/KiteMail.git
 cd KiteMail
 
 # 代码检查与单元测试
-cargo check --manifest-path desktop/Cargo.toml --workspace --locked
-cargo test --manifest-path desktop/Cargo.toml --workspace --locked
+cargo check --workspace --locked
+cargo test --workspace --locked
 
 # 启动开发版
-cargo run --manifest-path desktop/Cargo.toml -p hylki --bin hylki
+cargo run -p kitemail --bin kitemail
 
 # 构建 Release 可执行文件
-cargo build --manifest-path desktop/Cargo.toml -p hylki --bin hylki --release --target x86_64-pc-windows-msvc --locked
+cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc --locked
 ```
 
 ## 仓库结构
 
-- [`desktop/`](desktop/)：Windows 客户端工作区（`hylki` 桌面端主程序与 `hylki-mail-core` 邮件核心库）
+- [`crates/`](crates/)：Rust 工作区源码（[`crates/app`](crates/app) `kitemail` 桌面端主程序与 [`crates/mail-core`](crates/mail-core) `kitemail-mail-core` 邮件核心库）
 - [`.github/`](.github/)：Windows x64 CI/CD 工作流与 NSIS 安装包脚本
+- [`data/`](data/)、[`resources/`](resources/)：应用图标、欢迎页字标、品牌/SVG 图标资源与贡献者名单
+- [`tools/release-notes.sh`](tools/release-notes.sh)：GitHub Release 说明生成脚本
+- [`docs/`](docs/)：第三方许可声明、上游致谢名单与安全策略
 - [`CHANGELOG.md`](CHANGELOG.md)：Windows 客户端更新日志与早期历史记录
-- [`src/`](src/)、[`docs/`](docs/)：早期上游 Linux (GTK 4 / libadwaita) 源码与参考文档
 
 ## 参与贡献与反馈
 

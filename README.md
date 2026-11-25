@@ -23,7 +23,7 @@
 **KiteMail** is a fast, privacy-focused native email client for Windows, built with Rust, GPUI (`gpui-kit`), and Microsoft Edge WebView2. It sends no telemetry or analytics.
 
 > [!NOTE]
-> **Project Independence & Rename**: **KiteMail** (formerly Hylki for Windows) originally started as a fork of the Linux GNOME email client [hyprlab/hylki](https://github.com/hyprlab/hylki) and is now developed and maintained as an independent project. The Windows client lives in [`desktop/`](desktop/) with its own architecture and `0.x` release cycle, independent from the upstream Linux `1.x` series. Package/binary names (`hylki`) and data directories are scheduled to migrate to KiteMail in the next release.
+> **Project Independence**: **KiteMail** (originally forked from the Linux GNOME email client [hyprlab/hylki](https://github.com/hyprlab/hylki)) is developed and maintained as an independent native Windows email client. It lives in [`crates/`](crates/) with its own architecture and `0.x` release cycle, independent from the upstream Linux `1.x` series.
 
 ## Features
 
@@ -36,12 +36,12 @@
 
 ## Installation
 
-Download the latest Windows x64 release from [GitHub Releases](https://github.com/ISuuuu/KiteMail/releases) (currently packaged under the `Hylki` name prior to the next release):
+Download the latest Windows x64 release from [GitHub Releases](https://github.com/ISuuuu/KiteMail/releases):
 
-- **Installer (`Hylki_<version>_x64-setup.exe`)**: NSIS installer targeting `%LOCALAPPDATA%\Hylki` by default. Configuration and local data are stored in `%LOCALAPPDATA%\Hylki\`, with silent in-app updates.
-- **Portable (`Hylki_v<version>_portable.zip`)**: Extract and run. Includes `portable.flag` so configuration and global state stay inside a sibling `data\` directory, with in-place updates and optional custom mail storage paths.
+- **Installer (`KiteMail_<version>_x64-setup.exe`)**: NSIS installer targeting `%LOCALAPPDATA%\KiteMail` by default. Configuration and local data are stored in `%LOCALAPPDATA%\KiteMail\`, with silent in-app updates.
+- **Portable (`KiteMail_v<version>_portable.zip`)**: Extract and run. Includes `portable.flag` so configuration and global state stay inside a sibling `data\` directory, with in-place updates and optional custom mail storage paths.
 
-To preview the UI without adding a real email account, launch the executable with `--demo`.
+To preview the UI without adding a real email account, launch `kitemail.exe` with `--demo`.
 
 ## Building from Source
 
@@ -58,22 +58,24 @@ git clone https://github.com/ISuuuu/KiteMail.git
 cd KiteMail
 
 # Check and run unit tests
-cargo check --manifest-path desktop/Cargo.toml --workspace --locked
-cargo test --manifest-path desktop/Cargo.toml --workspace --locked
+cargo check --workspace --locked
+cargo test --workspace --locked
 
 # Run in development mode
-cargo run --manifest-path desktop/Cargo.toml -p hylki --bin hylki
+cargo run -p kitemail --bin kitemail
 
 # Build release binary
-cargo build --manifest-path desktop/Cargo.toml -p hylki --bin hylki --release --target x86_64-pc-windows-msvc --locked
+cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc --locked
 ```
 
 ## Repository Layout
 
-- [`desktop/`](desktop/): Windows client workspace (`hylki` desktop app and `hylki-mail-core` library)
+- [`crates/`](crates/): Rust workspace crates ([`crates/app`](crates/app) `kitemail` desktop UI and [`crates/mail-core`](crates/mail-core) `kitemail-mail-core` library)
 - [`.github/`](.github/): Windows x64 CI/CD workflow and NSIS installer script
+- [`data/`](data/), [`resources/`](resources/): App icons, welcome wordmarks, brand/SVG assets, and contributor lists
+- [`tools/release-notes.sh`](tools/release-notes.sh): Release notes generator for GitHub Releases
+- [`docs/`](docs/): Licensing notices, upstream credits, and security policy
 - [`CHANGELOG.md`](CHANGELOG.md): Windows client release history and earlier upstream changelog
-- [`src/`](src/), [`docs/`](docs/): Legacy upstream Linux (GTK 4 / libadwaita) source and reference docs
 
 ## Contributing & Support
 
