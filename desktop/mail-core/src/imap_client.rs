@@ -7,6 +7,7 @@ use async_imap::imap_proto::types::{
     BodyContentCommon, BodyContentSinglePart, BodyParams, BodyStructure, ContentEncoding,
     SectionPath,
 };
+use async_imap::types::NameAttribute;
 use async_native_tls::TlsConnector;
 use futures::StreamExt;
 use mail_parser::{MessageParser, MimeHeaders};
@@ -275,22 +276,22 @@ pub async fn fetch_folders(
         .await
         .map_err(|e| format!("拉取文件夹列表失败: {e}"))?;
 
-    let mut folders = Vec::new();
+    let mut raw_entries = Vec::new();
     while let Some(item) = stream.next().await {
         if let Ok(name) = item {
-            let path = name.name().to_string();
-            let display = friendly_folder_name(&path);
-            folders.push(RemoteFolder {
-                name: display,
-                path,
-                unread_count: 0,
-                total_count: 0,
+            let (no_select, special_role) = classify_imap_attributes(name.attributes());
+            raw_entries.push(RawImapFolderEntry {
+                path: name.name().to_string(),
+                delimiter: name.delimiter().map(str::to_string),
+                no_select,
+                special_role,
             });
         }
     }
     drop(stream);
     let _ = session.logout().await;
 
+    let mut folders = resolve_imap_folders(&raw_entries);
     if folders.is_empty() {
         folders.push(RemoteFolder {
             name: "收件箱".to_string(),
@@ -2169,16 +2170,209 @@ fn format_address(addr: &mail_parser::Addr<'_>) -> String {
     }
 }
 
-fn friendly_folder_name(path: &str) -> String {
-    match path.to_ascii_uppercase().as_str() {
-        "INBOX" => "收件箱".to_string(),
-        "SENT" | "SENT MESSAGES" | "SENT ITEMS" => "已发送".to_string(),
-        "DRAFTS" => "草稿箱".to_string(),
-        "TRASH" | "DELETED" | "DELETED MESSAGES" => "已删除".to_string(),
-        "JUNK" | "SPAM" => "垃圾邮件".to_string(),
-        "ARCHIVE" => "归档".to_string(),
-        _ => path.to_string(),
+const IMAP_MUTF7_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::IMAP_MUTF7,
+    base64::engine::general_purpose::NO_PAD
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone),
+);
+
+fn decode_imap_mutf7_run(run: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = IMAP_MUTF7_BASE64
+        .decode(run)
+        .ok()
+        .filter(|b| !b.is_empty() && b.len() % 2 == 0)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|p| u16::from_be_bytes([p[0], p[1]]))
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
+/// Decode IMAP Modified UTF-7 (RFC 3501 §5.1.3) mailbox names for display.
+/// Invalid or already-UTF-8 sequences are passed through unchanged.
+pub(crate) fn decode_imap_mutf7(name: &str) -> String {
+    if !name.contains('&') {
+        return name.to_string();
     }
+
+    let bytes = name.as_bytes();
+    let mut out = String::with_capacity(name.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            let rest = &name[i..];
+            let ch = rest.chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'-') {
+            out.push('&');
+            i += 2;
+            continue;
+        }
+        match bytes[i + 1..].iter().position(|&b| b == b'-') {
+            Some(end) => {
+                let run = &name[i + 1..i + 1 + end];
+                match decode_imap_mutf7_run(run) {
+                    Some(text) => {
+                        out.push_str(&text);
+                        i += end + 2;
+                    }
+                    None => {
+                        out.push('&');
+                        i += 1;
+                    }
+                }
+            }
+            None => {
+                out.push('&');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ImapSpecialRole {
+    Inbox,
+    Sent,
+    Drafts,
+    Trash,
+    Junk,
+    Archive,
+}
+
+impl ImapSpecialRole {
+    fn friendly_name(self) -> &'static str {
+        match self {
+            Self::Inbox => "收件箱",
+            Self::Sent => "已发送",
+            Self::Drafts => "草稿箱",
+            Self::Trash => "已删除",
+            Self::Junk => "垃圾邮件",
+            Self::Archive => "归档",
+        }
+    }
+
+    fn from_leaf_name(leaf: &str) -> Option<Self> {
+        match leaf.trim().to_ascii_lowercase().as_str() {
+            "sent" | "sent messages" | "sent items" | "sent mail" | "已发送" | "已发邮件" => {
+                Some(Self::Sent)
+            }
+            "drafts" | "draft" | "草稿" | "草稿箱" => Some(Self::Drafts),
+            "trash" | "deleted" | "deleted messages" | "deleted items" | "bin" | "已删除"
+            | "已删除邮件" | "废纸篓" => Some(Self::Trash),
+            "junk" | "junk email" | "spam" | "垃圾邮件" => Some(Self::Junk),
+            "archive" | "归档" | "存档" => Some(Self::Archive),
+            _ => None,
+        }
+    }
+}
+
+struct RawImapFolderEntry {
+    path: String,
+    delimiter: Option<String>,
+    no_select: bool,
+    special_role: Option<ImapSpecialRole>,
+}
+
+fn classify_imap_attributes(attrs: &[NameAttribute<'_>]) -> (bool, Option<ImapSpecialRole>) {
+    let mut no_select = false;
+    let mut special_role = None;
+    for attr in attrs {
+        match attr {
+            NameAttribute::NoSelect => no_select = true,
+            NameAttribute::Extension(s) => {
+                let lower = s.trim().to_ascii_lowercase();
+                if lower == "\\noselect" || lower == "noselect" {
+                    no_select = true;
+                }
+            }
+            NameAttribute::Sent if special_role.is_none() => {
+                special_role = Some(ImapSpecialRole::Sent);
+            }
+            NameAttribute::Drafts if special_role.is_none() => {
+                special_role = Some(ImapSpecialRole::Drafts);
+            }
+            NameAttribute::Trash if special_role.is_none() => {
+                special_role = Some(ImapSpecialRole::Trash);
+            }
+            NameAttribute::Junk if special_role.is_none() => {
+                special_role = Some(ImapSpecialRole::Junk);
+            }
+            NameAttribute::Archive if special_role.is_none() => {
+                special_role = Some(ImapSpecialRole::Archive);
+            }
+            _ => {}
+        }
+    }
+    (no_select, special_role)
+}
+
+fn is_role_placement(path: &str, delimiter: Option<&str>) -> bool {
+    let parts: Vec<&str> = match delimiter.filter(|d| !d.is_empty()) {
+        Some(d) => path.split(d).collect(),
+        None => vec![path],
+    };
+    match parts.as_slice() {
+        [_] => true,
+        [parent, _] => parent.eq_ignore_ascii_case("INBOX") || parent.starts_with('['),
+        _ => false,
+    }
+}
+
+fn resolve_imap_folders(entries: &[RawImapFolderEntry]) -> Vec<RemoteFolder> {
+    let mut present_special_roles = HashSet::new();
+    for entry in entries {
+        if entry.no_select {
+            continue;
+        }
+        if entry.path.eq_ignore_ascii_case("INBOX") {
+            present_special_roles.insert(ImapSpecialRole::Inbox);
+        } else if let Some(role) = entry.special_role {
+            present_special_roles.insert(role);
+        }
+    }
+
+    let mut folders = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.no_select {
+            continue;
+        }
+        let delim = entry.delimiter.as_deref().filter(|d| !d.is_empty());
+        let leaf_raw = match delim {
+            Some(d) => entry.path.rsplit(d).next().unwrap_or(&entry.path),
+            None => entry.path.as_str(),
+        };
+        let decoded_leaf = decode_imap_mutf7(leaf_raw);
+        let display = if entry.path.eq_ignore_ascii_case("INBOX") {
+            ImapSpecialRole::Inbox.friendly_name().to_string()
+        } else if let Some(role) = entry.special_role {
+            role.friendly_name().to_string()
+        } else if is_role_placement(&entry.path, delim) {
+            match ImapSpecialRole::from_leaf_name(&decoded_leaf) {
+                Some(candidate) if !present_special_roles.contains(&candidate) => {
+                    candidate.friendly_name().to_string()
+                }
+                _ if !decoded_leaf.is_empty() => decoded_leaf,
+                _ => entry.path.clone(),
+            }
+        } else if !decoded_leaf.is_empty() {
+            decoded_leaf
+        } else {
+            entry.path.clone()
+        };
+        folders.push(RemoteFolder {
+            name: display,
+            path: entry.path.clone(),
+            unread_count: 0,
+            total_count: 0,
+        });
+    }
+    folders
 }
 
 /// Convert HTML-only messages into readable plain text while stripping scripts/styles.
@@ -3226,5 +3420,189 @@ mod tests {
             false,
         );
         assert_eq!(decoded_text.as_deref(), Some("你好 MIME 正文"));
+    }
+
+    #[test]
+    fn decode_imap_mutf7_decodes_gmail_chinese_labels_and_passes_invalid() {
+        assert_eq!(decode_imap_mutf7("&g0l6Pw-"), "草稿");
+        assert_eq!(decode_imap_mutf7("&kc2JgQ-"), "重要");
+        assert_eq!(decode_imap_mutf7("&XfJSoGYfaAc-"), "已加星标");
+        assert_eq!(decode_imap_mutf7("&V4NXPpCuTvY-"), "垃圾邮件");
+        assert_eq!(decode_imap_mutf7("&XfJSIJZkkK5O9g-"), "已删除邮件");
+        assert_eq!(decode_imap_mutf7("&YkBnCZCuTvY-"), "所有邮件");
+        assert_eq!(decode_imap_mutf7("R&-D"), "R&D");
+        assert_eq!(decode_imap_mutf7("&2D3eQg-"), "🙂");
+        assert_eq!(decode_imap_mutf7("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(decode_imap_mutf7("&!!!-"), "&!!!-");
+        assert_eq!(decode_imap_mutf7("&"), "&");
+        assert_eq!(decode_imap_mutf7("已加星标"), "已加星标");
+    }
+
+    #[test]
+    fn resolve_imap_folders_filters_noselect_maps_special_use_and_decodes_leaves() {
+        let (no_select, role) = classify_imap_attributes(&[
+            NameAttribute::Extension("\\HasChildren".into()),
+            NameAttribute::Extension("\\Noselect".into()),
+        ]);
+        assert!(no_select);
+        assert_eq!(role, None);
+
+        let entries = vec![
+            RawImapFolderEntry {
+                path: "INBOX".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: None,
+            },
+            RawImapFolderEntry {
+                path: "[Gmail]".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: classify_imap_attributes(&[
+                    NameAttribute::NoSelect,
+                    NameAttribute::Extension("\\HasChildren".into()),
+                ])
+                .0,
+                special_role: None,
+            },
+            RawImapFolderEntry {
+                path: "[Gmail]/&g0l6Pw-".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: classify_imap_attributes(&[NameAttribute::Drafts]).1,
+            },
+            RawImapFolderEntry {
+                path: "[Gmail]/&XfJT0ZABkK5O9g-".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: classify_imap_attributes(&[NameAttribute::Sent]).1,
+            },
+            RawImapFolderEntry {
+                path: "[Gmail]/&XfJSIJZkkK5O9g-".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: classify_imap_attributes(&[NameAttribute::Trash]).1,
+            },
+            RawImapFolderEntry {
+                path: "[Gmail]/&V4NXPpCuTvY-".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: classify_imap_attributes(&[NameAttribute::Junk]).1,
+            },
+            RawImapFolderEntry {
+                path: "[Gmail]/&XfJSoGYfaAc-".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: classify_imap_attributes(&[NameAttribute::Flagged]).1,
+            },
+            RawImapFolderEntry {
+                path: "[Gmail]/&kc2JgQ-".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: classify_imap_attributes(&[NameAttribute::Extension(
+                    "\\Important".into(),
+                )])
+                .1,
+            },
+            RawImapFolderEntry {
+                path: "[Gmail]/&YkBnCZCuTvY-".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: classify_imap_attributes(&[NameAttribute::All]).1,
+            },
+            // 同名顶层自定义标签不应在已有真实 \Trash 时冒充 "已删除"。
+            RawImapFolderEntry {
+                path: "Trash".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: None,
+            },
+            // 多级中文自定义目录保留完整 MUTF-7 路径，显示名取解码后叶子段。
+            RawImapFolderEntry {
+                path: "&XeVPXA-".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: None,
+            },
+            RawImapFolderEntry {
+                path: "&XeVPXA-/&mHl27g-A".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: None,
+            },
+        ];
+
+        let got = resolve_imap_folders(&entries);
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|f| (f.path.as_str(), f.name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("INBOX", "收件箱"),
+                ("[Gmail]/&g0l6Pw-", "草稿箱"),
+                ("[Gmail]/&XfJT0ZABkK5O9g-", "已发送"),
+                ("[Gmail]/&XfJSIJZkkK5O9g-", "已删除"),
+                ("[Gmail]/&V4NXPpCuTvY-", "垃圾邮件"),
+                ("[Gmail]/&XfJSoGYfaAc-", "已加星标"),
+                ("[Gmail]/&kc2JgQ-", "重要"),
+                ("[Gmail]/&YkBnCZCuTvY-", "所有邮件"),
+                ("Trash", "Trash"),
+                ("&XeVPXA-", "工作"),
+                ("&XeVPXA-/&mHl27g-A", "项目A"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_imap_folders_falls_back_by_leaf_name_without_special_use() {
+        let entries = vec![
+            RawImapFolderEntry {
+                path: "INBOX".to_string(),
+                delimiter: Some(".".to_string()),
+                no_select: false,
+                special_role: None,
+            },
+            RawImapFolderEntry {
+                path: "INBOX.Sent".to_string(),
+                delimiter: Some(".".to_string()),
+                no_select: false,
+                special_role: None,
+            },
+            RawImapFolderEntry {
+                path: "Archive".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: None,
+            },
+            RawImapFolderEntry {
+                path: "Archive/2020/Sent".to_string(),
+                delimiter: Some("/".to_string()),
+                no_select: false,
+                special_role: None,
+            },
+            RawImapFolderEntry {
+                path: "Sent Messages".to_string(),
+                delimiter: None,
+                no_select: false,
+                special_role: None,
+            },
+        ];
+
+        let got = resolve_imap_folders(&entries);
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|f| (f.path.as_str(), f.name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("INBOX", "收件箱"),
+                ("INBOX.Sent", "已发送"),
+                ("Archive", "归档"),
+                ("Archive/2020/Sent", "Sent"),
+                ("Sent Messages", "已发送"),
+            ]
+        );
     }
 }

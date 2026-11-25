@@ -4058,6 +4058,14 @@ fn is_graph_not_found_error(err: &str) -> bool {
     err.contains("HTTP 404")
 }
 
+fn is_imap_nonexistent_mailbox_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("[nonexistent]")
+        || lower.contains("unknown mailbox")
+        || lower.contains("mailbox doesn't exist")
+        || lower.contains("mailbox does not exist")
+}
+
 async fn sync_folder_inner(
     cache: &mut CacheStore,
     tokens: &SharedTokenCache,
@@ -4178,6 +4186,33 @@ async fn sync_folder_inner(
                                 let _ = cache.set_folder_remote_cursor(folder_id, has_more, "");
                             }
                             commit_res
+                        }
+                        Err(e) if is_imap_nonexistent_mailbox_error(&e) => {
+                            if let Ok(remote_list) =
+                                imap_client::fetch_folders(account, &sec.imap_password).await
+                            {
+                                if !remote_list.is_empty()
+                                    && !remote_list.iter().any(|f| f.path == folder_path)
+                                {
+                                    if let Ok(updated_folders) =
+                                        cache.sync_folders(account.id, &remote_list)
+                                    {
+                                        let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                                            account_id: account.id,
+                                            folders: updated_folders,
+                                        });
+                                        let _ = evt_tx.send(WorkerEvent::Status {
+                                            account_id: Some(account.id),
+                                            text: format!(
+                                                "[{}] 该文件夹已在服务器删除或不可打开，已从本地列表移除",
+                                                account.email
+                                            ),
+                                        });
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e)
                         }
                         Err(e) => Err(e),
                     }
@@ -5901,5 +5936,22 @@ mod tests {
         assert!(!is_graph_not_found_error("Graph API 错误 (HTTP 500): ..."));
         assert!(!is_graph_not_found_error("Graph API 错误 (HTTP 401): ..."));
         assert!(!is_graph_not_found_error("Graph API 网络错误: timeout"));
+    }
+
+    #[test]
+    fn imap_nonexistent_mailbox_detector_matches_only_missing_mailbox() {
+        assert!(is_imap_nonexistent_mailbox_error(
+            "打开文件夹 [Gmail] 失败: no response: code: None, info: Some(\"[NONEXISTENT] Unknown Mailbox: [Gmail] (Failure)\")"
+        ));
+        assert!(is_imap_nonexistent_mailbox_error(
+            "打开文件夹 Archive 失败: Mailbox doesn't exist: Archive"
+        ));
+        assert!(is_imap_nonexistent_mailbox_error(
+            "打开文件夹 Old 失败: Mailbox does not exist"
+        ));
+        assert!(!is_imap_nonexistent_mailbox_error("同步文件夹超时"));
+        assert!(!is_imap_nonexistent_mailbox_error(
+            "IMAP 登录失败（请检查用户名或授权码）: Invalid credentials"
+        ));
     }
 }
