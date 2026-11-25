@@ -935,6 +935,8 @@ pub(crate) struct HylkiApp {
     pub(crate) show_accounts: bool,
     /// 待二次确认的「清空文件夹」目标 `(account_id, folder_id, folder_path, 显示名)`。
     pub(crate) pending_empty_folder: Option<(u32, u32, String, String)>,
+    /// 待二次确认的「移除账号」目标 `(account_id, 显示名)`。
+    pub(crate) pending_remove_account: Option<(u32, String)>,
     /// 阅读器是否强制以纯文本渲染（false = 有 HTML 时渲染富文本）。
     pub(crate) reader_prefer_plain: bool,
     /// 本次会话中用户手动放行远程图片的邮件 ID 集合。
@@ -1444,6 +1446,7 @@ impl HylkiApp {
                 collapsed_accounts: HashSet::new(),
                 show_accounts: initial_show_accounts,
                 pending_empty_folder: None,
+                pending_remove_account: None,
                 reader_prefer_plain: initial_reader_prefer_plain,
                 allowed_remote_image_ids: HashSet::new(),
                 collapsed_thread_cards: initial_collapsed,
@@ -1696,6 +1699,7 @@ impl HylkiApp {
             collapsed_accounts: HashSet::new(),
             show_accounts: initial_show_accounts,
             pending_empty_folder: None,
+            pending_remove_account: None,
             reader_prefer_plain: initial_reader_prefer_plain,
             allowed_remote_image_ids: HashSet::new(),
             collapsed_thread_cards: HashSet::new(),
@@ -1850,6 +1854,13 @@ impl HylkiApp {
                     self.folders_by_account.remove(&account_id);
                     self.outbox_by_account.remove(&account_id);
                     self.last_unread_by_account.remove(&account_id);
+                    if self
+                        .pending_remove_account
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == account_id)
+                    {
+                        self.pending_remove_account = None;
+                    }
                     folders_updated = true;
                     self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                     self.current_view = CurrentView::UnifiedInbox;
@@ -8274,6 +8285,25 @@ impl HylkiApp {
 
     // ---- 阶段二：文件夹右键动作（对齐原版 sidebar/menus.rs 的 folder_menu_items）----
 
+    /// 右键「刷新此账号」：独立同步指定账号的文件夹与邮件（demo 模式禁用）。
+    pub(crate) fn sync_account(&mut self, account_id: u32, cx: &mut Context<Self>) {
+        if self.demo_mode {
+            return;
+        }
+        let label = self
+            .accounts
+            .iter()
+            .find(|a| a.id == account_id)
+            .map(|a| a.display_label())
+            .unwrap_or_else(|| format!("账号 #{account_id}"));
+        if let Some(ref w) = self.worker {
+            self.error_banner = None;
+            self.status_line = SharedString::from(format!("正在刷新 {label}..."));
+            w.send(MailRequest::SyncAccount { account_id });
+        }
+        cx.notify();
+    }
+
     /// 右键「刷新此文件夹」：复用现有 `MailRequest::SyncFolder`（demo 模式禁用）。
     pub(crate) fn refresh_folder(
         &mut self,
@@ -8410,6 +8440,33 @@ impl HylkiApp {
             });
         }
         cx.notify();
+    }
+
+    /// 右键账号「移除账号…」：进入二次确认（demo 模式禁用）。
+    pub(crate) fn request_remove_account(
+        &mut self,
+        account_id: u32,
+        account_label: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.demo_mode {
+            return;
+        }
+        self.pending_remove_account = Some((account_id, account_label));
+        cx.notify();
+    }
+
+    /// 取消「移除账号」确认。
+    pub(crate) fn cancel_remove_account(&mut self, cx: &mut Context<Self>) {
+        self.pending_remove_account = None;
+        cx.notify();
+    }
+
+    /// 确认移除账号：调用 `delete_account` 清理配置、缓存与凭据。
+    pub(crate) fn confirm_remove_account(&mut self, cx: &mut Context<Self>) {
+        if let Some((account_id, _)) = self.pending_remove_account.take() {
+            self.delete_account(account_id, cx);
+        }
     }
 
     // ---- 阶段 3：全局路由、偏好、命令面板、快捷键（方案文档第五节）----
@@ -10478,6 +10535,55 @@ impl Render for HylkiApp {
                         ),
                 )
             })
+            // 「移除账号」二次确认条（侧栏账号右键触发，Esc 取消）。
+            .when_some(self.pending_remove_account.as_ref(), |el, pending| {
+                let (_, label) = pending.clone();
+                el.child(
+                    h_flex()
+                        .px_3()
+                        .py_1p5()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .bg(p.danger.opacity(0.12))
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .text_color(p.danger)
+                                .truncate()
+                                .child(SharedString::from(format!(
+                                    "确认移除账号「{label}」？将删除本地邮件缓存、配置与凭据管理器中的密钥，不影响服务器上的邮件。"
+                                ))),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .flex_shrink_0()
+                                .items_center()
+                                .child(
+                                    Button::new("remove-account-confirm")
+                                        .danger()
+                                        .compact()
+                                        .label("确认移除")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_remove_account(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("remove-account-cancel")
+                                        .outline()
+                                        .compact()
+                                        .label("取消")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_remove_account(cx);
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .child(body)
             // P3：窄窗口浮层侧栏（对齐 Linux sidebar_peek：完整侧栏从窄轨右缘
             // 滑出、盖在中栏列表 / 阅读器之上；导航选择后由各入口自动关闭）。
@@ -10932,6 +11038,8 @@ impl Render for HylkiApp {
                     this.close_modal(cx);
                 } else if this.pending_empty_folder.is_some() {
                     this.cancel_empty_folder(cx);
+                } else if this.pending_remove_account.is_some() {
+                    this.cancel_remove_account(cx);
                 } else if this.main_view == MainContentView::Mail
                     && this.right_mode == RightPaneMode::Compose
                 {

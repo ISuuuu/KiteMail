@@ -11,9 +11,9 @@
 //!   旋转小箭头，点击展开各账号对应文件夹的子行（账号彩色圆点 + 未读数）。
 //! - 收藏分区（WP-07 Favorites）：收藏的文件夹列表，右键「收藏」添加。
 //! - 账号折叠分组：彩色头像（角上未读小蓝圈）+ 账号名 + 邮箱小字 +
-//!   右侧单账号刷新按钮 + 折叠箭头；展开先列标准角色文件夹，随后直接平级
-//!   列出自定义文件夹并按 IMAP 分隔符构建多级树（WP-07），每行带完整右键
-//!   菜单。
+//!   折叠箭头（刷新 / 设置 / 新建文件夹 / 移除账号等操作收口至账号右键菜单，
+//!   对齐 Linux 版）；展开先列标准角色文件夹，随后直接平级列出自定义文件夹
+//!   并按 IMAP 分隔符构建多级树（WP-07），每行带完整右键菜单。
 //! - 底部固定区：联系人、附件入口。
 
 use std::collections::HashSet;
@@ -1518,7 +1518,136 @@ fn account_folder_row(
         })
 }
 
-/// 账号折叠分组（头像 + 名称 + 邮箱 + 单账号刷新 + 折叠箭头 + 文件夹列表）。
+/// 账号头右键菜单规格（由账号配置与文件夹状态派生，便于单测）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccountContextMenuSpec {
+    account_id: u32,
+    account_label: String,
+    inbox_target: Option<(u32, String)>,
+    delimiter: char,
+    is_graph: bool,
+    hidden_count: usize,
+    demo_mode: bool,
+}
+
+/// 生成账号右键菜单所需的纯逻辑规格（对齐 Linux `attach_account_menu`）。
+fn account_context_menu_spec(
+    acc: &AccountConfig,
+    folders: &[FolderSummary],
+    special_roles: &[SidebarFolderRole],
+    hidden_folders: &[SidebarFolderRef],
+    demo_mode: bool,
+) -> AccountContextMenuSpec {
+    let paths: Vec<&str> = folders.iter().map(|f| f.path.as_str()).collect();
+    let inbox_target = unified_subrow_folder(FolderRole::Inbox, acc.id, folders, special_roles)
+        .map(|f| (f.id, f.path));
+    let delimiter = detect_delimiter(&paths).unwrap_or('/');
+    let is_graph = acc.auth_backend == AuthBackend::MicrosoftGraphOAuth2;
+    let hidden_count = hidden_folders
+        .iter()
+        .filter(|h| h.account_id == acc.id)
+        .count();
+    AccountContextMenuSpec {
+        account_id: acc.id,
+        account_label: acc.display_label(),
+        inbox_target,
+        delimiter,
+        is_graph,
+        hidden_count,
+        demo_mode,
+    }
+}
+
+/// 构造账号右键菜单（宽栏账号头与折叠窄轨头像共用）。
+fn account_context_menu(
+    menu: PopupMenu,
+    app_entity: Entity<HylkiApp>,
+    spec: AccountContextMenuSpec,
+) -> PopupMenu {
+    let acc_id = spec.account_id;
+    if spec.demo_mode {
+        let mut menu = menu;
+        if spec.inbox_target.is_some() {
+            menu = menu.item(PopupMenuItem::new("收件箱全部标为已读").disabled(true));
+        }
+        return menu
+            .item(PopupMenuItem::new("刷新此账号").disabled(true))
+            .separator()
+            .item(PopupMenuItem::new("账号设置…").disabled(true))
+            .item(PopupMenuItem::new("移除账号…").disabled(true));
+    }
+
+    let mut menu = menu;
+    if let Some((inbox_id, inbox_path)) = spec.inbox_target.clone() {
+        let e_read = app_entity.clone();
+        menu = menu.item(
+            PopupMenuItem::new("收件箱全部标为已读").on_click(move |_, _, cx| {
+                let path = inbox_path.clone();
+                e_read.update(cx, |this, cx| {
+                    this.mark_folder_all_read(acc_id, inbox_id, path, cx);
+                });
+            }),
+        );
+    }
+    let e_sync = app_entity.clone();
+    let e_new = app_entity.clone();
+    let e_cfg = app_entity.clone();
+    let e_remove = app_entity.clone();
+    let delimiter = spec.delimiter;
+    let label_for_remove = spec.account_label.clone();
+
+    menu = menu
+        .item(PopupMenuItem::new("刷新此账号").on_click(move |_, _, cx| {
+            e_sync.update(cx, |this, cx| {
+                this.sync_account(acc_id, cx);
+            });
+        }))
+        .item(
+            PopupMenuItem::new("新建文件夹…")
+                .disabled(spec.is_graph)
+                .on_click(move |_, window, cx| {
+                    e_new.update(cx, |this, cx| {
+                        if this.auto_rail_active {
+                            this.sidebar_peek_open = true;
+                        } else if this.sidebar_hidden {
+                            this.sidebar_hidden = false;
+                        }
+                        this.begin_create_subfolder(acc_id, String::new(), delimiter, window, cx);
+                    });
+                }),
+        );
+    if spec.hidden_count > 0 {
+        let e_unhide = app_entity.clone();
+        menu = menu.item(
+            PopupMenuItem::new(format!("显示全部隐藏文件夹 ({})", spec.hidden_count)).on_click(
+                move |_, _, cx| {
+                    e_unhide.update(cx, |this, cx| {
+                        this.mutate_preferences(cx, |prefs| {
+                            prefs
+                                .sidebar_hidden_folders
+                                .retain(|h| h.account_id != acc_id);
+                        });
+                    });
+                },
+            ),
+        );
+    }
+    menu.separator()
+        .item(PopupMenuItem::new("账号设置…").on_click(move |_, _, cx| {
+            e_cfg.update(cx, |this, cx| {
+                let cfg = this.accounts.iter().find(|a| a.id == acc_id).cloned();
+                this.open_settings_edit_account(cfg, cx);
+            });
+        }))
+        .item(PopupMenuItem::new("移除账号…").on_click(move |_, _, cx| {
+            let label = label_for_remove.clone();
+            e_remove.update(cx, |this, cx| {
+                this.request_remove_account(acc_id, label, cx);
+            });
+        }))
+}
+
+/// 账号折叠分组（头像 + 名称 + 邮箱 + 折叠箭头 + 文件夹列表；操作项在右键菜单）。
 fn account_section(
     app: &HylkiApp,
     acc: &AccountConfig,
@@ -1542,13 +1671,13 @@ fn account_section(
         .filter(|f| f.path.eq_ignore_ascii_case("INBOX") || f.name.contains("收件箱"))
         .map(|f| f.unread_count)
         .sum();
-    let demo_mode = app.demo_mode;
-    let hidden_count = app
-        .prefs
-        .sidebar_hidden_folders
-        .iter()
-        .filter(|h| h.account_id == acc_id)
-        .count();
+    let menu_spec = account_context_menu_spec(
+        acc,
+        folders,
+        &app.prefs.sidebar_special_roles,
+        &app.prefs.sidebar_hidden_folders,
+        app.demo_mode,
+    );
     let acc_menu_entity = cx.entity();
 
     v_flex()
@@ -1557,7 +1686,8 @@ fn account_section(
             h_flex()
                 .id(("acc-header", acc_id))
                 .h(px(40.0))
-                .px_1()
+                .pl_1()
+                .pr_2()
                 .gap_2()
                 .items_center()
                 .rounded(px(8.0))
@@ -1597,32 +1727,6 @@ fn account_section(
                             )
                         }),
                 )
-                .when(!demo_mode, |row| {
-                    row.child(
-                        Button::new(("sync-acc", acc_id))
-                            .ghost()
-                            .compact()
-                            .icon(IconName::RefreshCw)
-                            .tooltip("刷新此账号")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(ref w) = this.worker {
-                                    w.send(MailRequest::SyncAccount { account_id: acc_id });
-                                    cx.notify();
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new(("cfg-acc", acc_id))
-                            .ghost()
-                            .compact()
-                            .icon(IconName::Settings)
-                            .tooltip("账号设置")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let cfg = this.accounts.iter().find(|a| a.id == acc_id).cloned();
-                                this.open_settings_edit_account(cfg, cx);
-                            })),
-                    )
-                })
                 .child(
                     Icon::new(if expanded {
                         IconName::ChevronDown
@@ -1633,22 +1737,7 @@ fn account_section(
                     .text_color(muted_fg),
                 )
                 .context_menu(move |menu, _, _| {
-                    let entity = acc_menu_entity.clone();
-                    if hidden_count == 0 || demo_mode {
-                        return menu;
-                    }
-                    menu.item(
-                        PopupMenuItem::new(format!("显示全部隐藏文件夹 ({hidden_count})"))
-                            .on_click(move |_, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.mutate_preferences(cx, |prefs| {
-                                        prefs
-                                            .sidebar_hidden_folders
-                                            .retain(|h| h.account_id != acc_id);
-                                    });
-                                });
-                            }),
-                    )
+                    account_context_menu(menu, acc_menu_entity.clone(), menu_spec.clone())
                 }),
         )
         .when(expanded, |section| {
@@ -2606,20 +2695,26 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
                     .gap_1()
                     .children(app.accounts.iter().filter(|acc| acc.enabled).map(|acc| {
                         let acc_id = acc.id;
-                        let account_unread: u32 = app
+                        let empty_folders: Vec<FolderSummary> = Vec::new();
+                        let acc_folders = app
                             .folders_by_account
                             .get(&acc.id)
-                            .map(|folders| {
-                                folders
-                                    .iter()
-                                    .filter(|f| {
-                                        f.path.eq_ignore_ascii_case("INBOX")
-                                            || f.name.contains("收件箱")
-                                    })
-                                    .map(|f| f.unread_count)
-                                    .sum()
+                            .unwrap_or(&empty_folders);
+                        let account_unread: u32 = acc_folders
+                            .iter()
+                            .filter(|f| {
+                                f.path.eq_ignore_ascii_case("INBOX") || f.name.contains("收件箱")
                             })
-                            .unwrap_or(0);
+                            .map(|f| f.unread_count)
+                            .sum();
+                        let menu_spec = account_context_menu_spec(
+                            acc,
+                            acc_folders,
+                            &app.prefs.sidebar_special_roles,
+                            &app.prefs.sidebar_hidden_folders,
+                            demo_mode,
+                        );
+                        let rail_menu_entity = cx.entity();
                         div()
                             .id(("rail-acc", acc_id))
                             .relative()
@@ -2659,6 +2754,13 @@ pub(crate) fn render_collapsed(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> gp
                                         .bg(accent)
                                         .border_1()
                                         .border_color(sidebar_bg),
+                                )
+                            })
+                            .context_menu(move |menu, _, _| {
+                                account_context_menu(
+                                    menu,
+                                    rail_menu_entity.clone(),
+                                    menu_spec.clone(),
                                 )
                             })
                     })),
@@ -2898,5 +3000,63 @@ mod tests {
                 "depth={depth} 时带折叠箭头与普通文件夹行的图标左起点必须对齐"
             );
         }
+    }
+
+    #[test]
+    fn account_context_menu_spec_covers_imap_special_role_graph_and_demo() {
+        let mut imap_acc = AccountConfig {
+            id: 7,
+            email: "work@example.com".to_string(),
+            label: Some("工作邮箱".to_string()),
+            ..Default::default()
+        };
+        let folders = vec![
+            folder(10, "收件箱", "INBOX"),
+            folder(11, "Projects", "INBOX.Projects"),
+        ];
+        let hidden = vec![
+            SidebarFolderRef {
+                account_id: 7,
+                path: "INBOX.Projects".to_string(),
+            },
+            SidebarFolderRef {
+                account_id: 99,
+                path: "Other".to_string(),
+            },
+        ];
+        let spec = account_context_menu_spec(&imap_acc, &folders, &[], &hidden, false);
+        assert_eq!(spec.account_id, 7);
+        assert_eq!(spec.account_label, "工作邮箱");
+        assert_eq!(spec.inbox_target, Some((10, "INBOX".to_string())));
+        assert_eq!(spec.delimiter, '.');
+        assert!(!spec.is_graph);
+        assert_eq!(spec.hidden_count, 1);
+        assert!(!spec.demo_mode);
+
+        // 通过 sidebar_special_roles 手动指定收件箱时优先匹配指定角色文件夹。
+        let custom_folders = vec![folder(20, "Mail", "CustomMail")];
+        let special_roles = vec![SidebarFolderRole {
+            account_id: 7,
+            path: "CustomMail".to_string(),
+            role: "inbox".to_string(),
+        }];
+        let assigned_spec =
+            account_context_menu_spec(&imap_acc, &custom_folders, &special_roles, &[], false);
+        assert_eq!(
+            assigned_spec.inbox_target,
+            Some((20, "CustomMail".to_string()))
+        );
+        assert_eq!(assigned_spec.delimiter, '/');
+
+        // 尚未同步出文件夹时 inbox_target 为 None，默认分隔符为 '/'。
+        let empty_spec = account_context_menu_spec(&imap_acc, &[], &[], &[], false);
+        assert_eq!(empty_spec.inbox_target, None);
+        assert_eq!(empty_spec.delimiter, '/');
+
+        // Microsoft Graph OAuth 账号禁用新建文件夹；demo 模式标记 demo_mode。
+        imap_acc.auth_backend = AuthBackend::MicrosoftGraphOAuth2;
+        let graph_spec = account_context_menu_spec(&imap_acc, &folders, &[], &[], true);
+        assert!(graph_spec.is_graph);
+        assert!(graph_spec.demo_mode);
     }
 }
