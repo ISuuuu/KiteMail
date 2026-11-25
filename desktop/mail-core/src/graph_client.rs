@@ -807,8 +807,27 @@ pub fn send_message(
         }));
     }
 
+    // 正文里的 data: 图片提升成 cid: 内联附件；Graph 用 contentId + isInline
+    // 把附件标成内联，否则收件端只会看到红叉。
+    let (body_html, inline_images) = match body_html {
+        Some(html) => {
+            let (html, images) = crate::inline::extract_data_images(html);
+            (Some(html), images)
+        }
+        None => (None, Vec::new()),
+    };
+    for image in inline_images {
+        graph_attachments.push(serde_json::json!({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": image.filename,
+            "contentId": image.content_id,
+            "isInline": true,
+            "contentBytes": base64::engine::general_purpose::STANDARD.encode(&image.data)
+        }));
+    }
+
     // 有 HTML 正文时按 HTML 发送（Graph 的 body.contentType 只有 Text / Html 两种）。
-    let (content_type, content) = match body_html {
+    let (content_type, content) = match body_html.as_deref() {
         Some(html) => ("Html", html),
         None => ("Text", body_text),
     };

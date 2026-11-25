@@ -9,6 +9,7 @@ pub mod contacts_io;
 pub mod demo;
 pub mod graph_client;
 pub mod imap_client;
+pub mod inline;
 pub mod invite;
 pub mod jmap;
 pub mod link_clean;

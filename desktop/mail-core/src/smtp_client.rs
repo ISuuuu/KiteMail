@@ -130,10 +130,36 @@ fn assemble_body(
     body_html: Option<&str>,
     attachment_paths: &[String],
 ) -> Result<Message, String> {
+    // 正文里的 data: 图片提升成 cid: 内联段（multipart/related）。没有这一步，
+    // Gmail / Outlook 会把 base64 图当外链拦掉，签名 logo 显示红叉。
+    let (body_html, inline_images) = match body_html {
+        Some(html) => {
+            let (html, images) = crate::inline::extract_data_images(html);
+            (Some(html), images)
+        }
+        None => (None, Vec::new()),
+    };
+
     let alternative = body_html.map(|html| {
-        MultiPart::alternative()
+        let alternative = MultiPart::alternative()
             .singlepart(SinglePart::plain(body_text.to_string()))
-            .singlepart(SinglePart::html(html.to_string()))
+            .singlepart(SinglePart::html(html));
+        if inline_images.is_empty() {
+            return alternative;
+        }
+        let mut related = MultiPart::related().multipart(alternative);
+        for image in &inline_images {
+            let content_type = image.mime.parse().unwrap_or_else(|_| {
+                "application/octet-stream"
+                    .parse()
+                    .expect("valid fallback mime")
+            });
+            related = related.singlepart(
+                Attachment::new_inline_with_name(image.content_id.clone(), image.filename.clone())
+                    .body(image.data.clone(), content_type),
+            );
+        }
+        related
     });
 
     let built = if attachment_paths.is_empty() {
@@ -360,6 +386,28 @@ mod tests {
         assert!(raw.contains("multipart/alternative"), "未发多段正文: {raw}");
         assert!(raw.contains("text/plain"), "缺纯文本兜底段: {raw}");
         assert!(raw.contains("text/html"), "缺 HTML 段: {raw}");
+    }
+
+    /// 正文里的 data: 图片提升成 multipart/related 里的 cid: 内联段，
+    /// 收件端才会显示图片而不是红叉。
+    #[test]
+    fn inline_data_image_becomes_related_part() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let account = AccountConfig {
+            email: "me@example.com".to_string(),
+            display_name: "我".to_string(),
+            ..Default::default()
+        };
+        let builder = build_envelope(&account, "to@example.com", "", "", "主题", "", "", "")
+            .expect("envelope builds");
+        let html = format!(r#"<p>正文<img src="data:image/png;base64,{PNG}"></p>"#);
+        let message = assemble_body(builder, "正文", Some(&html), &[]).expect("body assembles");
+        let raw = String::from_utf8(message.formatted()).expect("utf8 message");
+        assert!(raw.contains("multipart/related"), "缺内联段容器: {raw}");
+        assert!(raw.contains("Content-ID: <hylki-"), "缺 Content-ID: {raw}");
+        assert!(raw.contains("cid:hylki-"), "HTML 未改写成 cid: {raw}");
+        assert!(!raw.contains("data:image/png"), "base64 仍留在正文: {raw}");
+        assert!(raw.contains("image/png"), "缺图片类型: {raw}");
     }
 
     /// 纯文本模式仍发单段 text/plain（不引入 multipart 开销）。
