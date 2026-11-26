@@ -241,8 +241,12 @@ pub fn validate_target_mail_dir(current_dir: &Path, target_dir: &Path) -> Result
         .map_err(|e| format!("无法创建目标邮件目录 ({}): {e}", target_dir.display()))?;
 
     let probe = target_dir.join(format!(".kitemail-write-probe-{}.tmp", std::process::id()));
-    fs::write(&probe, b"ok")
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
         .map_err(|e| format!("目标目录不可写 ({}): {e}", target_dir.display()))?;
+    drop(file);
     let _ = fs::remove_file(&probe);
     Ok(())
 }
@@ -250,31 +254,144 @@ pub fn validate_target_mail_dir(current_dir: &Path, target_dir: &Path) -> Result
 /// Copy valid per-account folders (`mail.db` present) from `src_dir` to `dst_dir`
 /// (skipping transient `.db-wal` and `.db-shm` files) and verify copied file count and bytes.
 pub fn copy_mail_dir_contents(src_dir: &Path, dst_dir: &Path) -> Result<(usize, u64), String> {
-    fs::create_dir_all(dst_dir)
-        .map_err(|e| format!("创建目标邮件目录失败 ({}): {e}", dst_dir.display()))?;
-    if !src_dir.exists() {
-        return Ok((0, 0));
-    }
-    let mut copied_files = 0usize;
-    let mut copied_bytes = 0u64;
+    let mut migration = MailDirMigration::copy(src_dir, dst_dir)?;
+    let stats = migration.stats;
+    migration.commit();
+    Ok(stats)
+}
 
-    let Ok(entries) = fs::read_dir(src_dir) else {
-        return Ok((0, 0));
-    };
-    for entry in entries.flatten() {
-        let src_sub = entry.path();
-        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-            continue;
+/// Owns only paths created by this migration until the caller commits the switch.
+pub(crate) struct MailDirMigration {
+    staging: PathBuf,
+    published: Vec<PathBuf>,
+    stats: (usize, u64),
+    committed: bool,
+}
+
+impl MailDirMigration {
+    pub(crate) fn copy(src_dir: &Path, dst_dir: &Path) -> Result<Self, String> {
+        fs::create_dir_all(dst_dir)
+            .map_err(|e| format!("创建目标邮件目录失败 ({}): {e}", dst_dir.display()))?;
+        let dst_dir = fs::canonicalize(dst_dir)
+            .map_err(|e| format!("读取目标邮件目录失败 ({}): {e}", dst_dir.display()))?;
+        let entries = match fs::read_dir(src_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !src_dir.exists() => {
+                return Ok(Self {
+                    staging: PathBuf::new(),
+                    published: Vec::new(),
+                    stats: (0, 0),
+                    committed: false,
+                });
+            }
+            Err(e) => return Err(format!("读取源目录失败 ({}): {e}", src_dir.display())),
+        };
+        let mut accounts = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("读取源目录项失败: {e}"))?;
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("读取文件类型失败 ({}): {e}", entry.path().display()))?;
+            if ft.is_dir() && AccountDb::mail_db_path_in(&entry.path()).is_file() {
+                let target = dst_dir.join(entry.file_name());
+                ensure_target_free(&target)?;
+                accounts.push((entry.path(), entry.file_name()));
+            }
         }
-        if !AccountDb::mail_db_path_in(&src_sub).is_file() {
-            continue;
+        let staging = loop {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = dst_dir.join(format!(".kitemail-migration-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("创建迁移暂存目录失败 ({}): {e}", path.display())),
+            }
+        };
+        let mut migration = Self {
+            staging,
+            published: Vec::new(),
+            stats: (0, 0),
+            committed: false,
+        };
+        for (source, name) in &accounts {
+            let (files, bytes) =
+                copy_dir_recursive_filtered(source, &migration.staging.join(name))?;
+            migration.stats.0 += files;
+            migration.stats.1 += bytes;
         }
-        let dst_sub = dst_dir.join(entry.file_name());
-        let (f, b) = copy_dir_recursive_filtered(&src_sub, &dst_sub)?;
-        copied_files += f;
-        copied_bytes += b;
+        for (_, name) in &accounts {
+            let target = dst_dir.join(name);
+            ensure_target_free(&target)?;
+            if let Err(e) = publish_directory(&migration.staging.join(name), &target) {
+                ensure_target_free(&target)?;
+                return Err(format!("发布迁移目录失败 ({}): {e}", target.display()));
+            }
+            migration.published.push(target);
+        }
+        Ok(migration)
     }
-    Ok((copied_files, copied_bytes))
+
+    pub(crate) fn stats(&self) -> (usize, u64) {
+        self.stats
+    }
+
+    pub(crate) fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for MailDirMigration {
+    fn drop(&mut self) {
+        if !self.committed {
+            for path in &self.published {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+        if !self.staging.as_os_str().is_empty() {
+            let _ = fs::remove_dir_all(&self.staging);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn publish_directory(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // MoveFileW fails if the destination exists, including an empty directory.
+    if unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileW(source.as_ptr(), target.as_ptr())
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn publish_directory(source: &Path, target: &Path) -> std::io::Result<()> {
+    // Reserve the destination atomically, then publish into the directory we own.
+    fs::create_dir(target)?;
+    match fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_dir(target);
+            Err(e)
+        }
+    }
+}
+
+fn ensure_target_free(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(format!(
+            "目标已存在同名账号路径 ({})，请直接使用已有邮件数据（复用）或选择其他目录",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("检查目标账号路径失败 ({}): {e}", path.display())),
+    }
 }
 
 fn copy_dir_recursive_filtered(src: &Path, dst: &Path) -> Result<(usize, u64), String> {
@@ -302,10 +419,6 @@ fn copy_dir_recursive_filtered(src: &Path, dst: &Path) -> Result<(usize, u64), S
                 || name_str.ends_with(".tmp")
             {
                 continue;
-            }
-            if name_str.ends_with(".db") {
-                let _ = fs::remove_file(dst.join(format!("{name_str}-wal")));
-                let _ = fs::remove_file(dst.join(format!("{name_str}-shm")));
             }
             let expected_len = fs::metadata(&src_path)
                 .map_err(|e| format!("读取源文件元信息失败 ({}): {e}", src_path.display()))?

@@ -571,7 +571,16 @@ async fn handle_change_mail_data_dir(
 ) {
     let current_dir = config::resolve_mail_data_dir_in(data_dir);
     let default_dir = config::default_mail_data_dir_in(data_dir);
-    let new_dir = target_dir.clone().unwrap_or_else(|| default_dir.clone());
+    let new_dir = target_dir
+        .as_ref()
+        .map(|path| {
+            if path.as_os_str().is_empty() || path.is_absolute() {
+                path.clone()
+            } else {
+                data_dir.join(path)
+            }
+        })
+        .unwrap_or_else(|| default_dir.clone());
 
     // 1. 停止所有推送监测并等待在途后台任务关闭 SQLite 句柄，避免 Windows 共享违例。
     // 保持持有后台任务信号量许可，直到新目录打开或回滚完毕再释放，防止排队中的同步/索引重开旧库。
@@ -589,40 +598,49 @@ async fn handle_change_mail_data_dir(
         old_cache.checkpoint_and_close_all();
     }
 
-    let prev_cfg = config::load_storage_config_in(data_dir).unwrap_or_default();
     let is_default_target = target_dir.is_none()
         || config::normalized_path_key(&new_dir) == config::normalized_path_key(&default_dir);
 
-    let data_dir_cl = data_dir.clone();
     let current_dir_cl = current_dir.clone();
     let new_dir_cl = new_dir.clone();
-    let fs_res = tokio::task::spawn_blocking(move || -> Result<(usize, u64), String> {
-        crate::cache::validate_target_mail_dir(&current_dir_cl, &new_dir_cl)?;
-        let stats = if matches!(mode, crate::cache::MailDirSwitchMode::MigrateCurrent) {
-            crate::cache::copy_mail_dir_contents(&current_dir_cl, &new_dir_cl)?
-        } else {
-            (0, 0)
-        };
+    let switch_result = async {
+        let (copied_files, copied_bytes, mut migration) = tokio::task::spawn_blocking(
+            move || -> Result<(usize, u64, Option<crate::cache::migrate::MailDirMigration>), String> {
+                crate::cache::validate_target_mail_dir(&current_dir_cl, &new_dir_cl)?;
+                let migration = if matches!(mode, crate::cache::MailDirSwitchMode::MigrateCurrent) {
+                    Some(crate::cache::migrate::MailDirMigration::copy(&current_dir_cl, &new_dir_cl)?)
+                } else {
+                    None
+                };
+                let stats = migration.as_ref().map_or((0, 0), |m| m.stats());
+                Ok((stats.0, stats.1, migration))
+            },
+        )
+        .await
+        .map_err(|e| format!("邮件目录切换线程异常: {e}"))??;
+        // Declared after migration so it is closed before the migration rolls back on error.
+        let reopened = CacheStore::open_split(data_dir, &new_dir)
+            .map_err(|err| format!("打开新邮件存储目录失败，已回滚原目录: {err}"))?;
         config::save_storage_config_in(
-            &data_dir_cl,
+            data_dir,
             &config::StorageConfig {
                 mail_data_dir: if is_default_target {
                     None
                 } else {
-                    Some(new_dir_cl.to_string_lossy().into_owned())
+                    Some(new_dir.to_string_lossy().into_owned())
                 },
             },
         )?;
-        Ok(stats)
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("邮件目录切换线程异常: {e}")));
+        if let Some(migration) = migration.as_mut() {
+            migration.commit();
+        }
+        Ok::<_, String>((copied_files, copied_bytes, reopened))
+    }
+    .await;
 
-    let (copied_files, copied_bytes) = match fs_res {
-        Ok(stats) => stats,
+    let (copied_files, copied_bytes, reopened) = match switch_result {
+        Ok(result) => result,
         Err(err) => {
-            // 恢复原存储配置和数据库连接。
-            let _ = config::save_storage_config_in(data_dir, &prev_cfg);
             if let Ok(restored) = CacheStore::open_for_data_dir(data_dir) {
                 *cache_opt = Some(restored);
             }
@@ -639,28 +657,6 @@ async fn handle_change_mail_data_dir(
             return;
         }
     };
-
-    let reopened = match CacheStore::open_for_data_dir(data_dir) {
-        Ok(c) => c,
-        Err(err) => {
-            let _ = config::save_storage_config_in(data_dir, &prev_cfg);
-            if let Ok(restored) = CacheStore::open_for_data_dir(data_dir) {
-                *cache_opt = Some(restored);
-            }
-            if let Ok(accounts) = config::load_accounts_in(data_dir) {
-                for acc in &accounts {
-                    refresh_account_watcher(watchers, data_dir, acc, req_tx);
-                }
-            }
-            let _ = evt_tx.send(WorkerEvent::MailDataDirChanged {
-                ok: false,
-                mail_data_dir: current_dir,
-                message: format!("打开新邮件存储目录失败，已回滚原目录: {err}"),
-            });
-            return;
-        }
-    };
-
     *cache_opt = Some(reopened);
     *background.backfill.lock().await = BackfillIndexState::default();
     let _ = tokens;
@@ -5900,6 +5896,44 @@ mod tests {
         drop(cache);
 
         let worker = MailWorkerHandle::spawn(app_dir.clone()).unwrap();
+
+        // 配置写入失败时，已发布的账号目录必须回滚，原邮件库仍可读取。
+        config::save_storage_config_in(&app_dir, &config::StorageConfig::default()).unwrap();
+        let original_config = std::fs::read(config::storage_config_file_in(&app_dir)).unwrap();
+        let blocked_temp = app_dir.join(format!(".storage.toml.{}.tmp", std::process::id()));
+        std::fs::create_dir(&blocked_temp).unwrap();
+        worker
+            .send_checked(MailRequest::ChangeMailDataDir {
+                target_dir: Some(migrated_dir.clone()),
+                mode: MailDirSwitchMode::MigrateCurrent,
+                import_accounts: Vec::new(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "等待配置保存失败事件超时");
+            if worker
+                .drain_events()
+                .into_iter()
+                .any(|evt| matches!(evt, WorkerEvent::MailDataDirChanged { ok: false, .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(
+            config::resolve_mail_data_dir_in(&app_dir),
+            config::default_mail_data_dir_in(&app_dir)
+        );
+        assert_eq!(std::fs::read_dir(&migrated_dir).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(config::storage_config_file_in(&app_dir)).unwrap(),
+            original_config
+        );
+        let old_cache = CacheStore::open_for_data_dir(&app_dir).unwrap();
+        assert_eq!(old_cache.list_unified_inbox("", 0, 10).unwrap().total, 1);
+        drop(old_cache);
+        std::fs::remove_dir(blocked_temp).unwrap();
 
         // 1) 迁移模式：切换到 migrated_dir，应收到切换成功 + 文件夹 + 邮件页回填，且 storage.toml 更新。
         worker

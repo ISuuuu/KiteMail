@@ -1853,7 +1853,13 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 /// Atomically write UTF-8 contents via a same-directory temp file.
-fn atomic_write_file(dir: &Path, target: &Path, content: &str, kind: &str) -> Result<(), String> {
+fn atomic_write_file(
+    dir: &Path,
+    target: &Path,
+    content: &str,
+    kind: &str,
+    preserve_target: bool,
+) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败 ({}): {e}", dir.display()))?;
     let file_name = target
         .file_name()
@@ -1865,7 +1871,7 @@ fn atomic_write_file(dir: &Path, target: &Path, content: &str, kind: &str) -> Re
     if let Err(first_err) = fs::rename(&tmp_path, target) {
         // Windows `MoveFileEx` via `std::fs::rename` replaces existing files on modern NTFS,
         // but fallback gracefully if an existing target blocks direct rename.
-        if target.exists() {
+        if target.exists() && !preserve_target {
             let _ = fs::remove_file(target);
             if let Err(second_err) = fs::rename(&tmp_path, target) {
                 let _ = fs::remove_file(&tmp_path);
@@ -1964,7 +1970,7 @@ pub fn save_storage_config_in(dir: &Path, cfg: &StorageConfig) -> Result<(), Str
     let path = storage_config_file_in(dir);
     let text =
         toml::to_string_pretty(&normalized).map_err(|e| format!("序列化存储路径配置失败: {e}"))?;
-    atomic_write_file(dir, &path, &text, "存储路径配置")
+    atomic_write_file(dir, &path, &text, "存储路径配置", true)
 }
 
 /// 返回配置目录对应的默认独立邮件存储路径（`<app_data_dir>\mail`）。
@@ -2330,7 +2336,7 @@ pub fn load_preferences_in(dir: &Path) -> Result<AppPreferences, String> {
 pub fn save_preferences_in(dir: &Path, prefs: &AppPreferences) -> Result<(), String> {
     let path = preferences_file_in(dir);
     let text = toml::to_string_pretty(prefs).map_err(|e| format!("序列化偏好设置失败: {e}"))?;
-    atomic_write_file(dir, &path, &text, "偏好设置")
+    atomic_write_file(dir, &path, &text, "偏好设置", false)
 }
 
 /// Load saved non-sensitive account configurations from `dir`.
@@ -2353,7 +2359,7 @@ pub fn save_accounts_in(dir: &Path, accounts: &[AccountConfig]) -> Result<(), St
         accounts: accounts.to_vec(),
     };
     let text = toml::to_string_pretty(&data).map_err(|e| format!("序列化账号配置失败: {e}"))?;
-    atomic_write_file(dir, &path, &text, "账号配置")
+    atomic_write_file(dir, &path, &text, "账号配置", false)
 }
 
 /// Current portable settings backup bundle version.
@@ -2535,7 +2541,7 @@ pub(crate) fn register_known_data_dir_in(
 
     let text = toml::to_string_pretty(&KnownInstancesFile { data_dirs: deduped })
         .map_err(|e| format!("序列化实例注册表失败: {e}"))?;
-    atomic_write_file(registry_dir, &reg_file, &text, "实例注册表")
+    atomic_write_file(registry_dir, &reg_file, &text, "实例注册表", false)
 }
 
 /// 在运行时将当前生效的 `data_dir` 登记到同机共享实例注册表（单测与 `KITEMAIL_DATA_DIR` 隔离模式跳过）。

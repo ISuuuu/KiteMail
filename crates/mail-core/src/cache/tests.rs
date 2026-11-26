@@ -3769,7 +3769,7 @@ fn validate_and_copy_mail_dir_handles_overlaps_and_filtered_copy() {
 }
 
 #[test]
-fn copy_mail_dir_contents_removes_stale_target_wal_and_shm_before_overwrite() {
+fn copy_mail_dir_contents_preserves_existing_target_and_sidecars() {
     let cur = temp_cache_dir("mail-wal-cur");
     let dst = temp_cache_dir("mail-wal-dst");
     let app_dir = temp_cache_dir("mail-wal-app");
@@ -3802,28 +3802,114 @@ fn copy_mail_dir_contents_removes_stale_target_wal_and_shm_before_overwrite() {
     std::fs::write(dst_acc.join("mail.db-wal"), b"stale-wal").unwrap();
     std::fs::write(dst_acc.join("mail.db-shm"), b"stale-shm").unwrap();
     std::fs::write(dst_acc.join("content.db-wal"), b"stale-cwal").unwrap();
+    std::fs::create_dir(dst_acc.join("attachments")).unwrap();
+    std::fs::write(dst_acc.join("attachments/file"), b"attachment").unwrap();
 
-    let (files, bytes) = copy_mail_dir_contents(&cur, &dst).unwrap();
-    assert!(files >= 1 && bytes > 0);
-    assert!(!dst_acc.join("mail.db-wal").exists());
-    assert!(!dst_acc.join("mail.db-shm").exists());
+    let error = copy_mail_dir_contents(&cur, &dst).unwrap_err();
+    assert!(error.contains("复用"));
+    assert_eq!(std::fs::read(dst_acc.join("mail.db")).unwrap(), b"stale-db");
+    assert_eq!(
+        std::fs::read(dst_acc.join("mail.db-wal")).unwrap(),
+        b"stale-wal"
+    );
+    assert_eq!(
+        std::fs::read(dst_acc.join("mail.db-shm")).unwrap(),
+        b"stale-shm"
+    );
+    assert_eq!(
+        std::fs::read(dst_acc.join("content.db-wal")).unwrap(),
+        b"stale-cwal"
+    );
+    assert_eq!(
+        std::fs::read(dst_acc.join("attachments/file")).unwrap(),
+        b"attachment"
+    );
 
-    config::save_storage_config_in(
-        &app_dir,
-        &config::StorageConfig {
-            mail_data_dir: Some(dst.to_string_lossy().into_owned()),
-        },
-    )
-    .unwrap();
-    let reopened = CacheStore::open_for_data_dir(&app_dir).unwrap();
-    let page = reopened.list_unified_inbox("", 0, 10).unwrap();
-    assert_eq!(page.total, 1);
-    assert_eq!(page.items[0].subject, "覆盖迁移后的新邮件");
-
-    drop(reopened);
     let _ = std::fs::remove_dir_all(&cur);
     let _ = std::fs::remove_dir_all(&dst);
     let _ = std::fs::remove_dir_all(&app_dir);
+}
+
+#[test]
+fn mail_dir_migration_rolls_back_published_data_unless_committed() {
+    let cur = temp_cache_dir("mail-rollback-cur");
+    let dst = temp_cache_dir("mail-rollback-dst");
+    std::fs::create_dir_all(cur.join("account_1")).unwrap();
+    std::fs::write(cur.join("account_1/mail.db"), b"source").unwrap();
+    std::fs::write(dst.join("unrelated"), b"keep").unwrap();
+    {
+        let migration = super::migrate::MailDirMigration::copy(&cur, &dst).unwrap();
+        assert_eq!(migration.stats(), (1, 6));
+        assert_eq!(
+            std::fs::read(dst.join("account_1/mail.db")).unwrap(),
+            b"source"
+        );
+    }
+    assert!(!dst.join("account_1").exists());
+    assert_eq!(std::fs::read(dst.join("unrelated")).unwrap(), b"keep");
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(cur.join("account_1/mail.db")).unwrap(),
+        b"source"
+    );
+    assert!(copy_mail_dir_contents(&cur, &dst).is_ok());
+    let _ = std::fs::remove_dir_all(&cur);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
+#[cfg(windows)]
+#[test]
+fn mail_dir_migration_copy_failure_cleans_staging_and_allows_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let cur = temp_cache_dir("mail-copy-failure-cur");
+    let dst = temp_cache_dir("mail-copy-failure-dst");
+    let account = cur.join("account_1");
+    std::fs::create_dir_all(account.join("attachments")).unwrap();
+    std::fs::write(account.join("mail.db"), b"source-db").unwrap();
+    let attachment = account.join("attachments/file");
+    std::fs::write(&attachment, b"source-attachment").unwrap();
+    std::fs::write(dst.join("unrelated"), b"keep").unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&attachment)
+        .unwrap();
+
+    assert!(copy_mail_dir_contents(&cur, &dst).is_err());
+    assert!(!dst.join("account_1").exists());
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 1);
+    assert_eq!(std::fs::read(dst.join("unrelated")).unwrap(), b"keep");
+    drop(locked);
+    assert_eq!(
+        std::fs::read(account.join("mail.db")).unwrap(),
+        b"source-db"
+    );
+    assert_eq!(std::fs::read(&attachment).unwrap(), b"source-attachment");
+    copy_mail_dir_contents(&cur, &dst).unwrap();
+    assert_eq!(
+        std::fs::read(dst.join("account_1/attachments/file")).unwrap(),
+        b"source-attachment"
+    );
+    let _ = std::fs::remove_dir_all(&cur);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
+#[test]
+fn mail_dir_migration_conflict_prevents_all_publication() {
+    let cur = temp_cache_dir("mail-conflict-cur");
+    let dst = temp_cache_dir("mail-conflict-dst");
+    for name in ["account_1", "account_2"] {
+        std::fs::create_dir_all(cur.join(name)).unwrap();
+        std::fs::write(cur.join(name).join("mail.db"), b"source").unwrap();
+    }
+    std::fs::write(dst.join("account_2"), b"existing").unwrap();
+    assert!(copy_mail_dir_contents(&cur, &dst).is_err());
+    assert!(!dst.join("account_1").exists());
+    assert_eq!(std::fs::read(dst.join("account_2")).unwrap(), b"existing");
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 1);
+    let _ = std::fs::remove_dir_all(&cur);
+    let _ = std::fs::remove_dir_all(&dst);
 }
 
 #[test]
