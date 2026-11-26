@@ -15,13 +15,44 @@ const MAX_INLINE_CID_BYTES: usize = 5 * 1024 * 1024;
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0/me";
 
+fn validate_graph_url(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|_| "无效的 Graph 分页地址".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("graph.microsoft.com")
+        || url.port().is_some_and(|p| p != 443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("不可信的 Graph 分页地址".to_string());
+    }
+    Ok(())
+}
+
+fn graph_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().redirects(0).build()
+}
+
+fn require_graph_success(response: ureq::Response) -> Result<ureq::Response, String> {
+    let status = response.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("Graph API 返回非成功状态 (HTTP {status})"));
+    }
+    Ok(response)
+}
+
+fn graph_send_success(response: ureq::Response) -> SendOutcome {
+    let status = response.status();
+    if (200..300).contains(&status) {
+        SendOutcome::Accepted
+    } else {
+        SendOutcome::Uncertain(format!("Graph 发送结果待确认 (HTTP {status})"))
+    }
+}
+
 fn format_graph_error(err: ureq::Error) -> String {
     match err {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            format!("Graph API 错误 (HTTP {code}): {body}")
-        }
-        ureq::Error::Transport(t) => format!("Graph API 网络错误: {t}"),
+        ureq::Error::Status(code, _) => format!("Graph API 错误 (HTTP {code})"),
+        ureq::Error::Transport(t) => format!("Graph API 网络错误: {:?}", t.kind()),
     }
 }
 
@@ -89,6 +120,7 @@ impl GraphWellKnownRole {
 /// 准确识别系统文件夹，避免冒充标准角色。单项 404 或网络失败静默跳过。
 fn fetch_well_known_roles(access_token: &str) -> HashMap<String, GraphWellKnownRole> {
     let agent = ureq::AgentBuilder::new()
+        .redirects(0)
         .timeout(std::time::Duration::from_secs(10))
         .build();
     let auth = format!("Bearer {access_token}");
@@ -103,7 +135,12 @@ fn fetch_well_known_roles(access_token: &str) -> HashMap<String, GraphWellKnownR
                     let auth = &auth;
                     s.spawn(move || {
                         let url = format!("{GRAPH_BASE}/mailFolders/{wk}?$select=id");
-                        let resp = agent.get(&url).set("Authorization", auth).call().ok()?;
+                        let resp = agent
+                            .get(&url)
+                            .set("Authorization", auth)
+                            .call()
+                            .ok()
+                            .and_then(|r| require_graph_success(r).ok())?;
                         let json: serde_json::Value = resp.into_json().ok()?;
                         let id = json["id"].as_str()?.trim();
                         if id.is_empty() {
@@ -200,6 +237,7 @@ fn parse_graph_folders_json(
 /// [`MAX_GRAPH_FOLDER_PAGES`] pages so large mailboxes are never truncated).
 pub fn fetch_folders(access_token: &str) -> Result<Vec<(RemoteFolder, bool)>, String> {
     let agent = ureq::AgentBuilder::new()
+        .redirects(0)
         .timeout(std::time::Duration::from_secs(15))
         .build();
     let auth = format!("Bearer {access_token}");
@@ -216,11 +254,13 @@ pub fn fetch_folders(access_token: &str) -> Result<Vec<(RemoteFolder, bool)>, St
         if !seen_urls.insert(url.clone()) {
             break;
         }
+        validate_graph_url(&url)?;
         let resp = agent
             .get(&url)
             .set("Authorization", &auth)
             .call()
-            .map_err(format_graph_error)?;
+            .map_err(format_graph_error)
+            .and_then(require_graph_success)?;
         let json: serde_json::Value = resp
             .into_json()
             .map_err(|e| format!("解析 Graph 文件夹响应失败: {e}"))?;
@@ -241,11 +281,13 @@ pub fn fetch_folders(access_token: &str) -> Result<Vec<(RemoteFolder, bool)>, St
 /// Fetch inbox unread/total counts via a single lightweight Graph well-known query.
 pub(crate) fn fetch_inbox_counts(access_token: &str) -> Result<(u32, usize), String> {
     let url = format!("{GRAPH_BASE}/mailFolders/inbox?$select=unreadItemCount,totalItemCount");
-    let resp = ureq::get(&url)
+    let resp = graph_agent()
+        .get(&url)
         .timeout(std::time::Duration::from_secs(15))
         .set("Authorization", &format!("Bearer {access_token}"))
         .call()
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
     let json: serde_json::Value = resp
         .into_json()
         .map_err(|e| format!("解析 Graph 收件箱计数失败: {e}"))?;
@@ -295,12 +337,14 @@ pub fn search_messages(
         "{GRAPH_BASE}/messages?$search={encoded_search}&$top={top}&\
          $select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,hasAttachments,bodyPreview,internetMessageId"
     );
-    let resp = ureq::get(&url)
+    let resp = graph_agent()
+        .get(&url)
         .timeout(std::time::Duration::from_secs(15))
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("ConsistencyLevel", "eventual")
         .call()
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
 
     let json: serde_json::Value = resp
         .into_json()
@@ -316,11 +360,14 @@ fn fetch_headers_from_url(
 ) -> Result<(Vec<(CachedHeaderInput, String)>, Option<String>), String> {
     // 任务四：历史批次跑在后台，请求必须有限超时（对齐 search_messages 的 15 秒），
     // 避免一次卡住的响应占住单队列。
-    let resp = ureq::get(url)
+    validate_graph_url(url)?;
+    let resp = graph_agent()
+        .get(url)
         .timeout(std::time::Duration::from_secs(15))
         .set("Authorization", &format!("Bearer {access_token}"))
         .call()
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
 
     let json: serde_json::Value = resp
         .into_json()
@@ -437,10 +484,12 @@ pub fn fetch_message_body(
     let url = format!(
         "{GRAPH_BASE}/messages/{encoded_id}?$select=body,hasAttachments,internetMessageHeaders"
     );
-    let resp = ureq::get(&url)
+    let resp = graph_agent()
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .call()
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
 
     let json: serde_json::Value = resp
         .into_json()
@@ -461,10 +510,12 @@ pub fn fetch_message_body(
         let att_url = format!(
             "{GRAPH_BASE}/messages/{encoded_id}/attachments?$select=id,name,contentType,size,isInline"
         );
-        let att_resp = ureq::get(&att_url)
+        let att_resp = graph_agent()
+            .get(&att_url)
             .set("Authorization", &format!("Bearer {access_token}"))
             .call()
-            .map_err(format_graph_error)?;
+            .map_err(format_graph_error)
+            .and_then(require_graph_success)?;
         let att_json: serde_json::Value = att_resp
             .into_json()
             .map_err(|e| format!("解析 Graph 附件元数据失败: {e}"))?;
@@ -490,9 +541,12 @@ pub fn fetch_message_body(
                         let item_url = format!(
                             "{GRAPH_BASE}/messages/{encoded_id}/attachments/{encoded_att_id}"
                         );
-                        if let Ok(item_resp) = ureq::get(&item_url)
+                        if let Ok(item_resp) = graph_agent()
+                            .get(&item_url)
                             .set("Authorization", &format!("Bearer {access_token}"))
                             .call()
+                            .map_err(format_graph_error)
+                            .and_then(require_graph_success)
                         {
                             if let Ok(item_json) = item_resp.into_json::<serde_json::Value>() {
                                 if let (Some(cid_raw), Some(b64)) = (
@@ -602,11 +656,13 @@ pub fn fetch_attachment_content(
     let encoded_msg = urlencoding_segment(remote_msg_id);
     let encoded_att = urlencoding_segment(remote_att_id);
     let url = format!("{GRAPH_BASE}/messages/{encoded_msg}/attachments/{encoded_att}");
-    let resp = ureq::get(&url)
+    let resp = graph_agent()
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .timeout(std::time::Duration::from_secs(180))
         .call()
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
     let json: serde_json::Value = resp
         .into_json()
         .map_err(|e| format!("解析 Graph 附件内容失败: {e}"))?;
@@ -628,11 +684,13 @@ pub fn fetch_index_text(
     let url = format!(
         "{GRAPH_BASE}/messages/{encoded_id}?$select=body,hasAttachments,internetMessageHeaders"
     );
-    let response = ureq::get(&url)
+    let response = graph_agent()
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .timeout(std::time::Duration::from_secs(20))
         .call()
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
     let mut bytes = Vec::new();
     response
         .into_reader()
@@ -676,10 +734,12 @@ pub fn fetch_index_text(
 pub fn fetch_raw_message(access_token: &str, remote_id: &str) -> Result<Vec<u8>, String> {
     let encoded_id = urlencoding_segment(remote_id);
     let url = format!("{GRAPH_BASE}/messages/{encoded_id}/$value");
-    let resp = ureq::get(&url)
+    let resp = graph_agent()
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .call()
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
     let mut reader = resp.into_reader();
     let mut bytes = Vec::new();
     reader
@@ -706,10 +766,12 @@ pub fn undo_move_by_message_id(
     let url = format!(
         "{GRAPH_BASE}/mailFolders/{encoded_folder}/messages?$filter={encoded_filter}&$select=id&$top=1"
     );
-    let resp = ureq::get(&url)
+    let resp = graph_agent()
+        .get(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .call()
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
     let json: serde_json::Value = resp
         .into_json()
         .map_err(|e| format!("解析 Graph 撤销检索结果失败: {e}"))?;
@@ -728,10 +790,12 @@ pub fn undo_move_by_message_id(
 pub fn set_seen(access_token: &str, remote_id: &str, seen: bool) -> Result<(), String> {
     let encoded_id = urlencoding_segment(remote_id);
     let url = format!("{GRAPH_BASE}/messages/{encoded_id}");
-    ureq::patch(&url)
+    graph_agent()
+        .patch(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .send_json(serde_json::json!({ "isRead": seen }))
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
     Ok(())
 }
 
@@ -740,10 +804,12 @@ pub fn set_flagged(access_token: &str, remote_id: &str, flagged: bool) -> Result
     let encoded_id = urlencoding_segment(remote_id);
     let url = format!("{GRAPH_BASE}/messages/{encoded_id}");
     let status = if flagged { "flagged" } else { "notFlagged" };
-    ureq::patch(&url)
+    graph_agent()
+        .patch(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .send_json(serde_json::json!({ "flag": { "flagStatus": status } }))
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
     Ok(())
 }
 
@@ -760,10 +826,12 @@ pub fn move_message(
     }
     let encoded_id = urlencoding_segment(remote_id);
     let url = format!("{GRAPH_BASE}/messages/{encoded_id}/move");
-    ureq::post(&url)
+    graph_agent()
+        .post(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .send_json(serde_json::json!({ "destinationId": dest_folder_id }))
-        .map_err(format_graph_error)?;
+        .map_err(format_graph_error)
+        .and_then(require_graph_success)?;
     Ok(())
 }
 
@@ -865,21 +933,21 @@ pub fn send_message(
     });
 
     let url = format!("{GRAPH_BASE}/sendMail");
-    match ureq::post(&url)
+    match graph_agent()
+        .post(&url)
         .set("Authorization", &format!("Bearer {access_token}"))
         .send_json(payload)
     {
-        Ok(_) => SendOutcome::Accepted,
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
+        Ok(response) => graph_send_success(response),
+        Err(ureq::Error::Status(code, _)) => {
             if code >= 500 {
-                SendOutcome::Uncertain(format!("Graph 发送结果待确认 (HTTP {code}): {body}"))
+                SendOutcome::Uncertain(format!("Graph 发送结果待确认 (HTTP {code})"))
             } else {
-                SendOutcome::Failed(format!("Graph 发信被拒绝 (HTTP {code}): {body}"))
+                SendOutcome::Failed(format!("Graph 发信被拒绝 (HTTP {code})"))
             }
         }
         Err(ureq::Error::Transport(t)) => {
-            SendOutcome::Uncertain(format!("Graph 网络中断，发送结果待确认: {t}"))
+            SendOutcome::Uncertain(format!("Graph 网络中断，发送结果待确认: {:?}", t.kind()))
         }
     }
 }
@@ -1058,5 +1126,47 @@ mod tests {
         assert_eq!(parsed[0].0.unread_count, 2);
         assert_eq!(parsed[0].0.total_count, 7);
         assert!(!parsed[0].1);
+    }
+}
+
+#[cfg(test)]
+mod graph_url_security_tests {
+    use super::*;
+    #[test]
+    fn graph_error_does_not_copy_reply_body() {
+        let response = ureq::Response::new(404, "Not Found", "synthetic private text").unwrap();
+        assert_eq!(
+            format_graph_error(ureq::Error::Status(404, response)),
+            "Graph API 错误 (HTTP 404)"
+        );
+    }
+
+    #[test]
+    fn redirect_is_never_success_but_accepted_status_is() {
+        assert!(require_graph_success(ureq::Response::new(302, "Found", "").unwrap()).is_err());
+        assert!(require_graph_success(ureq::Response::new(202, "Accepted", "").unwrap()).is_ok());
+        assert!(matches!(
+            graph_send_success(ureq::Response::new(302, "Found", "").unwrap()),
+            SendOutcome::Uncertain(_)
+        ));
+        assert!(matches!(
+            graph_send_success(ureq::Response::new(202, "Accepted", "").unwrap()),
+            SendOutcome::Accepted
+        ));
+    }
+
+    #[test]
+    fn pagination_rejects_untrusted_origins() {
+        assert!(validate_graph_url("https://graph.microsoft.com/v1.0/me/messages?$skip=1").is_ok());
+        for url in [
+            "http://graph.microsoft.com/v1.0/me",
+            "https://graph.microsoft.com.evil.test/",
+            "https://graph.microsoft.com@evil.test/",
+            "https://graph.microsoft.com:444/",
+            "https://user@graph.microsoft.com/",
+        ] {
+            assert!(validate_graph_url(url).is_err(), "{url}");
+        }
+        assert!(fetch_folder_headers_next("secret", "https://evil.test/").is_err());
     }
 }

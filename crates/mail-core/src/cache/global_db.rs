@@ -739,6 +739,16 @@ impl GlobalDb {
         Ok(())
     }
 
+    pub(crate) fn recover_interrupted_outbox(&self) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE outbox SET status = 'uncertain', last_error = ?1 WHERE status = 'sending'",
+                ["发送期间客户端已退出，请先检查已发送邮件再决定是否重试"],
+            )
+            .map_err(|e| format!("恢复中断的发件箱记录失败: {e}"))?;
+        Ok(())
+    }
+
     pub(crate) fn claim_outbox_for_delivery(
         &mut self,
         outbox_id: u32,
@@ -1031,6 +1041,22 @@ impl GlobalDb {
                 .map_err(|e| format!("更新草稿失败: {e}"))?;
             Ok(draft.id)
         }
+    }
+
+    pub(crate) fn referenced_attachment_paths(&self) -> Result<Vec<String>, String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attachment_paths_json FROM drafts UNION ALL SELECT attachment_paths_json FROM outbox UNION ALL SELECT attachment_paths_json FROM templates"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut paths = Vec::new();
+        for row in rows {
+            let json = row.map_err(|e| e.to_string())?;
+            let parsed: Vec<String> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            paths.extend(parsed);
+        }
+        Ok(paths)
     }
 
     pub(crate) fn list_drafts(&self) -> Result<Vec<LocalDraft>, String> {

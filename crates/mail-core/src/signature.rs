@@ -3,9 +3,8 @@
 //! 对齐 Linux 原版 `src/ui/rich_editor/signature.rs` 与 `src/ui/compose/signature.rs`：
 //! - 纯文本签名转义后换行变 `<br>`；
 //! - 外部 HTML（导入的文件、粘贴的源码）过白名单清洗：脚本、样式块、事件属性、
-//!   危险协议一律丢掉，表格与 inline style 保留；
-//! - 图片按原版做法内联：本地路径读成 `data:` URI（相对路径按文件所在目录解析），
-//!   远程地址原样保留；
+//!   危险协议与内联样式一律丢掉，表格保留；
+//! - 导入目录内的本地图片内联成 `data:` URI，远程与目录外图片不自动加载；
 //! - 插入正文时 HTML 正文给 `<div class="hylki-sig">` 块，Markdown / 纯文本正文
 //!   先转换到对应表示，避免把标签当文字发出去。
 
@@ -230,7 +229,7 @@ fn sanitize_with_base(html: &str, base: Option<&Path>) -> String {
         out.push_str(name);
         for (key, value) in &parsed.attrs {
             let key = key.to_ascii_lowercase();
-            if key.starts_with("on") {
+            if key.starts_with("on") || key == "style" {
                 continue;
             }
             let allowed = GENERIC_ATTRS.contains(&key.as_str())
@@ -240,7 +239,16 @@ fn sanitize_with_base(html: &str, base: Option<&Path>) -> String {
                 continue;
             }
             let value = if key == "src" {
-                local_image_data_uri(value, base).unwrap_or_else(|| value.clone())
+                let Some(value) = local_image_data_uri(value, base).or_else(|| {
+                    value
+                        .trim()
+                        .to_ascii_lowercase()
+                        .starts_with("data:image/")
+                        .then(|| value.clone())
+                }) else {
+                    continue;
+                };
+                value
             } else {
                 value.clone()
             };
@@ -264,7 +272,9 @@ fn value_allowed(key: &str, value: &str) -> bool {
         "href" | "src" => url_is_safe(value),
         "style" => {
             let lower = value.to_ascii_lowercase();
-            !lower.contains("javascript:")
+            !lower.contains("url(")
+                && !lower.contains("@import")
+                && !lower.contains("javascript:")
                 && !lower.contains("vbscript:")
                 && !lower.contains("expression(")
         }
@@ -295,7 +305,6 @@ fn url_is_safe(value: &str) -> bool {
                 || rest.starts_with("image/gif")
                 || rest.starts_with("image/webp")
                 || rest.starts_with("image/bmp")
-                || rest.starts_with("image/svg+xml")
                 || rest.starts_with("image/avif")
         }
         _ => false,
@@ -308,19 +317,38 @@ fn local_image_data_uri(value: &str, base: Option<&Path>) -> Option<String> {
     if v.is_empty() || has_url_scheme(v) {
         return None;
     }
-    let path = Path::new(v);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base?.join(path)
-    };
+    if v.starts_with('/') || v.starts_with('\\') || v.contains(':') {
+        return None;
+    }
+    let base = base?;
+    if base.to_string_lossy().starts_with("\\\\") {
+        return None;
+    }
+    let base = base.canonicalize().ok()?;
+    let mut candidate = base.clone();
+    for component in Path::new(v).components() {
+        match component {
+            std::path::Component::Normal(part) => candidate.push(part),
+            _ => return None,
+        }
+        if std::fs::symlink_metadata(&candidate)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
+            return None;
+        }
+    }
+    let path = candidate.canonicalize().ok()?;
+    if !path.starts_with(&base) {
+        return None;
+    }
     let mime = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
         "avif" => "image/avif",
         _ => return None,
     };
@@ -457,8 +485,8 @@ mod tests {
                    <b>Ada</b> <a href=\"https://example.com\">site</a></td></tr></table>\
                    <script>alert(1)</script></body></html>";
         let out = sanitize_signature_html(src);
-        assert!(out.contains("<table style=\"border:0\">"), "{out}");
-        assert!(out.contains("<td style=\"color:#333\">"), "{out}");
+        assert!(out.contains("<table>"), "{out}");
+        assert!(out.contains("<td>"), "{out}");
         assert!(
             out.contains("<a href=\"https://example.com\">site</a>"),
             "{out}"
@@ -483,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn local_images_are_embedded_and_remote_ones_kept() {
+    fn local_images_are_embedded_and_remote_ones_blocked() {
         let dir = std::env::temp_dir().join(format!("hylki-sig-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("logo.png"), [0x89, b'P', b'N', b'G']).unwrap();
@@ -493,9 +521,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(out.contains("src=\"data:image/png;base64,"), "{out}");
         assert!(out.contains("width=\"80\""), "{out}");
-        assert!(out.contains("src=\"https://x.example/a.png\""), "{out}");
-        // 读不到的路径保持原样，不把签名弄丢。
-        assert!(out.contains("src=\"missing.png\""), "{out}");
+        assert!(!out.contains("src=\"https://x.example/a.png\""), "{out}");
+        assert!(!out.contains("src=\"missing.png\""), "{out}");
+        let escaped = signature_from_source(
+            "<img src=\"../outside.png\"><p style=\"background:url(https://evil.test/x)\">x</p>",
+            Some(&dir),
+        );
+        assert!(!escaped.contains("src="));
+        assert!(!escaped.contains("style="));
     }
 
     #[test]

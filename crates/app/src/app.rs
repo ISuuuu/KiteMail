@@ -4604,13 +4604,6 @@ impl HylkiApp {
                     self.allow_remote_images_for(msg_id, cx);
                 }
             }
-            WebViewAction::CardTrustSender(msg_id) => {
-                if let Some(tm) = find_tm(msg_id) {
-                    let sender = tm.sender.clone();
-                    self.allow_remote_images_for(msg_id, cx);
-                    self.trust_remote_sender(&sender, cx);
-                }
-            }
             WebViewAction::CardLoadBody(msg_id) => {
                 if find_tm(msg_id).is_some() {
                     if let Some(ref w) = self.worker {
@@ -5002,15 +4995,6 @@ impl HylkiApp {
     /// 临时允许指定邮件加载远程图片。
     pub(crate) fn allow_remote_images_for(&mut self, message_id: u32, cx: &mut Context<Self>) {
         self.allowed_remote_image_ids.insert(message_id);
-        cx.notify();
-    }
-
-    /// 总是信任并允许指定发件人加载远程图片（持久化到偏好设置）。
-    pub(crate) fn trust_remote_sender(&mut self, sender: &str, cx: &mut Context<Self>) {
-        let sender = sender.to_string();
-        self.mutate_preferences(cx, |p| {
-            p.allow_remote_sender(&sender);
-        });
         cx.notify();
     }
 
@@ -9545,10 +9529,9 @@ impl HylkiApp {
         }
     }
 
-    pub(crate) fn remote_images_allowed(&self, id: u32, sender: &str) -> bool {
-        !self.prefs.block_remote_images
-            || self.allowed_remote_image_ids.contains(&id)
-            || self.prefs.is_remote_sender_allowed(sender)
+    pub(crate) fn remote_images_allowed(&self, id: u32) -> bool {
+        self.prefs
+            .allow_message_images(self.allowed_remote_image_ids.contains(&id))
     }
 
     /// WP-05：按「系统 → 链接打开方式」偏好打开邮件内链接。`system` 走
@@ -11309,9 +11292,12 @@ impl HylkiApp {
         if added == 0 {
             return Ok(0);
         }
-        for acc in &import_accounts {
-            let _ = kitemail_mail_core::secrets::migrate_legacy_secret_to_email(acc.id, &acc.email);
-        }
+        let _verified = config::validate_discovered_account_import(
+            &data_dir,
+            &existing,
+            &import_accounts,
+            &merged,
+        )?;
         config::save_accounts_in(&data_dir, &merged)?;
         config::register_known_data_dir(&data_dir);
         self.accounts = merged;
@@ -12472,7 +12458,11 @@ impl Render for HylkiApp {
                 if let Some(host) = self.reader_webview.clone() {
                     cx.defer_in(window, move |this, _, _| {
                         if this.reader_webview_key.is_none() {
-                            host.unload_and_suspend();
+                            if host.retire_for_remote_reload(false) {
+                                this.reader_webview = None;
+                            } else {
+                                host.unload_and_suspend();
+                            }
                         }
                     });
                 }
@@ -15463,18 +15453,6 @@ mod tests {
         assert!(text.contains("Subject: 周报\r\n"));
         assert!(text.contains("Message-ID: <demo-7@hylki.example>\r\n"));
         assert!(text.contains("\r\n\r\n正文第一行"));
-    }
-
-    #[test]
-    fn remote_images_allowed_respects_whitelist_and_sender_trust() {
-        let mut prefs = kitemail_mail_core::config::AppPreferences::default();
-        prefs.block_remote_images = true;
-        prefs.allow_remote_sender("trusted@example.com");
-
-        // 验证发件人白名单解析与放行
-        assert!(prefs.is_remote_sender_allowed("trusted@example.com"));
-        assert!(prefs.is_remote_sender_allowed("Trusted User <trusted@example.com>"));
-        assert!(!prefs.is_remote_sender_allowed("untrusted@example.com"));
     }
 
     #[test]

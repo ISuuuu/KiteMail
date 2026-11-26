@@ -74,6 +74,178 @@ fn temp_cache_dir(suffix: &str) -> PathBuf {
 }
 
 #[test]
+fn collapsed_inbox_cache_invalidates_for_other_connection_and_local_writes() {
+    let dir = temp_cache_dir("collapsed-version");
+    let mut writer = CacheStore::open_for_data_dir(&dir).unwrap();
+    let inbox = writer
+        .sync_folders(1, &[folder("收件箱", "INBOX")])
+        .unwrap()[0]
+        .id;
+    writer
+        .commit_folder_headers(1, inbox, 1, &[sample_header(1, "first")], None)
+        .unwrap();
+    let mut reader = CacheStore::open_for_data_dir_existing(&dir).unwrap();
+    assert_eq!(
+        reader
+            .list_messages_page(inbox, "", 0, 10)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        reader
+            .list_messages_page(inbox, "", 0, 10)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    writer
+        .commit_folder_headers(1, inbox, 1, &[sample_header(2, "second")], None)
+        .unwrap();
+    assert_eq!(
+        reader
+            .list_messages_page(inbox, "", 0, 10)
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
+    reader
+        .commit_folder_headers(1, inbox, 1, &[sample_header(3, "third")], None)
+        .unwrap();
+    assert_eq!(
+        reader
+            .list_messages_page(inbox, "", 0, 10)
+            .unwrap()
+            .items
+            .len(),
+        3
+    );
+    writer
+        .commit_folder_headers(1, inbox, 1, &[], Some(&[1, 3]))
+        .unwrap();
+    assert_eq!(
+        reader
+            .list_messages_page(inbox, "", 0, 10)
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
+    drop(reader);
+    drop(writer);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn attachments_index_is_created_when_existing_database_reopens() {
+    let dir = temp_cache_dir("attachment-index");
+    let mut cache = CacheStore::open_for_data_dir(&dir).unwrap();
+    cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
+    cache.with_account_mail_conn(1, |conn| {
+        conn.execute("DROP INDEX idx_attachments_message_id", [])
+            .unwrap();
+    });
+    drop(cache);
+    let mut cache = CacheStore::open_for_data_dir_existing(&dir).unwrap();
+    cache.list_folders(1).unwrap();
+    cache.with_account_mail_conn(1, |conn| {
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT * FROM attachments WHERE message_id = 1",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_attachments_message_id"), "{plan}");
+    });
+    drop(cache);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn graph_remote_id_collision_keeps_distinct_messages_and_stable_identity() {
+    let mut cache = CacheStore::open_in_memory().unwrap();
+    let folder = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap()[0].id;
+    let a = sample_header(42, "first");
+    let mut b = sample_header(42, "second");
+    b.message_id = "<different@example.com>".into();
+    cache
+        .commit_folder_headers_with_remote(
+            1,
+            folder,
+            1,
+            &[
+                (a.clone(), "remote-a".into()),
+                (b.clone(), "remote-b".into()),
+            ],
+            None,
+        )
+        .unwrap();
+    let page = cache.list_messages_page(folder, "", 0, 10).unwrap();
+    assert_eq!(page.items.len(), 2);
+    let ids: std::collections::HashMap<_, _> = page
+        .items
+        .iter()
+        .map(|m| (m.subject.clone(), m.id))
+        .collect();
+    assert_eq!(
+        cache
+            .get_message_remote_id(ids["first"])
+            .unwrap()
+            .as_deref(),
+        Some("remote-a")
+    );
+    assert_eq!(
+        cache
+            .get_message_remote_id(ids["second"])
+            .unwrap()
+            .as_deref(),
+        Some("remote-b")
+    );
+    cache
+        .store_message_body(ids["first"], "body-a", &[])
+        .unwrap();
+    cache
+        .store_message_body(ids["second"], "body-b", &[])
+        .unwrap();
+    cache
+        .commit_folder_headers_with_remote(
+            1,
+            folder,
+            1,
+            &[(b, "remote-b".into()), (a, "remote-a".into())],
+            None,
+        )
+        .unwrap();
+    let page = cache.list_messages_page(folder, "", 0, 10).unwrap();
+    assert_eq!(page.items.len(), 2);
+    for m in page.items {
+        assert_eq!(m.id, ids[&m.subject]);
+    }
+    assert_eq!(
+        cache
+            .get_message_detail(ids["first"])
+            .unwrap()
+            .unwrap()
+            .0
+            .body_text,
+        "body-a"
+    );
+    assert_eq!(
+        cache
+            .get_message_detail(ids["second"])
+            .unwrap()
+            .unwrap()
+            .0
+            .body_text,
+        "body-b"
+    );
+}
+
+#[test]
 fn header_cc_is_cached_and_exposed_in_detail() {
     let mut cache = CacheStore::open_in_memory().expect("open memory db");
     let folders = cache.sync_folders(1, &[folder("收件箱", "INBOX")]).unwrap();
@@ -625,7 +797,7 @@ fn quit_preserves_queued_send_at_for_undo_and_scheduled_items() {
             .as_nanos()
     ));
     let mut cache = CacheStore::open_for_data_dir(&dir).unwrap();
-    let now = 1_700_000_000i64;
+    let now = chrono::Utc::now().timestamp() + 3600;
     let undo_due = now + 5;
     let scheduled_due = now + 3600;
     let undo_id = cache
@@ -658,12 +830,59 @@ fn quit_preserves_queued_send_at_for_undo_and_scheduled_items() {
         .unwrap();
     drop(cache);
 
+    let mut before_restart = CacheStore::open_for_data_dir_existing(&dir).unwrap();
+    let interrupted_id = before_restart
+        .enqueue_outbox(
+            1,
+            "recipient@example.invalid",
+            "",
+            "",
+            "中断",
+            "",
+            "",
+            &[],
+            now,
+            None,
+        )
+        .unwrap();
+    assert!(before_restart
+        .claim_outbox_for_delivery(interrupted_id, now)
+        .unwrap()
+        .is_some());
+    drop(before_restart);
+
     let worker = crate::worker::MailWorkerHandle::spawn(dir.clone()).unwrap();
     worker.prepare_quit_now().unwrap();
+    worker
+        .send_checked(crate::MailRequest::PrepareQuit)
+        .unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        if worker
+            .drain_events()
+            .into_iter()
+            .any(|event| matches!(event, crate::WorkerEvent::QuitPrepared { result: Ok(()) }))
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "worker did not acknowledge shutdown"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     drop(worker);
 
     let reopened = CacheStore::open_for_data_dir_existing(&dir).unwrap();
     let items = reopened.list_outbox(1).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .find(|i| i.id == interrupted_id)
+            .unwrap()
+            .status,
+        OutboxStatus::Uncertain
+    );
     assert_eq!(
         items.iter().find(|i| i.id == undo_id).unwrap().send_at,
         Some(undo_due)

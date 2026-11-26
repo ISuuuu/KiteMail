@@ -133,7 +133,7 @@ impl MessageWindow {
             cx.observe(&app, |this, app, cx| {
                 let app_ref = app.read(cx);
                 let remote_changed = this.webview_appearance.is_some_and(|(_, allowed)| {
-                    app_ref.remote_images_allowed(this.detail.id, &this.detail.sender) != allowed
+                    app_ref.remote_images_allowed(this.detail.id) != allowed
                 });
                 let next_prefs = &app_ref.prefs;
                 let prefs_changed = this.prefs.reader_zoom_percent
@@ -144,7 +144,6 @@ impl MessageWindow {
                     || this.prefs.show_remote_banner != next_prefs.show_remote_banner
                     || this.prefs.clean_links != next_prefs.clean_links
                     || this.prefs.block_remote_images != next_prefs.block_remote_images
-                    || this.prefs.allowed_remote_senders != next_prefs.allowed_remote_senders
                     || this.prefs.ui_text_scale_percent != next_prefs.ui_text_scale_percent;
                 let dark_changed = this.webview_appearance.is_some_and(|(appearance, _)| {
                     let forced_dark = match next_prefs.message_theme.as_str() {
@@ -357,7 +356,7 @@ impl Render for MessageWindow {
         let allow_remote = self
             .app_entity
             .upgrade()
-            .is_some_and(|app| app.read(cx).remote_images_allowed(d.id, &d.sender));
+            .is_some_and(|app| app.read(cx).remote_images_allowed(d.id));
         let app_for_link = self.app_entity.clone();
         let app_for_quote_link = self.app_entity.clone();
         let app_dark = self
@@ -392,6 +391,13 @@ impl Render for MessageWindow {
                 cx.defer_in(window, move |this, window, cx| {
                     if this.webview_appearance != settings {
                         return;
+                    }
+                    if this
+                        .webview
+                        .as_ref()
+                        .is_some_and(|host| host.retire_for_remote_reload(allow_remote))
+                    {
+                        this.webview = None;
                     }
                     if let Some(host) = &this.webview {
                         let _ = host.load_with_remote(document, allow_remote);
@@ -770,7 +776,6 @@ impl Render for MessageWindow {
             })
             .when(blocked_images > 0 && self.prefs.show_remote_banner && self.print_preview.is_none(), |root| {
                 let id = d.id;
-                let sender = d.sender.clone();
                 root.child(
                     h_flex()
                         .gap_2()
@@ -781,19 +786,6 @@ impl Render for MessageWindow {
                                 .label("显示本次图片")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let _ = this.app_entity.update(cx, |app, cx| app.allow_remote_images_for(id, cx));
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("popout-trust-remote")
-                                .outline()
-                                .compact()
-                                .label("总是信任此发件人")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let _ = this.app_entity.update(cx, |app, cx| {
-                                        app.allow_remote_images_for(id, cx);
-                                        app.trust_remote_sender(&sender, cx);
-                                    });
                                     cx.notify();
                                 })),
                         ),

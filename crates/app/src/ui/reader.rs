@@ -1017,7 +1017,6 @@ fn render_message_card(
         .when(
             !show_raw_source && blocked_images > 0 && show_remote_banner,
             |card| {
-                let sender_str = sender.to_string();
                 card.child(
                     h_flex()
                         .px_3()
@@ -1031,27 +1030,15 @@ fn render_message_card(
                             format!("已拦截 {blocked_images} 张远程图片以保护隐私"),
                         )))
                         .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new(("allow-remote-img", msg_id))
-                                        .outline()
-                                        .compact()
-                                        .label("显示本次图片")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.allow_remote_images_for(msg_id, cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new(("trust-remote-sender", msg_id))
-                                        .outline()
-                                        .compact()
-                                        .label("总是信任此发件人")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.allow_remote_images_for(msg_id, cx);
-                                            this.trust_remote_sender(&sender_str, cx);
-                                        })),
-                                ),
+                            h_flex().gap_2().child(
+                                Button::new(("allow-remote-img", msg_id))
+                                    .outline()
+                                    .compact()
+                                    .label("显示本次图片")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.allow_remote_images_for(msg_id, cx);
+                                    })),
+                            ),
                         ),
                 )
             },
@@ -1364,7 +1351,7 @@ pub(crate) fn render_with_pane_top(
         use std::hash::{Hash, Hasher};
 
         let html = detail.body_html.as_deref();
-        let block_remote = !app.remote_images_allowed(detail.id, &detail.sender);
+        let block_remote = !app.remote_images_allowed(detail.id);
         let eligible = webview_eligible(
             html,
             body_pending,
@@ -1398,7 +1385,11 @@ pub(crate) fn render_with_pane_top(
             if let Some(host) = app.reader_webview.clone() {
                 cx.defer_in(window, move |this, _, _| {
                     if this.reader_webview_key.is_none() {
-                        let _ = host.load(b"<!doctype html>".to_vec());
+                        if host.retire_for_remote_reload(false) {
+                            this.reader_webview = None;
+                        } else {
+                            let _ = host.load(b"<!doctype html>".to_vec());
+                        }
                     }
                 });
             }
@@ -1413,6 +1404,13 @@ pub(crate) fn render_with_pane_top(
                     || this.selected_message.as_ref().map(|message| message.id) != Some(message_id)
                 {
                     return;
+                }
+                if this
+                    .reader_webview
+                    .as_ref()
+                    .is_some_and(|host| host.retire_for_remote_reload(!block_remote))
+                {
+                    this.reader_webview = None;
                 }
                 if let Some(host) = this.ensure_reader_webview(window, cx) {
                     let _ = host.load_document(document, !block_remote, DocumentMode::SingleBody);
@@ -1474,7 +1472,7 @@ pub(crate) fn render_with_pane_top(
                 app.raw_source_message_ids
                     .contains(&tm.id)
                     .hash(&mut hasher);
-                (!app.remote_images_allowed(tm.id, &tm.sender)).hash(&mut hasher);
+                (!app.remote_images_allowed(tm.id)).hash(&mut hasher);
                 let card_dark = app
                     .message_bg_picks
                     .get(&tm.id)
@@ -1517,7 +1515,7 @@ pub(crate) fn render_with_pane_top(
                         is_current,
                         is_collapsed: app.collapsed_thread_cards.contains(&tm.id),
                         show_raw_source: app.raw_source_message_ids.contains(&tm.id),
-                        block_remote: !app.remote_images_allowed(tm.id, &tm.sender),
+                        block_remote: !app.remote_images_allowed(tm.id),
                         card_dark,
                         card_pending: is_current && body_pending,
                         eml_exporting: app.pending_eml_export == Some(tm.id),
@@ -1565,6 +1563,13 @@ pub(crate) fn render_with_pane_top(
                     || this.selected_message.as_ref().map(|message| message.id) != Some(message_id)
                 {
                     return;
+                }
+                if this
+                    .reader_webview
+                    .as_ref()
+                    .is_some_and(|host| host.retire_for_remote_reload(any_remote_allowed))
+                {
+                    this.reader_webview = None;
                 }
                 if let Some(host) = this.ensure_reader_webview(window, cx) {
                     let _ = host.load_document(
@@ -1680,7 +1685,7 @@ pub(crate) fn render_with_pane_top(
                     let is_current = tm.id == detail.id;
                     let is_collapsed = app.collapsed_thread_cards.contains(&tm.id);
                     let show_raw_source = app.raw_source_message_ids.contains(&tm.id);
-                    let block_remote = !app.remote_images_allowed(tm.id, &tm.sender);
+                    let block_remote = !app.remote_images_allowed(tm.id);
                     let card_subject = if tm.subject.trim().is_empty() {
                         detail.subject.clone()
                     } else {
@@ -1752,7 +1757,7 @@ pub(crate) fn render_with_pane_top(
     } else {
         let is_collapsed = app.collapsed_thread_cards.contains(&detail.id);
         let show_raw_source = app.raw_source_message_ids.contains(&detail.id);
-        let block_remote = !app.remote_images_allowed(detail.id, &detail.sender);
+        let block_remote = !app.remote_images_allowed(detail.id);
         let eml_exporting = app.pending_eml_export == Some(detail.id);
         let menu = build_card_more_menu(
             std::sync::Arc::clone(&detail),

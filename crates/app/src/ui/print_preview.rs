@@ -355,12 +355,79 @@ pub(crate) fn export_print_pdf(
     ))
 }
 
+pub(crate) fn cleanup_print_temp_files() {
+    let dir = kitemail_mail_core::config::data_dir().join("print-temp");
+    cleanup_print_temp_files_at(&dir, std::time::SystemTime::now());
+}
+
+fn cleanup_print_temp_files_at(dir: &Path, now: std::time::SystemTime) {
+    if !is_plain_print_directory(dir) {
+        return;
+    }
+    // Give an external browser ample time to consume a print page; only our
+    // own old files are candidates for cleanup on a later print operation.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(parts) = name
+                .strip_prefix("kitemail-print-")
+                .and_then(|s| s.strip_suffix(".html"))
+            else {
+                continue;
+            };
+            let parts: Vec<_> = parts.split('-').collect();
+            if parts.len() != 2
+                || !parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            {
+                continue;
+            }
+            if entry.file_type().is_ok_and(|t| t.is_file())
+                && entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .is_some_and(|age| age > std::time::Duration::from_secs(7 * 24 * 60 * 60))
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn is_plain_print_directory(dir: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn create_print_temp_file(html: &str) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let data_dir = kitemail_mail_core::config::data_dir();
+    let dir = data_dir.join("print-temp");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建打印临时目录失败: {e}"))?;
+    if !is_plain_print_directory(&dir) {
+        return Err("打印临时目录不是普通目录".into());
+    }
+    cleanup_print_temp_files();
     loop {
-        let path = std::env::temp_dir().join(format!(
+        let path = dir.join(format!(
             "kitemail-print-{}-{}.html",
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -776,6 +843,29 @@ pub(crate) fn render_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_cleanup_only_removes_old_owned_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "kitemail-print-cleanup-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let owned = dir.join("kitemail-print-1-2.html");
+        let other = dir.join("other.html");
+        std::fs::write(&owned, "synthetic").unwrap();
+        std::fs::write(&other, "synthetic").unwrap();
+        cleanup_print_temp_files_at(&dir, std::time::SystemTime::now());
+        assert!(owned.exists());
+        cleanup_print_temp_files_at(
+            &dir,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(8 * 24 * 60 * 60),
+        );
+        assert!(!owned.exists());
+        assert!(other.exists());
+        std::fs::remove_file(other).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn concurrent_print_jobs_use_distinct_temp_files() {

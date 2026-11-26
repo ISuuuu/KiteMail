@@ -284,6 +284,8 @@ fn main() {
         return;
     };
 
+    ui::print_preview::cleanup_print_temp_files();
+
     let demo_mode = std::env::args().any(|arg| arg == "--demo");
 
     // 注册 Hylki 欢迎页 Logo 与完整 Lucide 图标资源。

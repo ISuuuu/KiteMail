@@ -3,6 +3,9 @@
 KiteMail reads untrusted content (every message it opens was written by someone
 else), so security reports are welcome and taken seriously.
 
+The [Windows security and performance audit (中文, 2026-11-26)](security-performance-audit-2026-11-26.html)
+documents network destinations, credential handling, fixes, benchmarks, and remaining risks.
+
 ## Reporting a vulnerability
 
 **Please report privately, not as a public issue.**

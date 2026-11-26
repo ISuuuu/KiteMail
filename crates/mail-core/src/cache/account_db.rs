@@ -35,6 +35,7 @@ pub(crate) struct AccountDb {
     pub(crate) mail_conn: Connection,
     content_conn: RefCell<Option<Connection>>,
     read_only: bool,
+    collapsed_cache: RefCell<Option<CollapsedCache>>,
 }
 
 /// Extracted local message row used both for direct single-account pages and cross-account merges.
@@ -213,6 +214,7 @@ enum ListThreadKey {
     Singleton(u32),
 }
 
+#[derive(Clone)]
 struct CollapsedThreadEntry {
     rep_local_id: u32,
     unread: bool,
@@ -220,6 +222,15 @@ struct CollapsedThreadEntry {
     has_attachment: bool,
     importance: i8,
     tags: Vec<String>,
+}
+
+struct CollapsedCache {
+    where_sql: String,
+    args: Vec<rusqlite::types::Value>,
+    order_sql: String,
+    version: i64,
+    changes: u64,
+    entries: std::sync::Arc<Vec<CollapsedThreadEntry>>,
 }
 
 fn parse_tags_csv(tags_raw: &str) -> Vec<String> {
@@ -253,6 +264,7 @@ impl AccountDb {
             mail_conn,
             content_conn: RefCell::new(None),
             read_only: false,
+            collapsed_cache: RefCell::new(None),
         };
         db.configure_and_migrate_mail(true)?;
         Ok(db)
@@ -276,6 +288,14 @@ impl AccountDb {
                 "PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
             )
             .map_err(|e| format!("配置已有账号索引库失败: {e}"))?;
+        ensure_column(
+            &mail_conn,
+            "messages",
+            "remote_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        mail_conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id); CREATE INDEX IF NOT EXISTS idx_messages_folder_remote_id ON messages(folder_id, remote_id);")
+            .map_err(|e| format!("更新已有账号索引失败: {e}"))?;
         Ok(Self {
             account_id,
             slot,
@@ -284,6 +304,7 @@ impl AccountDb {
             mail_conn,
             content_conn: RefCell::new(None),
             read_only: false,
+            collapsed_cache: RefCell::new(None),
         })
     }
 
@@ -315,6 +336,7 @@ impl AccountDb {
             mail_conn,
             content_conn: RefCell::new(None),
             read_only: true,
+            collapsed_cache: RefCell::new(None),
         }))
     }
 
@@ -329,6 +351,7 @@ impl AccountDb {
             mail_conn,
             content_conn: RefCell::new(None),
             read_only: false,
+            collapsed_cache: RefCell::new(None),
         };
         db.configure_and_migrate_mail(false)?;
         Ok(db)
@@ -423,6 +446,9 @@ impl AccountDb {
                     transfer_encoding TEXT NOT NULL DEFAULT ''
                 );
 
+                CREATE INDEX IF NOT EXISTS idx_attachments_message_id
+                    ON attachments(message_id);
+
                 CREATE TABLE IF NOT EXISTS message_rfc_refs (
                     message_row_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
                     token TEXT NOT NULL,
@@ -438,6 +464,7 @@ impl AccountDb {
             ("folders", "is_inbox", "INTEGER NOT NULL DEFAULT 0"),
             ("folders", "has_more_remote", "INTEGER NOT NULL DEFAULT 0"),
             ("folders", "remote_next_link", "TEXT NOT NULL DEFAULT ''"),
+            ("messages", "remote_id", "TEXT NOT NULL DEFAULT ''"),
             ("messages", "cc", "TEXT NOT NULL DEFAULT ''"),
             ("messages", "body_loaded", "INTEGER NOT NULL DEFAULT 0"),
             ("messages", "body_cached_at", "INTEGER NOT NULL DEFAULT 0"),
@@ -470,6 +497,8 @@ impl AccountDb {
         self.mail_conn
             .execute_batch(
                 "
+                CREATE INDEX IF NOT EXISTS idx_messages_folder_remote_id
+                    ON messages(folder_id, remote_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_needing_index
                     ON messages(folder_id, id) WHERE body_loaded = 0 AND index_text IS NULL;
 
@@ -1017,6 +1046,18 @@ impl AccountDb {
             .map_err(|e| format!("读取文件夹元数据失败: {e}"))
     }
 
+    pub(crate) fn folder_cached_uids(&self, local_folder_id: u32) -> Result<HashSet<u32>, String> {
+        let mut stmt = self
+            .mail_conn
+            .prepare("SELECT uid FROM messages WHERE folder_id = ?1")
+            .map_err(|e| format!("读取缓存 UID 失败: {e}"))?;
+        let rows = stmt
+            .query_map(params![local_folder_id], |row| row.get(0))
+            .map_err(|e| format!("读取缓存 UID 失败: {e}"))?;
+        rows.collect::<Result<HashSet<u32>, _>>()
+            .map_err(|e| format!("读取缓存 UID 失败: {e}"))
+    }
+
     pub(crate) fn commit_folder_headers_with_remote(
         &mut self,
         local_folder_id: u32,
@@ -1094,6 +1135,38 @@ impl AccountDb {
         }
 
         for (item, remote_id) in headers {
+            // Graph IDs are opaque; the 32-bit UID is only a local surrogate.
+            // Reuse the exact ID's existing surrogate, otherwise probe for a free one.
+            let uid = if remote_id.is_empty() {
+                item.uid
+            } else {
+                let existing: Option<u32> = tx
+                    .query_row(
+                        "SELECT uid FROM messages WHERE folder_id = ?1 AND remote_id = ?2 LIMIT 1",
+                        params![local_folder_id, remote_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("读取远程邮件标识失败: {e}"))?;
+                if let Some(uid) = existing {
+                    uid
+                } else {
+                    let mut candidate = item.uid.max(1);
+                    loop {
+                        let occupied: bool = tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM messages WHERE folder_id = ?1 AND uid = ?2)",
+                            params![local_folder_id, candidate], |row| row.get(0),
+                        ).map_err(|e| format!("检查邮件 UID 失败: {e}"))?;
+                        if !occupied {
+                            break candidate;
+                        }
+                        candidate = candidate.wrapping_add(1).max(1);
+                        if candidate == item.uid.max(1) {
+                            return Err("邮件 UID 空间已满".to_string());
+                        }
+                    }
+                }
+            };
             let thread_subj = normalize_thread_subject(&item.subject);
             tx.execute(
                 "
@@ -1134,7 +1207,7 @@ impl AccountDb {
                 ",
                 params![
                     local_folder_id,
-                    item.uid,
+                    uid,
                     remote_id,
                     item.message_id,
                     item.in_reply_to,
@@ -1158,7 +1231,7 @@ impl AccountDb {
                 tx.query_row(
                     "SELECT id, message_id, in_reply_to, references_header
                      FROM messages WHERE folder_id = ?1 AND uid = ?2",
-                    params![local_folder_id, item.uid],
+                    params![local_folder_id, uid],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(|e| format!("读取写入后的邮件索引失败: {e}"))?;
@@ -1492,11 +1565,31 @@ impl AccountDb {
         offset: usize,
         limit: usize,
     ) -> Result<(usize, Vec<MessageSummary>), String> {
-        let mut dsu = RfcThreadDsu::load(&self.mail_conn)?;
-        let mut stmt = self
+        let version: i64 = self
             .mail_conn
-            .prepare(&format!(
-                "
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(|e| format!("读取缓存版本失败: {e}"))?;
+        let changes = self.mail_conn.total_changes();
+        let cached = self
+            .collapsed_cache
+            .borrow()
+            .as_ref()
+            .filter(|c| {
+                c.version == version
+                    && c.changes == changes
+                    && c.where_sql == where_sql
+                    && c.args == args
+                    && c.order_sql == order_sql
+            })
+            .map(|c| c.entries.clone());
+        let entries = if let Some(entries) = cached {
+            entries
+        } else {
+            let mut dsu = RfcThreadDsu::load(&self.mail_conn)?;
+            let mut stmt = self
+                .mail_conn
+                .prepare(&format!(
+                    "
                 SELECT m.id, m.in_reply_to, m.references_header, m.thread_subject, m.subject,
                        m.unread, m.flagged, m.has_attachment, m.importance, m.tags
                 FROM messages m
@@ -1504,102 +1597,119 @@ impl AccountDb {
                 WHERE {where_sql}
                 ORDER BY {order_sql}
                 "
-            ))
-            .map_err(|e| format!("准备{label}会话折叠查询失败: {e}"))?;
+                ))
+                .map_err(|e| format!("准备{label}会话折叠查询失败: {e}"))?;
 
-        let mut entries: Vec<CollapsedThreadEntry> = Vec::new();
-        let mut index_by_key: HashMap<ListThreadKey, usize> = HashMap::new();
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(args.iter()))
-            .map_err(|e| format!("执行{label}会话折叠查询失败: {e}"))?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("遍历{label}会话折叠行失败: {e}"))?
-        {
-            let local_id: u32 = row
-                .get(0)
-                .map_err(|e| format!("读取{label}邮件 ID 失败: {e}"))?;
-            let in_reply_to: String = row
-                .get(1)
-                .map_err(|e| format!("读取{label}回复头失败: {e}"))?;
-            let references_header: String = row
-                .get(2)
-                .map_err(|e| format!("读取{label}引用头失败: {e}"))?;
-            let thread_subject: String = row
-                .get(3)
-                .map_err(|e| format!("读取{label}归并主题失败: {e}"))?;
-            let subject: String = row
-                .get(4)
-                .map_err(|e| format!("读取{label}主题失败: {e}"))?;
-            let unread = row
-                .get::<_, i32>(5)
-                .map_err(|e| format!("读取{label}未读态失败: {e}"))?
-                != 0;
-            let flagged = row
-                .get::<_, i32>(6)
-                .map_err(|e| format!("读取{label}星标态失败: {e}"))?
-                != 0;
-            let has_attachment = row
-                .get::<_, i32>(7)
-                .map_err(|e| format!("读取{label}附件态失败: {e}"))?
-                != 0;
-            let importance = row
-                .get::<_, i32>(8)
-                .map_err(|e| format!("读取{label}重要性失败: {e}"))?
-                .clamp(-1, 1) as i8;
-            let tags_raw: String = row
-                .get(9)
-                .map_err(|e| format!("读取{label}标签失败: {e}"))?;
+            let mut entries: Vec<CollapsedThreadEntry> = Vec::new();
+            let mut index_by_key: HashMap<ListThreadKey, usize> = HashMap::new();
+            let mut rows = stmt
+                .query(rusqlite::params_from_iter(args.iter()))
+                .map_err(|e| format!("执行{label}会话折叠查询失败: {e}"))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| format!("遍历{label}会话折叠行失败: {e}"))?
+            {
+                let local_id: u32 = row
+                    .get(0)
+                    .map_err(|e| format!("读取{label}邮件 ID 失败: {e}"))?;
+                let in_reply_to: String = row
+                    .get(1)
+                    .map_err(|e| format!("读取{label}回复头失败: {e}"))?;
+                let references_header: String = row
+                    .get(2)
+                    .map_err(|e| format!("读取{label}引用头失败: {e}"))?;
+                let thread_subject: String = row
+                    .get(3)
+                    .map_err(|e| format!("读取{label}归并主题失败: {e}"))?;
+                let subject: String = row
+                    .get(4)
+                    .map_err(|e| format!("读取{label}主题失败: {e}"))?;
+                let unread = row
+                    .get::<_, i32>(5)
+                    .map_err(|e| format!("读取{label}未读态失败: {e}"))?
+                    != 0;
+                let flagged = row
+                    .get::<_, i32>(6)
+                    .map_err(|e| format!("读取{label}星标态失败: {e}"))?
+                    != 0;
+                let has_attachment = row
+                    .get::<_, i32>(7)
+                    .map_err(|e| format!("读取{label}附件态失败: {e}"))?
+                    != 0;
+                let importance = row
+                    .get::<_, i32>(8)
+                    .map_err(|e| format!("读取{label}重要性失败: {e}"))?
+                    .clamp(-1, 1) as i8;
+                let tags_raw: String = row
+                    .get(9)
+                    .map_err(|e| format!("读取{label}标签失败: {e}"))?;
 
-            let key = if let Some(root) = dsu.find(local_id) {
-                ListThreadKey::Rfc(root)
-            } else {
-                let has_reply_headers = (!in_reply_to.trim().is_empty()
-                    && !extract_rfc_message_ids(&in_reply_to).is_empty())
-                    || (!references_header.trim().is_empty()
-                        && !extract_rfc_message_ids(&references_header).is_empty());
-                if has_reply_headers {
-                    ListThreadKey::Singleton(local_id)
+                let key = if let Some(root) = dsu.find(local_id) {
+                    ListThreadKey::Rfc(root)
                 } else {
-                    let norm = if !thread_subject.is_empty() {
-                        thread_subject
-                    } else {
-                        normalize_thread_subject(&subject)
-                    };
-                    if norm.is_empty() {
+                    let has_reply_headers = (!in_reply_to.trim().is_empty()
+                        && !extract_rfc_message_ids(&in_reply_to).is_empty())
+                        || (!references_header.trim().is_empty()
+                            && !extract_rfc_message_ids(&references_header).is_empty());
+                    if has_reply_headers {
                         ListThreadKey::Singleton(local_id)
                     } else {
-                        ListThreadKey::Subject(norm)
+                        let norm = if !thread_subject.is_empty() {
+                            thread_subject
+                        } else {
+                            normalize_thread_subject(&subject)
+                        };
+                        if norm.is_empty() {
+                            ListThreadKey::Singleton(local_id)
+                        } else {
+                            ListThreadKey::Subject(norm)
+                        }
                     }
-                }
-            };
+                };
 
-            if let Some(&idx) = index_by_key.get(&key) {
-                let entry = &mut entries[idx];
-                entry.unread |= unread;
-                entry.flagged |= flagged;
-                entry.has_attachment |= has_attachment;
-                entry.importance = entry.importance.max(importance);
-                for tag in parse_tags_csv(&tags_raw) {
-                    if !entry.tags.contains(&tag) {
-                        entry.tags.push(tag);
+                if let Some(&idx) = index_by_key.get(&key) {
+                    let entry = &mut entries[idx];
+                    entry.unread |= unread;
+                    entry.flagged |= flagged;
+                    entry.has_attachment |= has_attachment;
+                    entry.importance = entry.importance.max(importance);
+                    for tag in parse_tags_csv(&tags_raw) {
+                        if !entry.tags.contains(&tag) {
+                            entry.tags.push(tag);
+                        }
                     }
+                } else {
+                    let idx = entries.len();
+                    index_by_key.insert(key, idx);
+                    entries.push(CollapsedThreadEntry {
+                        rep_local_id: local_id,
+                        unread,
+                        flagged,
+                        has_attachment,
+                        importance,
+                        tags: parse_tags_csv(&tags_raw),
+                    });
                 }
-            } else {
-                let idx = entries.len();
-                index_by_key.insert(key, idx);
-                entries.push(CollapsedThreadEntry {
-                    rep_local_id: local_id,
-                    unread,
-                    flagged,
-                    has_attachment,
-                    importance,
-                    tags: parse_tags_csv(&tags_raw),
+            }
+            drop(rows);
+            drop(stmt);
+            let end_version: i64 = self
+                .mail_conn
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .map_err(|e| format!("读取缓存版本失败: {e}"))?;
+            let entries = std::sync::Arc::new(entries);
+            if end_version == version && self.mail_conn.total_changes() == changes {
+                *self.collapsed_cache.borrow_mut() = Some(CollapsedCache {
+                    where_sql: where_sql.to_string(),
+                    args: args.to_vec(),
+                    order_sql: order_sql.to_string(),
+                    version,
+                    changes,
+                    entries: entries.clone(),
                 });
             }
-        }
-        drop(rows);
-        drop(stmt);
+            entries
+        };
 
         let total = entries.len();
         let start = offset.min(total);

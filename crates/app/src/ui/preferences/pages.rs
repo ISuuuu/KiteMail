@@ -2941,52 +2941,6 @@ fn render_privacy(
             )],
             p,
         ))
-        .child(setting_group(
-            "本地存储加密",
-            Some(if kitemail_mail_core::at_rest::is_sqlcipher_available() {
-                "SQLCipher 4 加密后端已就绪，密钥安全存储于 Windows 凭据管理器"
-            } else {
-                "已接入密钥管理与状态检测；当前离线构建的 rusqlite 未启用 sqlcipher 特性，暂以明文 SQLite 运行"
-            }),
-            CARD_MAX_WIDTH,
-            vec![
-                prefs_switch_row(
-                    &app_entity,
-                    "pref-encrypt-stored-mail",
-                    "加密本地存储的邮件",
-                    Some("使用本地密钥（Windows 凭据管理器托管）保护缓存数据库"),
-                    prefs.encrypt_stored_mail,
-                    false,
-                    is_hit(win, "pref-encrypt-stored-mail"),
-                    |p, v| p.encrypt_stored_mail = v,
-                    p,
-                ),
-                setting_row(
-                    "pref-storage-password",
-                    "SQLCipher 密钥状态",
-                    Some(if kitemail_mail_core::at_rest::is_sqlcipher_available() {
-                        "SQLCipher 已启用，可管理本地存储密钥"
-                    } else {
-                        "密钥生成与 Windows 凭据管理器接口已就绪（等待 SQLCipher 运行时特性）"
-                    }),
-                    Button::new("btn-storage-password")
-                        .outline()
-                        .compact()
-                        .label(if kitemail_mail_core::at_rest::is_sqlcipher_available() {
-                            "更改密码"
-                        } else {
-                            "检查密钥"
-                        })
-                        .disabled(!kitemail_mail_core::at_rest::is_sqlcipher_available())
-                        .tooltip("密钥托管于 Windows 凭据管理器")
-                        .into_any_element(),
-                    true,
-                    false,
-                    p,
-                ),
-            ],
-            p,
-        ))
         .into_any_element()
 }
 

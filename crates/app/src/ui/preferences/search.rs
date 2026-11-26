@@ -589,13 +589,6 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
         keywords: "read receipt mdn ask always never 已读回执 询问",
     },
     PrefSearchItem {
-        tab: PrefTab::Privacy,
-        row_id: "pref-encrypt-stored-mail",
-        title: "加密本地存储的邮件",
-        subtitle: "本地 SQLCipher 数据库加密开关与存储密码管理",
-        keywords: "encrypt local storage sqlcipher password 加密 本地存储 密码",
-    },
-    PrefSearchItem {
         tab: PrefTab::System,
         row_id: "pref-start-at-login",
         title: "登录 Windows 时自动启动",

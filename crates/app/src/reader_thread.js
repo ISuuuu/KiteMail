@@ -451,8 +451,6 @@
             const msgId = actionBtn.dataset.msgId;
             if (action === "allow-remote" && msgId) {
                 sendAction("card-allow-remote:" + msgId);
-            } else if (action === "trust-sender" && msgId) {
-                sendAction("card-trust-sender:" + msgId);
             } else if (action === "load-body" && msgId) {
                 sendAction("card-load-body:" + msgId);
             } else if (action === "save-att" && actionBtn.dataset.attId) {

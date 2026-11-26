@@ -23,54 +23,12 @@ pub struct SenderCheck {
     pub lookalike_warning: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthResult {
-    Pass,
-    Fail,
-    Other,
-    Missing,
-}
-
-impl AuthResult {
-    fn parse(value: &str) -> AuthResult {
-        match value {
-            "pass" => AuthResult::Pass,
-            "fail" | "softfail" | "permerror" => AuthResult::Fail,
-            _ => AuthResult::Other,
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct Evidence {
-    spf: Option<AuthResult>,
-    dkim: Option<AuthResult>,
-    dmarc: Option<AuthResult>,
-    dkim_domain: Option<String>,
     from_domain: String,
     from_name: String,
     reply_to_domain: Option<String>,
     return_path_domain: Option<String>,
-    checked: bool,
-    authority: Option<String>,
-}
-
-impl Evidence {
-    fn get(&self, which: Method) -> AuthResult {
-        match which {
-            Method::Spf => self.spf,
-            Method::Dkim => self.dkim,
-            Method::Dmarc => self.dmarc,
-        }
-        .unwrap_or(AuthResult::Missing)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Method {
-    Spf,
-    Dkim,
-    Dmarc,
 }
 
 /// Verify sender authenticity from a raw RFC 822 message.
@@ -100,28 +58,8 @@ pub fn check_sender(raw: &[u8]) -> SenderCheck {
         .and_then(header_text)
         .and_then(|v| domain_of(v.trim().trim_start_matches('<').trim_end_matches('>')));
 
-    for header in parsed
-        .headers()
-        .iter()
-        .filter(|h| h.name().eq_ignore_ascii_case("Authentication-Results"))
-    {
-        if let Some(line) = header_text(&header.value) {
-            let who = authserv_id(&line);
-            let top = ev.authority.get_or_insert_with(|| who.clone());
-            if registrable(top) != registrable(&who) {
-                continue;
-            }
-            ev.checked = true;
-            parse_auth_results(&line, &mut ev);
-        }
-    }
-    if ev.spf.is_none() {
-        if let Some(line) = parsed.header("Received-SPF").and_then(header_text) {
-            let word = line.split_whitespace().next().unwrap_or("").to_string();
-            ev.spf = Some(AuthResult::parse(&word.to_ascii_lowercase()));
-            ev.checked = true;
-        }
-    }
+    // Message headers are sender-controlled; there is no configured trusted
+    // receiving server whose authentication results can be distinguished.
     judge(&ev)
 }
 
@@ -132,13 +70,7 @@ pub fn check_sender_summary(from: &str, auth_results: Option<&str>) -> SenderChe
     let (name, email) = split_display_and_email(from);
     ev.from_name = name;
     ev.from_domain = domain_of(&email).unwrap_or_default();
-    if let Some(line) = auth_results {
-        if !line.trim().is_empty() {
-            ev.authority = Some(authserv_id(line));
-            ev.checked = true;
-            parse_auth_results(line, &mut ev);
-        }
-    }
+    let _ = auth_results; // No trusted receiving authority is configured.
     judge(&ev)
 }
 
@@ -167,112 +99,15 @@ fn header_text(value: &mail_parser::HeaderValue) -> Option<String> {
     }
 }
 
-fn parse_auth_results(line: &str, ev: &mut Evidence) {
-    let lower = line.to_ascii_lowercase();
-    let mut this_spf = None;
-    let mut this_dkim = None;
-    let mut this_dmarc = None;
-    let mut this_domain = None;
-    for token in lower.split([';', ' ', '\t', '\r', '\n']) {
-        let Some((key, value)) = token.split_once('=') else {
-            continue;
-        };
-        let value =
-            value.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
-        match key {
-            "spf" => this_spf = Some(AuthResult::parse(value)),
-            "dkim" => this_dkim = Some(AuthResult::parse(value)),
-            "dmarc" => this_dmarc = Some(AuthResult::parse(value)),
-            "header.d" if !value.is_empty() => this_domain = Some(value.to_string()),
-            _ => {}
-        }
-    }
-    if ev.spf.is_none() {
-        ev.spf = this_spf;
-    }
-    if ev.dkim.is_none() {
-        if let Some(r) = this_dkim {
-            ev.dkim = Some(r);
-            ev.dkim_domain = this_domain;
-        }
-    }
-    if ev.dmarc.is_none() {
-        ev.dmarc = this_dmarc;
-    }
-}
-
-fn authserv_id(line: &str) -> String {
-    let first = line.split(';').next().unwrap_or("").trim();
-    if first.contains('=') {
-        return String::new();
-    }
-    first
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
-}
-
-fn failed_and_nothing_passed(dkim: AuthResult, spf: AuthResult) -> bool {
-    let any_failed = dkim == AuthResult::Fail || spf == AuthResult::Fail;
-    let any_passed = dkim == AuthResult::Pass || spf == AuthResult::Pass;
-    any_failed && !any_passed
-}
-
 fn judge(ev: &Evidence) -> SenderCheck {
     let from = if ev.from_domain.is_empty() {
         "(未知域名)"
     } else {
         &ev.from_domain
     };
-    let dmarc = ev.get(Method::Dmarc);
-    let dkim = ev.get(Method::Dkim);
-    let spf = ev.get(Method::Spf);
-    let dkim_aligned = dkim == AuthResult::Pass
-        && ev
-            .dkim_domain
-            .as_deref()
-            .is_some_and(|d| same_site(d, &ev.from_domain));
-
-    let (mut trust, mut summary) = match (dmarc, dkim, spf) {
-        (AuthResult::Pass, _, _) => (
-            SenderTrust::Pass,
-            format!("邮件服务商已验证该邮件确实来自 {from}（DMARC 通过）。"),
-        ),
-        (AuthResult::Fail, _, _) => (
-            SenderTrust::Fail,
-            format!("该邮件未通过 {from} 的真实性校验（DMARC 失败），请警惕伪造发件人。"),
-        ),
-        _ if dkim_aligned => (
-            SenderTrust::Pass,
-            format!("该邮件携带来自 {from} 的有效 DKIM 签名。"),
-        ),
-        _ if failed_and_nothing_passed(dkim, spf) => (
-            SenderTrust::Suspicious,
-            format!("无法确认该邮件来自 {from}，且已执行的发件人校验失败。"),
-        ),
-        _ if !ev.checked => (
-            SenderTrust::Unverified,
-            "邮件服务商未提供 SPF/DKIM/DMARC 校验头。".to_string(),
-        ),
-        _ => (
-            SenderTrust::Unverified,
-            format!("现有校验信息不足以完全确认发件域名 {from}。"),
-        ),
-    };
-
+    let mut trust = SenderTrust::Unverified;
+    let mut summary = "无法确认认证结果来自可信的邮件服务商。".to_string();
     let mut findings = Vec::new();
-    for (label, res) in [("DMARC", dmarc), ("DKIM", dkim), ("SPF", spf)] {
-        match res {
-            AuthResult::Pass => findings.push(format!("{label}: 通过")),
-            AuthResult::Fail => findings.push(format!("{label}: 失败")),
-            AuthResult::Other => findings.push(format!("{label}: 未决")),
-            AuthResult::Missing => {}
-        }
-    }
-    if let Some(d) = &ev.dkim_domain {
-        findings.push(format!("DKIM 签名域: {d}"));
-    }
 
     let mut lookalike_warning: Option<String> = None;
 
@@ -314,8 +149,8 @@ fn judge(ev: &Evidence) -> SenderCheck {
         summary,
         findings,
         from_domain: ev.from_domain.clone(),
-        dkim_domain: ev.dkim_domain.clone(),
-        authority: ev.authority.clone(),
+        dkim_domain: None,
+        authority: None,
         lookalike_warning,
     }
 }
@@ -384,13 +219,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn untrusted_authentication_still_checks_reply_and_return_path() {
+        let raw = concat!(
+            "Authentication-Results: fake.example; dmarc=pass\r\n",
+            "From: User <user@example.com>\r\n",
+            "Reply-To: reply@other.example\r\n",
+            "Return-Path: <bounce@third.example>\r\n\r\nbody"
+        );
+        let result = check_sender(raw.as_bytes());
+        assert_eq!(result.trust, SenderTrust::Unverified);
+        assert!(result.findings.iter().any(|s| s.contains("other.example")));
+        assert!(result.findings.iter().any(|s| s.contains("third.example")));
+    }
+
+    #[test]
     fn dmarc_pass_and_spoof_detection() {
         let ok_raw = concat!(
             "Authentication-Results: mx.example.com; spf=pass; dkim=pass header.d=amazon.in; dmarc=pass\r\n",
             "From: Amazon <update@amazon.in>\r\n\r\nhi\r\n"
         );
         let res = check_sender(ok_raw.as_bytes());
-        assert_eq!(res.trust, SenderTrust::Pass);
+        assert_eq!(res.trust, SenderTrust::Unverified);
         assert!(res.lookalike_warning.is_none());
 
         let spoof_raw = concat!(

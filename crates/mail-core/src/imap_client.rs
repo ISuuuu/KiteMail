@@ -135,6 +135,12 @@ pub async fn connect_imap_xoauth2(
     account: &AccountConfig,
     access_token: &str,
 ) -> Result<ImapSession, String> {
+    if !account
+        .imap_host
+        .eq_ignore_ascii_case("outlook.office365.com")
+    {
+        return Err("Microsoft OAuth2 IMAP 仅允许连接 outlook.office365.com".to_string());
+    }
     let client = connect_imap_client(account).await?;
     let auth = XOAuth2 {
         user: imap_username_for(account).to_string(),
@@ -330,11 +336,12 @@ async fn fetch_headers_for_uids(
     let mut headers = Vec::with_capacity(target_uids.len());
 
     while let Some(fetch_res) = fetches.next().await {
-        let Ok(fetch) = fetch_res else {
+        let fetch = fetch_res.map_err(|e| format!("读取邮件头失败: {e}"))?;
+        if fetch.header().is_none() && fetch.body().is_none() {
             continue;
-        };
+        }
         let Some(uid) = fetch.uid else {
-            continue;
+            return Err("服务器返回的邮件头缺少 UID".to_string());
         };
         let mut unread = true;
         let mut flagged = false;
@@ -345,15 +352,34 @@ async fn fetch_headers_for_uids(
                 _ => {}
             }
         }
-        let raw = fetch.header().unwrap_or_default();
+        let raw = fetch
+            .header()
+            .ok_or_else(|| format!("服务器返回的邮件 {uid} 缺少头部"))?;
         let mut header = parse_header_bytes(&parser, uid, unread, flagged, raw);
-        if let Some(prefix) = fetch.body() {
-            header.preview = parse_header_bytes(&parser, uid, unread, flagged, prefix).preview;
-        }
+        let prefix = fetch
+            .body()
+            .ok_or_else(|| format!("服务器返回的邮件 {uid} 缺少正文前缀"))?;
+        header.preview = parse_header_bytes(&parser, uid, unread, flagged, prefix).preview;
         headers.push(header);
     }
     drop(fetches);
+    validate_fetched_uids(target_uids, headers.iter().map(|h| h.uid))?;
     Ok(headers)
+}
+
+fn validate_fetched_uids(
+    target: &[u32],
+    received: impl Iterator<Item = u32>,
+) -> Result<(), String> {
+    let received: Vec<u32> = received.collect();
+    let unique: HashSet<u32> = received.iter().copied().collect();
+    if received.len() != target.len()
+        || unique.len() != target.len()
+        || target.iter().any(|uid| !unique.contains(uid))
+    {
+        return Err("邮件 UID 已变化，稍后重新读取".to_string());
+    }
+    Ok(())
 }
 
 /// Fetch recent message headers and flags for `folder_path`.
@@ -392,6 +418,23 @@ pub async fn fetch_folder_headers_with_flags(
     ),
     String,
 > {
+    fetch_folder_headers_incremental(account, password, folder_path, None).await
+}
+
+pub(crate) async fn fetch_folder_headers_incremental(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    cached: Option<(u32, &HashSet<u32>)>,
+) -> Result<
+    (
+        u32,
+        Vec<CachedHeaderInput>,
+        Vec<u32>,
+        Option<FolderFlagSnapshot>,
+    ),
+    String,
+> {
     let mut session = connect_imap(account, password).await?;
     let mailbox = session
         .select(folder_path)
@@ -417,10 +460,6 @@ pub async fn fetch_folder_headers_with_flags(
         ));
     }
 
-    let start_idx = live_uids.len().saturating_sub(MAX_INITIAL_FETCH);
-    let target_uids = &live_uids[start_idx..];
-    let headers = fetch_headers_for_uids(&mut session, target_uids).await?;
-
     let flag_snapshot = match (
         tokio::time::timeout(IO_TIMEOUT, session.uid_search("FLAGGED")).await,
         tokio::time::timeout(IO_TIMEOUT, session.uid_search("UNSEEN")).await,
@@ -432,9 +471,50 @@ pub async fn fetch_folder_headers_with_flags(
         _ => None,
     };
 
+    let target_uids = select_sync_uids(&live_uids, uid_validity, cached, flag_snapshot.is_some());
+    let headers = fetch_headers_for_uids(&mut session, &target_uids).await?;
     let _ = session.logout().await;
 
     Ok((uid_validity, headers, live_uids, flag_snapshot))
+}
+
+fn select_sync_uids(
+    live: &[u32],
+    validity: u32,
+    cached: Option<(u32, &HashSet<u32>)>,
+    flags_available: bool,
+) -> Vec<u32> {
+    let start = live.len().saturating_sub(MAX_INITIAL_FETCH);
+    let Some((_, known)) =
+        cached.filter(|(v, known)| *v == validity && *v != 0 && !known.is_empty())
+    else {
+        return live[start..].to_vec();
+    };
+    let min_known = known.iter().copied().min().unwrap_or(0);
+    let mut selected: Vec<u32> = live
+        .iter()
+        .copied()
+        .filter(|uid| *uid >= min_known && !known.contains(uid))
+        .take(MAX_INITIAL_FETCH)
+        .collect();
+    for &uid in &live[start..] {
+        if (!known.contains(&uid) || !flags_available) && !selected.contains(&uid) {
+            selected.push(uid);
+        }
+    }
+    selected
+}
+
+fn select_history_uids(live: &[u32], known: &HashSet<u32>, limit: usize) -> (Vec<u32>, bool) {
+    let mut missing = live
+        .iter()
+        .rev()
+        .copied()
+        .filter(|uid| !known.contains(uid));
+    let mut selected: Vec<u32> = missing.by_ref().take(limit.max(1)).collect();
+    let more = missing.next().is_some();
+    selected.reverse();
+    (selected, more)
 }
 
 /// Fetch up to `limit` older message headers with `uid < before_uid` for `folder_path`.
@@ -447,6 +527,29 @@ pub async fn fetch_older_folder_headers(
     expected_validity: u32,
     limit: usize,
     uid_snapshot: &mut Option<(u32, Vec<u32>)>,
+) -> Result<(u32, Vec<CachedHeaderInput>, bool), String> {
+    fetch_older_folder_headers_with_known(
+        account,
+        password,
+        folder_path,
+        before_uid,
+        expected_validity,
+        limit,
+        uid_snapshot,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_older_folder_headers_with_known(
+    account: &AccountConfig,
+    password: &str,
+    folder_path: &str,
+    before_uid: u32,
+    expected_validity: u32,
+    limit: usize,
+    uid_snapshot: &mut Option<(u32, Vec<u32>)>,
+    known: Option<&HashSet<u32>>,
 ) -> Result<(u32, Vec<CachedHeaderInput>, bool), String> {
     let mut session = connect_imap(account, password).await?;
     // 任务四：历史批次跑在后台，每一步网络调用都必须有限超时，
@@ -475,25 +578,33 @@ pub async fn fetch_older_folder_headers(
     }
     let live_uids = &uid_snapshot.as_ref().unwrap().1;
 
-    let end_idx = live_uids.partition_point(|uid| *uid < before_uid);
-    if end_idx == 0 {
+    let (target_uids, has_more) = if let Some(known) = known {
+        select_history_uids(live_uids, known, limit)
+    } else {
+        let end_idx = live_uids.partition_point(|uid| *uid < before_uid);
+        let start_idx = end_idx.saturating_sub(limit.max(1));
+        (live_uids[start_idx..end_idx].to_vec(), start_idx > 0)
+    };
+    if target_uids.is_empty() {
         let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
         return Ok((uid_validity, Vec::new(), false));
     }
-
-    let start_idx = end_idx.saturating_sub(limit.max(1));
-    let target_uids = &live_uids[start_idx..end_idx];
-    let has_more = start_idx > 0;
-    let headers = tokio::time::timeout(
+    let headers = match tokio::time::timeout(
         IO_TIMEOUT,
-        fetch_headers_for_uids(&mut session, target_uids),
+        fetch_headers_for_uids(&mut session, &target_uids),
     )
     .await
-    .map_err(|_| format!("拉取历史邮件头超时 ({folder_path})"))??;
-    if headers.len() != target_uids.len() {
-        *uid_snapshot = None;
-        return Err("历史邮件 UID 已变化，稍后重新读取".to_string());
-    }
+    {
+        Ok(Ok(headers)) => headers,
+        result => {
+            *uid_snapshot = None;
+            return Err(match result {
+                Ok(Err(e)) => e,
+                Err(_) => format!("拉取历史邮件头超时 ({folder_path})"),
+                Ok(Ok(_)) => unreachable!(),
+            });
+        }
+    };
     let _ = tokio::time::timeout(IO_TIMEOUT, session.logout()).await;
 
     Ok((uid_validity, headers, has_more))
@@ -1749,8 +1860,46 @@ pub async fn undo_move_by_message_id(
     Ok(())
 }
 
-/// Mark a message `\Deleted` and expunge the mailbox. Fallback for deleting
-/// when the server has no dedicated trash folder.
+fn supports_targeted_expunge<'a>(atoms: impl Iterator<Item = &'a str>) -> bool {
+    atoms
+        .into_iter()
+        .any(|s| s.eq_ignore_ascii_case("UIDPLUS") || s.eq_ignore_ascii_case("IMAP4rev2"))
+}
+
+async fn require_targeted_expunge(session: &mut ImapSession) -> Result<(), String> {
+    let caps = session
+        .capabilities()
+        .await
+        .map_err(|e| format!("读取 IMAP 能力失败: {e}"))?;
+    let atoms = caps.iter().filter_map(|cap| match cap {
+        async_imap::types::Capability::Atom(atom) => Some(atom.as_str()),
+        _ => None,
+    });
+    if supports_targeted_expunge(atoms) {
+        Ok(())
+    } else {
+        Err("服务器不支持按 UID 清除单封邮件，操作已取消".to_string())
+    }
+}
+
+async fn expunge_selected_uid<T>(
+    session: &mut async_imap::Session<T>,
+    uid: u32,
+) -> Result<(), String>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    session
+        .run_command_and_check_ok(format!("UID STORE {uid} +FLAGS.SILENT (\\Deleted)"))
+        .await
+        .map_err(|e| format!("标记邮件删除失败: {e}"))?;
+    session
+        .run_command_and_check_ok(format!("UID EXPUNGE {uid}"))
+        .await
+        .map_err(|e| format!("清除指定邮件失败: {e}"))
+}
+
+/// Permanently delete one message when the server has no dedicated trash folder.
 pub async fn delete_message(
     account: &AccountConfig,
     password: &str,
@@ -1762,19 +1911,8 @@ pub async fn delete_message(
         .select(folder_path)
         .await
         .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
-    let mut stores = session
-        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
-        .await
-        .map_err(|e| format!("标记邮件删除失败: {e}"))?;
-    while stores.next().await.is_some() {}
-    drop(stores);
-    {
-        let mut expunged = std::pin::pin!(session
-            .expunge()
-            .await
-            .map_err(|e| format!("执行 EXPUNGE 失败: {e}"))?);
-        while expunged.as_mut().next().await.is_some() {}
-    }
+    require_targeted_expunge(&mut session).await?;
+    expunge_selected_uid(&mut session, uid).await?;
     let _ = session.logout().await;
     Ok(())
 }
@@ -1815,24 +1953,23 @@ pub async fn strip_imap_attachment(
         .select(folder_path)
         .await
         .map_err(|e| format!("打开文件夹 {folder_path} 失败: {e}"))?;
-    let uid_next = mailbox.uid_next;
+    let uid_next = mailbox
+        .uid_next
+        .ok_or_else(|| "服务器未提供 UIDNEXT，已取消剥离附件".to_string())?;
+    require_targeted_expunge(&mut session).await?;
 
     let mut fetches = session
-        .uid_fetch(
-            uid.to_string(),
-            "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] RFC822)",
-        )
+        .uid_fetch(uid.to_string(), "(UID FLAGS INTERNALDATE BODY.PEEK[])")
         .await
         .map_err(|e| format!("拉取原邮件失败 (UID {uid}): {e}"))?;
 
     let mut raw_body: Option<Vec<u8>> = None;
     let mut flags_str: Option<String> = None;
     let mut date_str: Option<String> = None;
-    let mut msgid = String::new();
 
     while let Some(fetch_res) = fetches.next().await {
         if let Ok(fetch) = fetch_res {
-            if fetch.uid == Some(uid) || raw_body.is_none() {
+            if fetch.uid == Some(uid) {
                 if let Some(body) = fetch.body() {
                     raw_body = Some(body.to_vec());
                 }
@@ -1853,12 +1990,6 @@ pub async fn strip_imap_attachment(
                 date_str = fetch
                     .internal_date()
                     .map(|d| format!("\"{}\"", d.format("%d-%b-%Y %H:%M:%S %z")));
-                if let Some(hdr) = fetch.header() {
-                    let text = String::from_utf8_lossy(hdr);
-                    if let Some(val) = text.split(':').nth(1) {
-                        msgid = val.trim().to_string();
-                    }
-                }
             }
         }
     }
@@ -1881,59 +2012,43 @@ pub async fn strip_imap_attachment(
     .map_err(|_| "上传剥离附件后的邮件副本超时".to_string())?
     .map_err(|e| format!("上传剥离附件后的邮件副本失败: {e}"))?;
 
-    // Find newly appended UID at or above uid_next / uid + 1.
-    let from_uid = uid_next.unwrap_or(0).max(uid + 1);
-    let mut new_uid = None;
-    if let Ok(mut search_fetches) = session
-        .uid_fetch(
-            format!("{from_uid}:*"),
-            "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
-        )
+    // APPEND succeeded. Only replace the local UID after identifying the exact
+    // rewritten bytes among messages created since SELECT.
+    let uncertain = "服务器已接收新副本，但无法确认其 UID。已保留原邮件，请刷新后检查副本。";
+    let mut sizes = session
+        .uid_fetch(format!("{uid_next}:*"), "(UID RFC822.SIZE)")
         .await
-    {
-        let mut candidates: Vec<(u32, String)> = Vec::new();
-        while let Some(res) = search_fetches.next().await {
-            if let Ok(f) = res {
-                if let Some(u) = f.uid.filter(|&u| u >= from_uid) {
-                    let mid = f
-                        .header()
-                        .and_then(|h| {
-                            String::from_utf8_lossy(h)
-                                .split(':')
-                                .nth(1)
-                                .map(|v| v.trim().to_string())
-                        })
-                        .unwrap_or_default();
-                    candidates.push((u, mid));
+        .map_err(|_| uncertain.to_string())?;
+    let mut candidates = Vec::new();
+    while let Some(item) = sizes.next().await {
+        let fetch = item.map_err(|_| uncertain.to_string())?;
+        if let Some(candidate) = fetch.uid.filter(|&u| u >= uid_next && u != uid) {
+            if fetch.size.map(u64::from) == Some(stripped.len() as u64) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    drop(sizes);
+
+    let mut new_uid = None;
+    for candidate in candidates {
+        let mut bodies = session
+            .uid_fetch(candidate.to_string(), "(UID BODY.PEEK[])")
+            .await
+            .map_err(|_| uncertain.to_string())?;
+        while let Some(item) = bodies.next().await {
+            let fetch = item.map_err(|_| uncertain.to_string())?;
+            if fetch.uid == Some(candidate) && fetch.body() == Some(stripped.as_slice()) {
+                if new_uid.replace(candidate).is_some() {
+                    return Err(uncertain.to_string());
                 }
             }
         }
-        candidates.sort();
-        new_uid = if msgid.is_empty() {
-            candidates.first().map(|(u, _)| *u)
-        } else {
-            candidates
-                .iter()
-                .find(|(_, m)| m == &msgid)
-                .map(|(u, _)| *u)
-                .or_else(|| candidates.first().map(|(u, _)| *u))
-        };
     }
-
-    // Purge original message.
-    let mut stores = session
-        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
-        .await
-        .map_err(|e| format!("标记原邮件删除失败: {e}"))?;
-    while stores.next().await.is_some() {}
-    drop(stores);
-    {
-        let mut expunged = std::pin::pin!(session
-            .expunge()
-            .await
-            .map_err(|e| format!("执行 EXPUNGE 失败: {e}"))?);
-        while expunged.as_mut().next().await.is_some() {}
+    if new_uid.is_none() {
+        return Err(uncertain.to_string());
     }
+    expunge_selected_uid(&mut session, uid).await?;
     let _ = session.logout().await;
     Ok((new_uid, stripped))
 }
@@ -3383,6 +3498,131 @@ pub fn plain_text_to_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn single_delete_checks_tagged_replies_and_sends_only_target_uid() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (store_ok, expunge_ok) in [(false, false), (true, false), (true, true)] {
+            let (client, server) = tokio::io::duplex(2048);
+            let server_task = tokio::spawn(async move {
+                let mut io = BufReader::new(server);
+                let mut expected = vec![
+                    ("LOGIN", true),
+                    ("UID STORE 42 +FLAGS.SILENT (\\Deleted)", store_ok),
+                ];
+                if store_ok {
+                    expected.push(("UID EXPUNGE 42", expunge_ok));
+                }
+                for (command, ok) in expected {
+                    let mut line = String::new();
+                    io.read_line(&mut line).await.unwrap();
+                    let (tag, received) = line.trim_end().split_once(' ').unwrap();
+                    if command == "LOGIN" {
+                        assert!(received.starts_with("LOGIN "));
+                    } else {
+                        assert_eq!(received, command);
+                    }
+                    let status = if ok { "OK" } else { "NO" };
+                    io.get_mut()
+                        .write_all(format!("{tag} {status} test\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                let mut extra = String::new();
+                assert_eq!(io.read_line(&mut extra).await.unwrap(), 0);
+            });
+            let mut session = async_imap::Client::new(client)
+                .login("test", "test")
+                .await
+                .unwrap();
+            let result = super::expunge_selected_uid(&mut session, 42).await;
+            assert_eq!(result.is_ok(), store_ok && expunge_ok);
+            drop(session);
+            server_task.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn targeted_expunge_requires_explicit_capability() {
+        use super::supports_targeted_expunge;
+        assert!(supports_targeted_expunge(["uidplus"].into_iter()));
+        assert!(supports_targeted_expunge(["IMAP4REV2"].into_iter()));
+        assert!(!supports_targeted_expunge(
+            ["IMAP4rev1", "MOVE"].into_iter()
+        ));
+    }
+
+    #[test]
+    fn incremental_sync_preserves_initial_window_and_flag_fallback() {
+        use super::{select_sync_uids, MAX_INITIAL_FETCH};
+        use std::collections::HashSet;
+        let live: Vec<u32> = (1..=250).collect();
+        let known: HashSet<u32> = (1..=100).collect();
+        assert_eq!(
+            select_sync_uids(&live, 7, Some((7, &known)), true),
+            (101..=250).collect::<Vec<_>>()
+        );
+        let all: HashSet<u32> = live.iter().copied().collect();
+        assert!(select_sync_uids(&live, 7, Some((7, &all)), true).is_empty());
+        assert_eq!(
+            select_sync_uids(&live, 7, Some((7, &all)), false),
+            live[250 - MAX_INITIAL_FETCH..]
+        );
+        assert_eq!(
+            select_sync_uids(&live, 8, Some((7, &all)), true),
+            live[250 - MAX_INITIAL_FETCH..]
+        );
+        let mut missing = all.clone();
+        missing.remove(&200);
+        assert_eq!(
+            select_sync_uids(&live, 7, Some((7, &missing)), true),
+            vec![200]
+        );
+    }
+
+    #[test]
+    fn fetched_uid_validation_rejects_partial_duplicate_and_wrong_results() {
+        use super::validate_fetched_uids;
+        assert!(validate_fetched_uids(&[1, 2], [2, 1].into_iter()).is_ok());
+        assert!(validate_fetched_uids(&[1, 2], [1].into_iter()).is_err());
+        assert!(validate_fetched_uids(&[1, 2], [1, 1].into_iter()).is_err());
+        assert!(validate_fetched_uids(&[1, 2], [1, 3].into_iter()).is_err());
+    }
+
+    #[test]
+    fn large_incremental_gap_is_bounded_and_history_can_fill_it() {
+        use super::{select_history_uids, select_sync_uids, MAX_INITIAL_FETCH};
+        use std::collections::HashSet;
+        let live: Vec<u32> = (1..=50_000).collect();
+        let mut known: HashSet<u32> = (1..=100).collect();
+        let first = select_sync_uids(&live, 7, Some((7, &known)), true);
+        assert_eq!(first.len(), MAX_INITIAL_FETCH * 2);
+        assert_eq!(&first[..3], &[101, 102, 103]);
+        assert_eq!(*first.last().unwrap(), 50_000);
+        known.extend(first);
+        let (history, more) = select_history_uids(&live, &known, 100);
+        assert!(more);
+        assert_eq!(history.len(), 100);
+        assert_eq!(*history.last().unwrap(), 49_900);
+        for _ in 0..500 {
+            let next = select_sync_uids(&live, 7, Some((7, &known)), true);
+            assert!(next.len() <= MAX_INITIAL_FETCH * 2);
+            if next.is_empty() {
+                break;
+            }
+            known.extend(next);
+        }
+        assert_eq!(known.len(), live.len());
+        known.remove(&25_000);
+        assert_eq!(
+            select_sync_uids(&live, 7, Some((7, &known)), true),
+            vec![25_000]
+        );
+        assert_eq!(
+            select_history_uids(&live, &known, 100),
+            (vec![25_000], false)
+        );
+    }
+
     #[test]
     fn rename_path_keeps_unchanged_nested_names_and_uses_server_delimiter() {
         assert_eq!(

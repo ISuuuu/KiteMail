@@ -17,7 +17,7 @@ use crate::{
     UnifiedView, WorkerEvent,
 };
 
-type TokenCache = HashMap<u32, (String, Instant)>;
+type TokenCache = HashMap<u32, (String, Instant, AccountConfig)>;
 type IdleWatchers = HashMap<u32, tokio::task::JoinHandle<()>>;
 type SharedAsyncCache = Arc<std::sync::Mutex<Option<CacheStore>>>;
 
@@ -36,9 +36,9 @@ impl SharedTokenCache {
         }
     }
 
-    async fn insert(&self, account_id: u32, token: String, expires_at: Instant) {
+    async fn insert(&self, account: &AccountConfig, token: String, expires_at: Instant) {
         let mut guard = self.cache.lock().await;
-        guard.insert(account_id, (token, expires_at));
+        guard.insert(account.id, (token, expires_at, account.clone()));
     }
 
     async fn remove(&self, account_id: u32) {
@@ -62,21 +62,25 @@ impl SharedTokenCache {
             .clone()
     }
 
-    async fn cached_valid_token(&self, account_id: u32) -> Option<String> {
+    async fn cached_valid_token(&self, account: &AccountConfig) -> Option<String> {
         let guard = self.cache.lock().await;
         guard
-            .get(&account_id)
-            .filter(|(_, exp)| Instant::now() < *exp)
-            .map(|(tok, _)| tok.clone())
+            .get(&account.id)
+            .filter(|(_, exp, saved)| {
+                Instant::now() < *exp
+                    && config::same_credential_endpoint(saved, account)
+                    && saved.oauth_client_id == account.oauth_client_id
+            })
+            .map(|(tok, _, _)| tok.clone())
     }
 
     async fn ensure_graph_token(&self, account: &AccountConfig) -> Result<String, String> {
-        if let Some(tok) = self.cached_valid_token(account.id).await {
+        if let Some(tok) = self.cached_valid_token(account).await {
             return Ok(tok);
         }
         let refresh_lock = self.account_refresh_lock(account.id);
         let _refresh_guard = refresh_lock.lock().await;
-        if let Some(tok) = self.cached_valid_token(account.id).await {
+        if let Some(tok) = self.cached_valid_token(account).await {
             return Ok(tok);
         }
 
@@ -85,26 +89,150 @@ impl SharedTokenCache {
                 .await?;
         let expires_at =
             Instant::now() + Duration::from_secs(refreshed.expires_in_secs.saturating_sub(120));
-        self.insert(account.id, refreshed.access_token.clone(), expires_at)
+        self.insert(account, refreshed.access_token.clone(), expires_at)
             .await;
         Ok(refreshed.access_token)
     }
 }
 
-fn select_oauth_refresh_token_to_persist(
-    returned: Option<&str>,
-    recovered_from_legacy: Option<&str>,
-) -> Option<String> {
-    returned
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            recovered_from_legacy
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+// Mail attachments are untrusted downloads. Preserve their Internet origin when
+// handing them to Windows applications through an explicit export.
+fn write_exported_attachment(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_EXPORT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (temp, mut file) = loop {
+        let temp = parent.join(format!(
+            ".kitemail-export-{}-{}.tmp",
+            std::process::id(),
+            NEXT_EXPORT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+            let mut stream = temp.as_os_str().to_os_string();
+            stream.push(":Zone.Identifier");
+            std::fs::write(stream, b"[ZoneTransfer]\r\nZoneId=3\r\n").map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("无法设置 Windows 来源标记，原目标未更改: {e}"),
+                )
+            })?;
+            let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+            let dest: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { MoveFileExW(source.as_ptr(), dest.as_ptr(), MOVEFILE_REPLACE_EXISTING) }
+                == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn prune_forward_copies(data_dir: &Path, cache: &CacheStore) -> Result<(), String> {
+    prune_forward_copies_at(data_dir, cache, std::time::SystemTime::now())
+}
+
+fn is_plain_directory(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_forward_batch_name(name: &str) -> bool {
+    let parts: Vec<_> = name.split('-').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn prune_forward_copies_at(
+    data_dir: &Path,
+    cache: &CacheStore,
+    now: std::time::SystemTime,
+) -> Result<(), String> {
+    let root = data_dir.join("forward-attachments");
+    if !root.exists() {
+        return Ok(());
+    }
+    if !is_plain_directory(&root) {
+        return Err("转发目录不是普通目录".into());
+    }
+    let referenced = cache.referenced_attachment_paths()?;
+    let mut referenced_files = HashSet::new();
+    for path in referenced {
+        // Canonicalize every reference so alternate spellings cannot bypass the
+        // comparison. If any cannot be resolved, skip cleanup altogether.
+        referenced_files.insert(std::fs::canonicalize(path).map_err(|e| e.to_string())?);
+    }
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !is_forward_batch_name(&entry.file_name().to_string_lossy())
+            || !is_plain_directory(&entry.path())
+        {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > Duration::from_secs(30 * 24 * 60 * 60));
+        if !old {
+            continue;
+        }
+        for file in std::fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
+            let file = file.map_err(|e| e.to_string())?;
+            if !file.file_type().map_err(|e| e.to_string())?.is_file() {
+                continue;
+            }
+            let canonical = std::fs::canonicalize(file.path()).map_err(|e| e.to_string())?;
+            if !referenced_files.contains(&canonical) {
+                std::fs::remove_file(file.path()).map_err(|e| e.to_string())?;
+            }
+        }
+        let _ = std::fs::remove_dir(entry.path());
+    }
+    Ok(())
 }
 
 async fn run_single_microsoft_refresh(
@@ -125,85 +253,26 @@ async fn run_single_microsoft_refresh(
     .map_err(|e| format!("刷新令牌任务异常: {e}"))?
 }
 
-async fn try_legacy_oauth_fallback(
-    account: &AccountConfig,
-    imap_scope: bool,
-    legacy_ids: &[u32],
-    already_tried: &str,
-    first_err: String,
-) -> Result<(oauth::RefreshedTokens, Option<String>), String> {
-    for candidate in secrets::load_distinct_legacy_oauth_refresh_tokens(legacy_ids, already_tried) {
-        if let Ok(refreshed) =
-            run_single_microsoft_refresh(&account.oauth_client_id, &candidate, imap_scope).await
-        {
-            return Ok((refreshed, Some(candidate)));
-        }
-    }
-    Err(first_err)
-}
-
 async fn refresh_microsoft_oauth_token_with_sync(
     data_dir: Option<&Path>,
     account: &AccountConfig,
     imap_scope: bool,
 ) -> Result<oauth::RefreshedTokens, String> {
-    let resolve_legacy_ids = || {
-        data_dir
-            .map(|d| config::non_conflicting_legacy_ids_for_email(d, &account.email))
-            .unwrap_or_else(|| vec![account.id])
-    };
-    let primary_res = secrets::load_oauth_refresh_token_for(account.id, &account.email);
-    let (refreshed, recovered_from_legacy) = match primary_res {
-        Ok(primary_rt) => {
-            match run_single_microsoft_refresh(&account.oauth_client_id, &primary_rt, imap_scope)
-                .await
-            {
-                Ok(refreshed) => (refreshed, None),
-                Err(first_err) => {
-                    let ids = resolve_legacy_ids();
-                    try_legacy_oauth_fallback(account, imap_scope, &ids, &primary_rt, first_err)
-                        .await?
-                }
-            }
-        }
-        Err(load_err) => {
-            let ids = resolve_legacy_ids();
-            try_legacy_oauth_fallback(account, imap_scope, &ids, "", load_err).await?
-        }
-    };
-
-    if let Some(rt_to_persist) = select_oauth_refresh_token_to_persist(
-        refreshed.refresh_token.as_deref(),
-        recovered_from_legacy.as_deref(),
-    ) {
-        let ids = resolve_legacy_ids();
-        let _ = secrets::save_oauth_refresh_token_and_sync_legacy(
-            account.id,
-            &account.email,
-            &ids,
-            rt_to_persist,
-        );
+    if let Some(dir) = data_dir {
+        config::validate_shared_credential_endpoint(dir, account)?;
+    }
+    let primary_rt = secrets::load_bound_oauth_token(account)?;
+    let refreshed =
+        run_single_microsoft_refresh(&account.oauth_client_id, &primary_rt, imap_scope).await?;
+    if let Some(rt) = refreshed
+        .refresh_token
+        .as_deref()
+        .filter(|rt| !rt.trim().is_empty())
+    {
+        secrets::save_bound_oauth_token(account, rt.to_string())?;
     }
 
     Ok(refreshed)
-}
-
-fn legacy_ids_for_oauth_save(data_dir: &Path, account_id: u32, email: &str) -> Vec<u32> {
-    let mut ids = config::non_conflicting_legacy_ids_for_email(data_dir, email);
-    let has_local_conflict = config::load_accounts_in(data_dir)
-        .unwrap_or_default()
-        .into_iter()
-        .any(|a| {
-            a.id == account_id
-                && !a.email.trim().is_empty()
-                && !a.email.trim().eq_ignore_ascii_case(email.trim())
-        });
-    let has_peer_conflict =
-        config::collect_peer_secret_usage(data_dir, account_id, email).legacy_id_in_use_by_peer;
-    if !has_local_conflict && !has_peer_conflict && !ids.contains(&account_id) {
-        ids.push(account_id);
-    }
-    ids
 }
 
 fn open_existing_or_create_cache(data_dir: &Path) -> Result<CacheStore, String> {
@@ -404,7 +473,10 @@ async fn worker_loop(
     req_rx: mpsc::Receiver<MailRequest>,
     evt_tx: EventSender,
 ) {
-    let initial_cache = match CacheStore::open_for_data_dir(&data_dir) {
+    let initial_cache = match CacheStore::open_for_data_dir(&data_dir).and_then(|cache| {
+        cache.recover_interrupted_outbox()?;
+        Ok(cache)
+    }) {
         Ok(c) => c,
         Err(e) => {
             let _ = evt_tx.send(WorkerEvent::Error {
@@ -414,6 +486,7 @@ async fn worker_loop(
             return;
         }
     };
+    let _ = prune_forward_copies(&data_dir, &initial_cache);
     config::register_known_data_dir(&data_dir);
     let mut cache_opt = Some(initial_cache);
     let tokens = SharedTokenCache::for_data_dir(data_dir.clone());
@@ -582,6 +655,36 @@ async fn handle_change_mail_data_dir(
         })
         .unwrap_or_else(|| default_dir.clone());
 
+    let existing_accounts = match config::load_accounts_in(data_dir) {
+        Ok(accounts) => accounts,
+        Err(message) => {
+            let _ = evt_tx.send(WorkerEvent::MailDataDirChanged {
+                ok: false,
+                mail_data_dir: current_dir,
+                message,
+            });
+            return;
+        }
+    };
+    let (merged_accounts, added_accounts) =
+        crate::cache::merge_imported_accounts(&existing_accounts, &import_accounts);
+    let _verified_imports = match config::validate_discovered_account_import(
+        data_dir,
+        &existing_accounts,
+        &import_accounts,
+        &merged_accounts,
+    ) {
+        Ok(verified) => verified,
+        Err(message) => {
+            let _ = evt_tx.send(WorkerEvent::MailDataDirChanged {
+                ok: false,
+                mail_data_dir: current_dir,
+                message,
+            });
+            return;
+        }
+    };
+
     // 1. 停止所有推送监测并等待在途后台任务关闭 SQLite 句柄，避免 Windows 共享违例。
     // 保持持有后台任务信号量许可，直到新目录打开或回滚完毕再释放，防止排队中的同步/索引重开旧库。
     for (_, handle) in watchers.drain() {
@@ -667,13 +770,10 @@ async fn handle_change_mail_data_dir(
     let mut imported_count = 0usize;
     let mut imported_ids = HashSet::new();
     if !import_accounts.is_empty() {
-        let existing = config::load_accounts_in(data_dir).unwrap_or_default();
-        let prev_ids: HashSet<u32> = existing.iter().map(|a| a.id).collect();
-        let (merged, added) = crate::cache::merge_imported_accounts(&existing, &import_accounts);
+        let prev_ids: HashSet<u32> = existing_accounts.iter().map(|a| a.id).collect();
+        let merged = merged_accounts;
+        let added = added_accounts;
         if added > 0 {
-            for acc in &import_accounts {
-                let _ = secrets::migrate_legacy_secret_to_email(acc.id, &acc.email);
-            }
             if let Err(err) = config::save_accounts_in(data_dir, &merged) {
                 let _ = evt_tx.send(WorkerEvent::Error {
                     account_id: None,
@@ -1138,7 +1238,7 @@ async fn run_account_push_watcher(
     loop {
         match account.auth_backend {
             AuthBackend::Password => {
-                let Ok(sec) = secrets::load_account_secrets_for(account.id, &account.email) else {
+                let Ok(sec) = secrets::load_account_secrets_for_config(&account) else {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     continue;
                 };
@@ -1183,18 +1283,7 @@ async fn run_account_push_watcher(
                             Some(refreshed.access_token)
                         }
                         Err(_) => {
-                            let legacy_ids = config::non_conflicting_legacy_ids_for_email(
-                                &data_dir,
-                                &account.email,
-                            );
-                            let missing_rt =
-                                secrets::load_oauth_refresh_token_for(account.id, &account.email)
-                                    .is_err()
-                                    && secrets::load_distinct_legacy_oauth_refresh_tokens(
-                                        &legacy_ids,
-                                        "",
-                                    )
-                                    .is_empty();
+                            let missing_rt = secrets::load_bound_oauth_token(&account).is_err();
                             if missing_rt {
                                 tokio::time::sleep(Duration::from_secs(60)).await;
                                 continue;
@@ -1304,6 +1393,10 @@ async fn handle_request(
             imap_password,
             smtp_password,
         } => {
+            if let Err(message) = config::validate_shared_credential_endpoint(data_dir, &config) {
+                let _ = evt_tx.send(WorkerEvent::AccountVerified { ok: false, message });
+                return;
+            }
             if config.auth_backend != AuthBackend::Password {
                 let _ = evt_tx.send(WorkerEvent::AccountVerified {
                     ok: true,
@@ -1315,7 +1408,10 @@ async fn handle_request(
                 || (config.smtp_separate_credentials
                     && smtp_password.as_deref().is_none_or(str::is_empty))
             {
-                secrets::load_account_secrets_for(config.id, &config.email).ok()
+                load_account_config(data_dir, config.id)
+                    .ok()
+                    .filter(|old| config::same_credential_endpoint(old, &config))
+                    .and_then(|_| secrets::load_account_secrets_for_config(&config).ok())
             } else {
                 None
             };
@@ -1379,12 +1475,42 @@ async fn handle_request(
             imap_password,
             smtp_password,
         } => {
+            if let Err(message) = config::validate_shared_credential_endpoint(data_dir, &config) {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(config.id),
+                    message,
+                });
+                return;
+            }
             if config.auth_backend == AuthBackend::Password {
+                let existing = config::load_accounts_in(data_dir).unwrap_or_default();
+                if !existing.iter().any(|old| old.id == config.id) {
+                    match secrets::has_account_credentials(config.id, &config.email) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            let _ = evt_tx.send(WorkerEvent::Error {
+                                account_id: Some(config.id),
+                                message: "该账号存在来源不明的本机凭据，请先手动处理".to_string(),
+                            });
+                            return;
+                        }
+                        Err(message) => {
+                            let _ = evt_tx.send(WorkerEvent::Error {
+                                account_id: Some(config.id),
+                                message,
+                            });
+                            return;
+                        }
+                    }
+                }
                 let stored = if imap_password.is_empty()
                     || (config.smtp_separate_credentials
                         && smtp_password.as_deref().is_none_or(str::is_empty))
                 {
-                    secrets::load_account_secrets_for(config.id, &config.email).ok()
+                    load_account_config(data_dir, config.id)
+                        .ok()
+                        .filter(|old| config::same_credential_endpoint(old, &config))
+                        .and_then(|_| secrets::load_account_secrets_for_config(&config).ok())
                 } else {
                     None
                 };
@@ -1435,9 +1561,8 @@ async fn handle_request(
                 } else {
                     None
                 };
-                if let Err(e) = secrets::save_account_secrets_for(
-                    config.id,
-                    &config.email,
+                if let Err(e) = secrets::save_bound_account_secrets(
+                    &config,
                     AccountSecrets {
                         imap_password: effective_imap,
                         smtp_password: effective_smtp,
@@ -1551,24 +1676,60 @@ async fn handle_request(
             // 编辑已有账号重新授权：只把新令牌写入 Keyring 与内存令牌缓存，
             // 账号配置、缓存与同步完全不动，由 UI 保留编辑表单并提示成功。
             if editing_account_id.is_some() {
+                if let Some(account) = existing.iter().find(|a| a.id == account_id) {
+                    if let Err(message) =
+                        config::validate_shared_credential_endpoint(data_dir, account)
+                    {
+                        let _ = evt_tx.send(WorkerEvent::Error {
+                            account_id: Some(account_id),
+                            message,
+                        });
+                        return;
+                    }
+                }
                 config::register_known_data_dir(data_dir);
-                let legacy_ids = legacy_ids_for_oauth_save(data_dir, account_id, &result.email);
-                if let Err(e) = secrets::save_oauth_refresh_token_and_sync_legacy(
-                    account_id,
-                    &result.email,
-                    &legacy_ids,
-                    result.refresh_token,
-                ) {
+                let Some(account) = existing.iter().find(|a| a.id == account_id) else {
                     let _ = evt_tx.send(WorkerEvent::Error {
                         account_id: Some(account_id),
-                        message: e,
+                        message: "账号配置不存在，请重新授权".into(),
+                    });
+                    return;
+                };
+                if !account
+                    .email
+                    .trim()
+                    .eq_ignore_ascii_case(result.email.trim())
+                {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: "授权邮箱与账号不匹配".into(),
+                    });
+                    return;
+                }
+                let configured_client = if account.oauth_client_id.trim().is_empty() {
+                    oauth::DEFAULT_MICROSOFT_CLIENT_ID
+                } else {
+                    account.oauth_client_id.trim()
+                };
+                if configured_client != result.client_id {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message: "授权客户端与账号配置不匹配，请保存配置后重新授权".into(),
+                    });
+                    return;
+                }
+                if let Err(message) = secrets::save_bound_oauth_token(account, result.refresh_token)
+                {
+                    let _ = evt_tx.send(WorkerEvent::Error {
+                        account_id: Some(account_id),
+                        message,
                     });
                     return;
                 }
                 let expires_at = Instant::now()
                     + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
                 tokens
-                    .insert(account_id, result.access_token, expires_at)
+                    .insert(&account, result.access_token, expires_at)
                     .await;
                 let _ = evt_tx.send(WorkerEvent::OAuthReauthorized {
                     account_id,
@@ -1625,16 +1786,17 @@ async fn handle_request(
                 storage_dir: prev.and_then(|p| p.storage_dir.clone()),
             };
 
-            let legacy_ids = legacy_ids_for_oauth_save(data_dir, account_id, &account.email);
-            if let Err(e) = secrets::save_oauth_refresh_token_and_sync_legacy(
-                account_id,
-                &account.email,
-                &legacy_ids,
-                result.refresh_token,
-            ) {
+            if let Err(message) = config::validate_shared_credential_endpoint(data_dir, &account) {
                 let _ = evt_tx.send(WorkerEvent::Error {
                     account_id: Some(account_id),
-                    message: e,
+                    message,
+                });
+                return;
+            }
+            if let Err(message) = secrets::save_bound_oauth_token(&account, result.refresh_token) {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message,
                 });
                 return;
             }
@@ -1654,7 +1816,7 @@ async fn handle_request(
             let expires_at =
                 Instant::now() + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
             tokens
-                .insert(account_id, result.access_token, expires_at)
+                .insert(&account, result.access_token, expires_at)
                 .await;
 
             let _ = evt_tx.send(WorkerEvent::AccountVerified {
@@ -1927,7 +2089,7 @@ async fn handle_request(
                     }
                     AuthBackend::Password => {
                         let folder_path = folder_path_opt.unwrap_or_default();
-                        match secrets::load_account_secrets_for(account_id, &account.email) {
+                        match secrets::load_account_secrets_for_config(&account) {
                             Ok(sec) => {
                                 imap_client::fetch_message_body(
                                     &account,
@@ -2020,20 +2182,18 @@ async fn handle_request(
                         Err(e) => Err(e),
                     }
                 }
-                AuthBackend::Password => {
-                    match secrets::load_account_secrets_for(account_id, &account.email) {
-                        Ok(sec) => {
-                            imap_client::fetch_raw_message(
-                                &account,
-                                &sec.imap_password,
-                                &folder_path,
-                                uid,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
+                AuthBackend::Password => match secrets::load_account_secrets_for_config(&account) {
+                    Ok(sec) => {
+                        imap_client::fetch_raw_message(
+                            &account,
+                            &sec.imap_password,
+                            &folder_path,
+                            uid,
+                        )
+                        .await
                     }
-                }
+                    Err(e) => Err(e),
+                },
             };
             match res {
                 Ok(bytes) => {
@@ -2088,7 +2248,7 @@ async fn handle_request(
                             }
                         }
                         AuthBackend::Password => {
-                            match secrets::load_account_secrets_for(account_id, &account.email) {
+                            match secrets::load_account_secrets_for_config(&account) {
                                 Ok(sec) => {
                                     imap_client::set_flag(
                                         &account,
@@ -2153,7 +2313,7 @@ async fn handle_request(
                             }
                         }
                         AuthBackend::Password => {
-                            match secrets::load_account_secrets_for(account_id, &account.email) {
+                            match secrets::load_account_secrets_for_config(&account) {
                                 Ok(sec) => {
                                     imap_client::set_flag(
                                         &account,
@@ -2231,19 +2391,17 @@ async fn handle_request(
                         Err(e) => Err(e),
                     }
                 }
-                AuthBackend::Password => {
-                    match secrets::load_account_secrets_for(account_id, &account.email) {
-                        Ok(sec) => {
-                            imap_client::mark_folder_all_read(
-                                &account,
-                                &sec.imap_password,
-                                &folder_path,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
+                AuthBackend::Password => match secrets::load_account_secrets_for_config(&account) {
+                    Ok(sec) => {
+                        imap_client::mark_folder_all_read(
+                            &account,
+                            &sec.imap_password,
+                            &folder_path,
+                        )
+                        .await
                     }
-                }
+                    Err(e) => Err(e),
+                },
             };
             match res {
                 Ok(()) => {
@@ -2284,7 +2442,7 @@ async fn handle_request(
                 });
                 return;
             }
-            let res = match secrets::load_account_secrets_for(account_id, &account.email) {
+            let res = match secrets::load_account_secrets_for_config(&account) {
                 Ok(sec) => {
                     imap_client::empty_folder(&account, &sec.imap_password, &folder_path).await
                 }
@@ -2571,21 +2729,19 @@ async fn handle_request(
                         Err(e) => Err(e),
                     }
                 }
-                AuthBackend::Password => {
-                    match secrets::load_account_secrets_for(account_id, &account.email) {
-                        Ok(sec) => {
-                            imap_client::undo_move_by_message_id(
-                                &account,
-                                &sec.imap_password,
-                                &current_folder_path,
-                                &rfc_message_id,
-                                &original_folder_path,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
+                AuthBackend::Password => match secrets::load_account_secrets_for_config(&account) {
+                    Ok(sec) => {
+                        imap_client::undo_move_by_message_id(
+                            &account,
+                            &sec.imap_password,
+                            &current_folder_path,
+                            &rfc_message_id,
+                            &original_folder_path,
+                        )
+                        .await
                     }
-                }
+                    Err(e) => Err(e),
+                },
             };
             match res {
                 Ok(()) => {
@@ -2627,7 +2783,30 @@ async fn handle_request(
         }
 
         MailRequest::ExportForwardAttachments { message_id } => {
-            let dest_dir = std::env::temp_dir().join(format!("kitemail-forward-{message_id}"));
+            let root = data_dir.join("forward-attachments");
+            if std::fs::create_dir_all(&root).is_err() || !is_plain_directory(&root) {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: "无法创建安全的转发附件目录".into(),
+                });
+                return;
+            }
+            let dest_dir = root.join(format!(
+                "{}-{}-{}",
+                std::process::id(),
+                message_id,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            if std::fs::create_dir(&dest_dir).is_err() || !is_plain_directory(&dest_dir) {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: None,
+                    message: "无法创建安全的转发附件副本目录".into(),
+                });
+                return;
+            }
             let att_ids = match cache.list_message_attachment_ids(message_id) {
                 Ok(ids) => ids,
                 Err(e) => {
@@ -2721,7 +2900,7 @@ async fn handle_request(
             dest_path,
         } => match cache.get_attachment_record(attachment_id) {
             Ok(Some(AttachmentRecord::Local { bytes, .. })) => {
-                match std::fs::write(&dest_path, bytes) {
+                match write_exported_attachment(&dest_path, &bytes) {
                     Ok(()) => {
                         let _ = evt_tx.send(WorkerEvent::AttachmentSaved { path: dest_path });
                     }
@@ -2749,18 +2928,20 @@ async fn handle_request(
                     )
                     .await
                     {
-                        Ok((_name, _mime, bytes)) => match std::fs::write(&dest_path, bytes) {
-                            Ok(()) => {
-                                let _ = evt_tx_cl
-                                    .send(WorkerEvent::AttachmentSaved { path: dest_path });
+                        Ok((_name, _mime, bytes)) => {
+                            match write_exported_attachment(&dest_path, &bytes) {
+                                Ok(()) => {
+                                    let _ = evt_tx_cl
+                                        .send(WorkerEvent::AttachmentSaved { path: dest_path });
+                                }
+                                Err(e) => {
+                                    let _ = evt_tx_cl.send(WorkerEvent::Error {
+                                        account_id: None,
+                                        message: format!("保存附件失败: {e}"),
+                                    });
+                                }
                             }
-                            Err(e) => {
-                                let _ = evt_tx_cl.send(WorkerEvent::Error {
-                                    account_id: None,
-                                    message: format!("保存附件失败: {e}"),
-                                });
-                            }
-                        },
+                        }
                         Err(e) => {
                             let _ = evt_tx_cl.send(WorkerEvent::Error {
                                 account_id: None,
@@ -2823,7 +3004,7 @@ async fn handle_request(
                     } = rec
                     {
                         let dest_path = crate::cache::unique_attachment_path(&dest_dir, &filename);
-                        match std::fs::write(&dest_path, bytes) {
+                        match write_exported_attachment(&dest_path, &bytes) {
                             Ok(()) => saved_count += 1,
                             Err(e) => {
                                 let _ = evt_tx.send(WorkerEvent::Error {
@@ -2867,7 +3048,7 @@ async fn handle_request(
                             Ok((name, bytes)) => {
                                 let dest_path =
                                     crate::cache::unique_attachment_path(&dest_dir, &name);
-                                match std::fs::write(&dest_path, bytes) {
+                                match write_exported_attachment(&dest_path, &bytes) {
                                     Ok(()) => saved_count += 1,
                                     Err(e) => {
                                         let _ = evt_tx_cl.send(WorkerEvent::Error {
@@ -2940,7 +3121,7 @@ async fn handle_request(
                 }
             };
             let (folder_path, uid) = loc;
-            let res = match secrets::load_account_secrets_for(account_id, &account.email) {
+            let res = match secrets::load_account_secrets_for_config(&account) {
                 Ok(sec) => {
                     imap_client::strip_imap_attachment(
                         &account,
@@ -3513,13 +3694,13 @@ async fn handle_request(
                 });
                 return;
             }
-            let res = match secrets::load_account_secrets_for(account_id, &account.email) {
+            let res = match secrets::load_account_secrets_for_config(&account) {
                 Ok(sec) => imap_client::create_folder(&account, &sec.imap_password, &trimmed).await,
                 Err(e) => Err(e),
             };
             match res {
                 Ok(()) => {
-                    if let Ok(sec) = secrets::load_account_secrets_for(account_id, &account.email) {
+                    if let Ok(sec) = secrets::load_account_secrets_for_config(&account) {
                         if let Ok(remote) =
                             imap_client::fetch_folders(&account, &sec.imap_password).await
                         {
@@ -3572,7 +3753,7 @@ async fn handle_request(
                 });
                 return;
             }
-            let res = match secrets::load_account_secrets_for(account_id, &account.email) {
+            let res = match secrets::load_account_secrets_for_config(&account) {
                 Ok(sec) => {
                     imap_client::rename_folder(&account, &sec.imap_password, &old_path, &trimmed)
                         .await
@@ -3641,7 +3822,7 @@ async fn handle_request(
                 });
                 return;
             }
-            let res = match secrets::load_account_secrets_for(account_id, &account.email) {
+            let res = match secrets::load_account_secrets_for_config(&account) {
                 Ok(sec) => {
                     imap_client::delete_folder(&account, &sec.imap_password, &folder_path).await
                 }
@@ -3785,12 +3966,9 @@ async fn move_message_inner(
                     Ok(None) => Err("该账号没有归档文件夹，无法归档邮件".to_string()),
                     Err(e) => Err(e),
                 },
-                // No trash folder: fall back to \Deleted + EXPUNGE.
-                MoveTarget::Trash => Ok(cache
+                MoveTarget::Trash => cache
                     .find_trash_folder(account_id)
-                    .ok()
-                    .flatten()
-                    .map(|(_, path)| path)),
+                    .map(|folder| folder.map(|(_, path)| path)),
                 MoveTarget::Spam => match cache.find_spam_folder(account_id) {
                     Ok(Some((_, path))) => Ok(Some(path)),
                     Ok(None) => Err("该账号没有垃圾邮件文件夹，无法标记为垃圾邮件".to_string()),
@@ -3801,7 +3979,7 @@ async fn move_message_inner(
             match dest_folder {
                 Ok(Some(dest)) => {
                     dest_for_undo = Some(dest.clone());
-                    match secrets::load_account_secrets_for(account_id, &account.email) {
+                    match secrets::load_account_secrets_for_config(&account) {
                         Ok(sec) => {
                             imap_client::move_message(
                                 &account,
@@ -3815,7 +3993,7 @@ async fn move_message_inner(
                         Err(e) => Err(e),
                     }
                 }
-                Ok(None) => match secrets::load_account_secrets_for(account_id, &account.email) {
+                Ok(None) => match secrets::load_account_secrets_for_config(&account) {
                     Ok(sec) => {
                         imap_client::delete_message(
                             &account,
@@ -3935,7 +4113,7 @@ async fn download_and_cache_pending_attachment(
             .map_err(|e| format!("下载 Graph 附件任务异常: {e}"))??
         }
         AuthBackend::Password => {
-            let sec = secrets::load_account_secrets_for(account_id, &account.email)?;
+            let sec = secrets::load_account_secrets_for_config(&account)?;
             imap_client::fetch_attachment_section(
                 &account,
                 &sec.imap_password,
@@ -4028,7 +4206,7 @@ async fn sync_account_inner(
             }
         }
         AuthBackend::Password => {
-            let Ok(sec) = secrets::load_account_secrets_for(account_id, &account.email) else {
+            let Ok(sec) = secrets::load_account_secrets_for_config(&account) else {
                 let _ = evt_tx.send(WorkerEvent::Error {
                     account_id: Some(account_id),
                     message: format!("[{}] 缺少系统凭据", account.email),
@@ -4212,83 +4390,85 @@ async fn sync_folder_inner(
                 Err(e) => Err(e),
             }
         }
-        AuthBackend::Password => {
-            match secrets::load_account_secrets_for(account.id, &account.email) {
-                Ok(sec) => {
-                    match tokio::time::timeout(
-                        Duration::from_secs(60),
-                        imap_client::fetch_folder_headers_with_flags(
-                            account,
-                            &sec.imap_password,
-                            folder_path,
-                        ),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err("同步文件夹超时".to_string()))
-                    {
-                        Ok((uid_validity, headers, live_uids, flag_snapshot)) => {
-                            let commit_res = cache.commit_folder_headers(
-                                account.id,
-                                folder_id,
-                                uid_validity,
-                                &headers,
-                                Some(&live_uids),
-                            );
-                            if commit_res.is_ok() {
-                                if let Some(flags) = flag_snapshot {
-                                    let _ = cache.reconcile_folder_flags(
-                                        folder_id,
-                                        &flags.flagged_uids,
-                                        &flags.unseen_uids,
-                                    );
-                                }
-                                let min_cached_uid = cache
-                                    .folder_remote_cursor(folder_id)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|(_, _, _, _, min_uid, _)| min_uid);
-                                let has_more = live_uids.first().zip(min_cached_uid).is_some_and(
-                                    |(&min_remote, min_cached)| min_remote < min_cached,
+        AuthBackend::Password => match secrets::load_account_secrets_for_config(&account) {
+            Ok(sec) => {
+                let cached_validity = cache
+                    .folder_meta(folder_id)
+                    .ok()
+                    .flatten()
+                    .map(|(_, v)| v)
+                    .unwrap_or(0);
+                let cached_uids = cache.folder_cached_uids(folder_id).unwrap_or_default();
+                match tokio::time::timeout(
+                    Duration::from_secs(60),
+                    imap_client::fetch_folder_headers_incremental(
+                        account,
+                        &sec.imap_password,
+                        folder_path,
+                        Some((cached_validity, &cached_uids)),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err("同步文件夹超时".to_string()))
+                {
+                    Ok((uid_validity, headers, live_uids, flag_snapshot)) => {
+                        let commit_res = cache.commit_folder_headers(
+                            account.id,
+                            folder_id,
+                            uid_validity,
+                            &headers,
+                            Some(&live_uids),
+                        );
+                        if commit_res.is_ok() {
+                            if let Some(flags) = flag_snapshot {
+                                let _ = cache.reconcile_folder_flags(
+                                    folder_id,
+                                    &flags.flagged_uids,
+                                    &flags.unseen_uids,
                                 );
-                                let _ = cache.set_folder_remote_cursor(folder_id, has_more, "");
                             }
-                            commit_res
+                            let has_more = cache
+                                .folder_cached_uids(folder_id)
+                                .map(|known| live_uids.iter().any(|uid| !known.contains(uid)))
+                                .unwrap_or(true);
+                            let _ = cache.set_folder_remote_cursor(folder_id, has_more, "");
                         }
-                        Err(e) if is_imap_nonexistent_mailbox_error(&e) => {
-                            if let Ok(remote_list) =
-                                imap_client::fetch_folders(account, &sec.imap_password).await
+                        commit_res
+                    }
+                    Err(e) if is_imap_nonexistent_mailbox_error(&e) => {
+                        if let Ok(remote_list) =
+                            imap_client::fetch_folders(account, &sec.imap_password).await
+                        {
+                            if !remote_list.is_empty()
+                                && !remote_list.iter().any(|f| f.path == folder_path)
                             {
-                                if !remote_list.is_empty()
-                                    && !remote_list.iter().any(|f| f.path == folder_path)
+                                if let Ok(updated_folders) =
+                                    cache.sync_folders(account.id, &remote_list)
                                 {
-                                    if let Ok(updated_folders) =
-                                        cache.sync_folders(account.id, &remote_list)
-                                    {
-                                        let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
-                                            account_id: account.id,
-                                            folders: updated_folders,
-                                        });
-                                        let _ = evt_tx.send(WorkerEvent::FolderSyncFailed {
-                                            account_id: account.id,
-                                            folder_id,
-                                            folder_path: folder_path.to_string(),
-                                            folder_name,
-                                            user_initiated,
-                                            removed_from_server: true,
-                                            message: e,
-                                        });
-                                        return Ok(());
-                                    }
+                                    let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
+                                        account_id: account.id,
+                                        folders: updated_folders,
+                                    });
+                                    let _ = evt_tx.send(WorkerEvent::FolderSyncFailed {
+                                        account_id: account.id,
+                                        folder_id,
+                                        folder_path: folder_path.to_string(),
+                                        folder_name,
+                                        user_initiated,
+                                        removed_from_server: true,
+                                        message: e,
+                                    });
+                                    return Ok(());
                                 }
                             }
-                            Err(e)
                         }
-                        Err(e) => Err(e),
+                        Err(e)
                     }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
-        }
+            Err(e) => Err(e),
+        },
     };
 
     match sync_res {
@@ -4402,56 +4582,59 @@ async fn fetch_older_batch_for_folder(
                 // 游标已收口（无更早历史），与 Graph 空游标分支同样视为完成。
                 Ok((0, false))
             }
-            Some(before_uid) => match secrets::load_account_secrets_for(account.id, &account.email)
-            {
-                Ok(sec) => match imap_client::fetch_older_folder_headers(
-                    &account,
-                    &sec.imap_password,
-                    &folder_path,
-                    before_uid,
-                    cache
-                        .folder_meta(fid)
-                        .ok()
-                        .flatten()
-                        .map(|(_, validity)| validity)
-                        .unwrap_or(0),
-                    batch,
-                    uid_snapshot,
-                )
-                .await
-                {
-                    Ok((uid_validity, headers, has_more)) => {
-                        let count = headers.len();
-                        match cache.commit_folder_headers(
-                            account.id,
-                            fid,
-                            uid_validity,
-                            &headers,
-                            None,
-                        ) {
-                            Ok(()) => {
-                                let _ = cache.set_folder_remote_cursor(fid, has_more, "");
-                                Ok((count, has_more))
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    Err(e) if e == "UIDVALIDITY_CHANGED" => {
-                        let background_events = EventSender::noop();
-                        let _ = sync_folder_inner(
-                            cache,
-                            tokens,
-                            &account,
-                            fid,
-                            &folder_path,
-                            batch,
-                            false,
-                            &background_events,
-                        )
-                        .await;
-                        Ok((0, true))
-                    }
+            Some(before_uid) => match secrets::load_account_secrets_for_config(&account) {
+                Ok(sec) => match cache.folder_cached_uids(fid) {
                     Err(e) => Err(e),
+                    Ok(known) => match imap_client::fetch_older_folder_headers_with_known(
+                        &account,
+                        &sec.imap_password,
+                        &folder_path,
+                        before_uid,
+                        cache
+                            .folder_meta(fid)
+                            .ok()
+                            .flatten()
+                            .map(|(_, validity)| validity)
+                            .unwrap_or(0),
+                        batch,
+                        uid_snapshot,
+                        Some(&known),
+                    )
+                    .await
+                    {
+                        Ok((uid_validity, headers, has_more)) => {
+                            let count = headers.len();
+                            match cache.commit_folder_headers(
+                                account.id,
+                                fid,
+                                uid_validity,
+                                &headers,
+                                None,
+                            ) {
+                                Ok(()) => {
+                                    let _ = cache.set_folder_remote_cursor(fid, has_more, "");
+                                    Ok((count, has_more))
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) if e == "UIDVALIDITY_CHANGED" => {
+                            let background_events = EventSender::noop();
+                            let _ = sync_folder_inner(
+                                cache,
+                                tokens,
+                                &account,
+                                fid,
+                                &folder_path,
+                                batch,
+                                false,
+                                &background_events,
+                            )
+                            .await;
+                            Ok((0, true))
+                        }
+                        Err(e) => Err(e),
+                    },
                 },
                 Err(e) => Err(e),
             },
@@ -4704,50 +4887,48 @@ async fn backfill_history_batch_inner(
             .unwrap_or(0);
         let results: Vec<(u32, Result<(String, Option<FetchedMessageBody>), String>)> =
             match account.auth_backend {
-                AuthBackend::Password => {
-                    match secrets::load_account_secrets_for(account.id, &account.email) {
-                        Ok(sec) => {
-                            let uids: Vec<u32> = missing.iter().map(|(_, uid, _)| *uid).collect();
-                            match imap_client::fetch_index_texts_batch(
-                                account,
-                                &sec.imap_password,
-                                path,
-                                &uids,
-                                validity,
-                            )
-                            .await
-                            {
-                                Ok(batch) => {
-                                    let mut by_uid: std::collections::HashMap<
-                                        u32,
-                                        (String, Option<FetchedMessageBody>),
-                                    > = batch
-                                        .into_iter()
-                                        .map(|(uid, text, full)| (uid, (text, full)))
-                                        .collect();
-                                    missing
-                                        .into_iter()
-                                        .map(|(message_id, uid, _)| {
-                                            let result = match by_uid.remove(&uid) {
-                                                Some(pair) => Ok(pair),
-                                                None => Err("服务器未返回索引正文".to_string()),
-                                            };
-                                            (message_id, result)
-                                        })
-                                        .collect()
-                                }
-                                Err(e) => missing
+                AuthBackend::Password => match secrets::load_account_secrets_for_config(&account) {
+                    Ok(sec) => {
+                        let uids: Vec<u32> = missing.iter().map(|(_, uid, _)| *uid).collect();
+                        match imap_client::fetch_index_texts_batch(
+                            account,
+                            &sec.imap_password,
+                            path,
+                            &uids,
+                            validity,
+                        )
+                        .await
+                        {
+                            Ok(batch) => {
+                                let mut by_uid: std::collections::HashMap<
+                                    u32,
+                                    (String, Option<FetchedMessageBody>),
+                                > = batch
                                     .into_iter()
-                                    .map(|(message_id, _, _)| (message_id, Err(e.clone())))
-                                    .collect(),
+                                    .map(|(uid, text, full)| (uid, (text, full)))
+                                    .collect();
+                                missing
+                                    .into_iter()
+                                    .map(|(message_id, uid, _)| {
+                                        let result = match by_uid.remove(&uid) {
+                                            Some(pair) => Ok(pair),
+                                            None => Err("服务器未返回索引正文".to_string()),
+                                        };
+                                        (message_id, result)
+                                    })
+                                    .collect()
                             }
+                            Err(e) => missing
+                                .into_iter()
+                                .map(|(message_id, _, _)| (message_id, Err(e.clone())))
+                                .collect(),
                         }
-                        Err(e) => missing
-                            .into_iter()
-                            .map(|(message_id, _, _)| (message_id, Err(e.clone())))
-                            .collect(),
                     }
-                }
+                    Err(e) => missing
+                        .into_iter()
+                        .map(|(message_id, _, _)| (message_id, Err(e.clone())))
+                        .collect(),
+                },
                 AuthBackend::MicrosoftGraphOAuth2 => {
                     match ensure_graph_token(tokens, account).await {
                         Ok(token) => {
@@ -5182,37 +5363,36 @@ async fn deliver_outbox_item(
             }
             Err(e) => (SendOutcome::Failed(e), None, None),
         },
-        AuthBackend::Password => {
-            match secrets::load_account_secrets_for(account_id, &account.email) {
-                Ok(secrets) => {
-                    let smtp_pwd = if account.smtp_separate_credentials {
-                        secrets
-                            .smtp_password
-                            .as_deref()
-                            .unwrap_or(&secrets.imap_password)
-                    } else {
-                        secrets.imap_password.as_str()
-                    };
-                    let (out, raw) = smtp_client::send_message_with_raw(
-                        &account,
-                        smtp_pwd,
-                        &item.to_addr,
-                        &item.cc_addr,
-                        &item.bcc_addr,
-                        &item.subject,
-                        &item.body_text,
-                        &item.in_reply_to,
-                        &item.from_addr,
-                        &item.reply_to,
-                        item.body_html.as_deref(),
-                        &item.attachment_paths,
-                    )
-                    .await;
-                    (out, raw, Some(secrets.imap_password))
-                }
-                Err(e) => (SendOutcome::Failed(e), None, None),
+        AuthBackend::Password => match secrets::load_account_secrets_for_config(&account) {
+            Ok(secrets) => {
+                let smtp_pwd = if account.smtp_separate_credentials {
+                    secrets
+                        .smtp_password
+                        .as_deref()
+                        .filter(|password| !password.is_empty())
+                        .unwrap_or("")
+                } else {
+                    secrets.imap_password.as_str()
+                };
+                let (out, raw) = smtp_client::send_message_with_raw(
+                    &account,
+                    smtp_pwd,
+                    &item.to_addr,
+                    &item.cc_addr,
+                    &item.bcc_addr,
+                    &item.subject,
+                    &item.body_text,
+                    &item.in_reply_to,
+                    &item.from_addr,
+                    &item.reply_to,
+                    item.body_html.as_deref(),
+                    &item.attachment_paths,
+                )
+                .await;
+                (out, raw, Some(secrets.imap_password))
             }
-        }
+            Err(e) => (SendOutcome::Failed(e), None, None),
+        },
     };
 
     match outcome {
@@ -5405,7 +5585,7 @@ async fn search_server_inner(
                 }
             }
             AuthBackend::Password => {
-                let Ok(sec) = secrets::load_account_secrets_for(account.id, &account.email) else {
+                let Ok(sec) = secrets::load_account_secrets_for_config(&account) else {
                     continue;
                 };
                 let res = imap_client::search_folder_messages(
@@ -5468,37 +5648,142 @@ fn load_account_config(data_dir: &PathBuf, account_id: u32) -> Result<AccountCon
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn forward_cleanup_rejects_junction_directory() {
+        let root =
+            std::env::temp_dir().join(format!("kitemail-junction-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        let junction = root.join("junction");
+        std::fs::create_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!is_plain_directory(&junction));
+        std::fs::remove_dir(&junction).unwrap();
+        std::fs::remove_dir(target).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn forward_cleanup_preserves_references_and_recent_files() {
+        let root = std::env::temp_dir().join(format!(
+            "kitemail-forward-cleanup-test-{}",
+            std::process::id()
+        ));
+        let cache = CacheStore::open_for_data_dir(&root).unwrap();
+        let dir = root.join("forward-attachments").join("1-2-3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kept = dir.join("kept.txt");
+        let unused = dir.join("unused.txt");
+        let unrelated_dir = root.join("forward-attachments").join("other");
+        std::fs::create_dir_all(&unrelated_dir).unwrap();
+        let unrelated = unrelated_dir.join("other.txt");
+        std::fs::write(&unrelated, b"synthetic").unwrap();
+        std::fs::write(&kept, b"synthetic").unwrap();
+        std::fs::write(&unused, b"synthetic").unwrap();
+        let template = crate::MailTemplate {
+            attachment_paths: vec![kept.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let mut cache = cache;
+        cache.upsert_template(&template).unwrap();
+        prune_forward_copies(&root, &cache).unwrap();
+        assert!(unused.exists());
+        let missing = crate::MailTemplate {
+            attachment_paths: vec![dir.join("missing.txt").to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let missing_id = cache.upsert_template(&missing).unwrap();
+        assert!(prune_forward_copies_at(
+            &root,
+            &cache,
+            std::time::SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60)
+        )
+        .is_err());
+        assert!(unused.exists());
+        cache.delete_template(missing_id).unwrap();
+        prune_forward_copies_at(
+            &root,
+            &cache,
+            std::time::SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60),
+        )
+        .unwrap();
+        assert!(kept.exists());
+        assert!(!unused.exists());
+        assert!(unrelated.exists());
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exported_attachment_has_internet_origin_on_windows() {
+        let dir = std::env::temp_dir().join(format!("kitemail-export-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("附件.txt");
+        write_exported_attachment(&path, b"synthetic attachment").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"synthetic attachment");
+        write_exported_attachment(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        #[cfg(windows)]
+        {
+            let mut stream = path.as_os_str().to_os_string();
+            stream.push(":Zone.Identifier");
+            assert_eq!(
+                std::fs::read(stream).unwrap(),
+                b"[ZoneTransfer]\r\nZoneId=3\r\n"
+            );
+        }
+        assert!(write_exported_attachment(&dir.join("missing").join("file"), b"x").is_err());
+        let existing_dir = dir.join("existing");
+        std::fs::create_dir(&existing_dir).unwrap();
+        assert!(write_exported_attachment(&existing_dir, b"x").is_err());
+        assert!(existing_dir.is_dir());
+        std::fs::remove_dir(existing_dir).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_cache_does_not_cross_account_or_client_identity() {
+        let cache = SharedTokenCache::default();
+        let mut account = AccountConfig::default();
+        account.id = 17;
+        account.email = "alice@example.invalid".into();
+        account.oauth_client_id = "client-a".into();
+        cache
+            .insert(
+                &account,
+                "synthetic-token".into(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(
+            cache.cached_valid_token(&account).await.as_deref(),
+            Some("synthetic-token")
+        );
+        let mut changed = account.clone();
+        changed.email = "bob@example.invalid".into();
+        assert!(cache.cached_valid_token(&changed).await.is_none());
+        changed = account.clone();
+        changed.oauth_client_id = "client-b".into();
+        assert!(cache.cached_valid_token(&changed).await.is_none());
+        changed = account.clone();
+        changed.imap_host = "attacker.invalid".into();
+        assert!(cache.cached_valid_token(&changed).await.is_none());
+    }
+
     fn account(id: u32, email: &str) -> AccountConfig {
         AccountConfig {
             id,
             email: email.to_string(),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn select_oauth_refresh_token_to_persist_covers_rotation_and_legacy_recovery() {
-        assert_eq!(
-            select_oauth_refresh_token_to_persist(Some("rt_new"), None),
-            Some("rt_new".to_string())
-        );
-        assert_eq!(select_oauth_refresh_token_to_persist(None, None), None);
-        assert_eq!(
-            select_oauth_refresh_token_to_persist(Some("   "), None),
-            None
-        );
-        assert_eq!(
-            select_oauth_refresh_token_to_persist(Some("rt_new"), Some("rt_legacy")),
-            Some("rt_new".to_string())
-        );
-        assert_eq!(
-            select_oauth_refresh_token_to_persist(None, Some("rt_legacy")),
-            Some("rt_legacy".to_string())
-        );
-        assert_eq!(
-            select_oauth_refresh_token_to_persist(Some(""), Some("  rt_legacy  ")),
-            Some("rt_legacy".to_string())
-        );
     }
 
     #[test]
@@ -5801,26 +6086,28 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let tokens = SharedTokenCache::default();
+            let first = account(1, "a@example.invalid");
+            let second = account(2, "b@example.invalid");
             tokens
                 .insert(
-                    1,
+                    &first,
                     "valid-tok".to_string(),
                     Instant::now() + Duration::from_secs(300),
                 )
                 .await;
             tokens
                 .insert(
-                    2,
+                    &second,
                     "expired-tok".to_string(),
                     Instant::now() - Duration::from_secs(1),
                 )
                 .await;
 
             assert_eq!(
-                tokens.cached_valid_token(1).await.as_deref(),
+                tokens.cached_valid_token(&first).await.as_deref(),
                 Some("valid-tok")
             );
-            assert_eq!(tokens.cached_valid_token(2).await, None);
+            assert_eq!(tokens.cached_valid_token(&second).await, None);
 
             let lock_1a = tokens.account_refresh_lock(1);
             let lock_1b = tokens.account_refresh_lock(1);
@@ -5829,7 +6116,7 @@ mod tests {
             assert!(!Arc::ptr_eq(&lock_1a, &lock_2));
 
             tokens.remove(1).await;
-            assert_eq!(tokens.cached_valid_token(1).await, None);
+            assert_eq!(tokens.cached_valid_token(&first).await, None);
         });
     }
 

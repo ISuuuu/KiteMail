@@ -976,6 +976,16 @@ impl CacheStore {
         db.folder_meta(local_fid)
     }
 
+    pub(crate) fn folder_cached_uids(&self, folder_id: u32) -> Result<HashSet<u32>, String> {
+        let Some((account_id, local_fid)) = self.resolve_scoped_account(folder_id)? else {
+            return Ok(HashSet::new());
+        };
+        let Some(db) = self.open_existing_account_for_read(account_id)? else {
+            return Ok(HashSet::new());
+        };
+        db.folder_cached_uids(local_fid)
+    }
+
     /// Commit a batch of synced headers and folder UIDVALIDITY in a single transaction.
     pub fn commit_folder_headers(
         &mut self,
@@ -2226,6 +2236,10 @@ impl CacheStore {
         self.global.delete_outbox(outbox_id)
     }
 
+    pub(crate) fn recover_interrupted_outbox(&self) -> Result<(), String> {
+        self.global.recover_interrupted_outbox()
+    }
+
     pub fn claim_outbox_for_delivery(
         &mut self,
         outbox_id: u32,
@@ -2280,6 +2294,10 @@ impl CacheStore {
 
     pub fn list_drafts(&self) -> Result<Vec<LocalDraft>, String> {
         self.global.list_drafts()
+    }
+
+    pub(crate) fn referenced_attachment_paths(&self) -> Result<Vec<String>, String> {
+        self.global.referenced_attachment_paths()
     }
 
     pub fn load_draft(&self, draft_id: u32) -> Result<Option<LocalDraft>, String> {

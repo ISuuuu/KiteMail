@@ -29,6 +29,9 @@ fn build_transport(
         return Err("SMTP 主机地址不能为空".to_string());
     }
 
+    if account.smtp_separate_credentials && password.is_empty() {
+        return Err("启用独立 SMTP 凭据时必须提供 SMTP 密码或授权码".to_string());
+    }
     let username = if account.smtp_separate_credentials && !account.smtp_username.trim().is_empty()
     {
         account.smtp_username.clone()
@@ -313,6 +316,18 @@ pub async fn send_message_with_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separate_smtp_password_is_required() {
+        let account = AccountConfig {
+            smtp_host: "smtp.example.invalid".into(),
+            smtp_separate_credentials: true,
+            ..AccountConfig::default()
+        };
+        assert!(
+            matches!(build_transport(&account, ""), Err(message) if message.contains("独立 SMTP 凭据"))
+        );
+    }
 
     #[test]
     fn parse_mailbox_list_supports_multiple_comma_separated_addresses() {

@@ -148,6 +148,24 @@ fn allow_remote_request(
         && allowed_mail_image_url(url, allowed)
 }
 
+fn clear_private_image_headers(
+    request: &ICoreWebView2WebResourceRequest,
+) -> windows::core::Result<()> {
+    let headers = unsafe { request.Headers()? };
+    for name in [w!("Referer"), w!("Cookie"), w!("Authorization")] {
+        let mut present = Default::default();
+        unsafe {
+            headers.Contains(name, &mut present)?;
+        }
+        if present.as_bool() {
+            unsafe {
+                headers.RemoveHeader(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn clipped_rects(content: RECT, viewport: RECT) -> Option<(RECT, RECT)> {
     let clip = RECT {
         left: content.left.max(viewport.left),
@@ -213,7 +231,6 @@ pub(crate) enum WebViewAction {
     CardToggleRaw(u32),
     CardUnsubscribe(u32),
     CardAllowRemote(u32),
-    CardTrustSender(u32),
     CardLoadBody(u32),
     CardSaveAttachment(u32),
     CardSaveAllAttachments(u32),
@@ -610,6 +627,22 @@ impl BodyView {
 pub(crate) struct WebViewHost(Rc<RefCell<State>>);
 
 impl WebViewHost {
+    pub(crate) fn retire_for_remote_reload(&self, next_allowed: bool) -> bool {
+        let mut state = self.0.borrow_mut();
+        if !needs_new_host(state.version != 0, state.allow_remote_images, next_allowed) {
+            return false;
+        }
+        state.allow_remote_images = false;
+        state.closed = true;
+        let controller = state.controller.take();
+        drop(state);
+        if let Some(controller) = controller {
+            unsafe {
+                let _ = controller.Close();
+            }
+        }
+        true
+    }
     pub(crate) fn for_window(
         window: &Window,
         scroll_window: Option<AsyncWindowContext>,
@@ -696,11 +729,15 @@ impl WebViewHost {
         } else {
             windows::core::PCWSTR(data_dir.as_ptr())
         };
+        let options = webview2_com::CoreWebView2EnvironmentOptions::default();
+        // This opts out of Windows sending WebView crash data to Microsoft.
+        unsafe { options.set_is_custom_crash_reporting_enabled(true) };
+        let options = ICoreWebView2EnvironmentOptions::from(options);
         let result = unsafe {
             CreateCoreWebView2EnvironmentWithOptions(
                 windows::core::PCWSTR::null(),
                 data_dir,
-                None::<&ICoreWebView2EnvironmentOptions>,
+                &options,
                 &callback,
             )
         };
@@ -1216,6 +1253,14 @@ impl WebViewHost {
     }
 }
 
+fn needs_new_host(has_document: bool, old_allowed: bool, new_allowed: bool) -> bool {
+    has_document && (old_allowed || new_allowed)
+}
+
+fn retired_resource_handler(state: &Weak<RefCell<State>>) -> bool {
+    state.upgrade().is_none_or(|state| state.borrow().closed)
+}
+
 unsafe fn navigate_to(
     controller: &ICoreWebView2Controller,
     url: &str,
@@ -1341,7 +1386,6 @@ pub(crate) fn parse_thread_action(message: &str) -> Option<WebViewAction> {
         ("card-toggle-raw", None) => Some(WebViewAction::CardToggleRaw(id)),
         ("card-unsub", None) => Some(WebViewAction::CardUnsubscribe(id)),
         ("card-allow-remote", None) => Some(WebViewAction::CardAllowRemote(id)),
-        ("card-trust-sender", None) => Some(WebViewAction::CardTrustSender(id)),
         ("card-load-body", None) => Some(WebViewAction::CardLoadBody(id)),
         ("card-save-att", None) => Some(WebViewAction::CardSaveAttachment(id)),
         ("card-save-all-atts", None) => Some(WebViewAction::CardSaveAllAttachments(id)),
@@ -1590,6 +1634,24 @@ unsafe fn configure(
     }
     let env = env.clone();
     let resource = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
+        if retired_resource_handler(&state) {
+            if let Some(args) = args {
+                if let Some(stream) = unsafe { SHCreateMemStream(Some(&[])) } {
+                    let response = unsafe {
+                        env.CreateWebResourceResponse(
+                            &stream,
+                            403,
+                            w!("Forbidden"),
+                            w!("Cache-Control: no-store"),
+                        )?
+                    };
+                    unsafe {
+                        args.SetResponse(&response)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
         if let (Some(state), Some(args)) = (state.upgrade(), args) {
             let mut uri = windows::core::PWSTR::null();
             let request = unsafe { args.Request() }.ok();
@@ -1628,12 +1690,11 @@ unsafe fn configure(
                     state.version,
                 );
             let allow_remote_images = current && state.allow_remote_images;
-            if allow_external {
-                if let Some(request) = &request {
-                    if let Ok(headers) = unsafe { request.Headers() } {
-                        let _ = unsafe { headers.RemoveHeader(w!("Referer")) };
-                    }
-                }
+            if allow_external
+                && request
+                    .as_ref()
+                    .is_some_and(|request| clear_private_image_headers(request).is_ok())
+            {
                 return Ok(());
             }
             let stream =
@@ -1680,6 +1741,148 @@ unsafe fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Windows WebView2 loopback smoke; launches an isolated subprocess"]
+    fn isolated_remote_image_smoke() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+        if std::env::var_os("KITEMAIL_WEBVIEW_SMOKE_CHILD").is_none() {
+            use std::hash::{BuildHasher, Hasher};
+            let mut random = std::collections::hash_map::RandomState::new().build_hasher();
+            random.write_u32(std::process::id());
+            let dir = std::env::temp_dir().join(format!(
+                "kitemail-webview-smoke-{}-{:016x}",
+                std::process::id(),
+                random.finish()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "webview_host::tests::isolated_remote_image_smoke",
+                    "--nocapture",
+                ])
+                .env("KITEMAIL_WEBVIEW_SMOKE_CHILD", "1")
+                .env("KITEMAIL_DATA_DIR", &dir)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WS_OVERLAPPEDWINDOW,
+        };
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+        }
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                0,
+                0,
+                200,
+                200,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let old_count = Arc::new(AtomicUsize::new(0));
+        let new_count = Arc::new(AtomicUsize::new(0));
+        let private_headers = Arc::new(AtomicUsize::new(0));
+        let old_cl = old_count.clone();
+        let new_cl = new_count.clone();
+        let private_cl = private_headers.clone();
+        std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < end {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let headers = request.to_ascii_lowercase();
+                    if headers.contains("\r\nreferer:")
+                        || headers.contains("\r\ncookie:")
+                        || headers.contains("\r\nauthorization:")
+                    {
+                        private_cl.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if request.starts_with("GET /old") {
+                        old_cl.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if request.starts_with("GET /new") {
+                        new_cl.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+        let old = WebViewHost::create(hwnd, None).unwrap();
+        old.load_with_remote(format!("<img src='http://{addr}/old'>").into_bytes(), false)
+            .unwrap();
+        let pump = |duration: Duration| {
+            let end = Instant::now() + duration;
+            while Instant::now() < end {
+                let mut msg = MSG::default();
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        pump(Duration::from_secs(3));
+        assert_eq!(old_count.load(Ordering::SeqCst), 0);
+        assert!(old.retire_for_remote_reload(true));
+        let new = WebViewHost::create(hwnd, None).unwrap();
+        new.load_with_remote(format!("<img src='http://{addr}/new'>").into_bytes(), true)
+            .unwrap();
+        pump(Duration::from_secs(5));
+        assert_eq!(old_count.load(Ordering::SeqCst), 0);
+        assert!(new_count.load(Ordering::SeqCst) > 0);
+        assert_eq!(private_headers.load(Ordering::SeqCst), 0);
+        drop(new);
+        drop(old);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn remote_permission_changes_retire_existing_document_host() {
+        assert!(!needs_new_host(false, false, true));
+        assert!(!needs_new_host(true, false, false));
+        assert!(needs_new_host(true, false, true));
+        assert!(needs_new_host(true, true, false));
+        assert!(needs_new_host(true, true, true));
+        let old = Rc::new(RefCell::new(State::default()));
+        let callback = Rc::downgrade(&old);
+        assert!(!retired_resource_handler(&callback));
+        old.borrow_mut().closed = true;
+        assert!(retired_resource_handler(&callback));
+        drop(old);
+        assert!(retired_resource_handler(&callback));
+    }
 
     #[test]
     fn a_scheduled_html_document_shows_loading_before_the_host_exists() {
@@ -1815,10 +2018,7 @@ mod tests {
             parse_thread_action("card-allow-remote:7"),
             Some(WebViewAction::CardAllowRemote(7))
         );
-        assert_eq!(
-            parse_thread_action("card-trust-sender:7"),
-            Some(WebViewAction::CardTrustSender(7))
-        );
+        assert_eq!(parse_thread_action("card-trust-sender:7"), None);
         assert_eq!(
             parse_thread_action("card-load-body:7"),
             Some(WebViewAction::CardLoadBody(7))

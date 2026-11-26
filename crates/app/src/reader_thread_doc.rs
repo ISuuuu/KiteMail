@@ -548,9 +548,8 @@ pub(crate) fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, boo
                 cards_html,
                 "<div class=\"km-banner km-banner-accent\"><span>已拦截 {blocked_images} 张远程图片以保护隐私</span><div class=\"km-btn-group\">\
                 <button type=\"button\" class=\"km-btn\" data-action=\"allow-remote\" data-msg-id=\"{}\">显示本次图片</button>\
-                <button type=\"button\" class=\"km-btn\" data-action=\"trust-sender\" data-msg-id=\"{}\">总是信任此发件人</button>\
                 </div></div>",
-                tm.id, tm.id
+                tm.id
             );
         }
 
