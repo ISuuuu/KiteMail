@@ -7,7 +7,7 @@
 //! - **逐卡远程图双层防线**：整份文档仅在存在至少一张允许远程图的卡片时才在 HTTP CSP
 //!   放开 `http: https:`；所有禁止远程图的卡片既先剥离外链 `<img>`，又在其 `srcdoc`
 //!   内部注入收紧版 `<meta http-equiv="Content-Security-Policy" content="... img-src data: ...">`。
-//! - **折叠卡片延迟水合**：初始处于 `km-folded` 的卡片只把正文写进 `data-km-srcdoc`，
+//! - **折叠卡片延迟水合**：初始处于 `km-folded` 的 iframe 放在模板中，正文写进 `data-km-srcdoc`，
 //!   不写入 `srcdoc`，只有用户或工具栏展开时才由 JS 水合，避免长会话内存暴涨。
 
 use std::fmt::Write as _;
@@ -384,9 +384,14 @@ pub(crate) fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, boo
                 ""
             };
             let pan_style = format!(" style=\"background:{}\"", css_hex_color(picked_bg));
+            let (template_start, template_end) = if card.is_collapsed {
+                ("<template class=\"km-frame-template\">", "</template>")
+            } else {
+                ("", "")
+            };
             (
                 format!(
-                    "<div class=\"km-pan{picked_class}\"{pan_style}><iframe class=\"km-frame\" data-msg-id=\"{}\" sandbox=\"allow-same-origin allow-popups\" style=\"height:160px\" {src_attr}=\"{}\"></iframe></div>",
+                    "<div class=\"km-pan{picked_class}\"{pan_style}>{template_start}<iframe class=\"km-frame\" data-msg-id=\"{}\" sandbox=\"allow-same-origin allow-popups\" style=\"height:160px\" {src_attr}=\"{}\"></iframe>{template_end}</div>",
                     tm.id,
                     escape_html(&frame_doc)
                 ),
@@ -699,6 +704,13 @@ mod tests {
         let (bytes, any_remote) = build_thread_document(&ctx);
         let html = String::from_utf8(bytes).unwrap();
         assert!(!any_remote);
+        assert!(html.contains(
+            "<template class=\"km-frame-template\"><iframe class=\"km-frame\" data-msg-id=\"1\""
+        ));
+        assert!(html.contains("</iframe></template></div>"));
+        assert!(!html.contains(
+            "<template class=\"km-frame-template\"><iframe class=\"km-frame\" data-msg-id=\"2\""
+        ));
         assert!(html.contains("data-msg-id=\"1\" sandbox=\"allow-same-origin allow-popups\" style=\"height:160px\" data-km-srcdoc=\""));
         assert!(html.contains("data-msg-id=\"2\" sandbox=\"allow-same-origin allow-popups\" style=\"height:160px\" srcdoc=\""));
     }

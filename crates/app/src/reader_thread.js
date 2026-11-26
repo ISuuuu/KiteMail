@@ -314,13 +314,17 @@
 
     function hydrateCard(card) {
         card.classList.remove("km-folded");
-        const frames = card.querySelectorAll("iframe.km-frame");
-        for (const frame of frames) {
+        for (const template of card.querySelectorAll("template.km-frame-template")) {
+            const frame = template.content.querySelector("iframe.km-frame");
+            if (!frame) continue;
             const pending = frame.getAttribute("data-km-srcdoc");
             if (pending !== null) {
                 frame.removeAttribute("data-km-srcdoc");
                 frame.setAttribute("srcdoc", pending);
             }
+            template.replaceWith(frame);
+        }
+        for (const frame of card.querySelectorAll("iframe.km-frame")) {
             watchFrame(frame);
         }
     }

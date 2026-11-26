@@ -517,6 +517,21 @@ mod win {
         found
     }
 
+    // A shutdown request must survive until the window thread attempts to publish its HWND.
+    const SHUTDOWN_REQUESTED: usize = usize::MAX;
+
+    fn publish_tray_window(slot: &AtomicUsize, hwnd: usize) -> bool {
+        slot.compare_exchange(0, hwnd, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn request_tray_shutdown(slot: &AtomicUsize) -> Option<usize> {
+        match slot.swap(SHUTDOWN_REQUESTED, Ordering::AcqRel) {
+            0 | SHUTDOWN_REQUESTED => None,
+            hwnd => Some(hwnd),
+        }
+    }
+
     pub(crate) struct TrayHandle {
         rx: Mutex<Receiver<TrayCommand>>,
         tray_hwnd: Arc<AtomicUsize>,
@@ -600,14 +615,22 @@ mod win {
                     let state_ptr = Box::into_raw(state);
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
                     (*state_ptr).add_tray_icon(hwnd);
-                    tray_hwnd_bg.store(hwnd as usize, Ordering::Release);
-
-                    let mut msg = core::mem::zeroed::<Msg>();
-                    while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) > 0 {
-                        TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
+                    if publish_tray_window(&tray_hwnd_bg, hwnd as usize) {
+                        let mut msg = core::mem::zeroed::<Msg>();
+                        while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) > 0 {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                        let _ = tray_hwnd_bg.compare_exchange(
+                            hwnd as usize,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    } else {
+                        // Shutdown raced with initialization: destroy on the owning thread.
+                        DestroyWindow(hwnd);
                     }
-                    tray_hwnd_bg.store(0, Ordering::Release);
                     UnregisterClassW(class_name.as_ptr(), hinstance);
                 })
                 .ok()?;
@@ -680,7 +703,7 @@ mod win {
         /// 弹出 Windows 托盘气球通知（`NIF_INFO`）。
         pub(crate) fn show_notification(&self, title: &str, body: &str) {
             let hwnd = self.tray_hwnd.load(Ordering::Acquire) as Hwnd;
-            if hwnd.is_null() {
+            if hwnd.is_null() || hwnd as usize == SHUTDOWN_REQUESTED {
                 return;
             }
             if let Ok(mut guard) = self.pending_balloon.lock() {
@@ -694,7 +717,7 @@ mod win {
         /// 更新托盘图标悬停提示文案。
         pub(crate) fn set_tooltip(&self, tooltip: String) {
             let hwnd = self.tray_hwnd.load(Ordering::Acquire) as Hwnd;
-            if hwnd.is_null() {
+            if hwnd.is_null() || hwnd as usize == SHUTDOWN_REQUESTED {
                 return;
             }
             if let Ok(mut guard) = self.pending_tooltip.lock() {
@@ -718,10 +741,9 @@ mod win {
 
         /// 主动销毁托盘图标并回收后台线程（退出时调用，避免残留幽灵图标）。
         pub(crate) fn shutdown(&self) {
-            let hwnd = self.tray_hwnd.swap(0, Ordering::AcqRel) as Hwnd;
-            if !hwnd.is_null() {
+            if let Some(hwnd) = request_tray_shutdown(&self.tray_hwnd) {
                 unsafe {
-                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    PostMessageW(hwnd as Hwnd, WM_CLOSE, 0, 0);
                 }
             }
             if let Ok(mut guard) = self.thread.lock() {
@@ -735,6 +757,27 @@ mod win {
     impl Drop for TrayHandle {
         fn drop(&mut self) {
             self.shutdown();
+        }
+    }
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+
+        #[test]
+        fn shutdown_during_startup_prevents_window_publication() {
+            let slot = AtomicUsize::new(0);
+            assert_eq!(request_tray_shutdown(&slot), None);
+            assert!(!publish_tray_window(&slot, 42));
+            assert_eq!(request_tray_shutdown(&slot), None);
+        }
+
+        #[test]
+        fn shutdown_after_publication_returns_window_once() {
+            let slot = AtomicUsize::new(0);
+            assert!(publish_tray_window(&slot, 42));
+            assert_eq!(request_tray_shutdown(&slot), Some(42));
+            assert_eq!(request_tray_shutdown(&slot), None);
         }
     }
 
