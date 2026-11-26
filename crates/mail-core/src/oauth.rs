@@ -25,6 +25,21 @@ const MICROSOFT_AUTH_SCOPES: &str = "https://graph.microsoft.com/Mail.ReadWrite 
 const MICROSOFT_IMAP_SCOPES: &str =
     "https://outlook.office.com/IMAP.AccessAsUser.All offline_access";
 
+fn oauth_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(20))
+        .build()
+}
+
+fn require_oauth_success(response: ureq::Response) -> Result<ureq::Response, String> {
+    let status = response.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("OAuth 服务返回非成功状态 (HTTP {status})"));
+    }
+    Ok(response)
+}
+
 const SUCCESS_HTML: &str = r##"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -155,6 +170,11 @@ pub fn run_microsoft_oauth_login(
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 let first_line = req_str.lines().next().unwrap_or("");
                 let target = first_line.split_whitespace().nth(1).unwrap_or("/");
+                if !target.starts_with('/') {
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+                    return Err("无效的 OAuth 回调请求路径".to_string());
+                }
                 if target.starts_with("/favicon.ico") {
                     let _ =
                         stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
@@ -216,7 +236,8 @@ pub fn run_microsoft_oauth_login(
         }
     };
 
-    let token_resp = ureq::post(MICROSOFT_TOKEN_URL)
+    let token_resp = oauth_agent()
+        .post(MICROSOFT_TOKEN_URL)
         .send_form(&[
             ("client_id", client_id.as_str()),
             ("grant_type", "authorization_code"),
@@ -225,7 +246,8 @@ pub fn run_microsoft_oauth_login(
             ("code_verifier", verifier.as_str()),
             ("scope", MICROSOFT_SCOPES),
         ])
-        .map_err(format_ureq_error)?;
+        .map_err(format_ureq_error)
+        .and_then(require_oauth_success)?;
 
     let json: serde_json::Value = token_resp
         .into_json()
@@ -280,14 +302,16 @@ fn refresh_microsoft_token_with_scope(
         custom_client_id.trim()
     };
 
-    let resp = ureq::post(MICROSOFT_TOKEN_URL)
+    let resp = oauth_agent()
+        .post(MICROSOFT_TOKEN_URL)
         .send_form(&[
             ("client_id", client_id),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("scope", scope),
         ])
-        .map_err(format_ureq_error)?;
+        .map_err(format_ureq_error)
+        .and_then(require_oauth_success)?;
 
     let json: serde_json::Value = resp
         .into_json()
@@ -308,11 +332,12 @@ fn refresh_microsoft_token_with_scope(
 }
 
 fn fetch_me(access_token: &str) -> Result<(String, String), String> {
-    let resp =
-        ureq::get("https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName")
-            .set("Authorization", &format!("Bearer {access_token}"))
-            .call()
-            .map_err(format_ureq_error)?;
+    let resp = oauth_agent()
+        .get("https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName")
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .call()
+        .map_err(format_ureq_error)
+        .and_then(require_oauth_success)?;
 
     let json: serde_json::Value = resp
         .into_json()
@@ -334,11 +359,8 @@ fn fetch_me(access_token: &str) -> Result<(String, String), String> {
 
 fn format_ureq_error(err: ureq::Error) -> String {
     match err {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            format!("HTTP {code}: {body}")
-        }
-        ureq::Error::Transport(t) => format!("网络请求失败: {t}"),
+        ureq::Error::Status(code, _) => format!("OAuth HTTP 错误 (HTTP {code})"),
+        ureq::Error::Transport(t) => format!("网络请求失败: {:?}", t.kind()),
     }
 }
 
@@ -416,9 +438,11 @@ pub fn refresh_custom_token(
     {
         form.push(("client_secret", secret.trim()));
     }
-    let resp = ureq::post(&cfg.token_url)
+    let resp = oauth_agent()
+        .post(&cfg.token_url)
         .send_form(&form)
-        .map_err(format_ureq_error)?;
+        .map_err(format_ureq_error)
+        .and_then(require_oauth_success)?;
     let json: serde_json::Value = resp
         .into_json()
         .map_err(|e| format!("解析 OAuth2 刷新响应失败: {e}"))?;
@@ -464,5 +488,16 @@ mod tests {
         assert!(url.contains("client_id=google-client-123"));
         assert!(url.contains("code_challenge=challenge_abc"));
         assert!(url.contains("login_hint=user%40gmail.com"));
+    }
+
+    #[test]
+    fn oauth_error_redacts_body_and_rejects_redirects() {
+        let resp = ureq::Response::new(400, "Bad Request", "secret token leak").unwrap();
+        let formatted = format_ureq_error(ureq::Error::Status(400, resp));
+        assert_eq!(formatted, "OAuth HTTP 错误 (HTTP 400)");
+        assert!(!formatted.contains("secret"));
+
+        assert!(require_oauth_success(ureq::Response::new(302, "Found", "").unwrap()).is_err());
+        assert!(require_oauth_success(ureq::Response::new(200, "OK", "").unwrap()).is_ok());
     }
 }

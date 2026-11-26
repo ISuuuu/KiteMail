@@ -2770,6 +2770,15 @@ fn export_message_attachments_writes_sanitized_unique_files() {
     assert_eq!(std::fs::read(&paths[2]).unwrap(), b"txt");
     assert_ne!(paths[0], paths[1]);
     assert!(paths[2].starts_with(&dest_dir));
+    #[cfg(windows)]
+    {
+        let mut stream = paths[0].as_os_str().to_os_string();
+        stream.push(":Zone.Identifier");
+        assert_eq!(
+            std::fs::read(stream).unwrap(),
+            b"[ZoneTransfer]\r\nZoneId=3\r\n"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dest_dir);
 }
 
@@ -4129,6 +4138,115 @@ fn mail_dir_migration_conflict_prevents_all_publication() {
     assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 1);
     let _ = std::fs::remove_dir_all(&cur);
     let _ = std::fs::remove_dir_all(&dst);
+}
+
+#[cfg(windows)]
+#[test]
+fn mail_dir_migration_rejects_account_and_database_junctions() {
+    for junction_at_db in [false, true] {
+        let app = temp_cache_dir("mail-root-junction-app");
+        let cur = app.join("mail");
+        let dst = temp_cache_dir("mail-root-junction-dst");
+        let outside = temp_cache_dir("mail-root-junction-outside");
+        std::fs::create_dir_all(&cur).unwrap();
+        let junction = if junction_at_db {
+            std::fs::create_dir_all(cur.join("linked")).unwrap();
+            cur.join("linked").join("mail.db")
+        } else {
+            cur.join("linked")
+        };
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(inspect_mail_data_dir_with_app_dir(&app, &dst, &[]).current_has_mail_data);
+        std::fs::create_dir_all(cur.join("valid")).unwrap();
+        std::fs::write(cur.join("valid/mail.db"), b"source").unwrap();
+        let err = copy_mail_dir_contents(&cur, &dst).unwrap_err();
+        assert!(err.contains(junction.to_string_lossy().as_ref()), "{err}");
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+        std::fs::remove_dir(&junction).unwrap();
+        let _ = std::fs::remove_dir_all(&app);
+        let _ = std::fs::remove_dir_all(&dst);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mail_dir_migration_rejects_dangling_database_symlink() {
+    let cur = temp_cache_dir("mail-dangling-cur");
+    let dst = temp_cache_dir("mail-dangling-dst");
+    std::fs::create_dir_all(cur.join("account")).unwrap();
+    let db = cur.join("account/mail.db");
+    std::os::unix::fs::symlink(cur.join("missing"), &db).unwrap();
+    let err = copy_mail_dir_contents(&cur, &dst).unwrap_err();
+    assert!(err.contains(db.to_string_lossy().as_ref()), "{err}");
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&cur);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
+#[test]
+fn mail_dir_migration_ignores_directory_without_database() {
+    let cur = temp_cache_dir("mail-no-db-cur");
+    let dst = temp_cache_dir("mail-no-db-dst");
+    std::fs::create_dir_all(cur.join("unrelated")).unwrap();
+    copy_mail_dir_contents(&cur, &dst).unwrap();
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&cur);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
+#[test]
+fn mail_dir_inspection_and_migration_detect_invalid_database() {
+    let app = temp_cache_dir("mail-invalid-db-app");
+    let cur = app.join("mail");
+    let dst = temp_cache_dir("mail-invalid-db-dst");
+    let db = cur.join("account").join("mail.db");
+    std::fs::create_dir_all(&db).unwrap();
+    assert!(inspect_mail_data_dir_with_app_dir(&app, &dst, &[]).current_has_mail_data);
+    let err = copy_mail_dir_contents(&cur, &dst).unwrap_err();
+    assert!(err.contains(db.to_string_lossy().as_ref()), "{err}");
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&app);
+    let _ = std::fs::remove_dir_all(&dst);
+}
+
+#[cfg(windows)]
+#[test]
+fn mail_dir_migration_rejects_junction_directories() {
+    let cur = temp_cache_dir("mail-junction-cur");
+    let dst = temp_cache_dir("mail-junction-dst");
+    let outside = temp_cache_dir("mail-junction-outside");
+    std::fs::create_dir_all(cur.join("account_1")).unwrap();
+    std::fs::write(cur.join("account_1/mail.db"), b"source-db").unwrap();
+    std::fs::write(outside.join("secret.txt"), b"outside-secret").unwrap();
+    let junction = cur.join("account_1").join("linked");
+    let status = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&outside)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let err = copy_mail_dir_contents(&cur, &dst).unwrap_err();
+    assert!(err.contains(junction.to_string_lossy().as_ref()), "{err}");
+    assert!(!dst.join("account_1").exists());
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read(cur.join("account_1/mail.db")).unwrap(),
+        b"source-db"
+    );
+
+    let _ = std::fs::remove_dir(&junction);
+    let _ = std::fs::remove_dir_all(&cur);
+    let _ = std::fs::remove_dir_all(&dst);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 #[test]

@@ -2558,3 +2558,59 @@ pub(crate) fn deduplicate_filename(filename: &str, used: &mut HashSet<String>) -
     }
     filename.to_string()
 }
+
+/// Write an untrusted mail attachment to disk atomically and mark it with
+/// Windows Mark-of-the-Web (`Zone.Identifier` / `ZoneId=3`).
+pub(crate) fn write_exported_attachment(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_EXPORT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (temp, mut file) = loop {
+        let temp = parent.join(format!(
+            ".kitemail-export-{}-{}.tmp",
+            std::process::id(),
+            NEXT_EXPORT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+            let mut stream = temp.as_os_str().to_os_string();
+            stream.push(":Zone.Identifier");
+            std::fs::write(stream, b"[ZoneTransfer]\r\nZoneId=3\r\n").map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("无法设置 Windows 来源标记，原目标未更改: {e}"),
+                )
+            })?;
+            let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+            let dest: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { MoveFileExW(source.as_ptr(), dest.as_ptr(), MOVEFILE_REPLACE_EXISTING) }
+                == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}

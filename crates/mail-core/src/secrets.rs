@@ -239,6 +239,27 @@ fn endpoint_fingerprint(account: &crate::config::AccountConfig) -> Result<String
     let fields = (
         normalize_credential_email(&account.email),
         &account.auth_backend,
+        crate::config::normalized_oauth_client_id(account),
+        account.imap_host.trim().to_ascii_lowercase(),
+        account.imap_port,
+        &account.imap_security,
+        account.imap_username.trim(),
+        account.smtp_host.trim().to_ascii_lowercase(),
+        account.smtp_port,
+        &account.smtp_security,
+        account.smtp_username.trim(),
+        account.smtp_separate_credentials,
+    );
+    let encoded = serde_json::to_vec(&fields).map_err(|e| format!("生成凭据绑定失败: {e}"))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn legacy_v1_endpoint_fingerprint(
+    account: &crate::config::AccountConfig,
+) -> Result<String, String> {
+    let fields = (
+        normalize_credential_email(&account.email),
+        &account.auth_backend,
         &account.oauth_client_id,
         account.imap_host.to_ascii_lowercase(),
         account.imap_port,
@@ -254,10 +275,36 @@ fn endpoint_fingerprint(account: &crate::config::AccountConfig) -> Result<String
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
+fn accepted_endpoint_fingerprints(
+    account: &crate::config::AccountConfig,
+) -> Result<Vec<String>, String> {
+    let mut accepted = vec![endpoint_fingerprint(account)?];
+    let legacy = legacy_v1_endpoint_fingerprint(account)?;
+    if !accepted.contains(&legacy) {
+        accepted.push(legacy);
+    }
+    if account.auth_backend == crate::config::AuthBackend::MicrosoftGraphOAuth2
+        && account.oauth_client_id.trim() == crate::oauth::DEFAULT_MICROSOFT_CLIENT_ID
+    {
+        let mut legacy_empty = account.clone();
+        legacy_empty.oauth_client_id.clear();
+        let legacy_empty_fp = legacy_v1_endpoint_fingerprint(&legacy_empty)?;
+        if !accepted.contains(&legacy_empty_fp) {
+            accepted.push(legacy_empty_fp);
+        }
+    }
+    Ok(accepted)
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BoundCredential<T> {
     endpoint: String,
     secret: T,
+}
+
+#[derive(serde::Deserialize)]
+struct BoundCredentialHeader {
+    endpoint: String,
 }
 
 fn bound_key(email: &str, kind: &str) -> String {
@@ -265,6 +312,47 @@ fn bound_key(email: &str, kind: &str) -> String {
         "email-{}-bound-{kind}-v1",
         normalize_credential_email(email)
     )
+}
+
+fn has_conflicting_bound_in(
+    service: &str,
+    email: &str,
+    accepted_endpoints: &[String],
+) -> Result<bool, String> {
+    if normalize_credential_email(email).is_empty() {
+        return Ok(false);
+    }
+    for kind in ["password", "oauth"] {
+        if let Some(raw) = read_entry_optional(
+            service,
+            &bound_key(email, kind),
+            "绑定凭据",
+            "读取绑定凭据失败",
+        )? {
+            let Ok(parsed) = serde_json::from_str::<BoundCredentialHeader>(&raw) else {
+                return Ok(true);
+            };
+            if !accepted_endpoints.contains(&parsed.endpoint) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Return whether the keyring already holds a bound credential for `account.email`
+/// whose endpoint does not match `account`, or is malformed. Legacy unbound entries
+/// are ignored because they are never read or migrated.
+pub fn has_conflicting_bound_credentials(
+    account: &crate::config::AccountConfig,
+) -> Result<bool, String> {
+    if normalize_credential_email(&account.email).is_empty() {
+        return Ok(false);
+    }
+    let accepted = accepted_endpoint_fingerprints(account)?;
+    let service = current_service_name();
+    let email = account.email.clone();
+    run_on_keyring_thread(move || has_conflicting_bound_in(&service, &email, &accepted))
 }
 
 fn write_bound<T: serde::Serialize>(
@@ -304,22 +392,68 @@ fn read_bound<T: serde::de::DeserializeOwned>(
     .ok_or_else(|| "凭据未绑定当前服务器，请重新输入凭据或重新授权".to_string())?;
     let bound: BoundCredential<T> = serde_json::from_str(&value)
         .map_err(|_| "绑定凭据损坏，请重新输入凭据或重新授权".to_string())?;
-    if bound.endpoint != endpoint_fingerprint(account)? {
+    let accepted = accepted_endpoint_fingerprints(account)?;
+    if !accepted.contains(&bound.endpoint) {
         return Err("凭据与当前连接端点不匹配，请重新输入凭据或重新授权".into());
     }
     Ok(bound.secret)
 }
 
-fn validate_account_config(account: &crate::config::AccountConfig) -> Result<(), String> {
-    let dir = credential_config_dir();
-    let saved = crate::config::load_accounts_in(&dir)?
+fn rotate_bound_oauth_in(
+    service: &str,
+    account: &crate::config::AccountConfig,
+    previous: &str,
+    token: &str,
+) -> Result<(), String> {
+    let key = bound_key(&account.email, "oauth");
+    let value = read_entry_optional(service, &key, "绑定凭据", "读取绑定凭据失败")?
+        .ok_or_else(|| "凭据未绑定当前服务器，请重新输入凭据或重新授权".to_string())?;
+    let mut bound: BoundCredential<String> = serde_json::from_str(&value)
+        .map_err(|_| "绑定凭据损坏，请重新输入凭据或重新授权".to_string())?;
+    if !accepted_endpoint_fingerprints(account)?.contains(&bound.endpoint)
+        || bound.secret != previous
+    {
+        return Err("凭据已更改或与当前连接端点不匹配，请重新授权".into());
+    }
+    bound.secret = token.to_string();
+    let value = serde_json::to_string(&bound).map_err(|e| format!("生成绑定凭据失败: {e}"))?;
+    write_entry(service, &key, &value, "绑定凭据", "保存绑定凭据失败")
+}
+
+pub fn rotate_bound_oauth_token_in(
+    data_dir: Option<&Path>,
+    account: &crate::config::AccountConfig,
+    previous: &str,
+    token: &str,
+) -> Result<(), String> {
+    let default_dir;
+    let dir = match data_dir {
+        Some(dir) => dir,
+        None => {
+            default_dir = credential_config_dir();
+            &default_dir
+        }
+    };
+    validate_account_config_in(dir, account)?;
+    let service = current_service_name();
+    let account = account.clone();
+    let previous = previous.to_string();
+    let token = token.to_string();
+    run_on_keyring_thread(move || rotate_bound_oauth_in(&service, &account, &previous, &token))
+}
+
+fn validate_account_config_in(
+    dir: &Path,
+    account: &crate::config::AccountConfig,
+) -> Result<(), String> {
+    let saved = crate::config::load_accounts_in(dir)?
         .into_iter()
         .find(|a| a.id == account.id)
         .ok_or_else(|| "账号配置不存在，请重新输入凭据或重新授权".to_string())?;
     if endpoint_fingerprint(&saved)? != endpoint_fingerprint(account)? {
         return Err("账号配置与连接端点不匹配".into());
     }
-    crate::config::validate_shared_credential_endpoint(&dir, account)
+    crate::config::validate_shared_credential_endpoint(dir, account)
 }
 
 pub fn save_bound_account_secrets(
@@ -331,13 +465,20 @@ pub fn save_bound_account_secrets(
     run_on_keyring_thread(move || write_bound(&service, &account, "password", secrets))
 }
 
-pub fn load_account_secrets_for_config(
+pub fn load_account_secrets_for_config_in(
+    data_dir: &Path,
     account: &crate::config::AccountConfig,
 ) -> Result<AccountSecrets, String> {
-    validate_account_config(account)?;
+    validate_account_config_in(data_dir, account)?;
     let service = current_service_name();
     let account = account.clone();
     run_on_keyring_thread(move || read_bound(&service, &account, "password"))
+}
+
+pub fn load_account_secrets_for_config(
+    account: &crate::config::AccountConfig,
+) -> Result<AccountSecrets, String> {
+    load_account_secrets_for_config_in(&credential_config_dir(), account)
 }
 
 pub fn save_bound_oauth_token(
@@ -349,11 +490,18 @@ pub fn save_bound_oauth_token(
     run_on_keyring_thread(move || write_bound(&service, &account, "oauth", token))
 }
 
-pub fn load_bound_oauth_token(account: &crate::config::AccountConfig) -> Result<String, String> {
-    validate_account_config(account)?;
+pub fn load_bound_oauth_token_in(
+    data_dir: &Path,
+    account: &crate::config::AccountConfig,
+) -> Result<String, String> {
+    validate_account_config_in(data_dir, account)?;
     let service = current_service_name();
     let account = account.clone();
     run_on_keyring_thread(move || read_bound(&service, &account, "oauth"))
+}
+
+pub fn load_bound_oauth_token(account: &crate::config::AccountConfig) -> Result<String, String> {
+    load_bound_oauth_token_in(&credential_config_dir(), account)
 }
 
 /// 按邮箱地址优先读取 IMAP（及可选独立 SMTP）凭据；若新邮箱键尚不存在，则回退读取旧版 `account-{id}-*` 并懒镜像到邮箱键。
@@ -622,6 +770,172 @@ mod tests {
         );
         account.oauth_client_id = "different-client".into();
         assert!(read_bound::<String>(&service, &account, "oauth").is_err());
+
+        // 冲突探测：同端点允许，异端点与损坏条目拒绝，旧未绑定条目忽略。
+        write_bound(
+            &service,
+            &account,
+            "password",
+            AccountSecrets {
+                imap_password: "aligned-secret".into(),
+                smtp_password: None,
+            },
+        )
+        .unwrap();
+        write_bound(&service, &account, "oauth", "aligned-token").unwrap();
+        let accepted = accepted_endpoint_fingerprints(&account).unwrap();
+        assert!(!has_conflicting_bound_in(&service, &account.email, &accepted).unwrap());
+        let mut wrong_endpoint = account.clone();
+        wrong_endpoint.imap_host = "other.invalid".into();
+        let wrong_accepted = accepted_endpoint_fingerprints(&wrong_endpoint).unwrap();
+        assert!(has_conflicting_bound_in(&service, &account.email, &wrong_accepted).unwrap());
+
+        write_entry(
+            &service,
+            &bound_key(&account.email, "password"),
+            "corrupted-json",
+            "test",
+            "test",
+        )
+        .unwrap();
+        assert!(has_conflicting_bound_in(&service, &account.email, &accepted).unwrap());
+
+        // 兼容 3f27df0e 旧版 v1 绑定指纹（默认微软客户端为空字符串、字段首尾带空格）且保持旧条目不变。
+        delete_entry(&service, &bound_key(&account.email, "password"));
+        let mut legacy_oauth = account.clone();
+        legacy_oauth.auth_backend = crate::config::AuthBackend::MicrosoftGraphOAuth2;
+        legacy_oauth.oauth_client_id.clear();
+        let legacy_oauth_fp = legacy_v1_endpoint_fingerprint(&legacy_oauth).unwrap();
+        let legacy_oauth_payload = serde_json::to_string(&BoundCredential {
+            endpoint: legacy_oauth_fp.clone(),
+            secret: "legacy-v1-rt".to_string(),
+        })
+        .unwrap();
+        write_entry(
+            &service,
+            &bound_key(&legacy_oauth.email, "oauth"),
+            &legacy_oauth_payload,
+            "test",
+            "test",
+        )
+        .unwrap();
+
+        let mut explicit_default_oauth = legacy_oauth.clone();
+        explicit_default_oauth.oauth_client_id = crate::oauth::DEFAULT_MICROSOFT_CLIENT_ID.into();
+        assert!(!has_conflicting_bound_in(
+            &service,
+            &legacy_oauth.email,
+            &accepted_endpoint_fingerprints(&legacy_oauth).unwrap(),
+        )
+        .unwrap());
+        assert!(!has_conflicting_bound_in(
+            &service,
+            &explicit_default_oauth.email,
+            &accepted_endpoint_fingerprints(&explicit_default_oauth).unwrap(),
+        )
+        .unwrap());
+        let mut other_client = legacy_oauth.clone();
+        other_client.oauth_client_id = "other-client".into();
+        assert!(has_conflicting_bound_in(
+            &service,
+            &other_client.email,
+            &accepted_endpoint_fingerprints(&other_client).unwrap(),
+        )
+        .unwrap());
+        assert!(read_bound::<String>(&service, &other_client, "oauth").is_err());
+
+        assert_eq!(
+            read_bound::<String>(&service, &legacy_oauth, "oauth").unwrap(),
+            "legacy-v1-rt"
+        );
+        let migrated_oauth_raw = read_entry_optional(
+            &service,
+            &bound_key(&legacy_oauth.email, "oauth"),
+            "绑定凭据",
+            "读取绑定凭据失败",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(migrated_oauth_raw, legacy_oauth_payload);
+        let legacy_oauth_read: BoundCredential<String> =
+            serde_json::from_str(&migrated_oauth_raw).unwrap();
+        assert_eq!(legacy_oauth_read.endpoint, legacy_oauth_fp);
+        assert_eq!(legacy_oauth_read.secret, "legacy-v1-rt");
+
+        rotate_bound_oauth_in(&service, &legacy_oauth, "legacy-v1-rt", "rotated-rt").unwrap();
+        let rotated_raw = read_entry_optional(
+            &service,
+            &bound_key(&legacy_oauth.email, "oauth"),
+            "test",
+            "test",
+        )
+        .unwrap()
+        .unwrap();
+        let rotated: BoundCredential<String> = serde_json::from_str(&rotated_raw).unwrap();
+        assert_eq!(rotated.endpoint, legacy_oauth_fp);
+        assert_eq!(rotated.secret, "rotated-rt");
+        assert!(rotate_bound_oauth_in(&service, &other_client, "rotated-rt", "wrong").is_err());
+        assert!(rotate_bound_oauth_in(&service, &legacy_oauth, "legacy-v1-rt", "stale").is_err());
+        assert_eq!(
+            read_entry_optional(
+                &service,
+                &bound_key(&legacy_oauth.email, "oauth"),
+                "test",
+                "test"
+            )
+            .unwrap()
+            .unwrap(),
+            rotated_raw
+        );
+        delete_entry(&service, &bound_key(&account.email, "oauth"));
+        assert!(rotate_bound_oauth_in(&service, &legacy_oauth, "rotated-rt", "missing").is_err());
+        let mut padded_pwd = crate::config::AccountConfig::default();
+        padded_pwd.id = account.id;
+        padded_pwd.email = account.email.clone();
+        padded_pwd.imap_host = " imap.example.invalid ".into();
+        padded_pwd.smtp_host = " smtp.example.invalid ".into();
+        let legacy_pwd_fp = legacy_v1_endpoint_fingerprint(&padded_pwd).unwrap();
+        let legacy_pwd_payload = serde_json::to_string(&BoundCredential {
+            endpoint: legacy_pwd_fp.clone(),
+            secret: AccountSecrets {
+                imap_password: "legacy-v1-secret".into(),
+                smtp_password: None,
+            },
+        })
+        .unwrap();
+        write_entry(
+            &service,
+            &bound_key(&padded_pwd.email, "password"),
+            &legacy_pwd_payload,
+            "test",
+            "test",
+        )
+        .unwrap();
+        assert!(!has_conflicting_bound_in(
+            &service,
+            &padded_pwd.email,
+            &accepted_endpoint_fingerprints(&padded_pwd).unwrap(),
+        )
+        .unwrap());
+        let read_legacy_pwd =
+            read_bound::<AccountSecrets>(&service, &padded_pwd, "password").unwrap();
+        assert_eq!(read_legacy_pwd.imap_password, "legacy-v1-secret");
+        let migrated_pwd_raw = read_entry_optional(
+            &service,
+            &bound_key(&padded_pwd.email, "password"),
+            "绑定凭据",
+            "读取绑定凭据失败",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(migrated_pwd_raw, legacy_pwd_payload);
+        let legacy_pwd_read: BoundCredential<AccountSecrets> =
+            serde_json::from_str(&migrated_pwd_raw).unwrap();
+        assert_eq!(legacy_pwd_read.endpoint, legacy_pwd_fp);
+        assert_eq!(legacy_pwd_read.secret.imap_password, "legacy-v1-secret");
+        let mut wrong_pwd_endpoint = padded_pwd.clone();
+        wrong_pwd_endpoint.imap_host = "other.invalid".into();
+        assert!(read_bound::<AccountSecrets>(&service, &wrong_pwd_endpoint, "password").is_err());
     }
 
     #[test]
@@ -631,7 +945,7 @@ mod tests {
         a.imap_host = "imap.example.com".into();
         let original = endpoint_fingerprint(&a).unwrap();
         a.email = " alice@EXAMPLE.COM ".into();
-        a.imap_host = "IMAP.EXAMPLE.COM".into();
+        a.imap_host = " IMAP.EXAMPLE.COM ".into();
         assert_eq!(original, endpoint_fingerprint(&a).unwrap());
         a.imap_host = "attacker.invalid".into();
         assert_ne!(original, endpoint_fingerprint(&a).unwrap());
@@ -641,6 +955,42 @@ mod tests {
         a.smtp_port -= 1;
         a.oauth_client_id = "other-client".into();
         assert_ne!(original, endpoint_fingerprint(&a).unwrap());
+
+        let mut oauth_empty = crate::config::AccountConfig {
+            auth_backend: crate::config::AuthBackend::MicrosoftGraphOAuth2,
+            email: "oauth@example.com".into(),
+            ..Default::default()
+        };
+        let mut oauth_default = oauth_empty.clone();
+        oauth_default.oauth_client_id = crate::oauth::DEFAULT_MICROSOFT_CLIENT_ID.into();
+        assert_eq!(
+            endpoint_fingerprint(&oauth_empty).unwrap(),
+            endpoint_fingerprint(&oauth_default).unwrap()
+        );
+        oauth_empty.oauth_client_id = "custom".into();
+        assert_ne!(
+            endpoint_fingerprint(&oauth_empty).unwrap(),
+            endpoint_fingerprint(&oauth_default).unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_account_config_in_uses_explicit_data_dir() {
+        let dir =
+            std::env::temp_dir().join(format!("kitemail-validate-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut acc = crate::config::AccountConfig::default();
+        acc.id = 42;
+        acc.email = "custom-dir@example.invalid".into();
+        acc.imap_host = "imap.example.invalid".into();
+        crate::config::save_accounts_in(&dir, &[acc.clone()]).unwrap();
+
+        assert!(validate_account_config_in(&dir, &acc).is_ok());
+        let mut altered = acc.clone();
+        altered.imap_host = "evil.invalid".into();
+        assert!(validate_account_config_in(&dir, &altered).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

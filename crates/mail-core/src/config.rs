@@ -2429,9 +2429,9 @@ pub fn import_settings_bundle_in(
                     account.id
                 ));
             }
-        } else if crate::secrets::has_account_credentials(account.id, &account.email)? {
+        } else if crate::secrets::has_conflicting_bound_credentials(account)? {
             return Err(format!(
-                "备份中账号 {} 存在来源不明的本机凭据，请先手动处理账号",
+                "备份中账号 {} 与本机已绑定其他服务器或客户端的凭据冲突，请先手动处理账号",
                 account.id
             ));
         }
@@ -2451,6 +2451,15 @@ pub fn import_settings_bundle_in(
     Ok(bundle.accounts.len())
 }
 
+pub fn normalized_oauth_client_id(account: &AccountConfig) -> &str {
+    let trimmed = account.oauth_client_id.trim();
+    if account.auth_backend == AuthBackend::MicrosoftGraphOAuth2 && trimmed.is_empty() {
+        crate::oauth::DEFAULT_MICROSOFT_CLIENT_ID
+    } else {
+        trimmed
+    }
+}
+
 /// Whether stored credentials remain bound to the same account and endpoints.
 pub fn same_credential_endpoint(a: &AccountConfig, b: &AccountConfig) -> bool {
     a.id == b.id && same_server_endpoints(a, b)
@@ -2459,14 +2468,15 @@ pub fn same_credential_endpoint(a: &AccountConfig, b: &AccountConfig) -> bool {
 pub fn same_server_endpoints(a: &AccountConfig, b: &AccountConfig) -> bool {
     a.email.trim().eq_ignore_ascii_case(b.email.trim())
         && a.auth_backend == b.auth_backend
-        && a.imap_host.eq_ignore_ascii_case(&b.imap_host)
+        && normalized_oauth_client_id(a) == normalized_oauth_client_id(b)
+        && a.imap_host.trim().eq_ignore_ascii_case(b.imap_host.trim())
         && a.imap_port == b.imap_port
         && a.imap_security == b.imap_security
-        && a.imap_username == b.imap_username
-        && a.smtp_host.eq_ignore_ascii_case(&b.smtp_host)
+        && a.imap_username.trim() == b.imap_username.trim()
+        && a.smtp_host.trim().eq_ignore_ascii_case(b.smtp_host.trim())
         && a.smtp_port == b.smtp_port
         && a.smtp_security == b.smtp_security
-        && a.smtp_username == b.smtp_username
+        && a.smtp_username.trim() == b.smtp_username.trim()
         && a.smtp_separate_credentials == b.smtp_separate_credentials
 }
 
@@ -2538,25 +2548,8 @@ pub fn validate_discovered_account_import(
         }
         if source_verified {
             verified.push((source.id, source.email.clone()));
-        }
-        if crate::secrets::has_account_credentials(source.id, &source.email)? && !source_verified {
-            return Err("导入账号的原始凭据来源不明".to_string());
-        }
-        if destination.id != source.id
-            && crate::secrets::has_legacy_account_credentials(destination.id)?
-        {
-            return Err("导入账号的新 ID 存在来源不明的旧版凭据".to_string());
-        }
-        if crate::secrets::has_legacy_account_credentials(source.id)?
-            && (existing.iter().any(|account| {
-                account.id == source.id
-                    && !account
-                        .email
-                        .trim()
-                        .eq_ignore_ascii_case(source.email.trim())
-            }) || legacy_key_conflict(dir, source.id, &source.email)?)
-        {
-            return Err("导入账号的原始 ID 与其他实例凭据冲突".to_string());
+        } else if crate::secrets::has_conflicting_bound_credentials(destination)? {
+            return Err("导入账号与本机已绑定其他服务器或客户端的凭据冲突".to_string());
         }
     }
     Ok(verified)
@@ -2738,44 +2731,6 @@ pub(crate) fn list_known_data_dirs_in(
         }
     }
     out
-}
-
-pub(crate) fn legacy_key_conflict_in(
-    registry_dir: &Path,
-    current_dir: &Path,
-    account_id: u32,
-    email: &str,
-) -> Result<bool, String> {
-    let current = normalized_path_key(current_dir);
-    for dir in list_known_data_dirs_in(registry_dir, current_dir) {
-        if normalized_path_key(&dir) == current {
-            continue;
-        }
-        if load_accounts_in(&dir)?
-            .iter()
-            .any(|a| a.id == account_id && !a.email.trim().eq_ignore_ascii_case(email.trim()))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-pub(crate) fn legacy_key_conflict(
-    current_dir: &Path,
-    account_id: u32,
-    email: &str,
-) -> Result<bool, String> {
-    if cfg!(test) {
-        return legacy_key_conflict_in(current_dir, current_dir, account_id, email);
-    }
-    if has_env_data_dir_override() {
-        return Ok(false);
-    }
-    match default_installed_registry_dir() {
-        Some(registry) => legacy_key_conflict_in(&registry, current_dir, account_id, email),
-        None => Ok(false),
-    }
 }
 
 /// 统计删除 `(account_id, email)` 时，本目录其他账号及同机其他实例对其邮箱键与旧版 ID 键的占用状态。
@@ -3417,6 +3372,40 @@ smtp_separate_credentials = false
     }
 
     #[test]
+    fn backup_rejects_changed_oauth_client_id_and_normalizes_default_client() {
+        let mut a = AccountConfig {
+            id: 10,
+            auth_backend: AuthBackend::MicrosoftGraphOAuth2,
+            email: "oauth@example.invalid".to_string(),
+            imap_host: "outlook.office365.com".to_string(),
+            smtp_host: "smtp.office365.com".to_string(),
+            ..AccountConfig::default()
+        };
+        let mut b = a.clone();
+        b.oauth_client_id = crate::oauth::DEFAULT_MICROSOFT_CLIENT_ID.to_string();
+        assert!(same_server_endpoints(&a, &b));
+
+        let dir =
+            std::env::temp_dir().join(format!("hylki-backup-oauth-client-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        save_accounts_in(&dir, &[a.clone()]).unwrap();
+        let prefs = AppPreferences::default();
+        save_preferences_in(&dir, &prefs).unwrap();
+
+        a.oauth_client_id = "attacker-client-id".to_string();
+        let mut changed_prefs = prefs.clone();
+        changed_prefs.theme_id = "modified".to_string();
+        let bundle = SettingsBackupBundle {
+            version: SETTINGS_BACKUP_VERSION,
+            preferences: changed_prefs,
+            accounts: vec![a],
+        };
+        assert!(import_settings_bundle_in(&dir, &bundle).is_err());
+        assert_eq!(load_preferences_in(&dir).unwrap(), prefs);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn legacy_sender_allowlist_cannot_unblock_another_message() {
         let mut prefs = AppPreferences::default();
         prefs.block_remote_images = true;
@@ -3469,25 +3458,6 @@ smtp_separate_credentials = false
         assert_eq!(load_preferences_in(&dir).unwrap(), original);
         assert!(!accounts_file_in(&dir).exists());
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn legacy_id_conflict_only_for_different_email_in_peer_directory() {
-        let root = std::env::temp_dir().join(format!("hylki-legacy-id-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let current = root.join("current");
-        let peer = root.join("peer");
-        let account = AccountConfig {
-            id: 1,
-            email: "peer@example.invalid".to_string(),
-            ..AccountConfig::default()
-        };
-        save_accounts_in(&peer, &[account]).unwrap();
-        register_known_data_dir_in(&root, &peer).unwrap();
-        assert!(legacy_key_conflict_in(&root, &current, 1, "other@example.invalid").unwrap());
-        assert!(!legacy_key_conflict_in(&root, &current, 1, "peer@example.invalid").unwrap());
-        assert!(!legacy_key_conflict_in(&root, &current, 2, "other@example.invalid").unwrap());
-        let _ = fs::remove_dir_all(&root);
     }
 
     // ---- WP-05 ----

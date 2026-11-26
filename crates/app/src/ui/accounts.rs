@@ -2929,7 +2929,7 @@ pub(crate) fn render_editor_page(
             .child(
                 TextView::html("acct-sig-preview-text", html)
                     .selectable(true)
-                    .image_source(|uri| crate::webview_host::mail_image_source(uri, true)),
+                    .image_source(|uri| crate::webview_host::mail_image_source(uri, false)),
             )
             .into_any_element()
     } else {

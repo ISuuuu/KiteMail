@@ -73,7 +73,6 @@ const DROP_WITH_CONTENT: &[&str] = &[
 
 /// 任何标签上都可以保留的属性（原版 `.add_generic_attributes`）。
 const GENERIC_ATTRS: &[&str] = &[
-    "style",
     "class",
     "title",
     "dir",
@@ -252,7 +251,7 @@ fn sanitize_with_base(html: &str, base: Option<&Path>) -> String {
             } else {
                 value.clone()
             };
-            if (key == "href" || key == "src" || key == "style") && !value_allowed(&key, &value) {
+            if (key == "href" || key == "src") && !value_allowed(&key, &value) {
                 continue;
             }
             out.push(' ');
@@ -266,25 +265,74 @@ fn sanitize_with_base(html: &str, base: Option<&Path>) -> String {
     out.trim().to_string()
 }
 
-/// 属性值是否可以留着：URL 类属性的协议白名单，`style` 里不许出现脚本协议。
+/// 属性值是否可以留着：URL 类属性的协议白名单。
 fn value_allowed(key: &str, value: &str) -> bool {
     match key {
         "href" | "src" => url_is_safe(value),
-        "style" => {
-            let lower = value.to_ascii_lowercase();
-            !lower.contains("url(")
-                && !lower.contains("@import")
-                && !lower.contains("javascript:")
-                && !lower.contains("vbscript:")
-                && !lower.contains("expression(")
-        }
         _ => true,
     }
 }
 
+fn decode_html_entities(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp + 1..];
+        if let Some(after_hash) = rest.strip_prefix('#') {
+            let (hex, digits_src) = match after_hash.strip_prefix(['x', 'X']) {
+                Some(h) => (true, h),
+                None => (false, after_hash),
+            };
+            let len = digits_src
+                .bytes()
+                .take_while(|b| {
+                    if hex {
+                        b.is_ascii_hexdigit()
+                    } else {
+                        b.is_ascii_digit()
+                    }
+                })
+                .count();
+            if len > 0 {
+                let code = u32::from_str_radix(&digits_src[..len], if hex { 16 } else { 10 }).ok();
+                if let Some(ch) = code.and_then(|n| (n != 0).then(|| char::from_u32(n)).flatten()) {
+                    out.push(ch);
+                }
+                rest = digits_src[len..]
+                    .strip_prefix(';')
+                    .unwrap_or(&digits_src[len..]);
+                continue;
+            }
+        } else if let Some(semi) = rest.find(';').filter(|&i| i <= 10) {
+            let name = &rest[..semi];
+            let decoded = match name.to_ascii_lowercase().as_str() {
+                "colon" => Some(':'),
+                "tab" => Some('\t'),
+                "newline" => Some('\n'),
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &rest[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+    }
+    out.push_str(rest);
+    out
+}
+
 /// 只放行原版允许的协议；相对地址（没有协议）照常放行。
 fn url_is_safe(value: &str) -> bool {
-    let compact: String = value
+    let decoded = decode_html_entities(value);
+    let compact: String = decoded
         .chars()
         .filter(|c| !c.is_whitespace() && !c.is_control())
         .collect();
@@ -311,6 +359,30 @@ fn url_is_safe(value: &str) -> bool {
     }
 }
 
+fn is_unc_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let lower = s.to_ascii_lowercase();
+    lower.starts_with(r"\\?\unc\")
+        || lower.starts_with(r"//?/unc/")
+        || (s.starts_with(r"\\") && !s.starts_with(r"\\?\") && !s.starts_with(r"\\.\"))
+        || s.starts_with("//")
+}
+
+fn is_reparse_or_symlink(path: &Path) -> Option<bool> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return Some(true);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// `src` 指向本地图片文件时读成 `data:` URI；URL 与读不到的路径返回 `None`。
 fn local_image_data_uri(value: &str, base: Option<&Path>) -> Option<String> {
     let v = value.trim();
@@ -321,26 +393,25 @@ fn local_image_data_uri(value: &str, base: Option<&Path>) -> Option<String> {
         return None;
     }
     let base = base?;
-    if base.to_string_lossy().starts_with("\\\\") {
+    if is_unc_path(base) || is_reparse_or_symlink(base) != Some(false) {
         return None;
     }
     let base = base.canonicalize().ok()?;
+    if is_unc_path(&base) {
+        return None;
+    }
     let mut candidate = base.clone();
     for component in Path::new(v).components() {
         match component {
             std::path::Component::Normal(part) => candidate.push(part),
             _ => return None,
         }
-        if std::fs::symlink_metadata(&candidate)
-            .ok()?
-            .file_type()
-            .is_symlink()
-        {
+        if is_reparse_or_symlink(&candidate) != Some(false) {
             return None;
         }
     }
     let path = candidate.canonicalize().ok()?;
-    if !path.starts_with(&base) {
+    if is_unc_path(&path) || !path.starts_with(&base) {
         return None;
     }
     let mime = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
@@ -500,14 +571,47 @@ mod tests {
     fn dangerous_urls_and_styles_are_dropped() {
         let out = sanitize_signature_html(
             "<a href=\"javascript:alert(1)\">x</a>\
+             <a href=\"&#106;avascript:alert(1)\">e1</a>\
+             <a href=\"&#x6a;avascript:alert(1)\">e2</a>\
+             <a href=\"java&#x09;script:alert(1)\">e3</a>\
              <a href=\"https://example.com\">y</a>\
              <img src=\"data:text/html;base64,AAA\">\
              <p style=\"background:url(javascript:alert(1))\">z</p>",
         );
         assert!(!out.contains("javascript"), "{out}");
+        assert!(!out.contains("&#106;"), "{out}");
+        assert!(!out.contains("&#x6a;"), "{out}");
+        assert!(!out.contains("&#x09;"), "{out}");
         assert!(out.contains("href=\"https://example.com\""), "{out}");
         assert!(!out.contains("text/html"), "{out}");
         assert!(!out.contains("background"), "{out}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_image_import_rejects_junctions() {
+        let root = std::env::temp_dir().join(format!("hylki-sig-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sig_dir = root.join("sig");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&sig_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        let junction = sig_dir.join("j");
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let out = signature_from_source("<img src=\"j/secret.png\">", Some(&sig_dir));
+        assert!(!out.contains("data:image/png"), "{out}");
+        assert!(!out.contains("src="), "{out}");
+
+        let _ = std::fs::remove_dir(&junction);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

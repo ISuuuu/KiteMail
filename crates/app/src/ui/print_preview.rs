@@ -390,7 +390,7 @@ fn cleanup_print_temp_files_at(dir: &Path, now: std::time::SystemTime) {
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| now.duration_since(t).ok())
-                    .is_some_and(|age| age > std::time::Duration::from_secs(7 * 24 * 60 * 60))
+                    .is_some_and(|age| age > std::time::Duration::from_secs(24 * 60 * 60))
             {
                 let _ = std::fs::remove_file(entry.path());
             }
@@ -855,11 +855,14 @@ mod tests {
         let other = dir.join("other.html");
         std::fs::write(&owned, "synthetic").unwrap();
         std::fs::write(&other, "synthetic").unwrap();
-        cleanup_print_temp_files_at(&dir, std::time::SystemTime::now());
+        cleanup_print_temp_files_at(
+            &dir,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 60 * 60),
+        );
         assert!(owned.exists());
         cleanup_print_temp_files_at(
             &dir,
-            std::time::SystemTime::now() + std::time::Duration::from_secs(8 * 24 * 60 * 60),
+            std::time::SystemTime::now() + std::time::Duration::from_secs(25 * 60 * 60),
         );
         assert!(!owned.exists());
         assert!(other.exists());

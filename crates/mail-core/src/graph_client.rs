@@ -22,6 +22,7 @@ fn validate_graph_url(value: &str) -> Result<(), String> {
         || url.port().is_some_and(|p| p != 443)
         || !url.username().is_empty()
         || url.password().is_some()
+        || !url.path().starts_with("/v1.0/")
     {
         return Err("不可信的 Graph 分页地址".to_string());
     }
@@ -992,7 +993,11 @@ fn graph_recipient_array(raw: &str) -> Vec<serde_json::Value> {
 }
 
 fn urlencoding_segment(input: &str) -> String {
-    url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
+    match input {
+        "." => "%2E".to_string(),
+        ".." => "%2E%2E".to_string(),
+        _ => url::form_urlencoded::byte_serialize(input.as_bytes()).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1160,13 +1165,16 @@ mod graph_url_security_tests {
         assert!(validate_graph_url("https://graph.microsoft.com/v1.0/me/messages?$skip=1").is_ok());
         for url in [
             "http://graph.microsoft.com/v1.0/me",
-            "https://graph.microsoft.com.evil.test/",
-            "https://graph.microsoft.com@evil.test/",
-            "https://graph.microsoft.com:444/",
-            "https://user@graph.microsoft.com/",
+            "https://graph.microsoft.com.evil.test/v1.0/me",
+            "https://graph.microsoft.com@evil.test/v1.0/me",
+            "https://graph.microsoft.com:444/v1.0/me",
+            "https://user@graph.microsoft.com/v1.0/me",
+            "https://graph.microsoft.com/other/endpoint",
         ] {
             assert!(validate_graph_url(url).is_err(), "{url}");
         }
+        assert_eq!(urlencoding_segment("."), "%2E");
+        assert_eq!(urlencoding_segment(".."), "%2E%2E");
         assert!(fetch_folder_headers_next("secret", "https://evil.test/").is_err());
     }
 }

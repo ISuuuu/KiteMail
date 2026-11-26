@@ -44,15 +44,17 @@ pub struct MailDirInspection {
     pub importable_config_dir: Option<PathBuf>,
 }
 
-/// Return whether `dir` contains at least one account folder with `mail.db`.
+/// Return whether `dir` contains, or may contain, account mail data.
 pub fn dir_has_account_mail_data(dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|ft| ft.is_dir())
-            && AccountDb::mail_db_path_in(&entry.path()).is_file()
-        {
+    for entry in entries {
+        let Ok(entry) = entry else { return true };
+        // Inspection errors may indicate data that migration must not silently skip.
+        if account_entry_has_mail_data(&entry).unwrap_or(true) {
             return true;
         }
     }
@@ -240,12 +242,23 @@ pub fn validate_target_mail_dir(current_dir: &Path, target_dir: &Path) -> Result
     fs::create_dir_all(target_dir)
         .map_err(|e| format!("无法创建目标邮件目录 ({}): {e}", target_dir.display()))?;
 
-    let probe = target_dir.join(format!(".kitemail-write-probe-{}.tmp", std::process::id()));
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .map_err(|e| format!("目标目录不可写 ({}): {e}", target_dir.display()))?;
+    static NEXT_PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (probe, file) = loop {
+        let probe = target_dir.join(format!(
+            ".kitemail-write-probe-{}-{}.tmp",
+            std::process::id(),
+            NEXT_PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(file) => break (probe, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("目标目录不可写 ({}): {e}", target_dir.display())),
+        }
+    };
     drop(file);
     let _ = fs::remove_file(&probe);
     Ok(())
@@ -289,13 +302,11 @@ impl MailDirMigration {
         let mut accounts = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| format!("读取源目录项失败: {e}"))?;
-            let ft = entry
-                .file_type()
-                .map_err(|e| format!("读取文件类型失败 ({}): {e}", entry.path().display()))?;
-            if ft.is_dir() && AccountDb::mail_db_path_in(&entry.path()).is_file() {
+            let path = entry.path();
+            if account_entry_has_mail_data(&entry)? {
                 let target = dst_dir.join(entry.file_name());
                 ensure_target_free(&target)?;
-                accounts.push((entry.path(), entry.file_name()));
+                accounts.push((path, entry.file_name()));
             }
         }
         let staging = loop {
@@ -394,6 +405,61 @@ fn ensure_target_free(path: &Path) -> Result<(), String> {
     }
 }
 
+fn account_entry_has_mail_data(entry: &fs::DirEntry) -> Result<bool, String> {
+    let path = entry.path();
+    let meta = entry
+        .metadata()
+        .map_err(|e| format!("读取文件属性失败 ({}): {e}", path.display()))?;
+    if metadata_is_reparse_point(&meta) {
+        return Err(format!(
+            "源邮件目录包含符号链接或重解析点，无法安全迁移 ({})",
+            path.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Ok(false);
+    }
+    let db_path = AccountDb::mail_db_path_in(&path);
+    let meta = match fs::symlink_metadata(&db_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(format!(
+                "读取邮件数据库属性失败 ({}): {e}",
+                db_path.display()
+            ))
+        }
+    };
+    if metadata_is_reparse_point(&meta) {
+        return Err(format!(
+            "源邮件目录包含符号链接或重解析点，无法安全迁移 ({})",
+            db_path.display()
+        ));
+    }
+    if !meta.is_file() {
+        return Err(format!("邮件数据库不是普通文件 ({})", db_path.display()));
+    }
+    Ok(true)
+}
+
+fn is_reparse_point(path: &Path) -> Result<bool, String> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| format!("读取文件属性失败 ({}): {e}", path.display()))?;
+    Ok(metadata_is_reparse_point(&meta))
+}
+
+fn metadata_is_reparse_point(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
 fn copy_dir_recursive_filtered(src: &Path, dst: &Path) -> Result<(usize, u64), String> {
     fs::create_dir_all(dst).map_err(|e| format!("创建目标子目录失败 ({}): {e}", dst.display()))?;
     let mut count = 0usize;
@@ -409,6 +475,12 @@ fn copy_dir_recursive_filtered(src: &Path, dst: &Path) -> Result<(usize, u64), S
         let ft = entry
             .file_type()
             .map_err(|e| format!("读取文件类型失败 ({}): {e}", src_path.display()))?;
+        if ft.is_symlink() || is_reparse_point(&src_path)? {
+            return Err(format!(
+                "源邮件目录包含符号链接或重解析点，无法安全迁移 ({})",
+                src_path.display()
+            ));
+        }
         if ft.is_dir() {
             let (sub_c, sub_b) = copy_dir_recursive_filtered(&src_path, &dst_path)?;
             count += sub_c;

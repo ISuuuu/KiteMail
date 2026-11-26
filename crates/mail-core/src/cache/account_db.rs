@@ -3950,7 +3950,7 @@ impl AccountDb {
             let safe = sanitize_attachment_filename(&raw_name);
             let unique = deduplicate_filename(&safe, &mut used_names);
             let path = dest_dir.join(unique);
-            std::fs::write(&path, bytes)
+            super::write_exported_attachment(&path, &bytes)
                 .map_err(|e| format!("写入转发附件失败 ({}): {e}", path.display()))?;
             exported.push(path);
         }

@@ -594,10 +594,37 @@ fn create_controller(
             Ok(())
         },
     ));
-    if unsafe { environment.CreateCoreWebView2Controller(parent, &handler) }.is_err() {
+    if unsafe { create_controller_with_inprivate(environment, parent, &handler) }.is_err() {
         let mut inner = state.borrow_mut();
         inner.failed = true;
         inner.notify_ui();
+    }
+}
+
+unsafe fn create_controller_with_inprivate(
+    environment: &ICoreWebView2Environment,
+    parent: HWND,
+    handler: &ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
+) -> windows::core::Result<()> {
+    if let Ok(env10) = environment.cast::<ICoreWebView2Environment10>() {
+        if let Ok(options) = env10.CreateCoreWebView2ControllerOptions() {
+            if options.SetIsInPrivateModeEnabled(true).is_ok() {
+                return env10.CreateCoreWebView2ControllerWithOptions(parent, &options, handler);
+            }
+        }
+    }
+    environment.CreateCoreWebView2Controller(parent, handler)
+}
+
+fn clear_webview_cookies(controller: &ICoreWebView2Controller) {
+    if let Ok(view) = unsafe { controller.CoreWebView2() } {
+        if let Ok(view2) = view.cast::<ICoreWebView2_2>() {
+            if let Ok(manager) = unsafe { view2.CookieManager() } {
+                unsafe {
+                    let _ = manager.DeleteAllCookies();
+                }
+            }
+        }
     }
 }
 
@@ -637,6 +664,7 @@ impl WebViewHost {
         let controller = state.controller.take();
         drop(state);
         if let Some(controller) = controller {
+            clear_webview_cookies(&controller);
             unsafe {
                 let _ = controller.Close();
             }
@@ -1217,6 +1245,7 @@ impl WebViewHost {
         }
         self.set_visible(false);
         let mut state = self.0.borrow_mut();
+        let prev_allowed = state.allow_remote_images;
         state.document = document;
         state.allow_remote_images = false;
         state.mode = mode;
@@ -1237,6 +1266,9 @@ impl WebViewHost {
             self.resume_if_needed(controller);
             if let Ok(view) = unsafe { controller.CoreWebView2() } {
                 let _ = unsafe { view.Stop() };
+            }
+            if prev_allowed || allow_remote_images {
+                clear_webview_cookies(controller);
             }
         }
         self.0.borrow_mut().allow_remote_images = allow_remote_images;
@@ -1347,6 +1379,7 @@ impl Drop for WebViewHost {
         let clip_window = state.clip_window;
         drop(state);
         if let Some(controller) = controller {
+            clear_webview_cookies(&controller);
             unsafe {
                 let _ = controller.Close();
             }
@@ -1805,12 +1838,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let old_count = Arc::new(AtomicUsize::new(0));
         let new_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
         let private_headers = Arc::new(AtomicUsize::new(0));
         let old_cl = old_count.clone();
         let new_cl = new_count.clone();
+        let second_cl = second_count.clone();
         let private_cl = private_headers.clone();
         std::thread::spawn(move || {
-            let end = Instant::now() + Duration::from_secs(15);
+            let end = Instant::now() + Duration::from_secs(25);
             while Instant::now() < end {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = [0; 4096];
@@ -1829,7 +1864,15 @@ mod tests {
                     if request.starts_with("GET /new") {
                         new_cl.fetch_add(1, Ordering::SeqCst);
                     }
-                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    if request.starts_with("GET /second") {
+                        second_cl.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let resp = if request.starts_with("GET /new") {
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nSet-Cookie: kitemail_track=1; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = stream.write_all(resp.as_bytes());
                 } else {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1860,7 +1903,18 @@ mod tests {
         pump(Duration::from_secs(5));
         assert_eq!(old_count.load(Ordering::SeqCst), 0);
         assert!(new_count.load(Ordering::SeqCst) > 0);
+        assert!(new.retire_for_remote_reload(true));
+        let second = WebViewHost::create(hwnd, None).unwrap();
+        second
+            .load_with_remote(
+                format!("<img src='http://{addr}/second'>").into_bytes(),
+                true,
+            )
+            .unwrap();
+        pump(Duration::from_secs(5));
+        assert!(second_count.load(Ordering::SeqCst) > 0);
         assert_eq!(private_headers.load(Ordering::SeqCst), 0);
+        drop(second);
         drop(new);
         drop(old);
         unsafe {
