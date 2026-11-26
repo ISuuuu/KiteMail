@@ -287,6 +287,24 @@ pub fn sender_initials(name: &str) -> String {
     }
 }
 
+/// 返回发件人头像的展示字符与背景十六进制颜色（与 [`avatar`] 规则一致，供 HTML 会话卡片复用）。
+pub(crate) fn avatar_badge_spec(name: &str, email: &str) -> (String, &'static str) {
+    let trimmed_email = email.trim();
+    if !trimmed_email.is_empty() {
+        if let Some(brand) = kitemail_mail_core::avatar::lookup_builtin_brand(trimmed_email) {
+            return (brand.short.to_string(), brand.color);
+        }
+    }
+    let initials = sender_initials(name);
+    let color_key = if trimmed_email.is_empty() {
+        name
+    } else {
+        trimmed_email
+    };
+    let bg = AVATAR_COLORS[(fnv1a(color_key) % AVATAR_COLORS.len() as u32) as usize];
+    (initials, bg)
+}
+
 /// 圆形头像：`size` x `size`（如 36.0 列表 / 34.0 阅读卡片）。
 ///
 /// 优先检查本地缓存的品牌 Logo / Gravatar 图片，其次匹配内置常见品牌图标，

@@ -11,10 +11,12 @@
 mod app;
 mod autostart;
 mod compose_schedule;
+mod reader_thread_doc;
 mod single_instance;
 mod theme;
 mod tray;
 mod ui;
+mod webview_dark;
 #[cfg(windows)]
 mod webview_host;
 

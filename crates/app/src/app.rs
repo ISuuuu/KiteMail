@@ -64,16 +64,6 @@ use crate::ui::toast::{
 };
 use crate::ui::{compose, message_list, reader, sidebar, welcome, window_controls};
 
-#[cfg(windows)]
-pub(crate) struct ThreadWebViewEntry {
-    pub(crate) host: std::rc::Rc<crate::webview_host::WebViewHost>,
-    pub(crate) key: u64,
-    pub(crate) last_visible_tick: std::rc::Rc<std::cell::Cell<u64>>,
-}
-
-#[cfg(windows)]
-pub(crate) const MAX_THREAD_WEBVIEWS: usize = 6;
-
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
 
 // ---- L-2：三栏宽度常量（对齐原版 app.rs L270-L341 与 list_header.rs）----
@@ -1059,15 +1049,13 @@ pub(crate) struct HylkiApp {
     #[cfg(windows)]
     pub(crate) reader_webview_warmup_scheduled: bool,
     #[cfg(windows)]
-    pub(crate) reader_thread_webviews: HashMap<u32, ThreadWebViewEntry>,
+    pub(crate) reader_webview_is_thread: bool,
     #[cfg(windows)]
-    pub(crate) reader_thread_heights: HashMap<u32, (u64, f32)>,
+    pub(crate) reader_thread_synced_folds: Option<Vec<u32>>,
     #[cfg(windows)]
-    pub(crate) reader_thread_overflow_ids: HashSet<u32>,
+    pub(crate) reader_thread_synced_meta: Option<u64>,
     #[cfg(windows)]
-    pub(crate) reader_thread_webview_failed: bool,
-    #[cfg(windows)]
-    pub(crate) reader_thread_frame_tick: u64,
+    pub(crate) reader_thread_scroll_anchor: Option<(u32, u32, i32)>,
     pub(crate) reader_popup_open: bool,
     /// WP-09：打印预览浮层状态。
     pub(crate) print_preview: Option<PrintPreviewState>,
@@ -1588,15 +1576,13 @@ impl HylkiApp {
                 #[cfg(windows)]
                 reader_webview_warmup_scheduled: false,
                 #[cfg(windows)]
-                reader_thread_webviews: HashMap::new(),
+                reader_webview_is_thread: false,
                 #[cfg(windows)]
-                reader_thread_heights: HashMap::new(),
+                reader_thread_synced_folds: None,
                 #[cfg(windows)]
-                reader_thread_overflow_ids: HashSet::new(),
+                reader_thread_synced_meta: None,
                 #[cfg(windows)]
-                reader_thread_webview_failed: false,
-                #[cfg(windows)]
-                reader_thread_frame_tick: 0,
+                reader_thread_scroll_anchor: None,
                 reader_popup_open: false,
                 print_preview: None,
                 pending_row_action: None,
@@ -1872,15 +1858,13 @@ impl HylkiApp {
             #[cfg(windows)]
             reader_webview_warmup_scheduled: false,
             #[cfg(windows)]
-            reader_thread_webviews: HashMap::new(),
+            reader_webview_is_thread: false,
             #[cfg(windows)]
-            reader_thread_heights: HashMap::new(),
+            reader_thread_synced_folds: None,
             #[cfg(windows)]
-            reader_thread_overflow_ids: HashSet::new(),
+            reader_thread_synced_meta: None,
             #[cfg(windows)]
-            reader_thread_webview_failed: false,
-            #[cfg(windows)]
-            reader_thread_frame_tick: 0,
+            reader_thread_scroll_anchor: None,
             reader_popup_open: false,
             print_preview: None,
             pending_row_action: None,
@@ -2026,11 +2010,6 @@ impl HylkiApp {
                     && host.load_status().1 == crate::webview_host::BodyView::Html;
                 host.set_popup_open(open, restore_visible);
             }
-            for entry in self.reader_thread_webviews.values() {
-                let restore_visible = base_visible
-                    && entry.host.load_status().1 == crate::webview_host::BodyView::Html;
-                entry.host.set_popup_open(open, restore_visible);
-            }
         }
     }
 
@@ -2057,10 +2036,6 @@ impl HylkiApp {
         self.reader_webview
             .as_ref()
             .is_some_and(|host| host.popup_settled())
-            || self
-                .reader_thread_webviews
-                .values()
-                .any(|entry| entry.host.popup_settled())
     }
 
     pub(crate) fn push_settings_or_main_toast(
@@ -3650,6 +3625,10 @@ impl HylkiApp {
                         #[cfg(windows)]
                         {
                             self.reader_webview_key = None;
+                            self.reader_webview_is_thread = false;
+                            self.reader_thread_synced_folds = None;
+                            self.reader_thread_synced_meta = None;
+                            self.reader_thread_scroll_anchor = None;
                         }
                         self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                         self.current_view = CurrentView::UnifiedInbox;
@@ -4443,6 +4422,16 @@ impl HylkiApp {
                         let Some(host) = this.reader_webview.clone() else {
                             return;
                         };
+                        if let (Some(detail), Some((msg_id, offset))) =
+                            (this.selected_message.as_ref(), host.last_scroll_anchor())
+                        {
+                            if this.reader_webview_is_thread
+                                && detail.thread_messages.iter().any(|m| m.id == msg_id)
+                            {
+                                this.reader_thread_scroll_anchor =
+                                    Some((detail.id, msg_id, offset));
+                            }
+                        }
                         let status = Some((host.load_status(), host.popup_settled()));
                         if status != previous {
                             previous = status;
@@ -4455,8 +4444,12 @@ impl HylkiApp {
                             for link in host.take_links() {
                                 this.open_mail_link(&link, cx);
                             }
+                            for action in host.take_actions() {
+                                this.handle_thread_webview_action(action, cx);
+                            }
                         } else {
                             let _ = host.take_links();
+                            let _ = host.take_actions();
                         }
                     })
                     .is_err()
@@ -4470,198 +4463,184 @@ impl HylkiApp {
     }
 
     #[cfg(windows)]
-    fn spawn_thread_webview_listener(
-        &self,
-        host: &std::rc::Rc<crate::webview_host::WebViewHost>,
-        cx: &mut Context<Self>,
-    ) {
-        let (tx, mut rx) = futures::channel::mpsc::channel::<()>(16);
-        host.set_notifier(tx);
-        host.set_svg_renderer(cx.svg_renderer());
-        let weak_host = std::rc::Rc::downgrade(host);
-        cx.spawn(async move |this, cx| {
-            use futures::StreamExt as _;
-            let mut previous = None;
-            while rx.next().await.is_some() {
-                let Some(host) = weak_host.upgrade() else {
-                    break;
-                };
-                if this
-                    .update(cx, |this, cx| {
-                        let Some((msg_id, key)) = this
-                            .reader_thread_webviews
-                            .iter()
-                            .find(|(_, entry)| std::rc::Rc::ptr_eq(&entry.host, &host))
-                            .map(|(&id, entry)| (id, entry.key))
-                        else {
-                            return;
-                        };
-                        let content_height = host.content_height();
-                        if let Some(height) = content_height {
-                            this.reader_thread_heights.insert(msg_id, (key, height));
-                        }
-                        let status = Some((
-                            host.load_status(),
-                            host.popup_settled(),
-                            content_height.map(f32::to_bits),
-                        ));
-                        if status != previous {
-                            previous = status;
-                            cx.notify();
-                        }
-                        if this.active_modal == ActiveModal::None
-                            && !this.reader_find_open
-                            && !this.reader_popup_open
-                        {
-                            for link in host.take_links() {
-                                this.open_mail_link(&link, cx);
-                            }
-                        } else {
-                            let _ = host.take_links();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn activate_thread_card_webview(
+    fn handle_thread_webview_action(
         &mut self,
-        msg_id: u32,
-        card_key: u64,
-        window: &mut Window,
+        action: crate::webview_host::WebViewAction,
         cx: &mut Context<Self>,
     ) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use crate::webview_host::WebViewAction;
 
-        if self.reader_thread_webview_failed {
-            return;
-        }
-        if let Some(entry) = self.reader_thread_webviews.get(&msg_id) {
-            if entry.key == card_key {
-                entry.last_visible_tick.set(self.reader_thread_frame_tick);
-                return;
-            }
-        }
-        let Some(detail) = self.selected_message.as_ref() else {
+        let Some(detail) = self.selected_message.clone() else {
             return;
         };
-        if detail.thread_messages.len() <= 1
-            || self.reader_prefer_plain
-            || self.raw_source_message_ids.contains(&msg_id)
-            || self.collapsed_thread_cards.contains(&msg_id)
-        {
+        if detail.thread_messages.len() <= 1 {
             return;
         }
-        let Some(tm) = detail.thread_messages.iter().find(|m| m.id == msg_id) else {
-            return;
-        };
-        if !tm.body_loaded {
-            return;
-        }
-        let Some(html) = tm
-            .body_html
-            .as_deref()
-            .filter(|h| crate::webview_host::supports_document(h))
-        else {
-            return;
-        };
-        let forced_theme_bg = match self.prefs.message_theme.as_str() {
-            "light" => Some(false),
-            "dark" => Some(true),
-            _ => None,
-        };
-        let dark = self
-            .message_bg_picks
-            .get(&msg_id)
-            .copied()
-            .or(forced_theme_bg)
-            .unwrap_or(self.dark_mode);
-        let zoom_percent = self.prefs.reader_zoom_percent.clamp(50, 250);
-        let (background, foreground) = theme::reader_body_colors(dark);
-        let appearance = crate::webview_host::DocumentAppearance {
-            dark,
-            zoom_percent,
-            background,
-            foreground,
-        };
-        let block_remote = !self.remote_images_allowed(msg_id, &tm.sender);
-        let mut hasher = DefaultHasher::new();
-        msg_id.hash(&mut hasher);
-        html.hash(&mut hasher);
-        appearance.hash(&mut hasher);
-        block_remote.hash(&mut hasher);
-        if hasher.finish() != card_key {
-            return;
-        }
+        let find_tm = |id: u32| detail.thread_messages.iter().find(|m| m.id == id);
 
-        let document = crate::webview_host::build_thread_body_document(html, appearance);
-        let current_tick = self.reader_thread_frame_tick;
-
-        if let Some(entry) = self.reader_thread_webviews.get_mut(&msg_id) {
-            entry.key = card_key;
-            entry.last_visible_tick.set(current_tick);
-            let _ = entry.host.load_document(document, !block_remote, true);
-            cx.notify();
-            return;
-        }
-
-        let host = if self.reader_thread_webviews.len() >= MAX_THREAD_WEBVIEWS {
-            let evict_id = self
-                .reader_thread_webviews
-                .iter()
-                .filter(|(_, entry)| entry.last_visible_tick.get() < current_tick)
-                .min_by_key(|(_, entry)| entry.last_visible_tick.get())
-                .map(|(&id, _)| id);
-            let Some(evict_id) = evict_id else {
-                // Hard cap reached while every slot is actively visible on screen;
-                // fall back to native rendering for this overflow card.
-                if self.reader_thread_overflow_ids.insert(msg_id) {
-                    cx.notify();
+        match action {
+            WebViewAction::CardFold { msg_id, collapsed } => {
+                if find_tm(msg_id).is_none() {
+                    return;
                 }
-                return;
-            };
-            self.reader_thread_webviews
-                .remove(&evict_id)
-                .map(|entry| entry.host)
-        } else {
-            None
-        };
-        self.reader_thread_overflow_ids.remove(&msg_id);
-
-        let host = match host {
-            Some(reused) => reused,
-            None => {
-                let Some(created) = crate::webview_host::WebViewHost::for_window(
-                    window,
-                    Some(window.to_async(cx)),
-                ) else {
-                    self.reader_thread_webview_failed = true;
-                    cx.notify();
+                if collapsed {
+                    self.collapsed_thread_cards.insert(msg_id);
+                } else {
+                    self.collapsed_thread_cards.remove(&msg_id);
+                }
+                self.reader_thread_synced_folds = Some(sorted_thread_collapsed_ids(
+                    &detail,
+                    &self.collapsed_thread_cards,
+                ));
+                cx.notify();
+            }
+            WebViewAction::CardReply(msg_id)
+            | WebViewAction::CardReplyAll(msg_id)
+            | WebViewAction::CardForward(msg_id) => {
+                let Some(tm) = find_tm(msg_id) else {
                     return;
                 };
-                let host = std::rc::Rc::new(created);
-                self.spawn_thread_webview_listener(&host, cx);
-                host
+                let card_detail = build_thread_card_detail(&detail, tm);
+                let entity = cx.entity();
+                let handle = self.window_handle;
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = entity.update(cx, |app, cx| match action {
+                            WebViewAction::CardReply(_) => {
+                                app.start_reply(&card_detail, window, cx);
+                            }
+                            WebViewAction::CardReplyAll(_) => {
+                                app.start_reply_all(&card_detail, window, cx);
+                            }
+                            WebViewAction::CardForward(_) => {
+                                app.start_forward(&card_detail, window, cx);
+                            }
+                            _ => {}
+                        });
+                    });
+                });
             }
-        };
-
-        let _ = host.load_document(document, !block_remote, true);
-        self.reader_thread_webviews.insert(
-            msg_id,
-            ThreadWebViewEntry {
-                host,
-                key: card_key,
-                last_visible_tick: std::rc::Rc::new(std::cell::Cell::new(current_tick)),
-            },
-        );
-        cx.notify();
+            WebViewAction::CardMarkUnread(msg_id) => {
+                let Some(tm) = find_tm(msg_id) else {
+                    return;
+                };
+                let uid = if tm.uid > 0 { tm.uid } else { detail.uid };
+                let folder_path = if tm.folder_path.is_empty() {
+                    detail.folder_path.clone()
+                } else {
+                    tm.folder_path.clone()
+                };
+                self.set_row_seen(detail.account_id, tm.id, uid, folder_path, false, cx);
+            }
+            WebViewAction::CardToggleFlag(msg_id) => {
+                let Some(tm) = find_tm(msg_id) else {
+                    return;
+                };
+                let uid = if tm.uid > 0 { tm.uid } else { detail.uid };
+                let folder_path = if tm.folder_path.is_empty() {
+                    detail.folder_path.clone()
+                } else {
+                    tm.folder_path.clone()
+                };
+                self.set_row_flagged(detail.account_id, tm.id, uid, folder_path, !tm.flagged, cx);
+            }
+            WebViewAction::CardArchive(msg_id) => {
+                if find_tm(msg_id).is_some() {
+                    self.archive_message(detail.account_id, msg_id, cx);
+                }
+            }
+            WebViewAction::CardDelete(msg_id) => {
+                if find_tm(msg_id).is_some() {
+                    self.delete_message(detail.account_id, msg_id, cx);
+                }
+            }
+            WebViewAction::CardExportEml(msg_id) => {
+                let Some(tm) = find_tm(msg_id) else {
+                    return;
+                };
+                let uid = if tm.uid > 0 { tm.uid } else { detail.uid };
+                let folder_path = if tm.folder_path.is_empty() {
+                    detail.folder_path.clone()
+                } else {
+                    tm.folder_path.clone()
+                };
+                self.request_export_eml(detail.account_id, tm.id, uid, folder_path, cx);
+            }
+            WebViewAction::CardCopyBody(msg_id) => {
+                let Some(tm) = find_tm(msg_id) else {
+                    return;
+                };
+                self.copy_text_to_clipboard(tm.body_text.clone(), cx);
+            }
+            WebViewAction::CardToggleRaw(msg_id) => {
+                if find_tm(msg_id).is_some() {
+                    self.toggle_raw_source(msg_id, cx);
+                }
+            }
+            WebViewAction::CardUnsubscribe(msg_id) => {
+                if msg_id == detail.id {
+                    if let Some(url) = detail.unsubscribe_url.clone() {
+                        self.trigger_unsubscribe(&url, detail.unsubscribe_one_click, cx);
+                    }
+                }
+            }
+            WebViewAction::CardAllowRemote(msg_id) => {
+                if find_tm(msg_id).is_some() {
+                    self.allow_remote_images_for(msg_id, cx);
+                }
+            }
+            WebViewAction::CardTrustSender(msg_id) => {
+                if let Some(tm) = find_tm(msg_id) {
+                    let sender = tm.sender.clone();
+                    self.allow_remote_images_for(msg_id, cx);
+                    self.trust_remote_sender(&sender, cx);
+                }
+            }
+            WebViewAction::CardLoadBody(msg_id) => {
+                if find_tm(msg_id).is_some() {
+                    if let Some(ref w) = self.worker {
+                        w.send(MailRequest::LoadMessageBody {
+                            account_id: detail.account_id,
+                            message_id: msg_id,
+                        });
+                        cx.notify();
+                    }
+                }
+            }
+            WebViewAction::CardSaveAttachment(att_id) => {
+                if let Some(att) = detail
+                    .thread_messages
+                    .iter()
+                    .flat_map(|m| m.attachments.iter())
+                    .find(|a| a.id == att_id)
+                {
+                    let filename = att.filename.clone();
+                    self.save_attachment(att_id, &filename, cx);
+                }
+            }
+            WebViewAction::CardSaveAllAttachments(msg_id) => {
+                if let Some(tm) = find_tm(msg_id) {
+                    let ids: Vec<u32> = tm.attachments.iter().map(|a| a.id).collect();
+                    self.save_all_attachments(ids, cx);
+                }
+            }
+            WebViewAction::CardIcsReply { msg_id, status } => {
+                if let Some(tm) = find_tm(msg_id) {
+                    if tm.body_text.contains("BEGIN:VCALENDAR") {
+                        if let Some(inv) = kitemail_mail_core::invite::parse(&tm.body_text) {
+                            let _ = kitemail_mail_core::invite::reply_ics(&inv, "", "", status);
+                        }
+                    }
+                    cx.notify();
+                }
+            }
+            WebViewAction::CardMdn { msg_id, send: _ } => {
+                if find_tm(msg_id).is_some() {
+                    cx.notify();
+                }
+            }
+            WebViewAction::ScrollAnchor { .. } => {}
+        }
     }
 
     pub(crate) fn select_message(
@@ -5084,6 +5063,10 @@ impl HylkiApp {
             self.collapsed_thread_cards.remove(&detail.id);
         } else {
             self.raw_source_message_ids.clear();
+            #[cfg(windows)]
+            {
+                self.reader_thread_scroll_anchor = None;
+            }
             // F-7：切换会话时清除未确认的退订横幅。
             self.pending_unsubscribe = None;
             if self.focus_mode && self.prefs.focus_reader_view {
@@ -12448,33 +12431,35 @@ impl Render for HylkiApp {
         }
         #[cfg(windows)]
         if self.selected_message.is_none() {
+            self.reader_webview_is_thread = false;
+            self.reader_thread_synced_folds = None;
+            self.reader_thread_synced_meta = None;
+            self.reader_thread_scroll_anchor = None;
             if self.reader_webview_key.take().is_some() {
                 if let Some(host) = self.reader_webview.clone() {
                     cx.defer_in(window, move |this, _, _| {
                         if this.reader_webview_key.is_none() {
-                            let _ = host.load(b"<!doctype html>".to_vec());
+                            host.unload_and_suspend();
                         }
                     });
                 }
             }
-            self.reader_thread_webviews.clear();
-            self.reader_thread_heights.clear();
-            self.reader_thread_overflow_ids.clear();
         }
         #[cfg(windows)]
         {
             let base_visible = self.reader_webview_base_visible();
+            let should_suspend = !self.reader_popup_open
+                && (self.main_view != MainContentView::Mail
+                    || self.reader_position == ReaderPosition::Hidden);
             if let Some(host) = self.reader_webview.clone() {
                 let visible = base_visible && !self.reader_webview_yields_to_popup();
                 if !visible {
-                    cx.defer_in(window, move |_, _, _| host.set_visible(false));
-                }
-            }
-            for entry in self.reader_thread_webviews.values() {
-                let visible = base_visible && !entry.host.popup_settled();
-                if !visible {
-                    let host = entry.host.clone();
-                    cx.defer_in(window, move |_, _, _| host.set_visible(false));
+                    cx.defer_in(window, move |_, _, _| {
+                        host.set_visible(false);
+                        if should_suspend {
+                            host.try_suspend();
+                        }
+                    });
                 }
             }
         }
@@ -14207,6 +14192,68 @@ pub(crate) fn capture_window_geometry(prefs: &mut AppPreferences, bounds: Window
         }
     }
     changed
+}
+
+/// 将单封会话卡片投影为完整的 [`MessageDetail`]（供回复 / 转发与卡片更多菜单复用）。
+pub(crate) fn build_thread_card_detail(
+    detail: &MessageDetail,
+    tm: &kitemail_mail_core::ThreadMessage,
+) -> MessageDetail {
+    let is_anchor = tm.id == detail.id;
+    let card_subject = if tm.subject.trim().is_empty() {
+        detail.subject.clone()
+    } else {
+        tm.subject.clone()
+    };
+    MessageDetail {
+        id: tm.id,
+        account_id: detail.account_id,
+        folder_id: detail.folder_id,
+        folder_path: if tm.folder_path.is_empty() {
+            detail.folder_path.clone()
+        } else {
+            tm.folder_path.clone()
+        },
+        uid: if tm.uid > 0 { tm.uid } else { detail.uid },
+        rfc_message_id: tm.rfc_message_id.clone(),
+        sender: tm.sender.clone(),
+        recipients: tm.recipients.clone(),
+        cc: tm.cc.clone(),
+        subject: card_subject,
+        date_display: tm.date_display.clone(),
+        date_ts: tm.date_ts,
+        body_text: tm.body_text.clone(),
+        body_html: tm.body_html.clone(),
+        flagged: tm.flagged,
+        attachments: tm.attachments.clone(),
+        thread_messages: Vec::new(),
+        unsubscribe_url: if is_anchor {
+            detail.unsubscribe_url.clone()
+        } else {
+            None
+        },
+        unsubscribe_one_click: is_anchor && detail.unsubscribe_one_click,
+        auth_results: if is_anchor {
+            detail.auth_results.clone()
+        } else {
+            None
+        },
+    }
+}
+
+/// 收集当前会话处于折叠态且排好序的卡片 ID 列表（供与单 WebView2 DOM 增量同步）。
+pub(crate) fn sorted_thread_collapsed_ids(
+    detail: &MessageDetail,
+    collapsed: &HashSet<u32>,
+) -> Vec<u32> {
+    let mut ids: Vec<u32> = detail
+        .thread_messages
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| collapsed.contains(id))
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// 计算多封会话打开时默认折叠的卡片 ID 集合：

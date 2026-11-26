@@ -2,60 +2,8 @@
     const frame = document.querySelector("iframe");
     if (!frame) return;
 
-    const forwardWheel = Boolean(window.__kitemailForwardWheel);
     const boundDocs = new WeakSet();
     const foldedDocs = new WeakSet();
-    const observedDocs = new WeakSet();
-    let lastReportedHeight = 0;
-
-    function reportContentHeight(doc) {
-        if (!forwardWheel || !doc || !doc.documentElement || doc.URL === "about:blank") return;
-        const zoom = parseFloat(doc.defaultView.getComputedStyle(doc.documentElement).zoom) || 1;
-        const rectH = doc.documentElement.getBoundingClientRect().height || 0;
-        const bodyH = doc.body ? doc.body.scrollHeight * zoom : 0;
-        const height = Math.ceil(Math.max(rectH, bodyH));
-        if (height > 0 && Math.abs(height - lastReportedHeight) >= 2) {
-            lastReportedHeight = height;
-            window.chrome.webview.postMessage("content-height:" + height);
-        }
-    }
-
-    function canScroll(element, delta) {
-        const remaining = delta < 0
-            ? element.scrollTop
-            : element.scrollHeight - element.clientHeight - element.scrollTop;
-        return remaining > 1;
-    }
-
-    function onWheel(event) {
-        const mode = event.deltaMode;
-        const delta = event.deltaY;
-        if (!event.isTrusted || event.ctrlKey || event.shiftKey || event.altKey
-            || event.metaKey || Math.abs(delta) <= Math.abs(event.deltaX)) {
-            return;
-        }
-
-        const doc = event.currentTarget;
-        const view = doc.defaultView;
-        const root = doc.scrollingElement;
-        for (const element of event.composedPath()) {
-            if (!(element instanceof view.Element) || element === root) continue;
-            if (canScroll(element, delta) && /^(auto|scroll)$/.test(view.getComputedStyle(element).overflowY)) {
-                return;
-            }
-        }
-        if (root && canScroll(root, delta)) {
-            const rootOverflow = view.getComputedStyle(doc.documentElement).overflowY;
-            const viewportOverflow = rootOverflow === "visible" && doc.body
-                ? view.getComputedStyle(doc.body).overflowY
-                : rootOverflow;
-            if (viewportOverflow !== "hidden" && viewportOverflow !== "clip") return;
-        }
-
-        event.preventDefault();
-        const pixels = delta * (mode === 1 ? 16 : mode === 2 ? window.innerHeight : 1);
-        window.chrome.webview.postMessage("thread-wheel:" + pixels);
-    }
 
     function onMailtoClick(event) {
         if (!event.isTrusted || event.defaultPrevented) return;
@@ -216,7 +164,6 @@
             const expanded = box.style.display !== "none";
             box.style.display = expanded ? "none" : "";
             btn.textContent = expanded ? "⋯ 显示引用内容" : "▾ 隐藏引用内容";
-            reportContentHeight(doc);
         });
     }
 
@@ -231,10 +178,6 @@
 
         if (!boundDocs.has(doc)) {
             boundDocs.add(doc);
-            if (forwardWheel) {
-                doc.addEventListener("wheel", onWheel, { passive: false });
-                doc.addEventListener("load", () => reportContentHeight(doc), true);
-            }
             doc.addEventListener("click", onMailtoClick, true);
             doc.addEventListener("auxclick", onMailtoClick, true);
         }
@@ -246,23 +189,9 @@
             } catch (_) {}
         }
 
-        if (forwardWheel && doc.body && !observedDocs.has(doc)) {
-            observedDocs.add(doc);
-            reportContentHeight(doc);
-            if (typeof ResizeObserver === "function") {
-                const observer = new ResizeObserver(() => reportContentHeight(doc));
-                observer.observe(doc.documentElement);
-                observer.observe(doc.body);
-            }
-            requestAnimationFrame(() => reportContentHeight(doc));
-        }
-
         return boundDocs.has(doc) && foldedDocs.has(doc);
     }
 
-    if (forwardWheel) {
-        document.addEventListener("wheel", onWheel, { passive: false });
-    }
     frame.addEventListener("load", attachToFrame);
     if (!attachToFrame()) {
         let polls = 0;

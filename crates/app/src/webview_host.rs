@@ -2,10 +2,7 @@
 #![allow(dead_code)]
 
 use futures::channel::mpsc as futures_mpsc;
-use gpui_kit::{
-    point, px, AsyncWindowContext, Hsla, PlatformInput, Rgba, ScrollDelta, ScrollEvent, TouchPhase,
-    Window,
-};
+use gpui_kit::{AsyncWindowContext, Hsla, Window};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
     cell::RefCell,
@@ -17,13 +14,13 @@ use webview2_com::{
     CreateCoreWebView2EnvironmentCompletedHandler, DOMContentLoadedEventHandler,
     LaunchingExternalUriSchemeEventHandler, Microsoft::Web::WebView2::Win32::*,
     NavigationCompletedEventHandler, NavigationStartingEventHandler,
-    NewWindowRequestedEventHandler, ProcessFailedEventHandler, WebMessageReceivedEventHandler,
-    WebResourceRequestedEventHandler,
+    NewWindowRequestedEventHandler, ProcessFailedEventHandler, TrySuspendCompletedHandler,
+    WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
 };
 use windows::{
     core::{w, Interface},
     Win32::{
-        Foundation::{HWND, POINT, RECT},
+        Foundation::{HWND, RECT},
         Graphics::Gdi::{
             BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
             GetMonitorInfoW, MonitorFromRect, ReleaseDC, SelectObject, BITMAPINFO,
@@ -33,19 +30,17 @@ use windows::{
         UI::{
             Shell::SHCreateMemStream,
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetAncestor, GetCursorPos, GetForegroundWindow,
-                GetParent, GetWindowInfo, GetWindowRect, SetWindowPos, ShowWindow, GA_ROOT,
-                SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOWINFO,
-                WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
+                CreateWindowExW, DestroyWindow, GetAncestor, GetForegroundWindow, GetWindowRect,
+                SetWindowPos, ShowWindow, GA_ROOT, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
+                SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
             },
         },
     },
 };
 
-const DOCUMENT_URL: &str = "https://kitemail.invalid/reader";
+use crate::webview_dark as dark;
 
-#[path = "webview_dark.rs"]
-mod dark;
+const DOCUMENT_URL: &str = "https://kitemail.invalid/reader";
 
 fn document_url(version: u64) -> String {
     format!("{DOCUMENT_URL}/{version}")
@@ -180,7 +175,7 @@ pub(crate) fn supports_document(html: &str) -> bool {
     !html.trim().is_empty()
 }
 
-fn find_html_tag(lower: &str, tag: &str) -> Option<usize> {
+pub(crate) fn find_html_tag(lower: &str, tag: &str) -> Option<usize> {
     let mut from = 0;
     while let Some(at) = lower[from..].find(tag).map(|i| from + i) {
         let next = lower
@@ -196,6 +191,37 @@ fn find_html_tag(lower: &str, tag: &str) -> Option<usize> {
     None
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DocumentMode {
+    #[default]
+    SingleBody,
+    ThreadContainer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WebViewAction {
+    CardFold { msg_id: u32, collapsed: bool },
+    CardReply(u32),
+    CardReplyAll(u32),
+    CardForward(u32),
+    CardMarkUnread(u32),
+    CardToggleFlag(u32),
+    CardArchive(u32),
+    CardDelete(u32),
+    CardExportEml(u32),
+    CardCopyBody(u32),
+    CardToggleRaw(u32),
+    CardUnsubscribe(u32),
+    CardAllowRemote(u32),
+    CardTrustSender(u32),
+    CardLoadBody(u32),
+    CardSaveAttachment(u32),
+    CardSaveAllAttachments(u32),
+    CardIcsReply { msg_id: u32, status: &'static str },
+    CardMdn { msg_id: u32, send: bool },
+    ScrollAnchor { msg_id: u32, offset_px: i32 },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DocumentAppearance {
     pub dark: bool,
@@ -205,11 +231,7 @@ pub(crate) struct DocumentAppearance {
 }
 
 pub(crate) fn build_body_document(html: &str, appearance: DocumentAppearance) -> Vec<u8> {
-    make_document(html, None, appearance, false)
-}
-
-pub(crate) fn build_thread_body_document(html: &str, appearance: DocumentAppearance) -> Vec<u8> {
-    make_document(html, None, appearance, true)
+    make_document(html, None, appearance)
 }
 
 pub(crate) fn build_document(
@@ -218,14 +240,13 @@ pub(crate) fn build_document(
     sender: &str,
     appearance: DocumentAppearance,
 ) -> Vec<u8> {
-    make_document(html, Some((subject, sender)), appearance, false)
+    make_document(html, Some((subject, sender)), appearance)
 }
 
 fn make_document(
     html: &str,
     header: Option<(&str, &str)>,
     appearance: DocumentAppearance,
-    in_thread: bool,
 ) -> Vec<u8> {
     let escape = |value: &str| {
         value
@@ -240,21 +261,11 @@ fn make_document(
         html.to_string()
     };
     let html = dark::pin_color_scheme(&html, appearance.dark);
-    let css_color = |color: Hsla| {
-        let rgb = Rgba::from(color);
-        let [r, g, b] = [rgb.r, rgb.g, rgb.b].map(|channel| (channel * 255.0).round() as u8);
-        format!("#{r:02x}{g:02x}{b:02x}")
-    };
-    let bg = css_color(appearance.background);
-    let fg = css_color(appearance.foreground);
+    let bg = crate::theme::css_hex_color(appearance.background);
+    let fg = crate::theme::css_hex_color(appearance.foreground);
     let scheme = if appearance.dark { "dark" } else { "light" };
-    let thread_css = if in_thread {
-        "html{display:flow-root!important;height:auto!important;min-height:0!important}body{height:auto!important;min-height:0!important}"
-    } else {
-        ""
-    };
     let style = format!(
-        "<style>:root{{color-scheme:{scheme};zoom:{}%}}{thread_css}:where(body){{background-color:{bg};color:{fg}}}</style>",
+        "<style>:root{{color-scheme:{scheme};zoom:{}%}}:where(body){{background-color:{bg};color:{fg}}}</style>",
         appearance.zoom_percent.clamp(50, 250)
     );
     let lower = html.to_ascii_lowercase();
@@ -294,11 +305,13 @@ struct State {
     navigation_id: Option<u64>,
     loaded: bool,
     links: Vec<(u64, String)>,
+    actions: Vec<(u64, WebViewAction)>,
+    last_scroll_anchor: Option<(u64, u32, i32)>,
     scroll_window: Option<AsyncWindowContext>,
     svg_renderer: Option<gpui_kit::SvgRenderer>,
     bridge_script_version: u64,
     notifier: Option<futures_mpsc::Sender<()>>,
-    in_thread: bool,
+    mode: DocumentMode,
     clip_rect: RECT,
     bounds: RECT,
     visible: bool,
@@ -306,12 +319,13 @@ struct State {
     window_shown: bool,
     failed: bool,
     closed: bool,
+    suspended: bool,
+    suspending: bool,
+    suspend_after_load: bool,
     popup_open: bool,
     capturing: bool,
     capture_seq: u64,
     snapshot: Option<(u64, PopupSnapshot)>,
-    content_height: Option<f32>,
-    height_updates: u8,
 }
 
 /// 将 top-down 32 位 BGRA 像素打包成 54 字节未压缩 BMP，供同步生成 `RenderImage`。
@@ -441,10 +455,18 @@ fn apply_dom_content_loaded(state: &mut State, navigation_id: u64) -> bool {
     }
 }
 
+fn should_allow_main_navigation(state: &State, url: &str) -> bool {
+    !state.loaded && allow_main_navigation(url, state.version)
+}
+
 fn apply_navigation_completed(state: &mut State, navigation_id: u64, success: bool) -> bool {
     if state.navigation_id == Some(navigation_id) {
         state.loaded = success;
         state.failed = !success;
+        if success {
+            state.document.clear();
+            state.document.shrink_to_fit();
+        }
         state.notify_ui();
         success
     } else {
@@ -453,22 +475,22 @@ fn apply_navigation_completed(state: &mut State, navigation_id: u64, success: bo
 }
 
 fn maybe_install_bridge_script(state: &Rc<RefCell<State>>, view: Option<&ICoreWebView2>) {
-    let forward_wheel = {
+    let mode = {
         let mut inner = state.borrow_mut();
         let version = inner.version;
         if inner.loaded && inner.bridge_script_version != version {
             inner.bridge_script_version = version;
-            Some(inner.in_thread && inner.scroll_window.is_some())
+            Some(inner.mode)
         } else {
             None
         }
     };
-    if let (Some(view), Some(forward_wheel)) = (view, forward_wheel) {
+    if let (Some(view), Some(mode)) = (view, mode) {
         // Run the trusted listener in the wrapper. The mail frame stays scriptless.
-        let script = format!(
-            "window.__kitemailForwardWheel = {forward_wheel};\n{}",
-            include_str!("thread_scroll.js")
-        );
+        let script = match mode {
+            DocumentMode::SingleBody => include_str!("thread_scroll.js"),
+            DocumentMode::ThreadContainer => include_str!("reader_thread.js"),
+        };
         let script: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
         unsafe {
             let _ = view.ExecuteScript(
@@ -719,10 +741,6 @@ impl WebViewHost {
         };
         (state.version, view)
     }
-    pub(crate) fn content_height(&self) -> Option<f32> {
-        let state = self.0.borrow();
-        state.in_thread.then_some(state.content_height).flatten()
-    }
     pub(crate) fn take_links(&self) -> Vec<String> {
         let mut state = self.0.borrow_mut();
         let version = state.version;
@@ -730,6 +748,100 @@ impl WebViewHost {
             .into_iter()
             .filter_map(|(v, url)| (v == version).then_some(url))
             .collect()
+    }
+    pub(crate) fn take_actions(&self) -> Vec<WebViewAction> {
+        let mut state = self.0.borrow_mut();
+        let version = state.version;
+        std::mem::take(&mut state.actions)
+            .into_iter()
+            .filter_map(|(v, action)| (v == version).then_some(action))
+            .collect()
+    }
+    pub(crate) fn last_scroll_anchor(&self) -> Option<(u32, i32)> {
+        let state = self.0.borrow();
+        state
+            .last_scroll_anchor
+            .filter(|(v, _, _)| *v == state.version)
+            .map(|(_, id, offset)| (id, offset))
+    }
+    pub(crate) fn execute_script(&self, script: &str) {
+        let controller = {
+            let state = self.0.borrow();
+            if state.closed || !state.loaded {
+                return;
+            }
+            state.controller.clone()
+        };
+        if let Some(controller) = controller {
+            if let Ok(view) = unsafe { controller.CoreWebView2() } {
+                let wide: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
+                unsafe {
+                    let _ = view.ExecuteScript(
+                        windows::core::PCWSTR(wide.as_ptr()),
+                        None::<&ICoreWebView2ExecuteScriptCompletedHandler>,
+                    );
+                }
+            }
+        }
+    }
+    pub(crate) fn try_suspend(&self) {
+        let (controller, version) = {
+            let mut state = self.0.borrow_mut();
+            if state.closed
+                || state.visible
+                || state.popup_open
+                || state.suspended
+                || state.suspending
+            {
+                return;
+            }
+            let Some(controller) = state.controller.clone() else {
+                return;
+            };
+            state.suspending = true;
+            (controller, state.version)
+        };
+        let Ok(view) = (unsafe { controller.CoreWebView2() }) else {
+            self.0.borrow_mut().suspending = false;
+            return;
+        };
+        let Ok(view3) = view.cast::<ICoreWebView2_3>() else {
+            self.0.borrow_mut().suspending = false;
+            return;
+        };
+        let weak = Rc::downgrade(&self.0);
+        let handler = TrySuspendCompletedHandler::create(Box::new(move |result, succeeded| {
+            if let Some(state) = weak.upgrade() {
+                let mut inner = state.borrow_mut();
+                inner.suspending = false;
+                if inner.version == version && !inner.visible && !inner.closed {
+                    inner.suspended = result.is_ok() && succeeded;
+                }
+            }
+            Ok(())
+        }));
+        if unsafe { view3.TrySuspend(&handler) }.is_err() {
+            self.0.borrow_mut().suspending = false;
+        }
+    }
+    fn resume_if_needed(&self, controller: &ICoreWebView2Controller) {
+        {
+            let mut state = self.0.borrow_mut();
+            state.suspended = false;
+            state.suspending = false;
+        }
+        if let Ok(view) = unsafe { controller.CoreWebView2() } {
+            if let Ok(view3) = view.cast::<ICoreWebView2_3>() {
+                let mut is_suspended = windows::core::BOOL::default();
+                if unsafe { view3.IsSuspended(&mut is_suspended) }.is_ok()
+                    && is_suspended.as_bool()
+                {
+                    unsafe {
+                        let _ = view3.Resume();
+                    }
+                }
+            }
+        }
     }
     pub(crate) fn set_bounds(&self, bounds: RECT) {
         self.set_clipped_bounds(bounds, bounds);
@@ -751,6 +863,11 @@ impl WebViewHost {
         let visibility_changed = state.window_shown != visible;
         state.window_shown = visible;
         drop(state);
+        if visibility_changed && visible {
+            if let Some(controller) = &controller {
+                self.resume_if_needed(controller);
+            }
+        }
         unsafe {
             if clip_changed {
                 let _ = SetWindowPos(
@@ -792,6 +909,11 @@ impl WebViewHost {
         drop(state);
         if !visibility_changed {
             return;
+        }
+        if visible {
+            if let Some(controller) = &controller {
+                self.resume_if_needed(controller);
+            }
         }
         unsafe {
             let _ = ShowWindow(
@@ -1073,25 +1195,43 @@ impl WebViewHost {
         document: Vec<u8>,
         allow_remote_images: bool,
     ) -> windows::core::Result<()> {
-        self.load_document(document, allow_remote_images, false)
+        self.load_document(document, allow_remote_images, DocumentMode::SingleBody)
+    }
+    pub(crate) fn unload_and_suspend(&self) {
+        let _ = self.load_document_with_suspend(
+            b"<!doctype html>".to_vec(),
+            false,
+            DocumentMode::SingleBody,
+            true,
+        );
     }
     pub(crate) fn load_document(
         &self,
         document: Vec<u8>,
         allow_remote_images: bool,
-        in_thread: bool,
+        mode: DocumentMode,
+    ) -> windows::core::Result<()> {
+        self.load_document_with_suspend(document, allow_remote_images, mode, false)
+    }
+    fn load_document_with_suspend(
+        &self,
+        document: Vec<u8>,
+        allow_remote_images: bool,
+        mode: DocumentMode,
+        suspend_after_load: bool,
     ) -> windows::core::Result<()> {
         self.set_visible(false);
         let mut state = self.0.borrow_mut();
         state.document = document;
         state.allow_remote_images = false;
-        state.in_thread = in_thread;
+        state.mode = mode;
+        state.suspend_after_load = suspend_after_load;
         state.version = state.version.wrapping_add(1);
         state.loaded = false;
         state.navigation_id = None;
         state.snapshot = None;
-        state.content_height = None;
-        state.height_updates = 0;
+        state.actions.clear();
+        state.last_scroll_anchor = None;
         let url = document_url(state.version);
         let controller = state.controller.clone();
         if controller.is_some() {
@@ -1099,6 +1239,7 @@ impl WebViewHost {
         }
         drop(state);
         if let Some(controller) = &controller {
+            self.resume_if_needed(controller);
             if let Ok(view) = unsafe { controller.CoreWebView2() } {
                 let _ = unsafe { view.Stop() };
             }
@@ -1108,6 +1249,7 @@ impl WebViewHost {
             if let Err(error) = unsafe { navigate_to(&controller, &url) } {
                 let mut state = self.0.borrow_mut();
                 state.navigation_id = None;
+                state.suspend_after_load = false;
                 state.failed = true;
                 return Err(error);
             }
@@ -1145,102 +1287,93 @@ impl Drop for WebViewHost {
     }
 }
 
-fn content_height_message(message: &str) -> Option<f32> {
-    let height: f32 = message.strip_prefix("content-height:")?.parse().ok()?;
-    (height.is_finite() && height > 0.0).then(|| height.clamp(40.0, 4800.0))
+pub(crate) fn parse_thread_action(message: &str) -> Option<WebViewAction> {
+    let mut parts = message.split(':');
+    let verb = parts.next()?;
+    let id: u32 = parts.next()?.parse().ok()?;
+    let third = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    match (verb, third) {
+        ("card-fold", Some("1")) => Some(WebViewAction::CardFold {
+            msg_id: id,
+            collapsed: true,
+        }),
+        ("card-fold", Some("0")) => Some(WebViewAction::CardFold {
+            msg_id: id,
+            collapsed: false,
+        }),
+        ("card-reply", None) => Some(WebViewAction::CardReply(id)),
+        ("card-reply-all", None) => Some(WebViewAction::CardReplyAll(id)),
+        ("card-forward", None) => Some(WebViewAction::CardForward(id)),
+        ("card-mark-unread", None) => Some(WebViewAction::CardMarkUnread(id)),
+        ("card-toggle-flag", None) => Some(WebViewAction::CardToggleFlag(id)),
+        ("card-archive", None) => Some(WebViewAction::CardArchive(id)),
+        ("card-delete", None) => Some(WebViewAction::CardDelete(id)),
+        ("card-export-eml", None) => Some(WebViewAction::CardExportEml(id)),
+        ("card-copy-body", None) => Some(WebViewAction::CardCopyBody(id)),
+        ("card-toggle-raw", None) => Some(WebViewAction::CardToggleRaw(id)),
+        ("card-unsub", None) => Some(WebViewAction::CardUnsubscribe(id)),
+        ("card-allow-remote", None) => Some(WebViewAction::CardAllowRemote(id)),
+        ("card-trust-sender", None) => Some(WebViewAction::CardTrustSender(id)),
+        ("card-load-body", None) => Some(WebViewAction::CardLoadBody(id)),
+        ("card-save-att", None) => Some(WebViewAction::CardSaveAttachment(id)),
+        ("card-save-all-atts", None) => Some(WebViewAction::CardSaveAllAttachments(id)),
+        ("card-ics", Some("ACCEPTED")) => Some(WebViewAction::CardIcsReply {
+            msg_id: id,
+            status: "ACCEPTED",
+        }),
+        ("card-ics", Some("TENTATIVE")) => Some(WebViewAction::CardIcsReply {
+            msg_id: id,
+            status: "TENTATIVE",
+        }),
+        ("card-ics", Some("DECLINED")) => Some(WebViewAction::CardIcsReply {
+            msg_id: id,
+            status: "DECLINED",
+        }),
+        ("card-mdn", Some("send")) => Some(WebViewAction::CardMdn {
+            msg_id: id,
+            send: true,
+        }),
+        ("card-mdn", Some("ignore")) => Some(WebViewAction::CardMdn {
+            msg_id: id,
+            send: false,
+        }),
+        ("scroll-anchor", Some(raw_offset)) => {
+            let offset: i32 = raw_offset.parse().ok()?;
+            (offset >= 0).then(|| WebViewAction::ScrollAnchor {
+                msg_id: id,
+                offset_px: offset.min(200_000),
+            })
+        }
+        _ => None,
+    }
 }
 
-fn record_content_height(state: &Rc<RefCell<State>>, source: &str, height: f32) -> bool {
+fn record_thread_action(state: &Rc<RefCell<State>>, source: &str, message: &str) -> bool {
+    let Some(action) = parse_thread_action(message) else {
+        return false;
+    };
     let mut inner = state.borrow_mut();
     if inner.closed
         || !inner.loaded
-        || !inner.in_thread
+        || inner.mode != DocumentMode::ThreadContainer
         || !allow_main_navigation(source, inner.version)
-        || inner.height_updates >= 24
     {
         return false;
     }
-    if inner
-        .content_height
-        .is_some_and(|prev| (prev - height).abs() < 1.0)
-    {
-        return false;
+    let version = inner.version;
+    match action {
+        WebViewAction::ScrollAnchor { msg_id, offset_px } => {
+            inner.last_scroll_anchor = Some((version, msg_id, offset_px));
+        }
+        other => {
+            inner.actions.push((version, other));
+            inner.notify_ui();
+        }
     }
-    inner.content_height = Some(height);
-    inner.height_updates = inner.height_updates.saturating_add(1);
-    inner.notify_ui();
     true
-}
-
-fn thread_wheel_delta(message: &str) -> Option<f32> {
-    let delta: f32 = message.strip_prefix("thread-wheel:")?.parse().ok()?;
-    (delta.is_finite() && delta != 0.0).then_some(delta)
-}
-
-fn forward_thread_wheel(
-    state: Rc<RefCell<State>>,
-    source: String,
-    delta: f32,
-) -> windows::core::Result<()> {
-    let (window, clip_window) = {
-        let state = state.borrow();
-        let Some(window) = state.scroll_window.clone() else {
-            return Ok(());
-        };
-        (window, state.clip_window)
-    };
-    let mut cursor = POINT::default();
-    unsafe { GetCursorPos(&mut cursor)? };
-
-    // Schedule GPUI input after the WebView2 callback returns.
-    window
-        .spawn(async move |cx| {
-            {
-                let state = state.borrow();
-                if state.closed
-                    || !state.loaded
-                    || !state.window_shown
-                    || !state.in_thread
-                    || !allow_main_navigation(&source, state.version)
-                {
-                    return;
-                }
-            }
-            let mut clip = RECT::default();
-            let mut info = WINDOWINFO {
-                cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
-                ..Default::default()
-            };
-            let position = unsafe {
-                GetWindowRect(clip_window, &mut clip)
-                    .and_then(|_| GetWindowInfo(GetParent(clip_window)?, &mut info))
-            };
-            if position.is_err()
-                || cursor.x < clip.left
-                || cursor.x >= clip.right
-                || cursor.y < clip.top
-                || cursor.y >= clip.bottom
-            {
-                return;
-            }
-            let _ = cx.update(|window, cx| {
-                let scale = window.scale_factor();
-                window.dispatch_event(
-                    PlatformInput::Scroll(ScrollEvent {
-                        position: point(
-                            px((cursor.x - info.rcClient.left) as f32 / scale),
-                            px((cursor.y - info.rcClient.top) as f32 / scale),
-                        ),
-                        delta: ScrollDelta::Pixels(point(px(0.), px(-delta))),
-                        touch_phase: TouchPhase::Moved,
-                        ..Default::default()
-                    }),
-                    cx,
-                );
-            });
-        })
-        .detach();
-    Ok(())
 }
 
 unsafe fn configure(
@@ -1249,6 +1382,12 @@ unsafe fn configure(
     state: Weak<RefCell<State>>,
 ) -> windows::core::Result<()> {
     let view = controller.CoreWebView2()?;
+    if let Ok(settings) = unsafe { view.Settings() } {
+        unsafe {
+            let _ = settings.SetAreDevToolsEnabled(false);
+            let _ = settings.SetIsStatusBarEnabled(false);
+        }
+    }
     let mut token = 0;
     let nav_state = state.clone();
     let nav = NavigationStartingEventHandler::create(Box::new(move |_, args| {
@@ -1260,7 +1399,7 @@ unsafe fn configure(
             let url = webview2_com::take_pwstr(uri);
             let allowed = nav_state
                 .upgrade()
-                .is_some_and(|state| allow_main_navigation(&url, state.borrow().version));
+                .is_some_and(|state| should_allow_main_navigation(&state.borrow(), &url));
             if allowed {
                 let mut id = 0;
                 unsafe {
@@ -1307,6 +1446,18 @@ unsafe fn configure(
                 apply_navigation_completed(&mut state.borrow_mut(), id, success.as_bool());
             if matched {
                 maybe_install_bridge_script(&state, view.as_ref());
+                let should_suspend = {
+                    let mut inner = state.borrow_mut();
+                    let flag = inner.suspend_after_load
+                        && !inner.visible
+                        && !inner.popup_open
+                        && !inner.closed;
+                    inner.suspend_after_load = false;
+                    flag
+                };
+                if should_suspend {
+                    WebViewHost(state).try_suspend();
+                }
             }
         }
         Ok(())
@@ -1321,12 +1472,10 @@ unsafe fn configure(
                 let mut source = windows::core::PWSTR::null();
                 unsafe { args.Source(&mut source)? };
                 let source = webview2_com::take_pwstr(source);
-                if let Some(delta) = thread_wheel_delta(&message) {
-                    forward_thread_wheel(state, source, delta)?;
-                } else if let Some(height) = content_height_message(&message) {
-                    record_content_height(&state, &source, height);
-                } else if let Some(url) = open_link_message(&message) {
+                if let Some(url) = open_link_message(&message) {
                     record_script_link(&state, &source, url);
+                } else {
+                    record_thread_action(&state, &source, &message);
                 }
             }
         }
@@ -1578,18 +1727,187 @@ mod tests {
     }
 
     #[test]
-    fn thread_wheel_messages_require_a_finite_nonzero_delta() {
-        assert_eq!(thread_wheel_delta("thread-wheel:42.5"), Some(42.5));
-        assert_eq!(thread_wheel_delta("thread-wheel:-120"), Some(-120.0));
-        for message in [
-            "42",
-            "thread-wheel:",
-            "thread-wheel:0",
-            "thread-wheel:NaN",
-            "thread-wheel:inf",
+    fn thread_actions_validate_verbs_ids_and_scroll_anchors() {
+        assert_eq!(
+            parse_thread_action("card-fold:42:1"),
+            Some(WebViewAction::CardFold {
+                msg_id: 42,
+                collapsed: true
+            })
+        );
+        assert_eq!(
+            parse_thread_action("card-fold:42:0"),
+            Some(WebViewAction::CardFold {
+                msg_id: 42,
+                collapsed: false
+            })
+        );
+        assert_eq!(
+            parse_thread_action("card-reply:7"),
+            Some(WebViewAction::CardReply(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-reply-all:7"),
+            Some(WebViewAction::CardReplyAll(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-forward:7"),
+            Some(WebViewAction::CardForward(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-mark-unread:7"),
+            Some(WebViewAction::CardMarkUnread(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-toggle-flag:7"),
+            Some(WebViewAction::CardToggleFlag(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-archive:7"),
+            Some(WebViewAction::CardArchive(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-delete:7"),
+            Some(WebViewAction::CardDelete(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-export-eml:7"),
+            Some(WebViewAction::CardExportEml(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-copy-body:7"),
+            Some(WebViewAction::CardCopyBody(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-toggle-raw:7"),
+            Some(WebViewAction::CardToggleRaw(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-unsub:7"),
+            Some(WebViewAction::CardUnsubscribe(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-allow-remote:7"),
+            Some(WebViewAction::CardAllowRemote(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-trust-sender:7"),
+            Some(WebViewAction::CardTrustSender(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-load-body:7"),
+            Some(WebViewAction::CardLoadBody(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-save-att:99"),
+            Some(WebViewAction::CardSaveAttachment(99))
+        );
+        assert_eq!(
+            parse_thread_action("card-save-all-atts:7"),
+            Some(WebViewAction::CardSaveAllAttachments(7))
+        );
+        assert_eq!(
+            parse_thread_action("card-ics:7:ACCEPTED"),
+            Some(WebViewAction::CardIcsReply {
+                msg_id: 7,
+                status: "ACCEPTED"
+            })
+        );
+        assert_eq!(
+            parse_thread_action("card-ics:7:TENTATIVE"),
+            Some(WebViewAction::CardIcsReply {
+                msg_id: 7,
+                status: "TENTATIVE"
+            })
+        );
+        assert_eq!(
+            parse_thread_action("card-ics:7:DECLINED"),
+            Some(WebViewAction::CardIcsReply {
+                msg_id: 7,
+                status: "DECLINED"
+            })
+        );
+        assert_eq!(
+            parse_thread_action("card-mdn:7:send"),
+            Some(WebViewAction::CardMdn {
+                msg_id: 7,
+                send: true
+            })
+        );
+        assert_eq!(
+            parse_thread_action("card-mdn:7:ignore"),
+            Some(WebViewAction::CardMdn {
+                msg_id: 7,
+                send: false
+            })
+        );
+        assert_eq!(
+            parse_thread_action("scroll-anchor:7:120"),
+            Some(WebViewAction::ScrollAnchor {
+                msg_id: 7,
+                offset_px: 120
+            })
+        );
+
+        for invalid in [
+            "",
+            "card-unknown:1",
+            "card-reply:-1",
+            "card-reply:abc",
+            "card-reply:1:extra",
+            "card-fold:1:2",
+            "card-fold:1",
+            "card-ics:1:MAYBE",
+            "card-mdn:1:maybe",
+            "scroll-anchor:1:-5",
+            "scroll-anchor:1:NaN",
         ] {
-            assert_eq!(thread_wheel_delta(message), None);
+            assert_eq!(parse_thread_action(invalid), None, "should reject {invalid}");
         }
+
+        let (tx, mut rx) = futures_mpsc::channel::<()>(8);
+        let state = Rc::new(RefCell::new(State {
+            version: 2,
+            loaded: true,
+            mode: DocumentMode::ThreadContainer,
+            notifier: Some(tx),
+            ..State::default()
+        }));
+
+        let host = WebViewHost(state.clone());
+
+        // Scroll anchor updates silently without waking UI or entering action queue.
+        assert!(record_thread_action(
+            &state,
+            &document_url(2),
+            "scroll-anchor:9:48"
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(host.last_scroll_anchor(), Some((9, 48)));
+        assert!(host.take_actions().is_empty());
+
+        // Action message queues and wakes UI; wrong version or SingleBody mode rejects.
+        assert!(record_thread_action(
+            &state,
+            &document_url(2),
+            "card-reply:9"
+        ));
+        assert_eq!(rx.try_recv().ok(), Some(()));
+        assert!(!record_thread_action(
+            &state,
+            &document_url(1),
+            "card-reply:9"
+        ));
+
+        state.borrow_mut().mode = DocumentMode::SingleBody;
+        assert!(!record_thread_action(
+            &state,
+            &document_url(2),
+            "card-reply:9"
+        ));
+
+        state.borrow_mut().mode = DocumentMode::ThreadContainer;
+        assert_eq!(host.take_actions(), vec![WebViewAction::CardReply(9)]);
     }
 
     #[test]
@@ -1966,47 +2284,24 @@ mod tests {
     }
 
     #[test]
-    fn thread_content_height_is_validated_clamped_and_deduped() {
-        assert_eq!(content_height_message("content-height:642.5"), Some(642.5));
-        assert_eq!(content_height_message("content-height:12"), Some(40.0));
-        assert_eq!(content_height_message("content-height:99999"), Some(4800.0));
-        for invalid in [
-            "content-height:",
-            "content-height:0",
-            "content-height:-10",
-            "content-height:NaN",
-            "content-height:inf",
-            "thread-wheel:10",
-        ] {
-            assert_eq!(content_height_message(invalid), None);
-        }
-
-        let (tx, mut rx) = futures_mpsc::channel::<()>(8);
-        let state = Rc::new(RefCell::new(State {
+    fn navigation_completed_frees_document_and_blocks_reloads() {
+        let (tx, mut rx) = futures_mpsc::channel::<()>(4);
+        let mut state = State {
             version: 2,
-            loaded: true,
-            in_thread: true,
+            navigation_id: Some(11),
+            document: b"<html><body>big email</body></html>".to_vec(),
             notifier: Some(tx),
             ..State::default()
-        }));
-        assert!(record_content_height(&state, &document_url(2), 512.0));
-        assert_eq!(WebViewHost(state.clone()).content_height(), Some(512.0));
-        assert_eq!(rx.try_recv().ok(), Some(()));
-
-        // Sub-pixel jitter and wrong version/source are ignored.
-        assert!(!record_content_height(&state, &document_url(2), 512.4));
-        assert!(!record_content_height(&state, &document_url(1), 700.0));
-        assert!(rx.try_recv().is_err());
-
-        let (background, foreground) = crate::theme::reader_body_colors(false);
-        let light = DocumentAppearance {
-            dark: false,
-            zoom_percent: 100,
-            background,
-            foreground,
         };
-        let doc = String::from_utf8(build_thread_body_document("<p>Hi</p>", light)).unwrap();
-        assert!(doc.contains("display:flow-root!important"));
-        assert!(doc.contains("height:auto!important"));
+
+        // Initial un-loaded state allows main navigation.
+        assert!(should_allow_main_navigation(&state, &document_url(2)));
+
+        // Completing navigation clears buffered HTML bytes and blocks subsequent reloads.
+        assert!(apply_navigation_completed(&mut state, 11, true));
+        assert!(state.loaded);
+        assert!(state.document.is_empty());
+        assert_eq!(rx.try_recv().ok(), Some(()));
+        assert!(!should_allow_main_navigation(&state, &document_url(2)));
     }
 }

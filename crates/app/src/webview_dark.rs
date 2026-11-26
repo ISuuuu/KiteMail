@@ -509,7 +509,7 @@ fn rewrite_tag_attrs(tag: &str) -> String {
 /// keeping any surrounding `only screen and …` intact — makes the email's own
 /// light/dark rules follow our ground deterministically. `999999px` stands in
 /// for "never" (no message is a million pixels wide) and `0px` for "always".
-pub(super) fn pin_color_scheme(doc: &str, dark: bool) -> String {
+pub(crate) fn pin_color_scheme(doc: &str, dark: bool) -> String {
     // (feature we're neutralising, replacement that matches iff we chose it)
     let (dark_repl, light_repl) = if dark {
         ("min-width:0px", "min-width:999999px")
@@ -555,7 +555,7 @@ pub(super) fn pin_color_scheme(doc: &str, dark: bool) -> String {
 /// The whole-document pass: `<style>` blocks through the CSS rewriter, every
 /// other tag through the attribute rewriter, text content untouched. Tag ends
 /// are found quote-aware, since `>` inside attribute values is legal HTML.
-pub(super) fn adapt_colors_for_dark(doc: &str) -> String {
+pub(crate) fn adapt_colors_for_dark(doc: &str) -> String {
     let lower = doc.to_ascii_lowercase();
     let mut out = String::with_capacity(doc.len() + 64);
     let mut i = 0;

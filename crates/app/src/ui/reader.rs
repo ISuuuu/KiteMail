@@ -69,7 +69,7 @@ fn action_button(id: &'static str, icon: IconName, tooltip: &'static str) -> But
 }
 
 /// 收件人预览文本（去空白项后以逗号重排）。
-fn recipient_list(raw: &str) -> String {
+pub(crate) fn recipient_list(raw: &str) -> String {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -78,7 +78,7 @@ fn recipient_list(raw: &str) -> String {
 }
 
 /// 提取折叠卡片用的单行正文摘要。
-fn first_snippet_line(body_text: &str) -> String {
+pub(crate) fn first_snippet_line(body_text: &str) -> String {
     body_text
         .lines()
         .map(str::trim)
@@ -90,7 +90,8 @@ fn first_snippet_line(body_text: &str) -> String {
 }
 
 /// 组装「查看邮件原文」展示内容（信头 + 原始纯文本 + 可选 HTML 源码）。
-fn format_raw_source(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn format_raw_source(
     rfc_message_id: &str,
     sender: &str,
     recipients: &str,
@@ -378,34 +379,7 @@ fn compute_webview_rects(
     (rect, clip)
 }
 
-#[cfg(windows)]
-fn bounds_intersects_viewport(
-    bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
-    mask: gpui_kit::Bounds<gpui_kit::Pixels>,
-    margin_y: f32,
-) -> bool {
-    let b_top = bounds.origin.y.as_f32();
-    let b_bottom = b_top + bounds.size.height.as_f32();
-    let m_top = mask.origin.y.as_f32() - margin_y;
-    let m_bottom = mask.origin.y.as_f32() + mask.size.height.as_f32() + margin_y;
-    let b_left = bounds.origin.x.as_f32();
-    let b_right = b_left + bounds.size.width.as_f32();
-    let m_left = mask.origin.x.as_f32();
-    let m_right = m_left + mask.size.width.as_f32();
-    b_right > m_left && b_left < m_right && b_bottom > m_top && b_top < m_bottom
-}
-
-#[cfg(windows)]
-pub(super) struct ThreadCardWebView {
-    pub(super) host: Option<std::rc::Rc<crate::webview_host::WebViewHost>>,
-    pub(super) key: u64,
-    pub(super) height_px: f32,
-    pub(super) last_visible_tick: Option<std::rc::Rc<std::cell::Cell<u64>>>,
-    pub(super) frame_tick: u64,
-    pub(super) visible: bool,
-}
-
-/// 渲染单张邮件正文卡片（既用于单封邮件，也用于会话线程中的多张叠放卡片）。
+/// 渲染单张邮件正文卡片（用于单封邮件与原生降级视图的多张叠放卡片）。
 ///
 /// `bg_pick` 为 B-5 的单封邮件亮 / 暗背景覆盖（`Some(false)` 强制亮色、
 /// `Some(true)` 强制暗色、`None` 跟随主题；会话级状态，不持久化）。
@@ -445,8 +419,6 @@ fn render_message_card(
     is_current: bool,
     more_menu: gpui_kit::AnyElement,
     body_view: BodyView,
-    webview_in_thread: bool,
-    #[cfg(windows)] thread_webview: Option<ThreadCardWebView>,
     scale_factor: f32,
     p: &theme::HylkiPalette,
     app: &mut HylkiApp,
@@ -719,10 +691,7 @@ fn render_message_card(
         .collect();
 
     v_flex()
-        .when(
-            body_view != BodyView::Native && !webview_in_thread,
-            |card| card.flex_1().min_h_0(),
-        )
+        .when(body_view != BodyView::Native, |card| card.flex_1().min_h_0())
         .when(card_chrome, |card| {
             card.bg(card_bg)
                 .rounded(px(12.0))
@@ -1119,95 +1088,22 @@ fn render_message_card(
             })
         })
         .when(body_view == BodyView::Loading, |card| {
-            #[cfg(windows)]
-            if let Some(ref twv) = thread_webview {
-                let app_entity = cx.entity().downgrade();
-                let card_key = twv.key;
-                let frame_tick = twv.frame_tick;
-                let last_visible_tick = twv.last_visible_tick.clone();
-                let needs_activate = twv.host.is_none();
-                return card.child(
-                    div()
-                        .relative()
-                        .w_full()
-                        .h(px(twv.height_px))
-                        .child(body_loading(body_bg, body_muted, body_pending).size_full())
-                        .child(
-                            gpui_kit::canvas(
-                                move |bounds, window, cx| {
-                                    let mask = window.content_mask().bounds;
-                                    if bounds_intersects_viewport(bounds, mask, 0.0) {
-                                        if let Some(ref tick) = last_visible_tick {
-                                            tick.set(frame_tick);
-                                        }
-                                    }
-                                    if needs_activate
-                                        && bounds_intersects_viewport(bounds, mask, 300.0)
-                                    {
-                                        let handle = window.window_handle();
-                                        let app_weak = app_entity.clone();
-                                        cx.defer(move |cx| {
-                                            let _ = handle.update(cx, |_, window, cx| {
-                                                let _ = app_weak.update(cx, |this, cx| {
-                                                    this.activate_thread_card_webview(
-                                                        msg_id, card_key, window, cx,
-                                                    );
-                                                });
-                                            });
-                                        });
-                                    }
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .inset_0(),
-                        ),
-                );
-            }
-            card.child(
-                body_loading(body_bg, body_muted, body_pending)
-                    .when(webview_in_thread, |el| {
-                        el.h(px(420.0)).justify_start().pt_4()
-                    })
-                    .when(!webview_in_thread, |el| el.flex_1().min_h_0()),
-            )
+            card.child(body_loading(body_bg, body_muted, body_pending).flex_1().min_h_0())
         })
         .when(body_view == BodyView::Html, |card| {
             #[cfg(windows)]
             {
-                let (host, height_px, last_visible_tick, frame_tick, visible) =
-                    if let Some(twv) = thread_webview {
-                        (
-                            twv.host.unwrap(),
-                            Some(twv.height_px),
-                            twv.last_visible_tick,
-                            twv.frame_tick,
-                            twv.visible,
-                        )
-                    } else {
-                        (
-                            app.reader_webview.as_ref().unwrap().clone(),
-                            None,
-                            None,
-                            0,
-                            !app.reader_webview_yields_to_popup(),
-                        )
-                    };
+                let host = app.reader_webview.as_ref().unwrap().clone();
+                let visible = !app.reader_webview_yields_to_popup();
                 let (version, _) = host.load_status();
                 if let Some(snapshot) = host.popup_snapshot() {
                     // 浮层打开期间：同一布局位置换成正文快照，尺寸与子窗口一致。
-                    return card.child(render_webview_snapshot(snapshot, scale_factor, height_px));
+                    return card.child(render_webview_snapshot(snapshot, scale_factor, None));
                 }
                 let app_reserved_strip_px = app.reader_webview_bottom_clearance_px();
                 return card.child(
                     gpui_kit::canvas(
                         move |bounds, window, cx| {
-                            let mask = window.content_mask().bounds;
-                            if bounds_intersects_viewport(bounds, mask, 0.0) {
-                                if let Some(ref tick) = last_visible_tick {
-                                    tick.set(frame_tick);
-                                }
-                            }
                             let (rect, clip) =
                                 compute_webview_rects(bounds, window, app_reserved_strip_px);
                             cx.defer(move |_| {
@@ -1219,8 +1115,8 @@ fn render_message_card(
                         },
                         |_, _, _, _| {},
                     )
-                    .when_some(height_px, |el, h| el.h(px(h)))
-                    .when(height_px.is_none(), |el| el.flex_1().min_h_0())
+                    .flex_1()
+                    .min_h_0()
                     .w_full(),
                 );
             }
@@ -1440,12 +1336,22 @@ pub(crate) fn render_with_pane_top(
         && app.drawer_image_preview.is_none()
         && !app.mail_dir_switching;
 
+    let date_style = app.prefs.date_style.clone();
+    let clock_style = app.prefs.clock_style.clone();
+    let clean_links = app.prefs.clean_links;
+    let show_remote_banner = app.prefs.show_remote_banner;
+    let always_show_recipients = app.prefs.always_show_recipients;
+    let card_attachments = app.prefs.card_attachments;
+    let show_account_chip = app.prefs.reader_show_account_chip;
+    let show_view_switch = app.prefs.reader_show_view_switch;
+    let show_theme_switch = app.prefs.reader_show_theme_switch;
+
     #[cfg(windows)]
     let body_view = if thread_count <= 1 {
-        app.reader_thread_webviews.clear();
-        app.reader_thread_heights.clear();
-        app.reader_thread_overflow_ids.clear();
-        use crate::webview_host::{build_body_document, DocumentAppearance};
+        app.reader_webview_is_thread = false;
+        app.reader_thread_synced_folds = None;
+        app.reader_thread_synced_meta = None;
+        use crate::webview_host::{build_body_document, DocumentAppearance, DocumentMode};
         use std::hash::{Hash, Hasher};
 
         let html = detail.body_html.as_deref();
@@ -1501,7 +1407,7 @@ pub(crate) fn render_with_pane_top(
                     return;
                 }
                 if let Some(host) = this.ensure_reader_webview(window, cx) {
-                    let _ = host.load_document(document, !block_remote, false);
+                    let _ = host.load_document(document, !block_remote, DocumentMode::SingleBody);
                 }
                 cx.notify();
             });
@@ -1518,7 +1424,82 @@ pub(crate) fn render_with_pane_top(
         }
         view
     } else {
-        if app.reader_webview_key.take().is_some() {
+        use crate::reader_thread_doc::{
+            build_thread_document, ThreadCardRenderInput, ThreadDocContext,
+        };
+        use crate::webview_host::DocumentMode;
+        use std::hash::{Hash, Hasher};
+
+        let thread_eligible = !prefer_plain;
+        let current_folds =
+            crate::app::sorted_thread_collapsed_ids(&detail, &app.collapsed_thread_cards);
+        let current_meta_hash = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for tm in &detail.thread_messages {
+                tm.id.hash(&mut hasher);
+                tm.flagged.hash(&mut hasher);
+                (app.pending_eml_export == Some(tm.id)).hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+
+        let key = thread_eligible.then(|| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            true.hash(&mut hasher);
+            detail.id.hash(&mut hasher);
+            detail.subject.hash(&mut hasher);
+            detail.thread_messages.len().hash(&mut hasher);
+            zoom_percent.hash(&mut hasher);
+            app.prefs.ui_text_scale_percent.hash(&mut hasher);
+            app.dark_mode.hash(&mut hasher);
+            app.prefs.theme_id.hash(&mut hasher);
+            date_style.hash(&mut hasher);
+            clock_style.hash(&mut hasher);
+            clean_links.hash(&mut hasher);
+            show_remote_banner.hash(&mut hasher);
+            always_show_recipients.hash(&mut hasher);
+            card_attachments.hash(&mut hasher);
+            app.demo_mode.hash(&mut hasher);
+            app.prefs.read_receipt_policy.hash(&mut hasher);
+            body_pending.hash(&mut hasher);
+            for tm in &detail.thread_messages {
+                tm.id.hash(&mut hasher);
+                tm.subject.hash(&mut hasher);
+                tm.sender.hash(&mut hasher);
+                tm.recipients.hash(&mut hasher);
+                tm.cc.hash(&mut hasher);
+                tm.date_ts.hash(&mut hasher);
+                tm.date_display.hash(&mut hasher);
+                tm.body_loaded.hash(&mut hasher);
+                tm.body_text.hash(&mut hasher);
+                tm.body_html.hash(&mut hasher);
+                for att in &tm.attachments {
+                    att.id.hash(&mut hasher);
+                    att.filename.hash(&mut hasher);
+                    att.size_bytes.hash(&mut hasher);
+                    att.downloaded.hash(&mut hasher);
+                }
+                app.raw_source_message_ids.contains(&tm.id).hash(&mut hasher);
+                (!app.remote_images_allowed(tm.id, &tm.sender)).hash(&mut hasher);
+                let card_dark = app
+                    .message_bg_picks
+                    .get(&tm.id)
+                    .copied()
+                    .or(forced_theme_bg)
+                    .unwrap_or(app.dark_mode);
+                card_dark.hash(&mut hasher);
+                if tm.id == detail.id {
+                    detail.auth_results.hash(&mut hasher);
+                    detail.unsubscribe_url.hash(&mut hasher);
+                }
+            }
+            hasher.finish()
+        });
+
+        if key.is_none() && app.reader_webview_key.take().is_some() {
+            app.reader_webview_is_thread = false;
+            app.reader_thread_synced_folds = None;
+            app.reader_thread_synced_meta = None;
             if let Some(host) = app.reader_webview.clone() {
                 cx.defer_in(window, move |this, _, _| {
                     if this.reader_webview_key.is_none() {
@@ -1526,41 +1507,145 @@ pub(crate) fn render_with_pane_top(
                     }
                 });
             }
-        } else if let Some(host) = app.reader_webview.clone() {
-            cx.defer_in(window, move |_, _, _| host.set_visible(false));
         }
-        app.reader_thread_frame_tick = app.reader_thread_frame_tick.wrapping_add(1);
-        app.reader_thread_webviews.retain(|id, _| {
-            !prefer_plain
-                && !app.collapsed_thread_cards.contains(id)
-                && !app.raw_source_message_ids.contains(id)
-                && detail.thread_messages.iter().any(|tm| {
-                    tm.id == *id
-                        && tm.body_loaded
-                        && tm
-                            .body_html
-                            .as_deref()
-                            .is_some_and(crate::webview_host::supports_document)
+
+        let new_key = key.filter(|key| app.reader_webview_key != Some(*key));
+        if let Some(key) = new_key {
+            let inputs: Vec<ThreadCardRenderInput<'_>> = detail
+                .thread_messages
+                .iter()
+                .map(|tm| {
+                    let is_current = tm.id == detail.id;
+                    let card_dark = app
+                        .message_bg_picks
+                        .get(&tm.id)
+                        .copied()
+                        .or(forced_theme_bg)
+                        .unwrap_or(app.dark_mode);
+                    ThreadCardRenderInput {
+                        message: tm,
+                        is_current,
+                        is_collapsed: app.collapsed_thread_cards.contains(&tm.id),
+                        show_raw_source: app.raw_source_message_ids.contains(&tm.id),
+                        block_remote: !app.remote_images_allowed(tm.id, &tm.sender),
+                        card_dark,
+                        card_pending: is_current && body_pending,
+                        eml_exporting: app.pending_eml_export == Some(tm.id),
+                        auth_results: if is_current {
+                            detail.auth_results.as_deref()
+                        } else {
+                            None
+                        },
+                        unsubscribe_url: if is_current {
+                            detail.unsubscribe_url.as_deref()
+                        } else {
+                            None
+                        },
+                    }
                 })
-        });
-        app.reader_thread_heights
-            .retain(|id, _| detail.thread_messages.iter().any(|tm| tm.id == *id));
-        if app.reader_thread_webviews.len() < crate::app::MAX_THREAD_WEBVIEWS
-            || app
-                .reader_thread_webviews
-                .values()
-                .any(|e| e.last_visible_tick.get().saturating_add(1) < app.reader_thread_frame_tick)
-        {
-            app.reader_thread_overflow_ids.clear();
-        } else {
-            app.reader_thread_overflow_ids.retain(|id| {
-                !prefer_plain
-                    && !app.collapsed_thread_cards.contains(id)
-                    && !app.raw_source_message_ids.contains(id)
-                    && detail.thread_messages.iter().any(|tm| tm.id == *id)
+                .collect();
+            let initial_anchor = app
+                .reader_thread_scroll_anchor
+                .filter(|(d_id, _, _)| *d_id == detail.id)
+                .map(|(_, card_id, offset)| (card_id, offset));
+            let ctx = ThreadDocContext {
+                detail: &detail,
+                cards: &inputs,
+                palette: &p,
+                app_dark_mode: app.dark_mode,
+                zoom_percent,
+                ui_text_scale_percent: app.prefs.ui_text_scale_percent,
+                date_style: &date_style,
+                clock_style: &clock_style,
+                clean_links,
+                show_remote_banner,
+                always_show_recipients,
+                card_attachments,
+                demo_mode: app.demo_mode,
+                read_receipt_policy: &app.prefs.read_receipt_policy,
+                initial_anchor,
+            };
+            let (document, any_remote_allowed) = build_thread_document(&ctx);
+            app.reader_webview_key = Some(key);
+            app.reader_webview_is_thread = true;
+            app.reader_thread_synced_folds = Some(current_folds.clone());
+            app.reader_thread_synced_meta = Some(current_meta_hash);
+            let message_id = detail.id;
+            cx.defer_in(window, move |this, window, cx| {
+                if this.reader_webview_key != Some(key)
+                    || this.selected_message.as_ref().map(|message| message.id) != Some(message_id)
+                {
+                    return;
+                }
+                if let Some(host) = this.ensure_reader_webview(window, cx) {
+                    let _ = host.load_document(
+                        document,
+                        any_remote_allowed,
+                        DocumentMode::ThreadContainer,
+                    );
+                }
+                cx.notify();
             });
         }
-        BodyView::Native
+
+        let view = BodyView::for_document(
+            thread_eligible && unobscured,
+            new_key.is_some(),
+            app.reader_webview.as_deref(),
+        );
+        if new_key.is_none() && view == BodyView::Html {
+            if let Some(host) = app.reader_webview.clone() {
+                let (version, _) = host.load_status();
+                if app.reader_thread_synced_folds.as_ref() != Some(&current_folds) {
+                    app.reader_thread_synced_folds = Some(current_folds.clone());
+                    let ids_json = current_folds
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let script = format!(
+                        "window.__kitemailSyncFolded&&window.__kitemailSyncFolded([{ids_json}]);"
+                    );
+                    let h = host.clone();
+                    cx.defer_in(window, move |_, _, _| {
+                        if h.load_status() == (version, BodyView::Html) {
+                            h.execute_script(&script);
+                        }
+                    });
+                }
+                if app.reader_thread_synced_meta != Some(current_meta_hash) {
+                    app.reader_thread_synced_meta = Some(current_meta_hash);
+                    let meta_items: Vec<String> = detail
+                        .thread_messages
+                        .iter()
+                        .map(|tm| {
+                            format!(
+                                "{{\"id\":{},\"flagged\":{},\"exporting\":{}}}",
+                                tm.id,
+                                tm.flagged,
+                                app.pending_eml_export == Some(tm.id)
+                            )
+                        })
+                        .collect();
+                    let script = format!(
+                        "window.__kitemailSyncCardMeta&&window.__kitemailSyncCardMeta([{}]);",
+                        meta_items.join(",")
+                    );
+                    let h = host.clone();
+                    cx.defer_in(window, move |_, _, _| {
+                        if h.load_status() == (version, BodyView::Html) {
+                            h.execute_script(&script);
+                        }
+                    });
+                }
+            }
+        }
+        if let Some(host) = app.reader_webview.clone() {
+            if view != BodyView::Html || app.reader_webview_yields_to_popup() {
+                cx.defer_in(window, move |_, _, _| host.set_visible(false));
+            }
+        }
+        view
     };
     #[cfg(not(windows))]
     let body_view = BodyView::Native;
@@ -1594,249 +1679,86 @@ pub(crate) fn render_with_pane_top(
         .copied()
         .unwrap_or(app.dark_mode);
 
-    let date_style = app.prefs.date_style.clone();
-    let clock_style = app.prefs.clock_style.clone();
-    let clean_links = app.prefs.clean_links;
-    let show_remote_banner = app.prefs.show_remote_banner;
-    let always_show_recipients = app.prefs.always_show_recipients;
-    let card_attachments = app.prefs.card_attachments;
-    let show_account_chip = app.prefs.reader_show_account_chip;
-    let show_view_switch = app.prefs.reader_show_view_switch;
-    let show_theme_switch = app.prefs.reader_show_theme_switch;
-
-    // 构造单卡或多线程叠放卡片列表：每张卡片均带独立的 `...` 操作菜单与折叠/原文态。
+    // 构造单卡或原生降级态的多线程叠放卡片列表；多线程由单 WebView2 容器接管时跳过原生卡片构建。
     let cards: Vec<gpui_kit::AnyElement> = if thread_count > 1 {
-        detail
-            .thread_messages
-            .iter()
-            .map(|tm: &ThreadMessage| {
-                let is_current = tm.id == detail.id;
-                let is_collapsed = app.collapsed_thread_cards.contains(&tm.id);
-                let show_raw_source = app.raw_source_message_ids.contains(&tm.id);
-                let block_remote = !app.remote_images_allowed(tm.id, &tm.sender);
-                let card_subject = if tm.subject.trim().is_empty() {
-                    detail.subject.clone()
-                } else {
-                    tm.subject.clone()
-                };
-                // 退订信息只在当前打开（锚点）邮件的 detail 中；会话其余卡片
-                // 无详情数据，维持 None（横幅仅出现在锚点卡片上）。
-                let is_anchor = tm.id == detail.id;
-                let card_unsubscribe_url = if is_anchor {
-                    detail.unsubscribe_url.as_deref()
-                } else {
-                    None
-                };
-                let card_unsubscribe_one_click = is_anchor && detail.unsubscribe_one_click;
-                let card_detail = MessageDetail {
-                    id: tm.id,
-                    account_id: detail.account_id,
-                    folder_id: detail.folder_id,
-                    // 卡片自身的 UID / 文件夹（旧缓存数据缺省时回落锚点值）。
-                    folder_path: if tm.folder_path.is_empty() {
-                        detail.folder_path.clone()
+        if body_view != BodyView::Native {
+            Vec::new()
+        } else {
+            detail
+                .thread_messages
+                .iter()
+                .map(|tm: &ThreadMessage| {
+                    let is_current = tm.id == detail.id;
+                    let is_collapsed = app.collapsed_thread_cards.contains(&tm.id);
+                    let show_raw_source = app.raw_source_message_ids.contains(&tm.id);
+                    let block_remote = !app.remote_images_allowed(tm.id, &tm.sender);
+                    let card_subject = if tm.subject.trim().is_empty() {
+                        detail.subject.clone()
                     } else {
-                        tm.folder_path.clone()
-                    },
-                    uid: if tm.uid > 0 { tm.uid } else { detail.uid },
-                    rfc_message_id: tm.rfc_message_id.clone(),
-                    sender: tm.sender.clone(),
-                    recipients: tm.recipients.clone(),
-                    cc: tm.cc.clone(),
-                    subject: card_subject.clone(),
-                    date_display: tm.date_display.clone(),
-                    date_ts: tm.date_ts,
-                    body_text: tm.body_text.clone(),
-                    body_html: tm.body_html.clone(),
-                    flagged: tm.flagged,
-                    attachments: tm.attachments.clone(),
-                    thread_messages: Vec::new(),
-                    unsubscribe_url: card_unsubscribe_url.map(str::to_string),
-                    unsubscribe_one_click: card_unsubscribe_one_click,
-                    auth_results: if is_anchor {
-                        detail.auth_results.clone()
+                        tm.subject.clone()
+                    };
+                    let is_anchor = tm.id == detail.id;
+                    let card_detail = crate::app::build_thread_card_detail(&detail, tm);
+                    let eml_exporting = app.pending_eml_export == Some(tm.id);
+                    let menu = build_card_more_menu(
+                        card_detail,
+                        show_raw_source,
+                        app.demo_mode,
+                        eml_exporting,
+                        cx,
+                    );
+                    let card_pending = is_current && body_pending;
+                    let card_body_view = if card_pending {
+                        BodyView::Loading
                     } else {
-                        None
-                    },
-                };
-                let eml_exporting = app.pending_eml_export == Some(tm.id);
-                let menu = build_card_more_menu(
-                    card_detail,
-                    show_raw_source,
-                    app.demo_mode,
-                    eml_exporting,
-                    cx,
-                );
-                let card_pending = is_current && body_pending;
-                #[cfg(windows)]
-                let (card_body_view, thread_webview) = {
-                    use crate::webview_host::{build_thread_body_document, DocumentAppearance};
-                    use std::hash::{Hash, Hasher};
-
-                    let card_eligible = tm.body_loaded
-                        && webview_eligible(
-                            tm.body_html.as_deref(),
-                            card_pending,
-                            prefer_plain,
-                            show_raw_source,
-                            is_collapsed,
-                        );
-                    if card_pending {
-                        (BodyView::Loading, None)
-                    } else if !card_eligible
-                        || !unobscured
-                        || app.reader_thread_webview_failed
-                        || (app.reader_thread_overflow_ids.contains(&tm.id)
-                            && !app.reader_thread_webviews.contains_key(&tm.id))
-                    {
-                        if let Some(entry) = app.reader_thread_webviews.get(&tm.id) {
-                            let host = entry.host.clone();
-                            cx.defer_in(window, move |_, _, _| host.set_visible(false));
-                        }
-                        (BodyView::Native, None)
-                    } else {
-                        let html = tm.body_html.as_deref().unwrap();
-                        let card_dark = app
-                            .message_bg_picks
-                            .get(&tm.id)
-                            .copied()
-                            .or(forced_theme_bg)
-                            .unwrap_or(app.dark_mode);
-                        let (background, foreground) = theme::reader_body_colors(card_dark);
-                        let appearance = DocumentAppearance {
-                            dark: card_dark,
-                            zoom_percent,
-                            background,
-                            foreground,
-                        };
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        tm.id.hash(&mut hasher);
-                        html.hash(&mut hasher);
-                        appearance.hash(&mut hasher);
-                        block_remote.hash(&mut hasher);
-                        let card_key = hasher.finish();
-
-                        let frame_tick = app.reader_thread_frame_tick;
-                        let mut reload_scheduled = false;
-                        if let Some(entry) = app.reader_thread_webviews.get_mut(&tm.id) {
-                            if entry.key != card_key {
-                                entry.key = card_key;
-                                reload_scheduled = true;
-                                app.reader_thread_heights.remove(&tm.id);
-                                let host = entry.host.clone();
-                                let doc = build_thread_body_document(html, appearance);
-                                let msg_id = tm.id;
-                                cx.defer_in(window, move |this, _, cx| {
-                                    if this
-                                        .reader_thread_webviews
-                                        .get(&msg_id)
-                                        .is_some_and(|e| e.key == card_key)
-                                    {
-                                        let _ = host.load_document(doc, !block_remote, true);
-                                        cx.notify();
-                                    }
-                                });
-                            } else if let Some(h) = entry.host.content_height() {
-                                app.reader_thread_heights.insert(tm.id, (card_key, h));
-                            }
-                        }
-
-                        let height_px = app
-                            .reader_thread_heights
-                            .get(&tm.id)
-                            .filter(|(k, _)| *k == card_key)
-                            .map(|(_, h)| *h)
-                            .unwrap_or(420.0);
-
-                        if let Some(entry) = app.reader_thread_webviews.get(&tm.id) {
-                            let host = entry.host.clone();
-                            let last_visible_tick = entry.last_visible_tick.clone();
-                            let view = BodyView::for_document(
-                                true,
-                                reload_scheduled,
-                                Some(&host),
-                            );
-                            let visible = !host.popup_settled();
-                            if view != BodyView::Html || !visible {
-                                let h = host.clone();
-                                cx.defer_in(window, move |_, _, _| h.set_visible(false));
-                            }
-                            (
-                                view,
-                                Some(ThreadCardWebView {
-                                    host: Some(host),
-                                    key: card_key,
-                                    height_px,
-                                    last_visible_tick: Some(last_visible_tick),
-                                    frame_tick,
-                                    visible,
-                                }),
-                            )
+                        BodyView::Native
+                    };
+                    render_message_card(
+                        detail.account_id,
+                        tm.id,
+                        &tm.rfc_message_id,
+                        &card_subject,
+                        &tm.sender,
+                        &tm.recipients,
+                        &tm.cc,
+                        if is_anchor {
+                            detail.auth_results.as_deref()
                         } else {
-                            (
-                                BodyView::Loading,
-                                Some(ThreadCardWebView {
-                                    host: None,
-                                    key: card_key,
-                                    height_px,
-                                    last_visible_tick: None,
-                                    frame_tick,
-                                    visible: false,
-                                }),
-                            )
-                        }
-                    }
-                };
-                #[cfg(not(windows))]
-                let card_body_view = BodyView::Native;
-                render_message_card(
-                    detail.account_id,
-                    tm.id,
-                    &tm.rfc_message_id,
-                    &card_subject,
-                    &tm.sender,
-                    &tm.recipients,
-                    &tm.cc,
-                    if is_anchor {
-                        detail.auth_results.as_deref()
-                    } else {
-                        None
-                    },
-                    &tm.date_display,
-                    tm.date_ts,
-                    &date_style,
-                    &clock_style,
-                    &tm.body_text,
-                    tm.body_html.as_deref(),
-                    tm.body_loaded,
-                    card_pending,
-                    prefer_plain,
-                    block_remote,
-                    clean_links,
-                    show_remote_banner,
-                    is_collapsed,
-                    show_raw_source,
-                    app.expanded_quote_message_ids.contains(&tm.id),
-                    zoom_percent,
-                    app.message_bg_picks.get(&tm.id).copied(),
-                    forced_theme_bg,
-                    true,
-                    always_show_recipients,
-                    card_attachments,
-                    &tm.attachments,
-                    is_current,
-                    menu,
-                    card_body_view,
-                    true,
-                    #[cfg(windows)]
-                    thread_webview,
-                    window.scale_factor(),
-                    &p,
-                    app,
-                    cx,
-                )
-            })
-            .collect()
+                            None
+                        },
+                        &tm.date_display,
+                        tm.date_ts,
+                        &date_style,
+                        &clock_style,
+                        &tm.body_text,
+                        tm.body_html.as_deref(),
+                        tm.body_loaded,
+                        card_pending,
+                        prefer_plain,
+                        block_remote,
+                        clean_links,
+                        show_remote_banner,
+                        is_collapsed,
+                        show_raw_source,
+                        app.expanded_quote_message_ids.contains(&tm.id),
+                        zoom_percent,
+                        app.message_bg_picks.get(&tm.id).copied(),
+                        forced_theme_bg,
+                        true,
+                        always_show_recipients,
+                        card_attachments,
+                        &tm.attachments,
+                        is_current,
+                        menu,
+                        card_body_view,
+                        window.scale_factor(),
+                        &p,
+                        app,
+                        cx,
+                    )
+                })
+                .collect()
+        }
     } else {
         let is_collapsed = app.collapsed_thread_cards.contains(&detail.id);
         let show_raw_source = app.raw_source_message_ids.contains(&detail.id);
@@ -1883,9 +1805,6 @@ pub(crate) fn render_with_pane_top(
             false,
             menu,
             body_view,
-            false,
-            #[cfg(windows)]
-            None,
             window.scale_factor(),
             &p,
             app,
@@ -2488,21 +2407,72 @@ pub(crate) fn render_with_pane_top(
                         .child(SharedString::from(detail.subject.clone())),
                 ),
         )
-        // 卡片式正文（外层滚动，内边距 12px 24px 24px；多封会话纵向叠放）。
+        // 卡片式正文（外层滚动，内边距 12px 24px 24px；多封会话正常态由单 WebView2 容器接管）。
         .child({
-            let content = v_flex()
-                .id("reader-scroll")
-                .flex_1()
-                .min_h_0()
-                .pt(px(12.0))
-                .px(px(24.0))
-                .pb(px(24.0))
-                .gap_3()
-                .children(cards);
-            if body_view != BodyView::Native && thread_count <= 1 {
-                content.into_any_element()
+            #[cfg(windows)]
+            let thread_webview_el: Option<gpui_kit::AnyElement> = if thread_count > 1 {
+                if body_view == BodyView::Html {
+                    let host = app.reader_webview.as_ref().unwrap().clone();
+                    let (version, _) = host.load_status();
+                    let visible = !app.reader_webview_yields_to_popup();
+                    let scale_factor = window.scale_factor();
+                    let app_reserved_strip_px = app.reader_webview_bottom_clearance_px();
+                    if let Some(snapshot) = host.popup_snapshot() {
+                        Some(render_webview_snapshot(snapshot, scale_factor, None))
+                    } else {
+                        Some(
+                            gpui_kit::canvas(
+                                move |bounds, window, cx| {
+                                    let (rect, clip) =
+                                        compute_webview_rects(bounds, window, app_reserved_strip_px);
+                                    cx.defer(move |_| {
+                                        if host.load_status() == (version, BodyView::Html) {
+                                            host.set_clipped_bounds(rect, clip);
+                                            host.set_visible(visible);
+                                        }
+                                    });
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .into_any_element(),
+                        )
+                    }
+                } else if body_view == BodyView::Loading {
+                    Some(
+                        body_loading(canvas, muted_fg, body_pending)
+                            .flex_1()
+                            .min_h_0()
+                            .into_any_element(),
+                    )
+                } else {
+                    None
+                }
             } else {
-                content.overflow_y_scrollbar().into_any_element()
+                None
+            };
+            #[cfg(not(windows))]
+            let thread_webview_el: Option<gpui_kit::AnyElement> = None;
+
+            if let Some(el) = thread_webview_el {
+                el
+            } else {
+                let content = v_flex()
+                    .id("reader-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .pt(px(12.0))
+                    .px(px(24.0))
+                    .pb(px(24.0))
+                    .gap_3()
+                    .children(cards);
+                if body_view != BodyView::Native && thread_count <= 1 {
+                    content.into_any_element()
+                } else {
+                    content.overflow_y_scrollbar().into_any_element()
+                }
             }
         })
         .when_some(drawer_element, |root, drawer| root.child(drawer))

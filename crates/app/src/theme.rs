@@ -75,6 +75,13 @@ pub(crate) fn reader_body_colors(dark: bool) -> (Hsla, Hsla) {
     }
 }
 
+/// 将 GPUI `Hsla` 转换为 `#rrggbb` 十六进制 CSS 颜色串。
+pub(crate) fn css_hex_color(color: Hsla) -> String {
+    let rgb = gpui_kit::Rgba::from(color);
+    let [r, g, b] = [rgb.r, rgb.g, rgb.b].map(|channel| (channel * 255.0).round() as u8);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
 /// 星标琥珀金十六进制值（与亮暗主题无关，对齐 Linux 原版 `#e5a50a`）。
 pub(crate) const STAR_GOLD: u32 = 0xe5_a5_0a;
 
