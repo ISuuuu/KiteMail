@@ -95,7 +95,7 @@ impl DemoStore {
             (
                 "Build Bot <ci@hylki.example>",
                 "[CI] x86_64-pc-windows-msvc 夜间构建完成",
-                "工作区 desktop/Cargo.toml 编译通过，未引入 GTK/Wayland 依赖。",
+                "工作区 Cargo.toml 编译通过，未引入 Linux 桌面依赖。",
                 "11:18",
                 true,
                 false,
@@ -919,7 +919,7 @@ impl DemoStore {
                 <p>你好，</p>\
                 <p>请确认以下三项核心指标已通过验证：</p>\
                 <ul>\
-                  <li><strong>MSVC 工具链</strong>：独立 <code>desktop/Cargo.toml</code> 工作区编译通过</li>\
+                  <li><strong>MSVC 工具链</strong>：工作区 <code>Cargo.toml</code> 编译通过</li>\
                   <li><strong>中文输入与复制</strong>：阅读器正文支持鼠标选中与 <code>Ctrl+C</code> 复制</li>\
                   <li><strong>隐私保护</strong>：默认拦截远程跟踪像素 <img src=\"https://tracker.hylki.example/pixel.png\"></li>\
                 </ul>\

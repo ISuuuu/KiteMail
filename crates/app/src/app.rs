@@ -320,6 +320,7 @@ impl Render for ComposeSplitDrag {
 #[derive(Clone)]
 pub(crate) struct CachedReaderBody {
     pub(crate) body_view_is_native: bool,
+    pub(crate) show_raw_source: bool,
     pub(crate) prefer_plain: bool,
     pub(crate) block_remote_images: bool,
     pub(crate) clean_links: bool,
@@ -833,6 +834,8 @@ pub(crate) struct HylkiApp {
     pub(crate) backfill: BackfillDriveState,
     pub(crate) current_page: MailPage,
     pub(crate) selected_message: Option<MessageDetail>,
+    /// 每当 `selected_message` 切换或正文/附件/线程顺序原地变更时递增，用于 WebView key O(1) 判等。
+    pub(crate) selected_detail_rev: u64,
     /// `selected_message` 是否仅是 `show_message_loading` 写入的空占位详情。
     pub(crate) selected_message_is_placeholder: bool,
     /// 正在等待远端正文的邮件 ID：用于立即占位显示并丢弃过期正文回包。
@@ -1446,6 +1449,7 @@ impl HylkiApp {
                 backfill: BackfillDriveState::default(),
                 current_page,
                 selected_message,
+                selected_detail_rev: 0,
                 selected_message_is_placeholder: false,
                 pending_body_message_id: None,
                 pending_mark_thread_seen: None,
@@ -1724,6 +1728,7 @@ impl HylkiApp {
                 items: Vec::new(),
             },
             selected_message: None,
+            selected_detail_rev: 0,
             selected_message_is_placeholder: false,
             pending_body_message_id: None,
             pending_mark_thread_seen: None,
@@ -2326,7 +2331,7 @@ impl HylkiApp {
                     folders_updated = true;
                     self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                     self.current_view = CurrentView::UnifiedInbox;
-                    self.selected_message = None;
+                    self.clear_selected_message();
                     self.with_settings_window(cx, move |win, window, cx| {
                         win.on_account_deleted(account_id, window, cx);
                     });
@@ -2386,7 +2391,7 @@ impl HylkiApp {
                         if current_disabled {
                             self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                             self.current_view = CurrentView::UnifiedInbox;
-                            self.selected_message = None;
+                            self.clear_selected_message();
                         }
                     }
                     folders_updated = true;
@@ -2432,7 +2437,7 @@ impl HylkiApp {
                     if selected_removed {
                         self.selected_folder_id = UNIFIED_INBOX_FOLDER_ID;
                         self.current_view = CurrentView::UnifiedInbox;
-                        self.selected_message = None;
+                        self.clear_selected_message();
                         self.reset_list_pagination();
                         self.reload_current_page(cx);
                     }
@@ -3520,12 +3525,14 @@ impl HylkiApp {
                 } => {
                     self.downloading_attachment_ids.remove(&attachment_id);
                     self.attachment_item_errors.remove(&attachment_id);
+                    let mut rev_dirty = false;
                     if let Some(ref mut detail) = self.selected_message {
                         if detail.id == message_id {
                             for att in &mut detail.attachments {
                                 if att.id == attachment_id {
                                     att.downloaded = true;
                                     att.size_bytes = size_bytes;
+                                    rev_dirty = true;
                                 }
                             }
                         }
@@ -3535,10 +3542,14 @@ impl HylkiApp {
                                     if att.id == attachment_id {
                                         att.downloaded = true;
                                         att.size_bytes = size_bytes;
+                                        rev_dirty = true;
                                     }
                                 }
                             }
                         }
+                    }
+                    if rev_dirty {
+                        self.bump_selected_detail_rev();
                     }
                     for item in &mut self.gallery_items {
                         if item.id == attachment_id {
@@ -3564,17 +3575,21 @@ impl HylkiApp {
                     if self.pending_strip_attachment_id == Some(attachment_id) {
                         self.pending_strip_attachment_id = None;
                     }
+                    let mut rev_dirty = false;
                     if let Some(ref mut sel) = self.selected_message {
                         if sel.id == message_id {
                             sel.attachments = attachments.clone();
+                            rev_dirty = true;
                         }
-                    }
-                    if let Some(ref mut sel) = self.selected_message {
                         for tm in &mut sel.thread_messages {
                             if tm.id == message_id {
                                 tm.attachments = attachments.clone();
+                                rev_dirty = true;
                             }
                         }
+                    }
+                    if rev_dirty {
+                        self.bump_selected_detail_rev();
                     }
                 }
                 WorkerEvent::AttachmentStripFailed {
@@ -3608,7 +3623,7 @@ impl HylkiApp {
                         self.folders_by_account.clear();
                         self.outbox_by_account.clear();
                         self.last_unread_by_account.clear();
-                        self.selected_message = None;
+                        self.clear_selected_message();
                         self.selected_message_is_placeholder = false;
                         self.selected_message_ids.clear();
                         self.pending_body_message_id = None;
@@ -4113,7 +4128,7 @@ impl HylkiApp {
         self.close_sidebar_peek();
         self.current_view = view;
         self.reset_list_pagination();
-        self.selected_message = None;
+        self.clear_selected_message();
         self.pending_mark_thread_seen = None;
         self.expanded_threads.clear();
         self.thread_children_cache.clear();
@@ -4156,7 +4171,7 @@ impl HylkiApp {
         self.search_input
             .update(cx, |s, cx| s.set_value(query, window, cx));
         self.reset_list_pagination();
-        self.selected_message = None;
+        self.clear_selected_message();
         self.pending_mark_thread_seen = None;
         self.expanded_threads.clear();
         self.thread_children_cache.clear();
@@ -4344,7 +4359,7 @@ impl HylkiApp {
         self.selected_folder_id = folder_id;
         self.current_view = CurrentView::AccountFolder;
         self.reset_list_pagination();
-        self.selected_message = None;
+        self.clear_selected_message();
         self.pending_mark_thread_seen = None;
         self.expanded_threads.clear();
         self.thread_children_cache.clear();
@@ -4368,7 +4383,7 @@ impl HylkiApp {
             if let Some(d) = first_detail {
                 self.set_selected_message(d);
             } else {
-                self.selected_message = None;
+                self.clear_selected_message();
             }
             cx.notify();
             return;
@@ -4681,7 +4696,7 @@ impl HylkiApp {
             if let Some(detail) = self.demo_message_detail(message_id) {
                 self.set_selected_message(detail);
             } else {
-                self.selected_message = None;
+                self.clear_selected_message();
             }
             if should_mark_now {
                 self.mark_message_seen_now(account_id, message_id, uid, folder_path);
@@ -5044,6 +5059,18 @@ impl HylkiApp {
         };
         self.selected_message_is_placeholder = true;
         self.selected_message = Some(placeholder);
+        self.bump_selected_detail_rev();
+    }
+
+    #[inline]
+    pub(crate) fn bump_selected_detail_rev(&mut self) {
+        self.selected_detail_rev = self.selected_detail_rev.wrapping_add(1);
+    }
+
+    fn clear_selected_message(&mut self) {
+        if self.selected_message.take().is_some() {
+            self.bump_selected_detail_rev();
+        }
     }
 
     /// 更新当前选中邮件详情并初始化会话卡片折叠态 / 原文态。
@@ -5087,6 +5114,7 @@ impl HylkiApp {
         self.pending_body_message_id = None;
         self.selected_message_is_placeholder = false;
         self.selected_message = Some(detail);
+        self.bump_selected_detail_rev();
     }
 
     /// 切换指定会话卡片的折叠/展开态。
@@ -5212,7 +5240,7 @@ impl HylkiApp {
             None
         };
         if was_displayed {
-            self.selected_message = None;
+            self.clear_selected_message();
             self.selected_message_is_placeholder = false;
         }
         // 先请求相邻邮件正文、后刷新列表：worker 按顺序处理，详情先回、页面后回，
@@ -8936,7 +8964,7 @@ impl HylkiApp {
         if let Some(detail) = selected_message {
             self.set_selected_message(detail);
         } else {
-            self.selected_message = None;
+            self.clear_selected_message();
         }
         let mut folders_by_account = BTreeMap::new();
         folders_by_account.insert(1, self.demo_store.folders.clone());
@@ -10280,7 +10308,7 @@ impl HylkiApp {
         if self.current_view == CurrentView::AccountFolder && self.selected_folder_id == folder_id {
             self.current_page.items.clear();
             self.current_page.total = 0;
-            self.selected_message = None;
+            self.clear_selected_message();
         }
         if self.worker.is_some() {
             self.push_toast(
@@ -10447,7 +10475,7 @@ impl HylkiApp {
             if let Some(detail) = self.demo_message_detail(message_id) {
                 self.set_selected_message(detail);
             } else {
-                self.selected_message = None;
+                self.clear_selected_message();
             }
             cx.notify();
             return;
@@ -11157,10 +11185,15 @@ impl HylkiApp {
             self.reload_current_page(cx);
         }
         if thread_order_changed {
+            let mut rev_dirty = false;
             if let Some(ref mut detail) = self.selected_message {
                 if detail.thread_messages.len() > 1 {
                     detail.thread_messages.reverse();
+                    rev_dirty = true;
                 }
+            }
+            if rev_dirty {
+                self.bump_selected_detail_rev();
             }
         }
         if fold_changed || thread_order_changed {
@@ -13203,6 +13236,7 @@ impl Render for HylkiApp {
                     this.prefs.single_key_shortcuts,
                 ) {
                     if this.selected_message.take().is_some() {
+                        this.bump_selected_detail_rev();
                         cx.notify();
                     }
                 }

@@ -131,7 +131,7 @@ pub(crate) fn format_raw_source(
 /// 为单张会话卡片构造独立的 `...` 更多操作菜单（B-2：回复 / 回复全部 / 转发 /
 /// 标为未读 / 星标切换 / 归档 / 删除 / 导出 .eml / 复制正文 / 查看原文）。
 fn build_card_more_menu(
-    card_detail: MessageDetail,
+    card_detail: std::sync::Arc<MessageDetail>,
     show_raw_source: bool,
     demo_mode: bool,
     eml_exporting: bool,
@@ -145,11 +145,8 @@ fn build_card_more_menu(
     let folder_path = card_detail.folder_path.clone();
     let card_flagged = card_detail.flagged;
     let body_for_copy = card_detail.body_text.clone();
-    let reply_detail = card_detail.clone();
-    let reply_all_detail = card_detail.clone();
     let unsubscribe_url = card_detail.unsubscribe_url.clone();
     let unsubscribe_one_click = card_detail.unsubscribe_one_click;
-    let forward_detail = card_detail;
 
     Button::new(("reader-card-more", msg_id))
         .ghost()
@@ -168,9 +165,9 @@ fn build_card_more_menu(
             let e_copy = entity.clone();
             let e_raw = entity.clone();
             let e_unsub = entity.clone();
-            let d_reply = reply_detail.clone();
-            let d_reply_all = reply_all_detail.clone();
-            let d_forward = forward_detail.clone();
+            let d_reply = std::sync::Arc::clone(&card_detail);
+            let d_reply_all = std::sync::Arc::clone(&card_detail);
+            let d_forward = std::sync::Arc::clone(&card_detail);
             let copy_text = body_for_copy.clone();
             let folder_seen = folder_path.clone();
             let folder_flag = folder_path.clone();
@@ -181,7 +178,7 @@ fn build_card_more_menu(
                     PopupMenuItem::new("回复")
                         .icon(Icon::new(IconName::Reply))
                         .on_click(move |_, window, cx| {
-                            let d = d_reply.clone();
+                            let d = std::sync::Arc::clone(&d_reply);
                             e_reply.update(cx, |this, cx| {
                                 this.start_reply(&d, window, cx);
                             });
@@ -191,7 +188,7 @@ fn build_card_more_menu(
                     PopupMenuItem::new("回复全部")
                         .icon(Icon::new(IconName::ReplyAll))
                         .on_click(move |_, window, cx| {
-                            let d = d_reply_all.clone();
+                            let d = std::sync::Arc::clone(&d_reply_all);
                             e_reply_all.update(cx, |this, cx| {
                                 this.start_reply_all(&d, window, cx);
                             });
@@ -201,7 +198,7 @@ fn build_card_more_menu(
                     PopupMenuItem::new("转发")
                         .icon(Icon::new(IconName::Forward))
                         .on_click(move |_, window, cx| {
-                            let d = d_forward.clone();
+                            let d = std::sync::Arc::clone(&d_forward);
                             e_forward.update(cx, |this, cx| {
                                 this.start_forward(&d, window, cx);
                             });
@@ -356,7 +353,10 @@ fn compute_webview_rects(
     bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
     window: &gpui_kit::Window,
     reserved_bottom: f32,
-) -> (windows::Win32::Foundation::RECT, windows::Win32::Foundation::RECT) {
+) -> (
+    windows::Win32::Foundation::RECT,
+    windows::Win32::Foundation::RECT,
+) {
     let scale = window.scale_factor();
     let rect = windows::Win32::Foundation::RECT {
         left: (bounds.origin.x.as_f32() * scale).round() as i32,
@@ -550,23 +550,13 @@ fn render_message_card(
     // 并拆出历史引用块以支持默认折叠（`⋯ 显示引用内容 (N 行)`）。
     let body_view_is_native = body_view == BodyView::Native;
     let (main_html, quoted_part, blocked_images): (String, Option<(String, usize)>, usize) =
-        if show_raw_source {
-            let raw = format_raw_source(
-                rfc_message_id,
-                sender,
-                recipients,
-                cc,
-                &formatted_date,
-                subject,
-                body_text,
-                body_html,
-            );
-            (plain_text_to_html(&raw), None, 0)
-        } else if let Some(cached) = app.reader_body_cache.get(&msg_id).filter(|c| {
+        if let Some(cached) = app.reader_body_cache.get(&msg_id).filter(|c| {
             c.body_view_is_native == body_view_is_native
-                && c.prefer_plain == prefer_plain
-                && c.block_remote_images == block_remote_images
-                && c.clean_links == clean_links
+                && c.show_raw_source == show_raw_source
+                && (show_raw_source
+                    || (c.prefer_plain == prefer_plain
+                        && c.block_remote_images == block_remote_images
+                        && c.clean_links == clean_links))
                 && c.raw_html.as_deref() == body_html
                 && c.body_text == body_text
         }) {
@@ -576,7 +566,19 @@ fn render_message_card(
                 cached.blocked_images,
             )
         } else {
-            let computed = if !prefer_plain {
+            let computed = if show_raw_source {
+                let raw = format_raw_source(
+                    rfc_message_id,
+                    sender,
+                    recipients,
+                    cc,
+                    &formatted_date,
+                    subject,
+                    body_text,
+                    body_html,
+                );
+                (plain_text_to_html(&raw), None, 0)
+            } else if !prefer_plain {
                 if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
                     let (sanitized, blocked) = sanitize_html_for_display_with_options(
                         raw_html,
@@ -613,6 +615,7 @@ fn render_message_card(
                 msg_id,
                 crate::app::CachedReaderBody {
                     body_view_is_native,
+                    show_raw_source,
                     prefer_plain,
                     block_remote_images,
                     clean_links,
@@ -691,7 +694,9 @@ fn render_message_card(
         .collect();
 
     v_flex()
-        .when(body_view != BodyView::Native, |card| card.flex_1().min_h_0())
+        .when(body_view != BodyView::Native, |card| {
+            card.flex_1().min_h_0()
+        })
         .when(card_chrome, |card| {
             card.bg(card_bg)
                 .rounded(px(12.0))
@@ -1088,7 +1093,11 @@ fn render_message_card(
             })
         })
         .when(body_view == BodyView::Loading, |card| {
-            card.child(body_loading(body_bg, body_muted, body_pending).flex_1().min_h_0())
+            card.child(
+                body_loading(body_bg, body_muted, body_pending)
+                    .flex_1()
+                    .min_h_0(),
+            )
         })
         .when(body_view == BodyView::Html, |card| {
             #[cfg(windows)]
@@ -1273,7 +1282,7 @@ pub(crate) fn render_with_pane_top(
     let entity_for_overflow = cx.entity();
     let win_controls = window_controls::render_window_controls("reader-wc", window, cx);
 
-    let Some(detail) = app.selected_message.clone() else {
+    let Some(detail) = app.selected_message.clone().map(std::sync::Arc::new) else {
         return v_flex()
             .flex_1()
             .min_w_0()
@@ -1376,11 +1385,10 @@ pub(crate) fn render_with_pane_top(
             background,
             foreground,
         };
-        let key = html.filter(|_| eligible).map(|html| {
+        let key = html.filter(|_| eligible).map(|_| {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             detail.id.hash(&mut hasher);
-            html.hash(&mut hasher);
-            detail.subject.hash(&mut hasher);
+            app.selected_detail_rev.hash(&mut hasher);
             appearance.hash(&mut hasher);
             block_remote.hash(&mut hasher);
             false.hash(&mut hasher);
@@ -1447,7 +1455,7 @@ pub(crate) fn render_with_pane_top(
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             true.hash(&mut hasher);
             detail.id.hash(&mut hasher);
-            detail.subject.hash(&mut hasher);
+            app.selected_detail_rev.hash(&mut hasher);
             detail.thread_messages.len().hash(&mut hasher);
             zoom_percent.hash(&mut hasher);
             app.prefs.ui_text_scale_percent.hash(&mut hasher);
@@ -1455,7 +1463,6 @@ pub(crate) fn render_with_pane_top(
             app.prefs.theme_id.hash(&mut hasher);
             date_style.hash(&mut hasher);
             clock_style.hash(&mut hasher);
-            clean_links.hash(&mut hasher);
             show_remote_banner.hash(&mut hasher);
             always_show_recipients.hash(&mut hasher);
             card_attachments.hash(&mut hasher);
@@ -1464,22 +1471,9 @@ pub(crate) fn render_with_pane_top(
             body_pending.hash(&mut hasher);
             for tm in &detail.thread_messages {
                 tm.id.hash(&mut hasher);
-                tm.subject.hash(&mut hasher);
-                tm.sender.hash(&mut hasher);
-                tm.recipients.hash(&mut hasher);
-                tm.cc.hash(&mut hasher);
-                tm.date_ts.hash(&mut hasher);
-                tm.date_display.hash(&mut hasher);
-                tm.body_loaded.hash(&mut hasher);
-                tm.body_text.hash(&mut hasher);
-                tm.body_html.hash(&mut hasher);
-                for att in &tm.attachments {
-                    att.id.hash(&mut hasher);
-                    att.filename.hash(&mut hasher);
-                    att.size_bytes.hash(&mut hasher);
-                    att.downloaded.hash(&mut hasher);
-                }
-                app.raw_source_message_ids.contains(&tm.id).hash(&mut hasher);
+                app.raw_source_message_ids
+                    .contains(&tm.id)
+                    .hash(&mut hasher);
                 (!app.remote_images_allowed(tm.id, &tm.sender)).hash(&mut hasher);
                 let card_dark = app
                     .message_bg_picks
@@ -1488,10 +1482,6 @@ pub(crate) fn render_with_pane_top(
                     .or(forced_theme_bg)
                     .unwrap_or(app.dark_mode);
                 card_dark.hash(&mut hasher);
-                if tm.id == detail.id {
-                    detail.auth_results.hash(&mut hasher);
-                    detail.unsubscribe_url.hash(&mut hasher);
-                }
             }
             hasher.finish()
         });
@@ -1557,7 +1547,6 @@ pub(crate) fn render_with_pane_top(
                 ui_text_scale_percent: app.prefs.ui_text_scale_percent,
                 date_style: &date_style,
                 clock_style: &clock_style,
-                clean_links,
                 show_remote_banner,
                 always_show_recipients,
                 card_attachments,
@@ -1698,7 +1687,8 @@ pub(crate) fn render_with_pane_top(
                         tm.subject.clone()
                     };
                     let is_anchor = tm.id == detail.id;
-                    let card_detail = crate::app::build_thread_card_detail(&detail, tm);
+                    let card_detail =
+                        std::sync::Arc::new(crate::app::build_thread_card_detail(&detail, tm));
                     let eml_exporting = app.pending_eml_export == Some(tm.id);
                     let menu = build_card_more_menu(
                         card_detail,
@@ -1765,7 +1755,7 @@ pub(crate) fn render_with_pane_top(
         let block_remote = !app.remote_images_allowed(detail.id, &detail.sender);
         let eml_exporting = app.pending_eml_export == Some(detail.id);
         let menu = build_card_more_menu(
-            detail.clone(),
+            std::sync::Arc::clone(&detail),
             show_raw_source,
             app.demo_mode,
             eml_exporting,
@@ -1871,10 +1861,6 @@ pub(crate) fn render_with_pane_top(
     let find_query = app.reader_find_query.clone();
     let find_active = app.reader_find_active_match;
     let find_total = app.reader_find_total_matches;
-    let print_detail = detail.clone();
-    let popout_detail = detail.clone();
-    let overflow_print_detail = detail.clone();
-    let overflow_popout_detail = detail.clone();
 
     v_flex()
         .flex_1()
@@ -1898,31 +1884,33 @@ pub(crate) fn render_with_pane_top(
                 .items_center()
                 .border_b_1()
                 .border_color(border)
-                .child({
-                    let reply_detail = detail.clone();
-                    let reply_all_detail = detail.clone();
-                    let forward_detail = detail.clone();
-                    let star_detail = detail.clone();
+                .child(
                     h_flex()
                         .gap_1()
                         .items_center()
                         .child(
                             action_button("reader-reply", IconName::Reply, "回复").on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    this.start_reply(&reply_detail, window, cx);
+                                cx.listener(|this, _, window, cx| {
+                                    if let Some(detail) = this.selected_message.clone() {
+                                        this.start_reply(&detail, window, cx);
+                                    }
                                 }),
                             ),
                         )
                         .child(
                             action_button("reader-reply-all", IconName::ReplyAll, "回复全部")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.start_reply_all(&reply_all_detail, window, cx);
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if let Some(detail) = this.selected_message.clone() {
+                                        this.start_reply_all(&detail, window, cx);
+                                    }
                                 })),
                         )
                         .child(
                             action_button("reader-forward", IconName::Forward, "转发").on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    this.start_forward(&forward_detail, window, cx);
+                                cx.listener(|this, _, window, cx| {
+                                    if let Some(detail) = this.selected_message.clone() {
+                                        this.start_forward(&detail, window, cx);
+                                    }
                                 }),
                             ),
                         )
@@ -1938,8 +1926,10 @@ pub(crate) fn render_with_pane_top(
                                 // 激活（已加星标）时统一用琥珀金星标色。
                                 .when(flagged, |btn| btn.text_color(theme::star_gold()))
                                 .tooltip(if flagged { "取消星标" } else { "加星标" })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_flagged(&star_detail, cx);
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(detail) = this.selected_message.clone() {
+                                        this.toggle_flagged(&detail, cx);
+                                    }
                                 })),
                         )
                         // 迭代 2：归档 / 删除 / 标垃圾 / 移动到文件夹接线（IMAP MOVE / Graph move）；
@@ -2023,8 +2013,8 @@ pub(crate) fn render_with_pane_top(
                                     }),
                                 ),
                             )
-                        })
-                })
+                        }),
+                )
                 .child(window_controls::drag_spacer())
                 // 右侧操作组：动态标记已读/未读 + 复制正文（严格放在 48px 顶栏内）。
                 // 缩放改为 Ctrl+= / Ctrl+- / Ctrl+0 快捷键 + 标题区缩放胶囊（S-8），不再常驻顶栏。
@@ -2037,8 +2027,6 @@ pub(crate) fn render_with_pane_top(
                         .pr_1()
                         .items_center()
                         .when(!narrow_topbar, |el| {
-                            let d_print = print_detail.clone();
-                            let d_pop = popout_detail.clone();
                             el.child(
                                 Button::new("reader-toggle-seen")
                                     .ghost()
@@ -2081,8 +2069,10 @@ pub(crate) fn render_with_pane_top(
                                     "打印 / 导出 PDF",
                                 )
                                 .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.open_print_preview(d_print.clone(), cx);
+                                    |this, _, _, cx| {
+                                        if let Some(detail) = this.selected_message.clone() {
+                                            this.open_print_preview(detail, cx);
+                                        }
                                     },
                                 )),
                             )
@@ -2093,16 +2083,16 @@ pub(crate) fn render_with_pane_top(
                                     "在新窗口打开邮件",
                                 )
                                 .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.pop_out_message_window(d_pop.clone(), cx);
+                                    |this, _, _, cx| {
+                                        if let Some(detail) = this.selected_message.clone() {
+                                            this.pop_out_message_window(detail, cx);
+                                        }
                                     },
                                 )),
                             )
                         })
                         .when(narrow_topbar, |el| {
                             let popup_entity = cx.entity();
-                            let d_print = overflow_print_detail.clone();
-                            let d_pop = overflow_popout_detail.clone();
                             el.child(
                                 Button::new("reader-overflow")
                                     .ghost()
@@ -2115,8 +2105,6 @@ pub(crate) fn render_with_pane_top(
                                         let e_find = entity_for_overflow.clone();
                                         let e_print = entity_for_overflow.clone();
                                         let e_pop = entity_for_overflow.clone();
-                                        let dp = d_print.clone();
-                                        let dpop = d_pop.clone();
                                         menu.item(
                                             PopupMenuItem::new(if is_unread {
                                                 "标记为已读"
@@ -2157,9 +2145,12 @@ pub(crate) fn render_with_pane_top(
                                             PopupMenuItem::new("打印 / 导出 PDF")
                                                 .icon(Icon::new(IconName::FileText))
                                                 .on_click(move |_, _, cx| {
-                                                    let d = dp.clone();
                                                     e_print.update(cx, |app, cx| {
-                                                        app.open_print_preview(d, cx);
+                                                        if let Some(d) =
+                                                            app.selected_message.clone()
+                                                        {
+                                                            app.open_print_preview(d, cx);
+                                                        }
                                                     });
                                                 }),
                                         )
@@ -2167,9 +2158,12 @@ pub(crate) fn render_with_pane_top(
                                             PopupMenuItem::new("在新窗口打开邮件")
                                                 .icon(Icon::new(IconName::ExternalLink))
                                                 .on_click(move |_, _, cx| {
-                                                    let d = dpop.clone();
                                                     e_pop.update(cx, |app, cx| {
-                                                        app.pop_out_message_window(d, cx);
+                                                        if let Some(d) =
+                                                            app.selected_message.clone()
+                                                        {
+                                                            app.pop_out_message_window(d, cx);
+                                                        }
                                                     });
                                                 }),
                                         )
@@ -2423,8 +2417,11 @@ pub(crate) fn render_with_pane_top(
                         Some(
                             gpui_kit::canvas(
                                 move |bounds, window, cx| {
-                                    let (rect, clip) =
-                                        compute_webview_rects(bounds, window, app_reserved_strip_px);
+                                    let (rect, clip) = compute_webview_rects(
+                                        bounds,
+                                        window,
+                                        app_reserved_strip_px,
+                                    );
                                     cx.defer(move |_| {
                                         if host.load_status() == (version, BodyView::Html) {
                                             host.set_clipped_bounds(rect, clip);

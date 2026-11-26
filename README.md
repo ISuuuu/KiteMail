@@ -72,7 +72,7 @@ cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc
 
 - [`crates/`](crates/): Rust workspace crates ([`crates/app`](crates/app) `kitemail` desktop UI and [`crates/mail-core`](crates/mail-core) `kitemail-mail-core` library)
 - [`.github/`](.github/): Windows x64 CI/CD workflow and NSIS installer script
-- [`data/`](data/), [`resources/`](resources/): App icons, welcome wordmarks, brand/SVG assets, and contributor lists
+- [`data/`](data/): App icons, welcome wordmarks, brand/SVG assets, and contributor lists
 - [`tools/release-notes.sh`](tools/release-notes.sh): Release notes generator for GitHub Releases
 - [`docs/`](docs/): Licensing notices, upstream credits, and security policy
 - [`CHANGELOG.md`](CHANGELOG.md): Windows client release history and earlier upstream changelog

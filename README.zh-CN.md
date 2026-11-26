@@ -72,7 +72,7 @@ cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc
 
 - [`crates/`](crates/)：Rust 工作区源码（[`crates/app`](crates/app) `kitemail` 桌面端主程序与 [`crates/mail-core`](crates/mail-core) `kitemail-mail-core` 邮件核心库）
 - [`.github/`](.github/)：Windows x64 CI/CD 工作流与 NSIS 安装包脚本
-- [`data/`](data/)、[`resources/`](resources/)：应用图标、欢迎页字标、品牌/SVG 图标资源与贡献者名单
+- [`data/`](data/)：应用图标、欢迎页字标、品牌/SVG 图标资源与贡献者名单
 - [`tools/release-notes.sh`](tools/release-notes.sh)：GitHub Release 说明生成脚本
 - [`docs/`](docs/)：第三方许可声明、上游致谢名单与安全策略
 - [`CHANGELOG.md`](CHANGELOG.md)：Windows 客户端更新日志与早期历史记录

@@ -734,6 +734,7 @@ fn message_row(
     list_focused: bool,
     kbd_cursor: bool,
     is_wide: bool,
+    now_ts: i64,
     p: &theme::HylkiPalette,
     cx: &mut Context<HylkiApp>,
 ) -> ContextMenu<Stateful<Div>> {
@@ -786,12 +787,6 @@ fn message_row(
     let active_sel = is_selected && list_focused;
     let inactive_sel = is_selected && !list_focused;
     let is_thread_expanded = app.expanded_threads.contains(&msg_id);
-    let msg_for_thread = msg.clone();
-    let msg_for_thread_wide = msg.clone();
-    let now_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let date_text = kitemail_mail_core::format_message_date(
         msg.date_ts,
         &msg.date_display,
@@ -1109,68 +1104,66 @@ fn message_row(
                         p.text_muted
                     })
                     .child(SharedString::from(date_text.clone())),
-                ListColumn::Subject => {
-                    let msg_chip = msg_for_thread_wide.clone();
-                    h_flex()
-                        .flex_1()
-                        .min_w(px(80.0))
-                        .items_center()
-                        .gap_1p5()
-                        .child(
+                ListColumn::Subject => h_flex()
+                    .flex_1()
+                    .min_w(px(80.0))
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(if unread {
+                                gpui_kit::FontWeight::SEMIBOLD
+                            } else {
+                                gpui_kit::FontWeight::NORMAL
+                            })
+                            .text_color(if active_sel {
+                                p.accent_fg
+                            } else if unread {
+                                p.text
+                            } else {
+                                p.text.opacity(0.85)
+                            })
+                            .child(SharedString::from(msg.subject.clone())),
+                    )
+                    .when(msg.thread_count > 1, |el| {
+                        let msg_chip = msg.clone();
+                        el.child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .font_weight(if unread {
-                                    gpui_kit::FontWeight::SEMIBOLD
-                                } else {
-                                    gpui_kit::FontWeight::NORMAL
-                                })
-                                .text_color(if active_sel {
+                                .id(("thread-chip", msg_id))
+                                .flex_shrink_0()
+                                .px(px(7.0))
+                                .py(px(2.0))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .bg(if active_sel {
                                     p.accent_fg
-                                } else if unread {
+                                } else {
+                                    p.text.opacity(0.10)
+                                })
+                                .text_size(px(10.0))
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(if active_sel {
+                                    p.accent
+                                } else if inactive_sel {
                                     p.text
                                 } else {
-                                    p.text.opacity(0.85)
+                                    p.text.opacity(0.70)
                                 })
-                                .child(SharedString::from(msg.subject.clone())),
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_thread_expand(&msg_chip, cx);
+                                }))
+                                .child(SharedString::from(format!(
+                                    "{} {}",
+                                    msg.thread_count,
+                                    if is_thread_expanded { "▾" } else { "▸" }
+                                ))),
                         )
-                        .when(msg.thread_count > 1, |el| {
-                            el.child(
-                                div()
-                                    .id(("thread-chip", msg_id))
-                                    .flex_shrink_0()
-                                    .px(px(7.0))
-                                    .py(px(2.0))
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .bg(if active_sel {
-                                        p.accent_fg
-                                    } else {
-                                        p.text.opacity(0.10)
-                                    })
-                                    .text_size(px(10.0))
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                    .text_color(if active_sel {
-                                        p.accent
-                                    } else if inactive_sel {
-                                        p.text
-                                    } else {
-                                        p.text.opacity(0.70)
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_thread_expand(&msg_chip, cx);
-                                    }))
-                                    .child(SharedString::from(format!(
-                                        "{} {}",
-                                        msg.thread_count,
-                                        if is_thread_expanded { "▾" } else { "▸" }
-                                    ))),
-                            )
-                        })
-                }
+                    }),
             };
             r = r.child(cell);
         }
@@ -1274,7 +1267,7 @@ fn message_row(
                                     )
                                     // B-4 + WP-08 会话计数胶囊（点击在列表内联展开/收起子邮件树）。
                                     .when(msg.thread_count > 1, |icons| {
-                                        let msg_chip = msg_for_thread.clone();
+                                        let msg_chip = msg.clone();
                                         icons.child(
                                             div()
                                                 .id(("thread-chip", msg_id))
@@ -1453,6 +1446,10 @@ pub(crate) fn render(
     };
 
     // 草稿视图行（随搜索过滤）。
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let is_wide = row_is_wide(app, drafts_view);
     let draft_rows: Vec<gpui_kit::AnyElement> = if drafts_view {
         app.drafts
@@ -1470,6 +1467,7 @@ pub(crate) fn render(
                     // 草稿行不参与键盘游标（无选择语义）。
                     false,
                     false,
+                    now_ts,
                     &p,
                     cx,
                 )
@@ -1509,10 +1507,6 @@ pub(crate) fn render(
     // （今天 / 昨天 / 最近 7 天 / 最近 14 天 / 更早）。
     let show_date_groups =
         !drafts_view && app.prefs.list_group_by_date && current_sort.uses_date_groups();
-    let now_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let mut group_counts: HashMap<&'static str, usize> = HashMap::new();
     if show_date_groups {
         for msg in &merged_items {
@@ -1522,6 +1516,7 @@ pub(crate) fn render(
     }
     let mut filtered_rows: Vec<gpui_kit::AnyElement> = Vec::with_capacity(merged_items.len() + 8);
     if !drafts_view {
+        let collapses_threads = app.current_list_collapses_threads();
         let mut last_group: Option<&'static str> = None;
         for msg in &merged_items {
             let mut group_collapsed = false;
@@ -1590,9 +1585,12 @@ pub(crate) fn render(
             if group_collapsed {
                 continue;
             }
+            let is_collapsed_head = collapses_threads
+                && msg.thread_count > 1
+                && !app.expanded_threads.contains(&msg.id);
             let is_selected = selected_id == Some(msg.id)
                 || app.selected_message_ids.contains(&msg.id)
-                || (app.is_collapsed_thread_head(msg.id)
+                || (is_collapsed_head
                     && app
                         .selected_message
                         .as_ref()
@@ -1609,6 +1607,7 @@ pub(crate) fn render(
                     list_focused,
                     kbd_cursor,
                     is_wide,
+                    now_ts,
                     &p,
                     cx,
                 )
@@ -1679,6 +1678,7 @@ pub(crate) fn render(
                                 list_focused,
                                 child_kbd,
                                 is_wide,
+                                now_ts,
                                 &p,
                                 cx,
                             )));

@@ -460,6 +460,9 @@ fn should_allow_main_navigation(state: &State, url: &str) -> bool {
 }
 
 fn apply_navigation_completed(state: &mut State, navigation_id: u64, success: bool) -> bool {
+    if state.closed {
+        return false;
+    }
     if state.navigation_id == Some(navigation_id) {
         state.loaded = success;
         state.failed = !success;
@@ -732,7 +735,7 @@ impl WebViewHost {
 
     pub(crate) fn load_status(&self) -> (u64, BodyView) {
         let state = self.0.borrow();
-        let view = if state.failed {
+        let view = if state.failed || state.closed {
             BodyView::Native
         } else if state.loaded {
             BodyView::Html
@@ -785,63 +788,11 @@ impl WebViewHost {
         }
     }
     pub(crate) fn try_suspend(&self) {
-        let (controller, version) = {
-            let mut state = self.0.borrow_mut();
-            if state.closed
-                || state.visible
-                || state.popup_open
-                || state.suspended
-                || state.suspending
-            {
-                return;
-            }
-            let Some(controller) = state.controller.clone() else {
-                return;
-            };
-            state.suspending = true;
-            (controller, state.version)
-        };
-        let Ok(view) = (unsafe { controller.CoreWebView2() }) else {
-            self.0.borrow_mut().suspending = false;
-            return;
-        };
-        let Ok(view3) = view.cast::<ICoreWebView2_3>() else {
-            self.0.borrow_mut().suspending = false;
-            return;
-        };
-        let weak = Rc::downgrade(&self.0);
-        let handler = TrySuspendCompletedHandler::create(Box::new(move |result, succeeded| {
-            if let Some(state) = weak.upgrade() {
-                let mut inner = state.borrow_mut();
-                inner.suspending = false;
-                if inner.version == version && !inner.visible && !inner.closed {
-                    inner.suspended = result.is_ok() && succeeded;
-                }
-            }
-            Ok(())
-        }));
-        if unsafe { view3.TrySuspend(&handler) }.is_err() {
-            self.0.borrow_mut().suspending = false;
-        }
+        try_suspend_state(&self.0);
     }
+
     fn resume_if_needed(&self, controller: &ICoreWebView2Controller) {
-        {
-            let mut state = self.0.borrow_mut();
-            state.suspended = false;
-            state.suspending = false;
-        }
-        if let Ok(view) = unsafe { controller.CoreWebView2() } {
-            if let Ok(view3) = view.cast::<ICoreWebView2_3>() {
-                let mut is_suspended = windows::core::BOOL::default();
-                if unsafe { view3.IsSuspended(&mut is_suspended) }.is_ok()
-                    && is_suspended.as_bool()
-                {
-                    unsafe {
-                        let _ = view3.Resume();
-                    }
-                }
-            }
-        }
+        resume_controller(&self.0, controller);
     }
     pub(crate) fn set_bounds(&self, bounds: RECT) {
         self.set_clipped_bounds(bounds, bounds);
@@ -1220,6 +1171,13 @@ impl WebViewHost {
         mode: DocumentMode,
         suspend_after_load: bool,
     ) -> windows::core::Result<()> {
+        {
+            let mut state = self.0.borrow_mut();
+            if state.closed {
+                state.failed = true;
+                return Ok(());
+            }
+        }
         self.set_visible(false);
         let mut state = self.0.borrow_mut();
         state.document = document;
@@ -1266,6 +1224,73 @@ unsafe fn navigate_to(
     controller
         .CoreWebView2()?
         .Navigate(windows::core::PCWSTR(url.as_ptr()))
+}
+
+fn resume_controller(state: &Rc<RefCell<State>>, controller: &ICoreWebView2Controller) {
+    {
+        let mut inner = state.borrow_mut();
+        inner.suspended = false;
+        inner.suspending = false;
+    }
+    if let Ok(view) = unsafe { controller.CoreWebView2() } {
+        if let Ok(view3) = view.cast::<ICoreWebView2_3>() {
+            let mut is_suspended = windows::core::BOOL::default();
+            if unsafe { view3.IsSuspended(&mut is_suspended) }.is_ok() && is_suspended.as_bool() {
+                unsafe {
+                    let _ = view3.Resume();
+                }
+            }
+        }
+    }
+}
+
+fn try_suspend_state(state: &Rc<RefCell<State>>) {
+    let (controller, version) = {
+        let mut inner = state.borrow_mut();
+        if inner.closed || inner.visible || inner.popup_open || inner.suspended || inner.suspending
+        {
+            return;
+        }
+        let Some(controller) = inner.controller.clone() else {
+            return;
+        };
+        inner.suspending = true;
+        (controller, inner.version)
+    };
+    let Ok(view) = (unsafe { controller.CoreWebView2() }) else {
+        state.borrow_mut().suspending = false;
+        return;
+    };
+    let Ok(view3) = view.cast::<ICoreWebView2_3>() else {
+        state.borrow_mut().suspending = false;
+        return;
+    };
+    let weak = Rc::downgrade(state);
+    let handler = TrySuspendCompletedHandler::create(Box::new(move |result, succeeded| {
+        if let Some(state) = weak.upgrade() {
+            let did_suspend = result.is_ok() && succeeded;
+            let resume_ctrl = {
+                let mut inner = state.borrow_mut();
+                inner.suspending = false;
+                if inner.closed {
+                    None
+                } else if inner.version == version && !inner.visible && !inner.popup_open {
+                    inner.suspended = did_suspend;
+                    None
+                } else {
+                    inner.suspended = false;
+                    did_suspend.then(|| inner.controller.clone()).flatten()
+                }
+            };
+            if let Some(ctrl) = resume_ctrl {
+                resume_controller(&state, &ctrl);
+            }
+        }
+        Ok(())
+    }));
+    if unsafe { view3.TrySuspend(&handler) }.is_err() {
+        state.borrow_mut().suspending = false;
+    }
 }
 
 impl Drop for WebViewHost {
@@ -1456,7 +1481,7 @@ unsafe fn configure(
                     flag
                 };
                 if should_suspend {
-                    WebViewHost(state).try_suspend();
+                    try_suspend_state(&state);
                 }
             }
         }
@@ -1862,7 +1887,11 @@ mod tests {
             "scroll-anchor:1:-5",
             "scroll-anchor:1:NaN",
         ] {
-            assert_eq!(parse_thread_action(invalid), None, "should reject {invalid}");
+            assert_eq!(
+                parse_thread_action(invalid),
+                None,
+                "should reject {invalid}"
+            );
         }
 
         let (tx, mut rx) = futures_mpsc::channel::<()>(8);
@@ -2303,5 +2332,35 @@ mod tests {
         assert!(state.document.is_empty());
         assert_eq!(rx.try_recv().ok(), Some(()));
         assert!(!should_allow_main_navigation(&state, &document_url(2)));
+    }
+
+    #[test]
+    fn try_suspend_state_and_closed_host_preserve_status() {
+        let rc = Rc::new(RefCell::new(State {
+            version: 3,
+            navigation_id: Some(7),
+            suspend_after_load: true,
+            ..State::default()
+        }));
+        try_suspend_state(&rc);
+        assert!(!rc.borrow().closed);
+        assert!(!rc.borrow().suspending);
+
+        let host = std::mem::ManuallyDrop::new(WebViewHost(Rc::clone(&rc)));
+        assert_eq!(host.load_status(), (3, BodyView::Loading));
+
+        rc.borrow_mut().closed = true;
+        assert!(!apply_navigation_completed(&mut rc.borrow_mut(), 7, true));
+        assert_eq!(host.load_status(), (3, BodyView::Native));
+
+        let res = host.load_document_with_suspend(
+            b"<p>x</p>".to_vec(),
+            false,
+            DocumentMode::SingleBody,
+            true,
+        );
+        assert!(res.is_ok());
+        assert!(rc.borrow().document.is_empty());
+        assert_eq!(host.load_status(), (3, BodyView::Native));
     }
 }

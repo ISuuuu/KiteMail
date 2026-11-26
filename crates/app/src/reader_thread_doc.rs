@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 
 use kitemail_mail_core::config;
-use kitemail_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display_with_options};
+use kitemail_mail_core::imap_client::{plain_text_to_html, strip_remote_images_for_webview};
 use kitemail_mail_core::verify::{check_sender_summary, SenderTrust};
 use kitemail_mail_core::{MessageDetail, ThreadMessage};
 
@@ -45,7 +45,6 @@ pub(crate) struct ThreadDocContext<'a> {
     pub ui_text_scale_percent: u32,
     pub date_style: &'a str,
     pub clock_style: &'a str,
-    pub clean_links: bool,
     pub show_remote_banner: bool,
     pub always_show_recipients: bool,
     pub card_attachments: bool,
@@ -98,19 +97,19 @@ fn build_card_frame_html(
     body_text: &str,
     body_html: Option<&str>,
     block_remote: bool,
-    clean_links: bool,
     card_dark: bool,
     zoom_percent: u32,
 ) -> (String, usize) {
-    let (source_html, blocked_images) = if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
-        if block_remote {
-            sanitize_html_for_display_with_options(raw_html, true, clean_links)
+    let (source_html, blocked_images) =
+        if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
+            if block_remote {
+                strip_remote_images_for_webview(raw_html)
+            } else {
+                (raw_html.to_string(), 0)
+            }
         } else {
-            (raw_html.to_string(), 0)
-        }
-    } else {
-        (plain_text_to_html(body_text), 0)
-    };
+            (plain_text_to_html(body_text), 0)
+        };
 
     let html = if card_dark {
         adapt_colors_for_dark(&source_html)
@@ -340,7 +339,10 @@ pub(crate) fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, boo
                 &tm.body_text,
                 tm.body_html.as_deref(),
             );
-            (format!("<pre class=\"km-raw\">{}</pre>", escape_html(&raw)), 0)
+            (
+                format!("<pre class=\"km-raw\">{}</pre>", escape_html(&raw)),
+                0,
+            )
         } else if card.card_pending {
             (
                 "<div class=\"km-loading\">正在加载邮件正文…</div>".to_string(),
@@ -367,7 +369,6 @@ pub(crate) fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, boo
                 &tm.body_text,
                 tm.body_html.as_deref(),
                 card.block_remote,
-                ctx.clean_links,
                 card.card_dark,
                 ctx.zoom_percent,
             );
@@ -688,7 +689,6 @@ mod tests {
             ui_text_scale_percent: 100,
             date_style: "relative",
             clock_style: "24h",
-            clean_links: true,
             show_remote_banner: true,
             always_show_recipients: false,
             card_attachments: true,
@@ -754,7 +754,6 @@ mod tests {
             ui_text_scale_percent: 100,
             date_style: "relative",
             clock_style: "24h",
-            clean_links: true,
             show_remote_banner: true,
             always_show_recipients: false,
             card_attachments: true,
@@ -825,7 +824,6 @@ mod tests {
             ui_text_scale_percent: 100,
             date_style: "relative",
             clock_style: "24h",
-            clean_links: true,
             show_remote_banner: true,
             always_show_recipients: false,
             card_attachments: true,
@@ -840,5 +838,57 @@ mod tests {
         assert!(html.contains("<pre class=\"km-raw\">"));
         assert!(html.contains("data-action=\"load-body\" data-msg-id=\"2\""));
         assert!(html.contains("data-action=\"save-att\" data-att-id=\"77\""));
+    }
+
+    #[test]
+    fn build_card_frame_html_preserves_styles_and_tables_when_blocking_remote_images() {
+        let raw_html = concat!(
+            "<html><head><style>.mail-wrap { background: #fafafa; } table { width: 100%; }</style></head>",
+            "<body><table class=\"mail-wrap\"><tr><td>",
+            "<img src=\"https://tracker.example/open.png\">",
+            "<img src=\"data:image/png;base64,AAA\">",
+            "<p>排版正文</p>",
+            "</td></tr></table></body></html>"
+        );
+        let msg = sample_thread_msg(1, Some(raw_html), "排版正文");
+        let detail = sample_detail(vec![msg.clone()]);
+        let inputs = vec![ThreadCardRenderInput {
+            message: &msg,
+            is_current: true,
+            is_collapsed: false,
+            show_raw_source: false,
+            block_remote: true,
+            card_dark: false,
+            card_pending: false,
+            eml_exporting: false,
+            auth_results: None,
+            unsubscribe_url: None,
+        }];
+        let palette = crate::theme::palette_for("system", false);
+        let ctx = ThreadDocContext {
+            detail: &detail,
+            cards: &inputs,
+            palette: &palette,
+            app_dark_mode: false,
+            zoom_percent: 100,
+            ui_text_scale_percent: 100,
+            date_style: "relative",
+            clock_style: "24h",
+            show_remote_banner: true,
+            always_show_recipients: false,
+            card_attachments: true,
+            demo_mode: false,
+            read_receipt_policy: "ask",
+            initial_anchor: None,
+        };
+        let (bytes, any_remote) = build_thread_document(&ctx);
+        let doc = String::from_utf8(bytes).unwrap();
+        assert!(!any_remote);
+        assert!(doc.contains("img-src data:;"));
+        assert!(doc.contains("已拦截 1 张远程图片以保护隐私"));
+        assert!(doc.contains(".mail-wrap { background: #fafafa; }"));
+        assert!(doc.contains("&lt;table class=&quot;mail-wrap&quot;&gt;"));
+        assert!(doc.contains("data:image/png;base64,AAA"));
+        assert!(!doc.contains("tracker.example/open.png"));
     }
 }

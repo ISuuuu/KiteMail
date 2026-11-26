@@ -175,6 +175,48 @@ fn recipient_row(
         )
 }
 
+struct CachedAttachmentSize {
+    checked_at: std::time::Instant,
+    label: String,
+}
+
+fn attachment_size_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedAttachmentSize>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, CachedAttachmentSize>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cached_attachment_size_label(path: &str) -> String {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+    let now = std::time::Instant::now();
+    if let Ok(cache) = attachment_size_cache().lock() {
+        if let Some(entry) = cache.get(path) {
+            if now.duration_since(entry.checked_at) < TTL {
+                return entry.label.clone();
+            }
+        }
+    }
+    let label = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map(|bytes| format!("{} KB", (bytes + 1023) / 1024))
+        .unwrap_or_default();
+    if let Ok(mut cache) = attachment_size_cache().lock() {
+        if cache.len() > 256 {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_string(),
+            CachedAttachmentSize {
+                checked_at: now,
+                label: label.clone(),
+            },
+        );
+    }
+    label
+}
+
 /// 附件芯片（圆角胶囊：📎 文件名 (大小) ×，点击移除）。
 fn attachment_chip(idx: usize, path: &str, cx: &mut Context<HylkiApp>) -> Button {
     let name = std::path::Path::new(path)
@@ -182,10 +224,7 @@ fn attachment_chip(idx: usize, path: &str, cx: &mut Context<HylkiApp>) -> Button
         .and_then(|n| n.to_str())
         .unwrap_or(path)
         .to_string();
-    let size_label = std::fs::metadata(path)
-        .map(|m| m.len())
-        .map(|bytes| format!("{} KB", (bytes + 1023) / 1024))
-        .unwrap_or_default();
+    let size_label = cached_attachment_size_label(path);
     let label = if size_label.is_empty() {
         format!("📎 {name} ×")
     } else {
@@ -506,10 +545,46 @@ fn compose_format_bar(
         .into_any_element()
 }
 
+struct CachedComposePreview {
+    format: ComposeFormat,
+    raw_body: String,
+    sanitized_html: String,
+}
+
+fn compose_preview_cache() -> &'static std::sync::Mutex<Option<CachedComposePreview>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedComposePreview>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 fn compose_editor(app: &HylkiApp, cx: &Context<HylkiApp>) -> gpui_kit::AnyElement {
     if app.compose_preview {
-        let html = app.compose_body_html(cx).unwrap_or_default();
-        let (html, _) = sanitize_html_for_display(&html, true);
+        let format = app.compose_format;
+        let raw_body = if format == ComposeFormat::Plain {
+            String::new()
+        } else {
+            app.compose_body.read(cx).value().to_string()
+        };
+        let cached = compose_preview_cache().lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .filter(|c| c.format == format && c.raw_body == raw_body)
+                .map(|c| c.sanitized_html.clone())
+        });
+        let html = if let Some(hit) = cached {
+            hit
+        } else {
+            let rendered = app.compose_body_html(cx).unwrap_or_default();
+            let (clean, _) = sanitize_html_for_display(&rendered, true);
+            if let Ok(mut guard) = compose_preview_cache().lock() {
+                *guard = Some(CachedComposePreview {
+                    format,
+                    raw_body,
+                    sanitized_html: clean.clone(),
+                });
+            }
+            clean
+        };
         return div()
             .id("compose-preview-body")
             .size_full()

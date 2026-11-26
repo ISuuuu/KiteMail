@@ -46,6 +46,7 @@ pub(crate) struct MessageWindow {
     find_active_match: usize,
     find_total_matches: usize,
     text_states: HashMap<u32, (String, Entity<TextViewState>)>,
+    cached_body: Option<crate::app::CachedReaderBody>,
     print_preview: Option<print_preview::PrintPreviewState>,
     webview: Option<Rc<WebViewHost>>,
     webview_appearance: Option<(DocumentAppearance, bool)>,
@@ -175,6 +176,7 @@ impl MessageWindow {
             find_active_match: 0,
             find_total_matches: 0,
             text_states: HashMap::new(),
+            cached_body: None,
             print_preview: None,
             webview: None,
             webview_appearance: None,
@@ -358,47 +360,6 @@ impl Render for MessageWindow {
             .is_some_and(|app| app.read(cx).remote_images_allowed(d.id, &d.sender));
         let app_for_link = self.app_entity.clone();
         let app_for_quote_link = self.app_entity.clone();
-        let mut blocked_images = 0;
-        let (main_html, quoted_opt) = if !self.prefer_plain {
-            if let Some(ref raw_html) = d.body_html {
-                if !raw_html.trim().is_empty() {
-                    let (clean, blocked) = sanitize_html_for_display_with_options(
-                        raw_html,
-                        !allow_remote,
-                        self.prefs.clean_links,
-                    );
-                    blocked_images = blocked;
-                    let split = split_quoted_html(&clean);
-                    (split.main, split.quoted.map(|(q, lines)| (q, lines)))
-                } else {
-                    let split = split_quoted_plain(&d.body_text);
-                    (
-                        plain_text_to_html(&split.main),
-                        split
-                            .quoted
-                            .map(|(q, lines)| (plain_text_to_html(&q), lines)),
-                    )
-                }
-            } else {
-                let split = split_quoted_plain(&d.body_text);
-                (
-                    plain_text_to_html(&split.main),
-                    split
-                        .quoted
-                        .map(|(q, lines)| (plain_text_to_html(&q), lines)),
-                )
-            }
-        } else {
-            let split = split_quoted_plain(&d.body_text);
-            (
-                plain_text_to_html(&split.main),
-                split
-                    .quoted
-                    .map(|(q, lines)| (plain_text_to_html(&q), lines)),
-            )
-        };
-
-        let quote_expanded = self.expanded_quote_ids.contains(&d.id);
         let app_dark = self
             .app_entity
             .upgrade()
@@ -452,8 +413,85 @@ impl Render for MessageWindow {
         if let Some(host) = self.webview.clone().filter(|_| body_view != BodyView::Html) {
             cx.defer_in(window, move |_, _, _| host.set_visible(false));
         }
-        let text_state =
-            (body_view == BodyView::Native).then(|| self.ensure_text_state(d.id, &main_html, cx));
+
+        let body_view_is_native = body_view == BodyView::Native;
+        let need_blocked_images =
+            body_view_is_native || (self.prefs.show_remote_banner && self.print_preview.is_none());
+        let block_remote_images = !allow_remote;
+        let clean_links = self.prefs.clean_links;
+        let (main_html, quoted_opt, blocked_images): (String, Option<(String, usize)>, usize) =
+            if !need_blocked_images {
+                (String::new(), None, 0)
+            } else if let Some(cached) = self.cached_body.as_ref().filter(|c| {
+                c.body_view_is_native == body_view_is_native
+                    && !c.show_raw_source
+                    && c.prefer_plain == self.prefer_plain
+                    && c.block_remote_images == block_remote_images
+                    && c.clean_links == clean_links
+                    && c.raw_html == d.body_html
+                    && c.body_text == d.body_text
+            }) {
+                (
+                    cached.main_html.clone(),
+                    cached.quoted_part.clone(),
+                    cached.blocked_images,
+                )
+            } else {
+                let computed = if !self.prefer_plain {
+                    if let Some(raw_html) = d.body_html.as_deref().filter(|s| !s.trim().is_empty())
+                    {
+                        let (clean, blocked) = sanitize_html_for_display_with_options(
+                            raw_html,
+                            block_remote_images,
+                            clean_links,
+                        );
+                        if body_view_is_native {
+                            let split = split_quoted_html(&clean);
+                            (split.main, split.quoted, blocked)
+                        } else {
+                            (String::new(), None, blocked)
+                        }
+                    } else if body_view_is_native {
+                        let split = split_quoted_plain(&d.body_text);
+                        (
+                            plain_text_to_html(&split.main),
+                            split
+                                .quoted
+                                .map(|(q, lines)| (plain_text_to_html(&q), lines)),
+                            0,
+                        )
+                    } else {
+                        (String::new(), None, 0)
+                    }
+                } else if body_view_is_native {
+                    let split = split_quoted_plain(&d.body_text);
+                    (
+                        plain_text_to_html(&split.main),
+                        split
+                            .quoted
+                            .map(|(q, lines)| (plain_text_to_html(&q), lines)),
+                        0,
+                    )
+                } else {
+                    (String::new(), None, 0)
+                };
+                self.cached_body = Some(crate::app::CachedReaderBody {
+                    body_view_is_native,
+                    show_raw_source: false,
+                    prefer_plain: self.prefer_plain,
+                    block_remote_images,
+                    clean_links,
+                    raw_html: d.body_html.clone(),
+                    body_text: d.body_text.clone(),
+                    main_html: computed.0.clone(),
+                    quoted_part: computed.1.clone(),
+                    blocked_images: computed.2,
+                });
+                computed
+            };
+
+        let quote_expanded = self.expanded_quote_ids.contains(&d.id);
+        let text_state = body_view_is_native.then(|| self.ensure_text_state(d.id, &main_html, cx));
         let win_controls =
             window_controls::render_standalone_window_controls("popout-wc", window, cx);
         let d_reply = d.clone();

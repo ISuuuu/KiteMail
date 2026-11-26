@@ -243,8 +243,11 @@ pub(crate) struct SettingsWindow {
     pub(crate) attachment_keywords_input: Entity<InputState>,
     pub(crate) compose_inputs_feedback: Option<SharedString>,
     pub(crate) confirm_clear_cache: bool,
-    /// 系统页双目录及分项磁盘占用摘要（进入系统页时计算一次，清除缓存或切换目录后失效）。
+    /// 系统页双目录及分项磁盘占用摘要（后台统计，进入系统页且失效时触发）。
     pub(crate) storage_summary: Option<config::AppStorageSummary>,
+    pub(crate) storage_summary_loading: bool,
+    pub(crate) storage_summary_gen: u64,
+    pub(crate) autostart_enabled: Option<bool>,
     /// 待二次确认的邮件存储目录切换 `(target_dir_override, target_inspection)`。
     pub(crate) pending_mail_dir_switch: Option<(Option<std::path::PathBuf>, MailDirInspection)>,
     /// 后台正在执行邮件存储目录切换或迁移。
@@ -472,6 +475,9 @@ impl SettingsWindow {
             compose_inputs_feedback: None,
             confirm_clear_cache: false,
             storage_summary: None,
+            storage_summary_loading: false,
+            storage_summary_gen: 0,
+            autostart_enabled: None,
             pending_mail_dir_switch: None,
             mail_dir_switching: false,
             mail_dir_switch_active: None,
@@ -657,7 +663,7 @@ impl SettingsWindow {
                 self.narrow_show_content = true;
                 self.confirm_clear_cache = false;
                 // 系统页存储占用统计在每次进入时重新计算。
-                self.storage_summary = None;
+                self.invalidate_storage_summary();
                 if !self.mail_dir_switching {
                     self.pending_mail_dir_switch = None;
                     self.mail_dir_feedback = None;
@@ -806,7 +812,7 @@ impl SettingsWindow {
     ) {
         self.active_tab = item.tab;
         if item.tab == PrefTab::System {
-            self.storage_summary = None;
+            self.invalidate_storage_summary();
         }
         self.narrow_show_content = true;
         self.highlighted_row_id = Some(item.row_id);
@@ -908,7 +914,7 @@ impl SettingsWindow {
             "默认"
         };
         let report = format!(
-            "Hylki Windows 诊断信息\n=======================\n\
+            "KiteMail Windows 诊断信息\n=======================\n\
              版本: v{}\n\
              运行模式: {}\n\
              操作系统: {} {}\n\
@@ -1162,7 +1168,7 @@ impl SettingsWindow {
         });
         match res {
             Ok(added) if added > 0 => {
-                self.storage_summary = None;
+                self.invalidate_storage_summary();
                 self.current_mail_dir_importable.clear();
                 self.mail_dir_feedback = Some((
                     true,
@@ -1172,7 +1178,7 @@ impl SettingsWindow {
                 ));
             }
             Ok(_) => {
-                self.storage_summary = None;
+                self.invalidate_storage_summary();
                 self.current_mail_dir_importable.clear();
                 self.mail_dir_feedback =
                     Some((true, SharedString::from("关联账号已存在于当前配置中")));
@@ -1192,6 +1198,13 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    pub(crate) fn invalidate_storage_summary(&mut self) {
+        self.storage_summary = None;
+        self.storage_summary_loading = false;
+        self.storage_summary_gen = self.storage_summary_gen.wrapping_add(1);
+        self.autostart_enabled = None;
+    }
+
     pub(crate) fn on_mail_data_dir_changed(
         &mut self,
         ok: bool,
@@ -1202,7 +1215,7 @@ impl SettingsWindow {
         self.mail_dir_switching = false;
         self.pending_mail_dir_switch = None;
         self.mail_dir_switch_active = None;
-        self.storage_summary = None;
+        self.invalidate_storage_summary();
         self.current_mail_dir_importable.clear();
         self.mail_dir_feedback = Some((ok, SharedString::from(message.to_string())));
         cx.notify();
@@ -2332,17 +2345,39 @@ impl Render for SettingsWindow {
                 accounts::render_list_page(self, app_entity, &p, cx)
             }
         } else {
-            if self.active_tab == PrefTab::System && self.storage_summary.is_none() {
-                let app_dir = config::data_dir();
-                let summary = config::app_storage_summary_in(&app_dir);
-                let accounts = self.app.read(cx).accounts.clone();
-                let inspection = cache::inspect_mail_data_dir_with_app_dir(
-                    &app_dir,
-                    &summary.mail_data_dir,
-                    &accounts,
-                );
-                self.current_mail_dir_importable = inspection.importable_accounts;
-                self.storage_summary = Some(summary);
+            if self.active_tab == PrefTab::System {
+                if self.autostart_enabled.is_none() {
+                    self.autostart_enabled = Some(crate::autostart::is_autostart_enabled());
+                }
+                if self.storage_summary.is_none() && !self.storage_summary_loading {
+                    self.storage_summary_loading = true;
+                    let gen = self.storage_summary_gen;
+                    let app_dir = config::data_dir();
+                    let accounts = self.app.read(cx).accounts.clone();
+                    cx.spawn(async move |this, cx| {
+                        let (summary, inspection) = cx
+                            .background_executor()
+                            .spawn(async move {
+                                let summary = config::app_storage_summary_in(&app_dir);
+                                let inspection = cache::inspect_mail_data_dir_with_app_dir(
+                                    &app_dir,
+                                    &summary.mail_data_dir,
+                                    &accounts,
+                                );
+                                (summary, inspection)
+                            })
+                            .await;
+                        let _ = this.update(cx, |win, cx| {
+                            if win.storage_summary_gen == gen {
+                                win.storage_summary_loading = false;
+                                win.current_mail_dir_importable = inspection.importable_accounts;
+                                win.storage_summary = Some(summary);
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                }
             }
             let app_entity = self.app.clone();
             pages::render_tab(self, app_entity, &p, window, cx)

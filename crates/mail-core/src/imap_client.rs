@@ -2719,7 +2719,15 @@ pub fn sanitize_html_for_display_with_options(
                     }
                     if matches!(
                         tag_name,
-                        "body" | "html" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
+                        "body"
+                            | "html"
+                            | "table"
+                            | "thead"
+                            | "tbody"
+                            | "tfoot"
+                            | "tr"
+                            | "td"
+                            | "th"
                     ) {
                         hidden_stack.clear();
                         // Container closed before malformed hidden tag; fall through to emit `</tag>`.
@@ -3126,6 +3134,221 @@ fn normalize_layout_tables_for_display(html: &str) -> String {
 /// Sanitize HTML email bodies for safe native display (legacy default without link cleaning).
 pub fn sanitize_html_for_display(html: &str, block_remote_images: bool) -> (String, usize) {
     sanitize_html_for_display_with_options(html, block_remote_images, false)
+}
+
+fn find_tag_end_quote_aware(html: &str, start: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i + 1),
+            None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_closing_raw_tag_end(html: &str, from: usize, close_prefix: &[u8]) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut i = from;
+    while i + close_prefix.len() <= bytes.len() {
+        if bytes[i] == b'<' && bytes[i..i + close_prefix.len()].eq_ignore_ascii_case(close_prefix) {
+            let next = bytes.get(i + close_prefix.len()).copied();
+            if next.is_some_and(|c| c.is_ascii_whitespace() || c == b'>' || c == b'/') {
+                if let Some(gt) = bytes[i + close_prefix.len()..]
+                    .iter()
+                    .position(|&b| b == b'>')
+                {
+                    return Some(i + close_prefix.len() + gt + 1);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn bytes_contain_http_url(bytes: &[u8]) -> bool {
+    bytes.windows(7).any(|w| w.eq_ignore_ascii_case(b"http://"))
+        || bytes
+            .windows(8)
+            .any(|w| w.eq_ignore_ascii_case(b"https://"))
+}
+
+fn is_remote_url_token(url: &str) -> bool {
+    let b = url.trim_start().as_bytes();
+    (b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"http://"))
+        || (b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://"))
+        || b.starts_with(b"//")
+}
+
+fn img_attrs_have_remote_url(attrs: &str) -> bool {
+    let bytes = attrs.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    while i < len {
+        while i < len && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        let name_start = i;
+        while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' && bytes[i] != b'/' {
+            i += 1;
+        }
+        let name = attrs[name_start..i].to_ascii_lowercase();
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let val = if i < len && bytes[i] == b'=' {
+            i += 1;
+            while i < len && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < len && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
+                i += 1;
+                let v_start = i;
+                while i < len && bytes[i] != quote {
+                    i += 1;
+                }
+                let v = &attrs[v_start..i];
+                if i < len {
+                    i += 1;
+                }
+                v
+            } else {
+                let v_start = i;
+                while i < len && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                &attrs[v_start..i]
+            }
+        } else {
+            ""
+        };
+
+        match name.as_str() {
+            "src" | "data-src" | "data-original" | "lowsrc" | "dynsrc" => {
+                if is_remote_url_token(val) {
+                    return true;
+                }
+            }
+            "srcset" => {
+                if val.split(',').any(|part| {
+                    part.split_whitespace()
+                        .next()
+                        .is_some_and(is_remote_url_token)
+                }) {
+                    return true;
+                }
+            }
+            "style" => {
+                if bytes_contain_http_url(val.as_bytes()) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
+/// Strip remote `<img>` tags and `<script>` blocks from HTML while preserving
+/// `<head>`, `<style>`, `<table>`, inline styles, and `data:`/`cid:` images
+/// for sandboxed WebView2 thread rendering.
+pub fn strip_remote_images_for_webview(html: &str) -> (String, usize) {
+    let mut out = String::with_capacity(html.len());
+    let mut blocked_count = 0usize;
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0usize;
+
+    while pos < len {
+        let Some(rel) = html[pos..].find('<') else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        out.push_str(&html[pos..pos + rel]);
+        let tag_start = pos + rel;
+
+        if html[tag_start..].starts_with("<!--") {
+            if let Some(end_rel) = html[tag_start + 4..].find("-->") {
+                let end = tag_start + 4 + end_rel + 3;
+                out.push_str(&html[tag_start..end]);
+                pos = end;
+            } else {
+                out.push_str(&html[tag_start..]);
+                break;
+            }
+            continue;
+        }
+
+        if bytes
+            .get(tag_start + 1)
+            .is_some_and(|b| *b == b'!' || *b == b'?')
+        {
+            if let Some(tag_end) = find_tag_end_quote_aware(html, tag_start + 1) {
+                out.push_str(&html[tag_start..tag_end]);
+                pos = tag_end;
+            } else {
+                out.push_str(&html[tag_start..]);
+                break;
+            }
+            continue;
+        }
+
+        let Some(tag_end) = find_tag_end_quote_aware(html, tag_start + 1) else {
+            out.push_str(&html[tag_start..]);
+            break;
+        };
+
+        let inner = &html[tag_start + 1..tag_end - 1];
+        let trimmed = inner.trim_start();
+        if trimmed.starts_with('/') {
+            out.push_str(&html[tag_start..tag_end]);
+            pos = tag_end;
+            continue;
+        }
+
+        let name_end = trimmed
+            .find(|c: char| c.is_ascii_whitespace() || c == '/')
+            .unwrap_or(trimmed.len());
+        let tag_name = trimmed[..name_end].to_ascii_lowercase();
+        let attrs = &trimmed[name_end..];
+
+        if tag_name == "script" {
+            pos = find_closing_raw_tag_end(html, tag_end, b"</script").unwrap_or(len);
+            continue;
+        }
+
+        if tag_name == "style" {
+            let end = find_closing_raw_tag_end(html, tag_end, b"</style").unwrap_or(len);
+            out.push_str(&html[tag_start..end]);
+            pos = end;
+            continue;
+        }
+
+        if tag_name == "img" && img_attrs_have_remote_url(attrs) {
+            blocked_count += 1;
+            pos = tag_end;
+            continue;
+        }
+
+        out.push_str(&html[tag_start..tag_end]);
+        pos = tag_end;
+    }
+
+    (out, blocked_count)
 }
 
 /// Convert plain text into escaped HTML paragraphs so it can be rendered in a
@@ -3788,5 +4011,31 @@ mod tests {
         assert!(clean.contains("Cell body"), "got: {clean}");
         assert!(clean.contains("<p>Next p</p>"), "got: {clean}");
         assert!(clean.contains("<p>After outer div</p>"), "got: {clean}");
+    }
+
+    #[test]
+    fn strip_remote_images_for_webview_preserves_styles_tables_and_inline_images() {
+        let raw = concat!(
+            "<html><head><style>.card { color: red; } /* <img src=\"https://fake\"> */</style></head>",
+            "<body><!-- <img src=\"https://comment.example/a.png\"> -->",
+            "<script>alert(1)</script>",
+            "<table width=\"600\"><tr><td>",
+            "<img alt=\"1 > 0\" SRC=\"HTTPS://tracker.example/pixel.png\" />",
+            "<img srcset=\"data:image/png;base64,AAA 1x, https://cdn.example/b.png 2x\">",
+            "<img alt=\"https://safe-alt.example\" src=\"data:image/png;base64,BBB\">",
+            "<img src=\"cid:logo@example.com\">",
+            "<p style=\"color: blue\">正文</p>",
+            "</td></tr></table></body></html>"
+        );
+        let (stripped, blocked) = strip_remote_images_for_webview(raw);
+        assert_eq!(blocked, 2, "stripped: {stripped}");
+        assert!(stripped.contains("<style>.card { color: red; }"));
+        assert!(stripped.contains("<table width=\"600\">"));
+        assert!(stripped.contains("<p style=\"color: blue\">正文</p>"));
+        assert!(stripped.contains("src=\"data:image/png;base64,BBB\""));
+        assert!(stripped.contains("src=\"cid:logo@example.com\""));
+        assert!(!stripped.contains("tracker.example"));
+        assert!(!stripped.contains("cdn.example/b.png"));
+        assert!(!stripped.contains("<script>"));
     }
 }

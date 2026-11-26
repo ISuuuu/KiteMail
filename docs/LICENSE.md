@@ -10,15 +10,12 @@ Contributions ship under the same licence; there is no CLA.
 
 ## Trademarks
 
-The Nextcloud, ownCloud, OpenCloud, OneDrive, Dropbox and Seafile marks shown
-in Settings are trademarks of their owners, used only to identify those
+The email provider marks shown when adding accounts (Gmail, Outlook, iCloud,
+Yahoo, Proton, Fastmail, AOL, Zoho, GMX, Yandex, mail.com and Stalwart) are
+trademarks of their respective owners, used only to identify those mail
 services, and are not covered by that licence (see
 [data/brands/README.md](../data/brands/README.md)). KiteMail is not affiliated
-with or endorsed by any of them. The same goes for the bundled sender logos
-that can fill a sender's avatar: they come from
-[gilbarbara/logos](https://github.com/gilbarbara/logos) (MIT) and
-[Simple Icons](https://simpleicons.org) (CC0), remain their owners' marks, and
-are listed with their sources in [data/logos/README.md](../data/logos/README.md).
+with or endorsed by any of them.
 
 ## Appearance themes
 

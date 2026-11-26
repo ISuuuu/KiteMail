@@ -88,7 +88,15 @@ pub fn avatar_bg_color(key: &str) -> Hsla {
     rgb_to_hsla(value)
 }
 
-type AvatarImageCache = HashMap<PathBuf, (u64, Arc<Image>)>;
+struct CachedAvatarEntry {
+    checked_at: std::time::Instant,
+    stamp: u64,
+    image: Option<Arc<Image>>,
+}
+
+type AvatarImageCache = HashMap<PathBuf, CachedAvatarEntry>;
+
+const AVATAR_STAT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn avatar_image_cache() -> &'static Mutex<AvatarImageCache> {
     static CACHE: OnceLock<Mutex<AvatarImageCache>> = OnceLock::new();
@@ -166,7 +174,29 @@ fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
 pub fn load_local_avatar_image(data_dir: &Path, filename: &str) -> Option<Arc<Image>> {
     let path = config::avatar_path_in(data_dir, filename)?;
     let format = image_format_for_path(&path)?;
-    let meta = std::fs::metadata(&path).ok()?;
+    let now = std::time::Instant::now();
+
+    if let Ok(cache) = avatar_image_cache().lock() {
+        if let Some(entry) = cache.get(&path) {
+            if now.duration_since(entry.checked_at) < AVATAR_STAT_TTL {
+                return entry.image.as_ref().map(Arc::clone);
+            }
+        }
+    }
+
+    let Ok(meta) = std::fs::metadata(&path) else {
+        if let Ok(mut cache) = avatar_image_cache().lock() {
+            cache.insert(
+                path,
+                CachedAvatarEntry {
+                    checked_at: now,
+                    stamp: 0,
+                    image: None,
+                },
+            );
+        }
+        return None;
+    };
     let modified_nanos = meta
         .modified()
         .ok()
@@ -175,20 +205,28 @@ pub fn load_local_avatar_image(data_dir: &Path, filename: &str) -> Option<Arc<Im
         .unwrap_or(0);
     let stamp = modified_nanos ^ meta.len().rotate_left(17);
 
-    if let Ok(cache) = avatar_image_cache().lock() {
-        if let Some((cached_stamp, cached_img)) = cache.get(&path) {
-            if *cached_stamp == stamp {
-                return Some(Arc::clone(cached_img));
+    if let Ok(mut cache) = avatar_image_cache().lock() {
+        if let Some(entry) = cache.get_mut(&path) {
+            if entry.stamp == stamp && entry.image.is_some() {
+                entry.checked_at = now;
+                return entry.image.as_ref().map(Arc::clone);
             }
         }
     }
 
-    let bytes = std::fs::read(&path).ok()?;
-    let image = Arc::new(Image::from_bytes(format, bytes));
+    let bytes = std::fs::read(&path).ok();
+    let image = bytes.map(|b| Arc::new(Image::from_bytes(format, b)));
     if let Ok(mut cache) = avatar_image_cache().lock() {
-        cache.insert(path, (stamp, Arc::clone(&image)));
+        cache.insert(
+            path,
+            CachedAvatarEntry {
+                checked_at: now,
+                stamp,
+                image: image.as_ref().map(Arc::clone),
+            },
+        );
     }
-    Some(image)
+    image
 }
 
 /// 简化 sRGB → HSL 转换（预设色不透明、无色相丢失场景）。

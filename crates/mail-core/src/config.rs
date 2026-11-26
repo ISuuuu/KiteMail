@@ -1905,6 +1905,18 @@ pub fn resolve_data_dir(
 /// 返回当前运行时生效的 KiteMail 本地配置与全局数据库根目录。
 /// 安装版为 `%LOCALAPPDATA%\KiteMail`；便携版（同级存在 `portable.flag`）为 `<exe_dir>\data`。
 pub fn data_dir() -> PathBuf {
+    #[cfg(not(test))]
+    {
+        static CACHED_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        return CACHED_DATA_DIR.get_or_init(compute_data_dir).clone();
+    }
+    #[cfg(test)]
+    {
+        compute_data_dir()
+    }
+}
+
+fn compute_data_dir() -> PathBuf {
     let env_override = std::env::var("KITEMAIL_DATA_DIR").ok();
     let exe_dir = std::env::current_exe()
         .ok()
@@ -2510,7 +2522,7 @@ pub(crate) fn register_known_data_dir_in(
     atomic_write_file(registry_dir, &reg_file, &text, "实例注册表")
 }
 
-/// 在运行时将当前生效的 `data_dir` 登记到同机共享实例注册表（单测与 `HYLKI_DATA_DIR` 隔离模式跳过）。
+/// 在运行时将当前生效的 `data_dir` 登记到同机共享实例注册表（单测与 `KITEMAIL_DATA_DIR` 隔离模式跳过）。
 pub fn register_known_data_dir(data_dir: &Path) {
     if cfg!(test) || has_env_data_dir_override() {
         return;

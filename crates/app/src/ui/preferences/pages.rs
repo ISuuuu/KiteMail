@@ -3090,37 +3090,43 @@ fn render_system(
 ) -> AnyElement {
     let demo_mode = app_entity.read(cx).demo_mode;
     let prefs = app_entity.read(cx).prefs.clone();
-    let summary = win
-        .storage_summary
-        .clone()
-        .unwrap_or_else(|| config::app_storage_summary_in(&config::data_dir()));
-    let app_dir_path = summary.app_data_dir.clone();
+    let summary_opt = win.storage_summary.as_ref();
+    let app_dir_path = summary_opt
+        .map(|s| s.app_data_dir.clone())
+        .unwrap_or_else(config::data_dir);
     let app_dir_str = app_dir_path.display().to_string();
-    let mail_dir_path = summary.mail_data_dir.clone();
-    let mail_dir_desc = format!(
-        "{} · {}",
-        if summary.is_custom_mail_dir {
-            "自定义目录"
-        } else {
-            "默认位置"
-        },
-        mail_dir_path.display()
-    );
-    let storage_text = format!(
-        "配置与全局索引 {}（{} 文件）· 邮件与附件 {}（{} 文件）",
-        config::format_bytes(summary.config_stats.total_bytes),
-        summary.config_stats.file_count,
-        config::format_bytes(summary.mail_stats.total_bytes),
-        summary.mail_stats.file_count
-    );
+    let mail_dir_path = summary_opt.map(|s| s.mail_data_dir.clone());
+    let is_custom_mail_dir = summary_opt.is_some_and(|s| s.is_custom_mail_dir);
+    let mail_dir_desc = match summary_opt {
+        Some(summary) => format!(
+            "{} · {}",
+            if summary.is_custom_mail_dir {
+                "自定义目录"
+            } else {
+                "默认位置"
+            },
+            summary.mail_data_dir.display()
+        ),
+        None => "正在读取邮件存储目录...".to_string(),
+    };
+    let storage_text = match summary_opt {
+        Some(summary) => format!(
+            "配置与全局索引 {}（{} 文件）· 邮件与附件 {}（{} 文件）",
+            config::format_bytes(summary.config_stats.total_bytes),
+            summary.config_stats.file_count,
+            config::format_bytes(summary.mail_stats.total_bytes),
+            summary.mail_stats.file_count
+        ),
+        None => "正在后台统计磁盘占用...".to_string(),
+    };
     let run_mode_text = if demo_mode {
         "演示模式（内存模拟）"
-    } else if summary.is_portable {
+    } else if summary_opt.map_or_else(kitemail_mail_core::update::is_portable, |s| s.is_portable) {
         "便携版（EXE 同级 data 配置 + 分账号分库存储）"
     } else {
         "安装版（LocalAppData 配置 + 分账号分库存储）"
     };
-    let autostart_on = crate::autostart::is_autostart_enabled();
+    let autostart_on = win.autostart_enabled.unwrap_or(prefs.start_at_login);
     let app_clear = app_entity.clone();
     let app_close = app_entity.clone();
     let app_min_tray = app_entity.clone();
@@ -3142,7 +3148,7 @@ fn render_system(
                     .label("确认清除")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.confirm_clear_cache = false;
-                        this.storage_summary = None;
+                        this.invalidate_storage_summary();
                         app_clear.update(cx, |app, cx| {
                             app.clear_body_caches(cx);
                         });
@@ -3208,6 +3214,10 @@ fn render_system(
                         false,
                         move |val, _, cx| match crate::autostart::set_autostart_enabled(val) {
                             Ok(()) => {
+                                win_for_autostart.update(cx, |this, cx| {
+                                    this.autostart_enabled = Some(val);
+                                    cx.notify();
+                                });
                                 app_autostart.update(cx, |app, cx| {
                                     app.mutate_preferences(cx, |p| p.start_at_login = val);
                                 });
@@ -3388,12 +3398,15 @@ fn render_system(
                             Button::new("btn-open-mail-dir")
                                 .outline()
                                 .compact()
+                                .disabled(mail_dir_path.is_none())
                                 .label("打开目录")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_dir_in_explorer(&mail_dir_path, cx);
+                                    if let Some(ref path) = mail_dir_path {
+                                        this.open_dir_in_explorer(path, cx);
+                                    }
                                 })),
                         )
-                        .when(summary.is_custom_mail_dir, |el| {
+                        .when(is_custom_mail_dir, |el| {
                             el.child(
                                 Button::new("btn-reset-mail-dir")
                                     .outline()
@@ -3497,19 +3510,21 @@ fn render_system(
                 is_hit(win, "pref-storage-stats"),
                 p,
             ));
-            for acc_stat in &summary.per_account {
-                storage_rows.push(info_row(
-                    SharedString::from(format!("pref-acc-storage-{}", acc_stat.account_id)),
-                    format!("  · {}", acc_stat.email),
-                    format!(
-                        "文件夹 {} · {}（{} 个文件）",
-                        acc_stat.dir_name,
-                        config::format_bytes(acc_stat.stats.total_bytes),
-                        acc_stat.stats.file_count
-                    ),
-                    false,
-                    p,
-                ));
+            if let Some(summary) = summary_opt {
+                for acc_stat in &summary.per_account {
+                    storage_rows.push(info_row(
+                        SharedString::from(format!("pref-acc-storage-{}", acc_stat.account_id)),
+                        format!("  · {}", acc_stat.email),
+                        format!(
+                            "文件夹 {} · {}（{} 个文件）",
+                            acc_stat.dir_name,
+                            config::format_bytes(acc_stat.stats.total_bytes),
+                            acc_stat.stats.file_count
+                        ),
+                        false,
+                        p,
+                    ));
+                }
             }
             storage_rows.extend([
                 setting_row(

@@ -33,8 +33,7 @@ Nothing here is meant to restrict what you may say about your own research.
 
 Fixes go into the next release from `main`. Older versions are not patched
 separately. KiteMail ships for Windows x64 as an NSIS installer and a portable
-ZIP archive via GitHub Releases (currently packaged under the `Hylki` name prior
-to the next release).
+ZIP archive via GitHub Releases.
 
 ## Scope
 
