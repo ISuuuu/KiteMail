@@ -756,6 +756,15 @@ pub struct AppPreferences {
     /// 本地数据库加密（SQLCipher 后端暂缺，仅存配置，不伪造加密行为）。
     #[serde(default)]
     pub encrypt_stored_mail: bool,
+    /// 前台无操作自动锁屏分钟数（`0` = 从不，默认 `15`）。
+    #[serde(default = "default_app_lock_idle_minutes")]
+    pub app_lock_idle_minutes: u32,
+    /// 切到后台 / 最小化 / 隐藏托盘后自动锁屏策略（`"immediate"` / `"1"` / `"3"` / `"5"` / `"10"` / `"15"` / `"30"` / `"never"`，默认 `"5"`）。
+    #[serde(default = "default_app_lock_background_timeout")]
+    pub app_lock_background_timeout: String,
+    /// Windows 系统锁屏（Win+L）或睡眠 / 休眠时立即锁定应用（默认开启）。
+    #[serde(default = "default_true")]
+    pub app_lock_on_system_lock: bool,
     // ---- WP-05：系统 ----
     /// 已下载邮件保留天数（`0` = 永久；对齐 Linux `[0, 365, 90, 30]`）。
     #[serde(default)]
@@ -930,6 +939,37 @@ fn default_notification_buttons() -> Vec<String> {
 
 fn default_read_receipt_policy() -> String {
     "ask".to_string()
+}
+
+fn default_app_lock_idle_minutes() -> u32 {
+    15
+}
+
+fn default_app_lock_background_timeout() -> String {
+    "5".to_string()
+}
+
+/// 规范化前台无操作自动锁屏分钟数（非法值回落默认 15 分钟）。
+pub fn normalize_app_lock_idle_minutes(mins: u32) -> u32 {
+    match mins {
+        0 | 1 | 5 | 10 | 15 | 30 | 60 => mins,
+        _ => 15,
+    }
+}
+
+/// 规范化切到后台自动锁屏策略（非法值回落默认 `"5"`）。
+pub fn normalize_app_lock_background_timeout(value: &str) -> &'static str {
+    match value.trim() {
+        "immediate" => "immediate",
+        "1" => "1",
+        "3" => "3",
+        "5" => "5",
+        "10" => "10",
+        "15" => "15",
+        "30" => "30",
+        "never" => "never",
+        _ => "5",
+    }
 }
 
 fn default_link_open_mode() -> String {
@@ -1265,6 +1305,9 @@ impl Default for AppPreferences {
             sender_logos: false,
             read_receipt_policy: default_read_receipt_policy(),
             encrypt_stored_mail: false,
+            app_lock_idle_minutes: default_app_lock_idle_minutes(),
+            app_lock_background_timeout: default_app_lock_background_timeout(),
+            app_lock_on_system_lock: true,
             keep_downloads_days: 0,
             start_at_login: false,
             link_open_mode: default_link_open_mode(),
@@ -4129,6 +4172,35 @@ smtp_separate_credentials = false
         let reloaded = load_preferences_in(&base).expect("reload user choice");
         assert!(!reloaded.thread_newest_first);
         assert!(reloaded.thread_newest_first_default_applied);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_lock_preferences_backward_compat_and_backup_excludes_passcode() {
+        let base = std::env::temp_dir().join(format!(
+            "hylki-app-lock-prefs-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        fs::write(preferences_file_in(&base), "theme_id = \"default\"\n").unwrap();
+        let loaded = load_preferences_in(&base).expect("load legacy prefs without app_lock");
+        assert_eq!(loaded.app_lock_idle_minutes, 15);
+        assert_eq!(loaded.app_lock_background_timeout, "5");
+        assert!(loaded.app_lock_on_system_lock);
+
+        assert_eq!(normalize_app_lock_idle_minutes(0), 0);
+        assert_eq!(normalize_app_lock_idle_minutes(30), 30);
+        assert_eq!(normalize_app_lock_idle_minutes(999), 15);
+        assert_eq!(normalize_app_lock_background_timeout("immediate"), "immediate");
+        assert_eq!(normalize_app_lock_background_timeout("never"), "never");
+        assert_eq!(normalize_app_lock_background_timeout("bogus"), "5");
+
+        let exported = export_settings_bundle_in(&base).expect("export bundle");
+        assert!(!exported.contains("passcode"));
+        assert!(!exported.contains("hash"));
 
         let _ = fs::remove_dir_all(&base);
     }

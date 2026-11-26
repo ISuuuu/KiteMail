@@ -14,15 +14,17 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    black, div, px, AnyElement, AppContext, Context, Entity, FontWeight, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window, WindowControlArea,
+    black, div, px, AnyElement, AnyWindowHandle, AppContext, Context, Entity, FontWeight,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Window, WindowControlArea,
 };
+use kitemail_mail_core::app_lock;
 use kitemail_mail_core::cache::{self, MailDirInspection, MailDirSwitchMode, TagItem};
 use kitemail_mail_core::config::{
     self, AccountConfig, AppPreferences, FilterField, FilterMatch, SettingsBackupBundle,
     DEFAULT_ATTACHMENT_KEYWORDS,
 };
+use kitemail_mail_core::secrets;
 
 use crate::app::{CloseOverlay, CloseSettingsWindow, FocusSearch, HylkiApp};
 use crate::theme::{self, HylkiPalette};
@@ -217,9 +219,19 @@ pub(crate) fn compute_sidebar_width(window_width: f32) -> f32 {
     (window_width * 0.27).clamp(180.0, 250.0)
 }
 
+/// 「隐私 → 应用锁屏密码」内联配置表单模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppLockFormMode {
+    Closed,
+    Setup,
+    Change,
+    Disable,
+}
+
 /// 独立偏好设置窗口主视图（单实例、非模态，持有子窗口级输入控件并双向订阅 `HylkiApp`）。
 pub(crate) struct SettingsWindow {
     pub(crate) app: Entity<HylkiApp>,
+    pub(crate) window_handle: AnyWindowHandle,
     pub(crate) active_tab: PrefTab,
     pub(crate) narrow_show_content: bool,
     pub(crate) search_open: bool,
@@ -305,6 +317,12 @@ pub(crate) struct SettingsWindow {
     pub(crate) trans_feedback: Option<(bool, SharedString)>,
     pub(crate) mcp_socket_input: Entity<InputState>,
     pub(crate) mcp_feedback: Option<(bool, SharedString)>,
+    pub(crate) app_lock_form_mode: AppLockFormMode,
+    pub(crate) app_lock_current_input: Entity<InputState>,
+    pub(crate) app_lock_new_input: Entity<InputState>,
+    pub(crate) app_lock_confirm_input: Entity<InputState>,
+    pub(crate) app_lock_busy: bool,
+    pub(crate) app_lock_feedback: Option<(bool, SharedString)>,
     pub(crate) sidebar_scroll: ScrollHandle,
     pub(crate) content_scroll: ScrollHandle,
     last_rem_scale: u32,
@@ -323,6 +341,7 @@ impl SettingsWindow {
     ) -> Self {
         let initial_scale = config::clamp_ui_text_scale(initial_prefs.ui_text_scale_percent);
         window.set_rem_size(px(16.0 * initial_scale as f32 / 100.0));
+        let window_handle = window.window_handle();
 
         // 任务二：Alt+F4 / 系统关闭与窗口关闭按钮走同一套离开确认——账号编辑
         // 页有未保存改动时先拦截并弹「保存 / 放弃 / 继续编辑」确认条。
@@ -442,6 +461,40 @@ impl SettingsWindow {
                 .placeholder(r"\\.\pipe\kitemail-mcp")
                 .default_value(initial_prefs.mcp_socket_path.clone())
         });
+        let app_lock_current_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("输入当前锁屏密码")
+        });
+        let app_lock_new_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("输入新密码（至少 4 个字符）")
+        });
+        let app_lock_confirm_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("再次输入新密码以确认")
+        });
+        cx.subscribe(&app_lock_current_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. })
+                && this.app_lock_form_mode == AppLockFormMode::Disable
+            {
+                this.submit_app_lock_form(cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&app_lock_confirm_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. })
+                && matches!(
+                    this.app_lock_form_mode,
+                    AppLockFormMode::Setup | AppLockFormMode::Change
+                )
+            {
+                this.submit_app_lock_form(cx);
+            }
+        })
+        .detach();
 
         let mut account_form = AccountFormState::new(edit_account.as_ref(), window, cx);
         if let Some(idx) = preset_idx {
@@ -453,6 +506,7 @@ impl SettingsWindow {
 
         Self {
             app,
+            window_handle,
             active_tab: initial_tab,
             narrow_show_content,
             search_open: false,
@@ -529,10 +583,209 @@ impl SettingsWindow {
             trans_feedback: None,
             mcp_socket_input,
             mcp_feedback: None,
+            app_lock_form_mode: AppLockFormMode::Closed,
+            app_lock_current_input,
+            app_lock_new_input,
+            app_lock_confirm_input,
+            app_lock_busy: false,
+            app_lock_feedback: None,
             sidebar_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
             last_rem_scale: initial_scale,
         }
+    }
+
+    pub(crate) fn clear_app_lock_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.app_lock_current_input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.app_lock_new_input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.app_lock_confirm_input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+    }
+
+    pub(crate) fn open_app_lock_form(
+        &mut self,
+        mode: AppLockFormMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.app_lock_busy {
+            return;
+        }
+        self.app_lock_form_mode = mode;
+        self.app_lock_feedback = None;
+        self.clear_app_lock_inputs(window, cx);
+        match mode {
+            AppLockFormMode::Setup => {
+                self.app_lock_new_input
+                    .update(cx, |s, cx| s.focus(window, cx));
+            }
+            AppLockFormMode::Change | AppLockFormMode::Disable => {
+                self.app_lock_current_input
+                    .update(cx, |s, cx| s.focus(window, cx));
+            }
+            AppLockFormMode::Closed => {}
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_app_lock_form(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.app_lock_busy {
+            return;
+        }
+        self.app_lock_form_mode = AppLockFormMode::Closed;
+        if let Some(w) = window {
+            self.clear_app_lock_inputs(w, cx);
+        } else {
+            let handle = self.window_handle;
+            let cur = self.app_lock_current_input.clone();
+            let new_in = self.app_lock_new_input.clone();
+            let confirm = self.app_lock_confirm_input.clone();
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    cur.update(cx, |s, cx| s.set_value("", window, cx));
+                    new_in.update(cx, |s, cx| s.set_value("", window, cx));
+                    confirm.update(cx, |s, cx| s.set_value("", window, cx));
+                });
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn submit_app_lock_form(&mut self, cx: &mut Context<Self>) {
+        if self.app_lock_busy || self.app_lock_form_mode == AppLockFormMode::Closed {
+            return;
+        }
+        let mode = self.app_lock_form_mode;
+        let current_val = self.app_lock_current_input.read(cx).value().to_string();
+        let new_val = self.app_lock_new_input.read(cx).value().to_string();
+        let confirm_val = self.app_lock_confirm_input.read(cx).value().to_string();
+
+        match mode {
+            AppLockFormMode::Setup => {
+                if let Err(err) = app_lock::validate_new_passcode(&new_val) {
+                    self.app_lock_feedback = Some((false, SharedString::from(err)));
+                    cx.notify();
+                    return;
+                }
+                if new_val != confirm_val {
+                    self.app_lock_feedback =
+                        Some((false, SharedString::from("两次输入的新密码不一致")));
+                    cx.notify();
+                    return;
+                }
+            }
+            AppLockFormMode::Change => {
+                if current_val.is_empty() {
+                    self.app_lock_feedback = Some((false, SharedString::from("请输入当前锁屏密码")));
+                    cx.notify();
+                    return;
+                }
+                if let Err(err) = app_lock::validate_new_passcode(&new_val) {
+                    self.app_lock_feedback = Some((false, SharedString::from(err)));
+                    cx.notify();
+                    return;
+                }
+                if new_val != confirm_val {
+                    self.app_lock_feedback =
+                        Some((false, SharedString::from("两次输入的新密码不一致")));
+                    cx.notify();
+                    return;
+                }
+            }
+            AppLockFormMode::Disable => {
+                if current_val.is_empty() {
+                    self.app_lock_feedback = Some((false, SharedString::from("请输入当前锁屏密码")));
+                    cx.notify();
+                    return;
+                }
+            }
+            AppLockFormMode::Closed => return,
+        }
+
+        let (demo_mode, existing_hash) = {
+            let app = self.app.read(cx);
+            (app.demo_mode, app.app_lock_hash_snapshot())
+        };
+        self.app_lock_busy = true;
+        self.app_lock_feedback = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let outcome: Result<(Option<String>, bool, &'static str), String> = cx
+                .background_executor()
+                .spawn(async move {
+                    match mode {
+                        AppLockFormMode::Setup => {
+                            let hash = app_lock::hash_passcode(&new_val)?;
+                            if !demo_mode {
+                                secrets::save_app_lock_hash(&hash)?;
+                            }
+                            Ok((Some(hash), true, "锁屏密码已启用，已默认开启自动锁定"))
+                        }
+                        AppLockFormMode::Change => {
+                            let stored = if demo_mode {
+                                existing_hash
+                            } else {
+                                secrets::load_app_lock_hash()?.or(existing_hash)
+                            };
+                            let Some(stored_hash) = stored else {
+                                return Err("尚未设置锁屏密码".to_string());
+                            };
+                            if !app_lock::verify_passcode(&current_val, &stored_hash) {
+                                return Err("当前锁屏密码错误".to_string());
+                            }
+                            let new_hash = app_lock::hash_passcode(&new_val)?;
+                            if !demo_mode {
+                                secrets::save_app_lock_hash(&new_hash)?;
+                            }
+                            Ok((Some(new_hash), false, "锁屏密码已更新"))
+                        }
+                        AppLockFormMode::Disable => {
+                            let stored = if demo_mode {
+                                existing_hash
+                            } else {
+                                secrets::load_app_lock_hash()?.or(existing_hash)
+                            };
+                            let Some(stored_hash) = stored else {
+                                return Err("尚未设置锁屏密码".to_string());
+                            };
+                            if !app_lock::verify_passcode(&current_val, &stored_hash) {
+                                return Err("当前锁屏密码错误".to_string());
+                            }
+                            if !demo_mode {
+                                secrets::delete_app_lock_hash()?;
+                            }
+                            Ok((None, false, "已关闭应用锁屏密码"))
+                        }
+                        AppLockFormMode::Closed => Err("表单已关闭".to_string()),
+                    }
+                })
+                .await;
+
+            let _ = this.update(cx, |win, cx| {
+                win.app_lock_busy = false;
+                match outcome {
+                    Ok((hash_opt, is_initial_setup, msg)) => {
+                        win.app.update(cx, |app, cx| {
+                            app.apply_app_lock_hash(hash_opt, is_initial_setup, cx);
+                        });
+                        win.close_app_lock_form(None, cx);
+                        win.app_lock_feedback = Some((true, SharedString::from(msg)));
+                    }
+                    Err(err) => {
+                        win.app_lock_feedback = Some((false, SharedString::from(err)));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn is_account_editor_dirty(&self, cx: &Context<Self>) -> bool {
@@ -671,6 +924,12 @@ impl SettingsWindow {
                 }
                 self.sender_feedback = None;
                 self.compose_inputs_feedback = None;
+                if tab != PrefTab::Privacy {
+                    self.app_lock_feedback = None;
+                    if self.app_lock_form_mode != AppLockFormMode::Closed {
+                        self.close_app_lock_form(Some(window), cx);
+                    }
+                }
                 cx.notify();
             }
             EditorLeaveAction::ActivateSearchHit(item) => {
@@ -811,6 +1070,12 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) {
         self.active_tab = item.tab;
+        if item.tab != PrefTab::Privacy {
+            self.app_lock_feedback = None;
+            if self.app_lock_form_mode != AppLockFormMode::Closed {
+                self.close_app_lock_form(Some(window), cx);
+            }
+        }
         if item.tab == PrefTab::System {
             self.invalidate_storage_summary();
         }
@@ -2412,6 +2677,8 @@ impl Render for SettingsWindow {
                 } else if this.pending_leave_action.is_some() {
                     this.pending_leave_action = None;
                     cx.notify();
+                } else if this.app_lock_form_mode != AppLockFormMode::Closed && !this.app_lock_busy {
+                    this.close_app_lock_form(Some(window), cx);
                 } else if this.active_tab == PrefTab::MailAccounts && this.account_editor_open {
                     this.request_leave_editor(EditorLeaveAction::BackToAccountList, window, cx);
                 } else if window.viewport_size().width.as_f32() <= NARROW_BREAKPOINT

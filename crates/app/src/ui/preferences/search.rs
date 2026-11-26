@@ -376,6 +376,34 @@ pub(crate) const SEARCH_ITEMS: &[PrefSearchItem] = &[
     // ---- 隐私 ----
     PrefSearchItem {
         tab: PrefTab::Privacy,
+        row_id: "pref-app-lock-status",
+        title: "应用锁屏密码",
+        subtitle: "设置用于解锁应用的本地密码，重启、空闲或后台超时后需密码解锁",
+        keywords: "app lock passcode password 锁屏 密码 解锁 隐私 安全",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Privacy,
+        row_id: "pref-app-lock-idle",
+        title: "无操作自动锁定",
+        subtitle: "连续未操作鼠标或键盘达到设定时间后自动锁定应用",
+        keywords: "idle auto lock timeout 空闲 无操作 自动 锁定 超时",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Privacy,
+        row_id: "pref-app-lock-background",
+        title: "切到后台或最小化后自动锁定",
+        subtitle: "切离窗口、最小化或隐藏到托盘达到设定时间后自动锁定",
+        keywords: "background minimize tray auto lock 后台 最小化 托盘 锁定",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Privacy,
+        row_id: "pref-app-lock-system",
+        title: "系统锁屏或休眠时立即锁定",
+        subtitle: "Windows 锁屏（Win+L）、切换用户或休眠时立即锁定应用",
+        keywords: "windows lock screen suspend sleep win+l 系统 锁屏 休眠 睡眠",
+    },
+    PrefSearchItem {
+        tab: PrefTab::Privacy,
         row_id: "pref-block-remote-images",
         title: "默认屏蔽邮件中的远程图像",
         subtitle: "阻止未加入白名单发件人的外部追踪像素与图片自动加载",
@@ -749,6 +777,13 @@ mod tests {
         assert!(reply_hits
             .iter()
             .any(|item| item.row_id == "pref-reply-inline"));
+
+        let lock_hits = filter_search_items("锁屏");
+        assert!(lock_hits
+            .iter()
+            .any(|item| item.tab == PrefTab::Privacy && item.row_id == "pref-app-lock-status"));
+        let pwd_hits = filter_search_items("密码");
+        assert!(pwd_hits.iter().any(|item| item.tab == PrefTab::Privacy));
     }
 
     #[test]

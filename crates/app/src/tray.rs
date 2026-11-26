@@ -13,6 +13,8 @@ pub(crate) enum TrayCommand {
     ShowWindow,
     NewCompose,
     SyncAll,
+    LockNow,
+    SystemLockOrSuspend,
     Quit,
 }
 
@@ -83,7 +85,7 @@ pub(crate) fn write_wide_truncated<const N: usize>(buf: &mut [u16; N], text: &st
 mod win {
     use super::*;
     use core::ffi::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread::JoinHandle;
 
     type Hwnd = *mut c_void;
@@ -137,6 +139,15 @@ mod win {
     const MENU_COMPOSE: u32 = 1002;
     const MENU_SYNC: u32 = 1003;
     const MENU_QUIT: u32 = 1004;
+    const MENU_LOCK: u32 = 1005;
+
+    const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+    const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+    const WTS_CONSOLE_DISCONNECT: usize = 0x2;
+    const WTS_REMOTE_DISCONNECT: usize = 0x4;
+    const WTS_SESSION_LOCK: usize = 0x7;
+    const WM_POWERBROADCAST: u32 = 0x0218;
+    const PBT_APMSUSPEND: usize = 0x4;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -314,6 +325,12 @@ mod win {
         fn Shell_NotifyIconW(dw_message: u32, lp_data: *const NotifyIconDataW) -> i32;
     }
 
+    #[link(name = "wtsapi32")]
+    extern "system" {
+        fn WTSRegisterSessionNotification(hwnd: Hwnd, dw_flags: u32) -> i32;
+        fn WTSUnRegisterSessionNotification(hwnd: Hwnd) -> i32;
+    }
+
     fn to_wide_null(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(core::iter::once(0)).collect()
     }
@@ -324,6 +341,7 @@ mod win {
         taskbar_created_msg: u32,
         pending_balloon: Arc<Mutex<Option<(String, String)>>>,
         pending_tooltip: Arc<Mutex<Option<String>>>,
+        lock_enabled: Arc<AtomicBool>,
         tooltip: String,
     }
 
@@ -367,6 +385,7 @@ mod win {
             let open_label = to_wide_null("打开 KiteMail");
             let compose_label = to_wide_null("写新邮件");
             let sync_label = to_wide_null("同步所有账号");
+            let lock_label = to_wide_null("立即锁定");
             let quit_label = to_wide_null("退出 KiteMail");
 
             AppendMenuW(hmenu, MF_STRING, MENU_OPEN as usize, open_label.as_ptr());
@@ -377,6 +396,9 @@ mod win {
                 compose_label.as_ptr(),
             );
             AppendMenuW(hmenu, MF_STRING, MENU_SYNC as usize, sync_label.as_ptr());
+            if self.lock_enabled.load(Ordering::Acquire) {
+                AppendMenuW(hmenu, MF_STRING, MENU_LOCK as usize, lock_label.as_ptr());
+            }
             AppendMenuW(hmenu, MF_SEPARATOR, 0, core::ptr::null());
             AppendMenuW(hmenu, MF_STRING, MENU_QUIT as usize, quit_label.as_ptr());
 
@@ -402,6 +424,9 @@ mod win {
                 }
                 MENU_SYNC => {
                     let _ = self.tx.send(TrayCommand::SyncAll);
+                }
+                MENU_LOCK => {
+                    let _ = self.tx.send(TrayCommand::LockNow);
                 }
                 MENU_QUIT => {
                     let _ = self.tx.send(TrayCommand::Quit);
@@ -460,6 +485,20 @@ mod win {
                     }
                     return 0;
                 }
+                WM_WTSSESSION_CHANGE => {
+                    if matches!(
+                        wparam,
+                        WTS_SESSION_LOCK | WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT
+                    ) {
+                        let _ = state.tx.send(TrayCommand::SystemLockOrSuspend);
+                    }
+                    return 0;
+                }
+                WM_POWERBROADCAST => {
+                    if wparam == PBT_APMSUSPEND {
+                        let _ = state.tx.send(TrayCommand::SystemLockOrSuspend);
+                    }
+                }
                 WM_COMMAND => {
                     return 0;
                 }
@@ -468,6 +507,7 @@ mod win {
                     return 0;
                 }
                 WM_DESTROY => {
+                    WTSUnRegisterSessionNotification(hwnd);
                     state.delete_tray_icon(hwnd);
                     if !state.hicon.is_null() {
                         DestroyIcon(state.hicon);
@@ -538,6 +578,7 @@ mod win {
         main_hwnd: AtomicUsize,
         pending_balloon: Arc<Mutex<Option<(String, String)>>>,
         pending_tooltip: Arc<Mutex<Option<String>>>,
+        lock_enabled: Arc<AtomicBool>,
         thread: Mutex<Option<JoinHandle<()>>>,
     }
 
@@ -550,6 +591,8 @@ mod win {
             let pending_balloon_bg = Arc::clone(&pending_balloon);
             let pending_tooltip = Arc::new(Mutex::new(None));
             let pending_tooltip_bg = Arc::clone(&pending_tooltip);
+            let lock_enabled = Arc::new(AtomicBool::new(false));
+            let lock_enabled_bg = Arc::clone(&lock_enabled);
 
             let thread = std::thread::Builder::new()
                 .name("kitemail-win-tray".to_string())
@@ -610,10 +653,12 @@ mod win {
                         taskbar_created_msg,
                         pending_balloon: pending_balloon_bg,
                         pending_tooltip: pending_tooltip_bg,
+                        lock_enabled: lock_enabled_bg,
                         tooltip: "KiteMail".to_string(),
                     });
                     let state_ptr = Box::into_raw(state);
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+                    WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
                     (*state_ptr).add_tray_icon(hwnd);
                     if publish_tray_window(&tray_hwnd_bg, hwnd as usize) {
                         let mut msg = core::mem::zeroed::<Msg>();
@@ -641,8 +686,14 @@ mod win {
                 main_hwnd: AtomicUsize::new(0),
                 pending_balloon,
                 pending_tooltip,
+                lock_enabled,
                 thread: Mutex::new(Some(thread)),
             })
+        }
+
+        /// 更新托盘右键菜单是否展示「立即锁定」菜单项。
+        pub(crate) fn set_lock_enabled(&self, enabled: bool) {
+            self.lock_enabled.store(enabled, Ordering::Release);
         }
 
         /// 记录 GPUI 主窗口 HWND（须在主 UI 线程调用）。
@@ -813,6 +864,7 @@ mod stub {
         }
         pub(crate) fn show_notification(&self, _title: &str, _body: &str) {}
         pub(crate) fn set_tooltip(&self, _tooltip: String) {}
+        pub(crate) fn set_lock_enabled(&self, _enabled: bool) {}
         pub(crate) fn drain_commands(&self) -> Vec<TrayCommand> {
             Vec::new()
         }

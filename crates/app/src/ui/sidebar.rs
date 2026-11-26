@@ -2628,6 +2628,7 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
     let show_accounts = app.show_accounts;
     let reader_position = app.reader_position;
     let focus_mode = app.focus_mode;
+    let lock_enabled = app.has_app_lock_passcode();
     let entity = cx.entity();
     let entity_for_accounts = entity.clone();
     let entity_for_fullscreen = entity.clone();
@@ -2636,6 +2637,7 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
     let entity_for_palette = entity.clone();
     let entity_for_shortcuts = entity.clone();
     let entity_for_about = entity.clone();
+    let entity_for_lock = entity.clone();
     let entity_for_quit = entity.clone();
     let entity_for_reader_pos = entity.clone();
     let entity_for_focus = entity.clone();
@@ -2653,10 +2655,11 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
             let entity_for_palette = entity_for_palette.clone();
             let entity_for_shortcuts = entity_for_shortcuts.clone();
             let entity_for_about = entity_for_about.clone();
+            let entity_for_lock = entity_for_lock.clone();
             let entity_for_quit = entity_for_quit.clone();
             let entity_for_reader_pos = entity_for_reader_pos.clone();
             let entity_for_focus = entity_for_focus.clone();
-            menu.item(
+            let menu = menu.item(
                 // 演示模式下账号管理不可用（无 worker 账号可编辑）。
                 PopupMenuItem::new("账号管理")
                     .icon(Icon::new(IconName::Settings))
@@ -2776,8 +2779,21 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
                         });
                     }),
             )
-            .separator()
-            .item(
+            .separator();
+            let menu = if lock_enabled {
+                menu.item(
+                    PopupMenuItem::new("立即锁定  Ctrl+Shift+L")
+                        .icon(Icon::new(IconName::Ban))
+                        .on_click(move |_, _, cx| {
+                            entity_for_lock.update(cx, |app, cx| {
+                                app.lock_app(cx);
+                            });
+                        }),
+                )
+            } else {
+                menu
+            };
+            menu.item(
                 PopupMenuItem::new("退出 KiteMail")
                     .icon(Icon::new(IconName::LogOut))
                     .on_click(move |_, _, cx| {

@@ -23,7 +23,7 @@ use crate::ui::preferences::widgets::{
     search_scroll_anchor_consumed, setting_group, setting_row, take_search_scroll_pending,
     theme_gallery, CARDS_WIDE_MAX_WIDTH, CARD_MAX_WIDTH,
 };
-use crate::ui::preferences::{extra_pages, PrefTab, SettingsWindow};
+use crate::ui::preferences::{extra_pages, AppLockFormMode, PrefTab, SettingsWindow};
 
 const PAGE_SIZE_OPTIONS: &[(&str, usize)] = &[
     ("50 封 / 页", 50),
@@ -142,6 +142,29 @@ const READ_RECEIPT_OPTIONS: &[(&str, &str)] = &[
     ("每次询问", "ask"),
     ("总是发送", "always"),
     ("从不发送", "never"),
+];
+
+/// 前台无操作自动锁屏超时（分钟，`0` 表示从不）。
+const APP_LOCK_IDLE_OPTIONS: &[(&str, u32)] = &[
+    ("1 分钟", 1),
+    ("5 分钟", 5),
+    ("10 分钟", 10),
+    ("15 分钟", 15),
+    ("30 分钟", 30),
+    ("60 分钟", 60),
+    ("从不", 0),
+];
+
+/// 切到后台 / 最小化 / 隐藏托盘自动锁屏超时。
+const APP_LOCK_BG_OPTIONS: &[(&str, &str)] = &[
+    ("立即", "immediate"),
+    ("1 分钟", "1"),
+    ("3 分钟", "3"),
+    ("5 分钟", "5"),
+    ("10 分钟", "10"),
+    ("15 分钟", "15"),
+    ("30 分钟", "30"),
+    ("从不", "never"),
 ];
 
 /// 已下载邮件保留时长（对齐 Linux `KEEP_DOWNLOADS_DAYS = [0, 365, 90, 30]`）。
@@ -273,7 +296,7 @@ pub(crate) fn render_tab(
         PrefTab::Conversations => render_conversations(win, app_entity, p, cx),
         PrefTab::Reading => render_reading(win, app_entity, p, cx),
         PrefTab::Composing => render_composing(win, app_entity, p, cx),
-        PrefTab::Privacy => render_privacy(win, app_entity, p, cx),
+        PrefTab::Privacy => render_privacy(win, app_entity, p, window, cx),
         PrefTab::Mcp => extra_pages::render_mcp(win, app_entity, p, cx),
         PrefTab::DateTime => render_date_time(win, app_entity, p, cx),
         PrefTab::System => render_system(win, app_entity, p, cx),
@@ -2792,18 +2815,328 @@ fn render_privacy(
     win: &SettingsWindow,
     app_entity: Entity<HylkiApp>,
     p: &HylkiPalette,
+    _window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
-    let prefs = app_entity.read(cx).prefs.clone();
+    let (prefs, has_passcode) = {
+        let app = app_entity.read(cx);
+        (app.prefs.clone(), app.has_app_lock_passcode())
+    };
+    let idle_mins = config::normalize_app_lock_idle_minutes(prefs.app_lock_idle_minutes);
+    let bg_timeout = config::normalize_app_lock_background_timeout(&prefs.app_lock_background_timeout);
+
+    let app_lock_now = app_entity.clone();
+    let app_lock_idle = app_entity.clone();
+    let app_lock_bg = app_entity.clone();
+    let app_lock_sys = app_entity.clone();
     let a1 = app_entity.clone();
     let a2 = app_entity.clone();
     let a3 = app_entity.clone();
     let a_receipt = app_entity.clone();
 
-    v_flex()
-        .w_full()
-        .max_w(px(CARD_MAX_WIDTH))
-        .gap_5()
+    let status_controls: AnyElement = if has_passcode {
+        h_flex()
+            .gap_1p5()
+            .child(
+                Button::new("btn-app-lock-now")
+                    .outline()
+                    .compact()
+                    .disabled(win.app_lock_busy)
+                    .label("立即锁定")
+                    .on_click(move |_, _, cx| {
+                        app_lock_now.update(cx, |app, cx| {
+                            app.lock_app(cx);
+                        });
+                    }),
+            )
+            .child(
+                Button::new("btn-app-lock-change")
+                    .outline()
+                    .compact()
+                    .disabled(win.app_lock_busy)
+                    .label("修改密码")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_app_lock_form(AppLockFormMode::Change, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("btn-app-lock-disable")
+                    .danger()
+                    .compact()
+                    .disabled(win.app_lock_busy)
+                    .label("关闭密码")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_app_lock_form(AppLockFormMode::Disable, window, cx);
+                    })),
+            )
+            .into_any_element()
+    } else {
+        Button::new("btn-app-lock-setup")
+            .primary()
+            .compact()
+            .disabled(win.app_lock_busy)
+            .label("设置密码")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_app_lock_form(AppLockFormMode::Setup, window, cx);
+            }))
+            .into_any_element()
+    };
+
+    let mut lock_rows = vec![setting_row(
+        "pref-app-lock-status",
+        "锁屏密码",
+        Some(if has_passcode {
+            "已启用 · 每次重新打开软件、空闲或切到后台超时后需输入密码解锁"
+        } else {
+            "未设置 · 设置密码后将默认开启自动锁定与启动锁屏保护"
+        }),
+        status_controls,
+        false,
+        is_hit(win, "pref-app-lock-status"),
+        p,
+    )];
+
+    if win.app_lock_form_mode != AppLockFormMode::Closed {
+        let mode = win.app_lock_form_mode;
+        let (form_title, form_hint, submit_label, danger_submit) = match mode {
+            AppLockFormMode::Setup => (
+                "设置锁屏密码",
+                "密码至少需要 4 个字符；保存后将默认开启空闲 15 分钟 / 后台 5 分钟自动锁定。",
+                if win.app_lock_busy {
+                    "保存中..."
+                } else {
+                    "保存密码"
+                },
+                false,
+            ),
+            AppLockFormMode::Change => (
+                "修改锁屏密码",
+                "请先验证当前密码，再输入并确认新密码（至少 4 个字符）。",
+                if win.app_lock_busy {
+                    "保存中..."
+                } else {
+                    "确认修改"
+                },
+                false,
+            ),
+            AppLockFormMode::Disable => (
+                "关闭锁屏密码",
+                "关闭前需验证当前密码；关闭后重启与自动锁屏将不再要求输入密码。",
+                if win.app_lock_busy {
+                    "处理中..."
+                } else {
+                    "确认关闭"
+                },
+                true,
+            ),
+            AppLockFormMode::Closed => unreachable!(),
+        };
+
+        let mut form = v_flex()
+            .w_full()
+            .px_4()
+            .py_3()
+            .gap_2p5()
+            .bg(p.surface)
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text)
+                            .child(form_title),
+                    )
+                    .child(div().text_xs().text_color(p.text_muted).child(form_hint)),
+            );
+
+        if matches!(mode, AppLockFormMode::Change | AppLockFormMode::Disable) {
+            form = form.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.text_muted)
+                            .child("当前密码"),
+                    )
+                    .child(Input::new(&win.app_lock_current_input).mask_toggle()),
+            );
+        }
+        if matches!(mode, AppLockFormMode::Setup | AppLockFormMode::Change) {
+            form = form
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.text_muted)
+                                .child("新密码"),
+                        )
+                        .child(Input::new(&win.app_lock_new_input).mask_toggle()),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.text_muted)
+                                .child("确认新密码"),
+                        )
+                        .child(Input::new(&win.app_lock_confirm_input).mask_toggle()),
+                );
+        }
+
+        if let Some((ok, ref msg)) = win.app_lock_feedback {
+            form = form.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.0))
+                    .bg(if ok {
+                        p.accent.opacity(0.12)
+                    } else {
+                        p.danger.opacity(0.12)
+                    })
+                    .text_xs()
+                    .text_color(if ok { p.accent } else { p.danger })
+                    .child(msg.clone()),
+            );
+        }
+
+        let submit_btn = if danger_submit {
+            Button::new("btn-app-lock-submit").danger()
+        } else {
+            Button::new("btn-app-lock-submit").primary()
+        };
+        form = form.child(
+            h_flex()
+                .pt_1()
+                .gap_2()
+                .justify_end()
+                .child(
+                    Button::new("btn-app-lock-cancel")
+                        .outline()
+                        .compact()
+                        .disabled(win.app_lock_busy)
+                        .label("取消")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.app_lock_feedback = None;
+                            this.close_app_lock_form(Some(window), cx);
+                        })),
+                )
+                .child(
+                    submit_btn
+                        .compact()
+                        .disabled(win.app_lock_busy)
+                        .label(submit_label)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.submit_app_lock_form(cx);
+                        })),
+                ),
+        );
+
+        lock_rows.push(form.into_any_element());
+    }
+
+    lock_rows.extend([
+        setting_row(
+            "pref-app-lock-idle",
+            "无操作自动锁定",
+            Some("连续未操作鼠标或键盘达到设定时长后自动锁定界面"),
+            combo_button(
+                "cb-app-lock-idle",
+                lookup_label(APP_LOCK_IDLE_OPTIONS, &idle_mins, "15 分钟"),
+                APP_LOCK_IDLE_OPTIONS,
+                idle_mins,
+                !has_passcode,
+                move |val: u32, _, cx| {
+                    app_lock_idle.update(cx, |app, cx| {
+                        app.mutate_preferences(cx, |p| p.app_lock_idle_minutes = val);
+                    });
+                },
+            ),
+            !has_passcode,
+            is_hit(win, "pref-app-lock-idle"),
+            p,
+        ),
+        setting_row(
+            "pref-app-lock-background",
+            "切到后台或最小化后自动锁定",
+            Some("窗口切到后台、最小化或隐藏到托盘超过设定时长后自动锁定"),
+            combo_button(
+                "cb-app-lock-bg",
+                lookup_label(APP_LOCK_BG_OPTIONS, &bg_timeout, "5 分钟"),
+                APP_LOCK_BG_OPTIONS,
+                bg_timeout,
+                !has_passcode,
+                move |val: &str, _, cx| {
+                    app_lock_bg.update(cx, |app, cx| {
+                        app.mutate_preferences(cx, |p| {
+                            p.app_lock_background_timeout = val.to_string();
+                        });
+                    });
+                },
+            ),
+            !has_passcode,
+            is_hit(win, "pref-app-lock-background"),
+            p,
+        ),
+        setting_row(
+            "pref-app-lock-system",
+            "系统锁屏或休眠时立即锁定",
+            Some("触发 Windows 锁屏（Win+L）、切换用户或电脑睡眠时立刻锁定应用"),
+            bool_switch(
+                "sw-app-lock-system",
+                prefs.app_lock_on_system_lock,
+                !has_passcode,
+                move |val, _, cx| {
+                    app_lock_sys.update(cx, |app, cx| {
+                        app.mutate_preferences(cx, |p| p.app_lock_on_system_lock = val);
+                    });
+                },
+            ),
+            !has_passcode,
+            is_hit(win, "pref-app-lock-system"),
+            p,
+        ),
+    ]);
+
+    let mut stack = v_flex().w_full().max_w(px(CARD_MAX_WIDTH)).gap_5();
+
+    if win.app_lock_form_mode == AppLockFormMode::Closed {
+        if let Some((ok, ref msg)) = win.app_lock_feedback {
+            stack = stack.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.0))
+                    .bg(if ok {
+                        p.accent.opacity(0.12)
+                    } else {
+                        p.danger.opacity(0.12)
+                    })
+                    .text_xs()
+                    .text_color(if ok { p.accent } else { p.danger })
+                    .child(msg.clone()),
+            );
+        }
+    }
+
+    stack
+        .child(setting_group(
+            "应用锁屏密码",
+            Some("设置本地密码后，无操作或切到后台超过设定时间将自动锁定界面；每次重新打开软件也需输入密码解锁"),
+            CARD_MAX_WIDTH,
+            lock_rows,
+            p,
+        ))
         .child(setting_group(
             "远程图像与跟踪保护",
             None,

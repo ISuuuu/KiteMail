@@ -679,6 +679,49 @@ pub fn load_oauth_refresh_token(account_id: u32) -> Result<String, String> {
     load_oauth_refresh_token_for(account_id, "")
 }
 
+const APP_LOCK_PASSCODE_KEY: &str = "app-lock-passcode-hash";
+
+/// 将应用锁屏密码哈希持久化到 Windows 凭据管理器。
+pub fn save_app_lock_hash(hash: &str) -> Result<(), String> {
+    let service_name = current_service_name();
+    let hash_owned = hash.to_string();
+    run_on_keyring_thread(move || {
+        write_entry(
+            &service_name,
+            APP_LOCK_PASSCODE_KEY,
+            &hash_owned,
+            "锁屏密码",
+            "保存锁屏密码失败",
+        )
+    })
+}
+
+/// 从 Windows 凭据管理器读取应用锁屏密码哈希；未配置时返回 `Ok(None)`。
+pub fn load_app_lock_hash() -> Result<Option<String>, String> {
+    let service_name = current_service_name();
+    run_on_keyring_thread(move || {
+        read_entry_optional(
+            &service_name,
+            APP_LOCK_PASSCODE_KEY,
+            "锁屏密码",
+            "读取锁屏密码失败",
+        )
+    })
+}
+
+/// 从 Windows 凭据管理器删除应用锁屏密码哈希（不存在时幂等返回 `Ok(())`）。
+pub fn delete_app_lock_hash() -> Result<(), String> {
+    let service_name = current_service_name();
+    run_on_keyring_thread(move || {
+        let entry = keyring::Entry::new(&service_name, APP_LOCK_PASSCODE_KEY)
+            .map_err(|e| format!("初始化 锁屏密码 凭据项失败: {e}"))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!("删除锁屏密码失败: {e}")),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,5 +1077,35 @@ mod tests {
         assert_eq!(email_imap_entry_name("   "), None);
         assert_eq!(email_smtp_entry_name(""), None);
         assert_eq!(email_oauth_refresh_entry_name(""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn app_lock_hash_roundtrip_and_delete() {
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = delete_app_lock_hash();
+            }
+        }
+        let _cleanup = Cleanup;
+
+        delete_app_lock_hash().expect("initial idempotent delete");
+        assert_eq!(load_app_lock_hash().expect("load empty"), None);
+
+        save_app_lock_hash("pbkdf2_sha256$200000$c2FsdA==$ZGs=").expect("save hash");
+        assert_eq!(
+            load_app_lock_hash().expect("load saved"),
+            Some("pbkdf2_sha256$200000$c2FsdA==$ZGs=".to_string())
+        );
+
+        save_app_lock_hash("pbkdf2_sha256$200000$bmV3c2FsdA==$bmV3ZGs=").expect("update hash");
+        assert_eq!(
+            load_app_lock_hash().expect("load updated"),
+            Some("pbkdf2_sha256$200000$bmV3c2FsdA==$bmV3ZGs=".to_string())
+        );
+
+        delete_app_lock_hash().expect("delete hash");
+        assert_eq!(load_app_lock_hash().expect("load after delete"), None);
     }
 }

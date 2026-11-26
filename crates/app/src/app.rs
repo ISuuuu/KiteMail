@@ -28,6 +28,9 @@ use gpui_kit::{
     StyledImage, Subscription, TitlebarOptions, Window, WindowAppearance, WindowBounds,
     WindowOptions,
 };
+use kitemail_mail_core::app_lock::{
+    self, AutoLockTickInput, AutoLockTracker, BackgroundLockPolicy,
+};
 use kitemail_mail_core::cache::{
     sanitize_filename, CachedAttachment, KnownContact, MailDirSwitchMode,
 };
@@ -36,6 +39,7 @@ use kitemail_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_SENT_ID,
 };
 use kitemail_mail_core::markup::ComposeFormat;
+use kitemail_mail_core::secrets;
 use kitemail_mail_core::signature;
 use kitemail_mail_core::worker::MailWorkerHandle;
 use kitemail_mail_core::{
@@ -62,7 +66,8 @@ use crate::ui::toast::{
     self, SendToastStage, SendToastViewModel, ToastAction, ToastActionKind, ToastKind,
     WindowToastQueue, MOVE_UNDO_TOAST_DURATION, TRANSIENT_TOAST_DURATION,
 };
-use crate::ui::{compose, message_list, reader, sidebar, welcome, window_controls};
+use crate::ui::{compose, lock_screen, message_list, reader, sidebar, welcome, window_controls};
+use crate::win_idle;
 
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
 
@@ -383,7 +388,8 @@ actions!(
         SetReaderPositionBelow,
         SetReaderPositionHidden,
         ToggleFocusMode,
-        CloseSettingsWindow
+        CloseSettingsWindow,
+        LockApp
     ]
 );
 
@@ -1151,6 +1157,18 @@ pub(crate) struct HylkiApp {
     pub(crate) expanded_threads: HashSet<u32>,
     pub(crate) thread_children_cache: HashMap<u32, Vec<MessageSummary>>,
     pub(crate) collapsed_day_groups: HashSet<String>,
+
+    // ---- 应用锁屏密码与自动锁定状态机 ----
+    app_lock_hash: Option<String>,
+    pub(crate) app_locked: bool,
+    pub(crate) lock_passcode_input: Entity<InputState>,
+    pub(crate) lock_error: Option<SharedString>,
+    pub(crate) lock_verifying: bool,
+    lock_failed_attempts: u32,
+    pub(crate) lock_cooldown_until: Option<Instant>,
+    pub(crate) lock_input_needs_focus: bool,
+    lock_tracker: AutoLockTracker,
+    restore_detached_compose_on_unlock: bool,
 }
 
 impl HylkiApp {
@@ -1219,6 +1237,17 @@ impl HylkiApp {
             })
             .detach();
         }
+
+        // 每秒评估一次前台无操作 / 切后台自动锁屏状态与冷却倒计时（正式与演示模式共用）。
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let res = this.update(cx, |app, cx| app.app_lock_tick(cx));
+            if res.is_err() {
+                break;
+            }
+        })
+        .detach();
+
         let data_dir = config::data_dir();
         let existing_accounts = if demo_mode {
             Vec::new()
@@ -1361,6 +1390,27 @@ impl HylkiApp {
                 _ => {}
             },
         )
+        .detach();
+
+        let lock_passcode_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("输入锁屏密码…")
+        });
+        cx.subscribe(&lock_passcode_input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::PressEnter { .. } => {
+                this.submit_unlock_passcode(cx);
+            }
+            InputEvent::Change => {
+                if this
+                    .lock_cooldown_until
+                    .is_none_or(|until| until <= Instant::now())
+                {
+                    this.lock_error = None;
+                }
+            }
+            _ => {}
+        })
         .detach();
 
         let initial_rem_scale = config::clamp_ui_text_scale(prefs.ui_text_scale_percent);
@@ -1633,7 +1683,26 @@ impl HylkiApp {
                 expanded_threads: HashSet::new(),
                 thread_children_cache: HashMap::new(),
                 collapsed_day_groups: HashSet::new(),
+                app_lock_hash: None,
+                app_locked: false,
+                lock_passcode_input,
+                lock_error: None,
+                lock_verifying: false,
+                lock_failed_attempts: 0,
+                lock_cooldown_until: None,
+                lock_input_needs_focus: false,
+                lock_tracker: AutoLockTracker::new(Instant::now()),
+                restore_detached_compose_on_unlock: false,
             };
+        }
+
+        let (initial_app_lock_hash, initial_app_lock_error) = match secrets::load_app_lock_hash() {
+            Ok(hash) => (hash, None),
+            Err(err) => (None, Some(err)),
+        };
+        let initial_app_locked = initial_app_lock_hash.is_some();
+        if let Some(ref tray_handle) = tray {
+            tray_handle.set_lock_enabled(initial_app_locked);
         }
 
         let (worker_evt_tx, mut worker_evt_rx) = futures::channel::mpsc::channel::<()>(16);
@@ -1916,7 +1985,27 @@ impl HylkiApp {
             expanded_threads: HashSet::new(),
             thread_children_cache: HashMap::new(),
             collapsed_day_groups: HashSet::new(),
+            app_lock_hash: initial_app_lock_hash,
+            app_locked: initial_app_locked,
+            lock_passcode_input,
+            lock_error: None,
+            lock_verifying: false,
+            lock_failed_attempts: 0,
+            lock_cooldown_until: None,
+            lock_input_needs_focus: initial_app_locked,
+            lock_tracker: AutoLockTracker::new(Instant::now()),
+            restore_detached_compose_on_unlock: false,
         };
+
+        if let Some(err) = initial_app_lock_error {
+            app.push_toast(
+                "app-lock-load-err",
+                ToastKind::Warning,
+                format!("无法读取锁屏密码配置：{err}"),
+                None,
+                cx,
+            );
+        }
 
         // 启动视图非统一收件箱时立即请求对应列表（LoadAllCached 只覆盖收件箱）。
         if app.current_view != CurrentView::UnifiedInbox {
@@ -2033,6 +2122,7 @@ impl HylkiApp {
             && !self.sidebar_peek_open
             && self.drawer_image_preview.is_none()
             && !self.mail_dir_switching
+            && !self.app_locked
     }
 
     /// 浮层打开期间 WebView2 是否该让位（快照已到手，或没得拍）。
@@ -3713,7 +3803,7 @@ impl HylkiApp {
                         sender,
                         subject,
                         account_label,
-                        self.prefs.notification_show_content,
+                        self.prefs.notification_show_content && !self.app_locked,
                     );
                     tray.show_notification(&title, &body);
                 }
@@ -3753,6 +3843,7 @@ impl HylkiApp {
             if let Some(first) = self.current_page.items.first().cloned() {
                 // L-6：阅读器关闭或设为仅手动标已读时，首屏自动选中不立即标已读。
                 let mark_now = first.unread
+                    && !self.app_locked
                     && self.reader_position != ReaderPosition::Hidden
                     && self.prefs.read_mark_mode == "shown";
                 let is_collapsed_head = self.is_collapsed_thread_head(first.id);
@@ -4010,10 +4101,19 @@ impl HylkiApp {
                 if let Some(ref tray) = self.tray {
                     tray.show_main_window();
                 }
+                if self.app_locked {
+                    self.lock_input_needs_focus = true;
+                    cx.notify();
+                }
             }
             TrayCommand::NewCompose => {
                 if let Some(ref tray) = self.tray {
                     tray.show_main_window();
+                }
+                if self.app_locked {
+                    self.lock_input_needs_focus = true;
+                    cx.notify();
+                    return;
                 }
                 // 本方法运行在 `HylkiApp::update` 内部（托盘轮询任务），此处再
                 // `entity.update` 会对同一实体重复租借并 panic，故延后到下一 tick。
@@ -4022,6 +4122,9 @@ impl HylkiApp {
                 cx.defer(move |cx| {
                     let _ = handle.update(cx, |_, window, cx| {
                         entity.update(cx, |this, cx| {
+                            if this.app_locked {
+                                return;
+                            }
                             this.active_modal = ActiveModal::None;
                             this.main_view = MainContentView::Mail;
                             this.start_new_compose(window, cx);
@@ -4032,10 +4135,252 @@ impl HylkiApp {
             TrayCommand::SyncAll => {
                 self.refresh_all(cx);
             }
+            TrayCommand::LockNow => {
+                self.lock_app(cx);
+            }
+            TrayCommand::SystemLockOrSuspend => {
+                if self.prefs.app_lock_on_system_lock {
+                    self.lock_app(cx);
+                }
+            }
             TrayCommand::Quit => {
                 self.quit_app(cx);
             }
         }
+    }
+
+    pub(crate) fn has_app_lock_passcode(&self) -> bool {
+        self.app_lock_hash.is_some()
+    }
+
+    pub(crate) fn app_lock_hash_snapshot(&self) -> Option<String> {
+        self.app_lock_hash.clone()
+    }
+
+    pub(crate) fn apply_app_lock_hash(
+        &mut self,
+        new_hash: Option<String>,
+        is_initial_setup: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.app_lock_hash = new_hash;
+        if let Some(ref tray) = self.tray {
+            tray.set_lock_enabled(self.app_lock_hash.is_some());
+        }
+        if is_initial_setup && self.app_lock_hash.is_some() {
+            self.mutate_preferences(cx, |p| {
+                if p.app_lock_idle_minutes == 0 {
+                    p.app_lock_idle_minutes = 15;
+                }
+                if config::normalize_app_lock_background_timeout(&p.app_lock_background_timeout)
+                    == "never"
+                {
+                    p.app_lock_background_timeout = "5".to_string();
+                }
+                p.app_lock_on_system_lock = true;
+            });
+        }
+        self.lock_tracker.reset_after_unlock(Instant::now());
+        self.lock_failed_attempts = 0;
+        self.lock_cooldown_until = None;
+        if self.app_lock_hash.is_none() {
+            self.app_locked = false;
+            self.lock_error = None;
+            self.lock_verifying = false;
+        }
+        cx.notify();
+    }
+
+    fn app_lock_tick(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if self.app_locked {
+            if let Some(until) = self.lock_cooldown_until {
+                if now >= until {
+                    self.lock_cooldown_until = None;
+                    self.lock_error = None;
+                }
+                cx.notify();
+            }
+            return;
+        }
+        if self.app_lock_hash.is_none() {
+            return;
+        }
+        let in_foreground = win_idle::is_current_process_foreground();
+        let system_idle = if in_foreground
+            || config::normalize_app_lock_background_timeout(
+                &self.prefs.app_lock_background_timeout,
+            ) == "never"
+        {
+            win_idle::system_idle_duration()
+        } else {
+            None
+        };
+        let settings_dialog_open = self
+            .settings_window
+            .as_ref()
+            .is_some_and(|(_, entity)| entity.read(cx).file_dialog_open);
+        let file_dialog_open = self.file_dialog_open || settings_dialog_open;
+        let trigger = self.lock_tracker.evaluate(AutoLockTickInput {
+            now,
+            has_passcode: true,
+            is_locked: false,
+            in_foreground,
+            file_dialog_open,
+            system_idle,
+            idle_minutes: self.prefs.app_lock_idle_minutes,
+            background_policy: BackgroundLockPolicy::from_pref_str(
+                &self.prefs.app_lock_background_timeout,
+            ),
+        });
+        if trigger.is_some() {
+            self.lock_app(cx);
+        }
+    }
+
+    pub(crate) fn lock_app(&mut self, cx: &mut Context<Self>) {
+        if self.app_lock_hash.is_none() || self.app_locked {
+            return;
+        }
+        let is_composing = self.right_mode == RightPaneMode::Compose
+            || self.compose_split
+            || (self.compose_detached && self.compose_window.is_some());
+        if is_composing && self.compose_has_unsaved_content(cx) && !self.demo_mode {
+            self.cancel_draft_autosave();
+            self.save_local_draft(cx);
+        }
+        if self.compose_detached && self.compose_window.is_some() {
+            self.restore_detached_compose_on_unlock = true;
+            self.close_compose_window(cx);
+        }
+        let popout_handles: Vec<AnyWindowHandle> = self
+            .popout_message_windows
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
+        if !popout_handles.is_empty() {
+            cx.defer(move |cx| {
+                for handle in popout_handles {
+                    let _ = handle.update(cx, |_, window, _| window.remove_window());
+                }
+            });
+        }
+        if let Some((settings_handle, _)) = self.settings_window.take() {
+            self.clear_settings_window_ref();
+            cx.defer(move |cx| {
+                let _ = settings_handle.update(cx, |_, window, _| window.remove_window());
+            });
+        } else {
+            self.settings_window_opening = false;
+        }
+
+        self.app_locked = true;
+        self.lock_error = None;
+        self.lock_verifying = false;
+        self.lock_input_needs_focus = true;
+        self.active_modal = ActiveModal::None;
+        self.palette = None;
+        self.palette_sub = None;
+        self.sidebar_peek_open = false;
+        self.reader_popup_open = false;
+        self.lock_tracker.reset_after_unlock(Instant::now());
+
+        #[cfg(windows)]
+        if let Some(ref host) = self.reader_webview {
+            host.set_visible(false);
+            host.try_suspend();
+        }
+
+        let handle = self.window_handle;
+        let input = self.lock_passcode_input.clone();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                input.update(cx, |s, cx| s.set_value("", window, cx));
+            });
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn submit_unlock_passcode(&mut self, cx: &mut Context<Self>) {
+        if !self.app_locked || self.lock_verifying {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(until) = self.lock_cooldown_until {
+            if until > now {
+                let d = until.saturating_duration_since(now);
+                let secs = d
+                    .as_secs()
+                    .saturating_add(if d.subsec_nanos() > 0 { 1 } else { 0 });
+                self.lock_error = Some(SharedString::from(format!(
+                    "密码错误次数过多，请 {secs} 秒后再试"
+                )));
+                cx.notify();
+                return;
+            }
+            self.lock_cooldown_until = None;
+        }
+        let passcode = self.lock_passcode_input.read(cx).value().to_string();
+        if passcode.is_empty() {
+            self.lock_error = Some(SharedString::from("请输入锁屏密码"));
+            self.lock_input_needs_focus = true;
+            cx.notify();
+            return;
+        }
+        let Some(stored_hash) = self.app_lock_hash.clone() else {
+            self.app_locked = false;
+            self.lock_error = None;
+            cx.notify();
+            return;
+        };
+        self.lock_verifying = true;
+        self.lock_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let matched = cx
+                .background_executor()
+                .spawn(async move { app_lock::verify_passcode(&passcode, &stored_hash) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.lock_verifying = false;
+                if !app.app_locked {
+                    return;
+                }
+                let handle = app.window_handle;
+                let input = app.lock_passcode_input.clone();
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        input.update(cx, |s, cx| s.set_value("", window, cx));
+                    });
+                });
+                if matched {
+                    app.app_locked = false;
+                    app.lock_failed_attempts = 0;
+                    app.lock_cooldown_until = None;
+                    app.lock_error = None;
+                    app.lock_tracker.reset_after_unlock(Instant::now());
+                    if std::mem::take(&mut app.restore_detached_compose_on_unlock) {
+                        app.pop_out_compose(cx);
+                    }
+                } else {
+                    app.lock_failed_attempts = app.lock_failed_attempts.saturating_add(1);
+                    let cooldown = app_lock::unlock_cooldown_secs(app.lock_failed_attempts);
+                    if cooldown > 0 {
+                        app.lock_cooldown_until =
+                            Some(Instant::now() + Duration::from_secs(cooldown));
+                        app.lock_error = Some(SharedString::from(format!(
+                            "密码错误次数过多，请 {cooldown} 秒后再试"
+                        )));
+                    } else {
+                        app.lock_error = Some(SharedString::from("锁屏密码错误，请重新输入"));
+                    }
+                    app.lock_input_needs_focus = true;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 彻底退出应用（菜单「退出 Hylki」或托盘右键「退出 Hylki」入口）。
@@ -6813,6 +7158,9 @@ impl HylkiApp {
     /// 独立窗口直接渲染同一份 [`HylkiApp`] 写信状态（对齐设置窗口的做法），
     /// 所以草稿自动保存、发送、附件等逻辑无需复制；主窗口同时回到阅读器。
     pub(crate) fn pop_out_compose(&mut self, cx: &mut Context<Self>) {
+        if self.app_locked {
+            return;
+        }
         if self.compose_detached {
             if let Some(handle) = self.compose_window {
                 cx.defer(move |cx| {
@@ -6850,7 +7198,9 @@ impl HylkiApp {
         cx.defer(move |cx| {
             let still_valid = {
                 let app = app_entity.read(cx);
-                app.compose_session_generation == generation && app.compose_detached
+                !app.app_locked
+                    && app.compose_session_generation == generation
+                    && app.compose_detached
             };
             if !still_valid {
                 return;
@@ -8150,6 +8500,9 @@ impl HylkiApp {
     }
 
     pub(crate) fn pop_out_message_window(&mut self, detail: MessageDetail, cx: &mut Context<Self>) {
+        if self.app_locked {
+            return;
+        }
         if let Some(&existing) = self.popout_message_windows.get(&detail.id) {
             let app_entity = cx.entity();
             let msg_id = detail.id;
@@ -8190,6 +8543,9 @@ impl HylkiApp {
         };
         // 独立窗口首帧会读取主窗口状态，等当前更新释放主窗口实体后再打开。
         cx.defer(move |cx| {
+            if app_entity.read(cx).app_locked {
+                return;
+            }
             if let Some(existing) = app_entity
                 .read(cx)
                 .popout_message_windows
@@ -10990,6 +11346,9 @@ impl HylkiApp {
 
     /// 打开统一设置窗口（侧栏菜单 / 命令面板 / Ctrl+,）。
     pub(crate) fn open_preferences(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.app_locked {
+            return;
+        }
         let tab = if self.prefs.settings_open_accounts {
             PrefTab::MailAccounts
         } else {
@@ -11022,7 +11381,7 @@ impl HylkiApp {
     }
 
     fn open_settings_window(&mut self, target: SettingsOpenTarget, cx: &mut Context<Self>) {
-        if self.settings_window_opening {
+        if self.app_locked || self.settings_window_opening {
             return;
         }
         self.settings_window_opening = true;
@@ -11102,6 +11461,14 @@ impl HylkiApp {
 
             let _ = this.update(cx, |app, cx| {
                 app.settings_window_opening = false;
+                if app.app_locked {
+                    if let Some((handle, _)) = outcome {
+                        cx.defer(move |cx| {
+                            let _ = handle.update(cx, |_, window, _| window.remove_window());
+                        });
+                    }
+                    return;
+                }
                 app.settings_window = outcome;
                 cx.notify();
             });
@@ -11130,6 +11497,11 @@ impl HylkiApp {
         self.prefs.ui_text_scale_percent =
             config::clamp_ui_text_scale(self.prefs.ui_text_scale_percent);
         self.prefs.reader_zoom_percent = config::clamp_reader_zoom(self.prefs.reader_zoom_percent);
+        self.prefs.app_lock_idle_minutes =
+            config::normalize_app_lock_idle_minutes(self.prefs.app_lock_idle_minutes);
+        self.prefs.app_lock_background_timeout =
+            config::normalize_app_lock_background_timeout(&self.prefs.app_lock_background_timeout)
+                .to_string();
 
         if let Err(e) = config::save_preferences_in(&config::data_dir(), &self.prefs) {
             self.push_settings_or_main_toast("prefs-save-fail", ToastKind::Error, e, None, cx);
@@ -11711,6 +12083,7 @@ impl HylkiApp {
             || self.compose_body.focus_handle(cx).is_focused(window)
             || self.reader_find_input.focus_handle(cx).is_focused(window)
             || self.folder_action_input.focus_handle(cx).is_focused(window)
+            || self.lock_passcode_input.focus_handle(cx).is_focused(window)
     }
 
     /// 键盘方向键切换中栏下一封 (`delta = 1`) / 上一封 (`delta = -1`) 邮件。
@@ -12429,6 +12802,16 @@ impl Render for HylkiApp {
             window.set_rem_size(px(16.0 * scale as f32 / 100.0));
             self.last_rem_scale = scale;
         }
+        if self.app_locked {
+            #[cfg(windows)]
+            if let Some(host) = self.reader_webview.clone() {
+                cx.defer_in(window, move |_, _, _| {
+                    host.set_visible(false);
+                    host.try_suspend();
+                });
+            }
+            return lock_screen::render(self, window, cx);
+        }
         self.retain_current_reader_text_states();
         #[cfg(windows)]
         if !self.reader_webview_warmup_scheduled && self.reader_webview.is_none() {
@@ -12936,6 +13319,11 @@ impl Render for HylkiApp {
             }))
             .on_action(cx.listener(|this, _: &QuitApp, _window, cx| {
                 this.quit_app(cx);
+            }))
+            .on_action(cx.listener(|this, _: &LockApp, _window, cx| {
+                if !this.app_locked && this.has_app_lock_passcode() {
+                    this.lock_app(cx);
+                }
             }))
             // F11 全屏切换（不设浮层守卫：全屏与浮层互不干扰）。
             .on_action(cx.listener(|this, _: &ToggleFullscreen, window, cx| {
@@ -13548,7 +13936,7 @@ impl Render for HylkiApp {
                     ),
             );
         }
-        root
+        root.into_any_element()
     }
 }
 
@@ -13600,6 +13988,7 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("全屏切换", "F11"),
             ("本清单", "F1 / ?"),
             ("打开偏好设置", "Ctrl+,"),
+            ("立即锁定应用", "Ctrl+Shift+L"),
             ("退出 KiteMail", "Ctrl+Q"),
             ("关闭浮层 / 返回", "Esc"),
         ],

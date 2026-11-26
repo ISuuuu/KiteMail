@@ -1,6 +1,7 @@
 //! Core mail domain models, UI-worker command/event protocol, local SQLite cache,
 //! Windows Credential Manager secrets, and IMAP/SMTP worker runtime.
 
+pub mod app_lock;
 pub mod at_rest;
 pub mod avatar;
 pub mod cache;

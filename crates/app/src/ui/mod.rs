@@ -12,6 +12,7 @@ pub(crate) mod compose;
 pub(crate) mod compose_window;
 pub(crate) mod contacts;
 pub(crate) mod gallery;
+pub(crate) mod lock_screen;
 pub(crate) mod message_list;
 pub(crate) mod message_window;
 pub(crate) mod preferences;

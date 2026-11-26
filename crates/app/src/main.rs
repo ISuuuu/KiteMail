@@ -19,6 +19,7 @@ mod ui;
 mod webview_dark;
 #[cfg(windows)]
 mod webview_host;
+mod win_idle;
 
 use std::borrow::Cow;
 
@@ -30,15 +31,15 @@ use gpui_kit::{
 use kitemail_mail_core::config;
 
 use crate::app::{
-    CloseOverlay, CloseSettingsWindow, DeleteSelectedMessage, FocusSearch, HylkiApp, NewCompose,
-    OpenCommandPalette, OpenCommandPaletteActions, OpenPreferences, OpenShortcutsWindow, QuitApp,
-    RefreshAllAccounts, ReplyAllCurrent, ReplyCurrent, SelectNextMessage, SelectPrevMessage,
-    SendCompose, SetReaderPositionBelow, SetReaderPositionHidden, SetReaderPositionRight,
-    SingleKeyArchive, SingleKeyBackToList, SingleKeyCompose, SingleKeyDelete, SingleKeyForward,
-    SingleKeyMarkSpam, SingleKeyNextCard, SingleKeyNextMessage, SingleKeyPrevCard,
-    SingleKeyPrevMessage, SingleKeyReply, SingleKeyReplyAll, SingleKeyToggleRead,
-    SingleKeyToggleStar, ToggleAccountsList, ToggleFocusMode, ToggleFullscreen, UndoLastMove,
-    ViewMessageSource, ZoomIn, ZoomOut, ZoomReset,
+    CloseOverlay, CloseSettingsWindow, DeleteSelectedMessage, FocusSearch, HylkiApp, LockApp,
+    NewCompose, OpenCommandPalette, OpenCommandPaletteActions, OpenPreferences,
+    OpenShortcutsWindow, QuitApp, RefreshAllAccounts, ReplyAllCurrent, ReplyCurrent,
+    SelectNextMessage, SelectPrevMessage, SendCompose, SetReaderPositionBelow,
+    SetReaderPositionHidden, SetReaderPositionRight, SingleKeyArchive, SingleKeyBackToList,
+    SingleKeyCompose, SingleKeyDelete, SingleKeyForward, SingleKeyMarkSpam, SingleKeyNextCard,
+    SingleKeyNextMessage, SingleKeyPrevCard, SingleKeyPrevMessage, SingleKeyReply,
+    SingleKeyReplyAll, SingleKeyToggleRead, SingleKeyToggleStar, ToggleAccountsList,
+    ToggleFocusMode, ToggleFullscreen, UndoLastMove, ViewMessageSource, ZoomIn, ZoomOut, ZoomReset,
 };
 
 const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
@@ -321,6 +322,7 @@ fn main() {
                 KeyBinding::new("f5", RefreshAllAccounts, None),
                 KeyBinding::new("ctrl-enter", SendCompose, None),
                 KeyBinding::new("ctrl-,", OpenPreferences, None),
+                KeyBinding::new("ctrl-shift-l", LockApp, None),
                 KeyBinding::new("ctrl-q", QuitApp, None),
                 // 阅读器正文字号缩放（Ctrl+= 放大 / Ctrl+- 缩小 / Ctrl+0 重置）。
                 KeyBinding::new("ctrl-=", ZoomIn, None),
