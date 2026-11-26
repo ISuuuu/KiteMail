@@ -205,7 +205,11 @@ pub(crate) struct DocumentAppearance {
 }
 
 pub(crate) fn build_body_document(html: &str, appearance: DocumentAppearance) -> Vec<u8> {
-    make_document(html, None, appearance)
+    make_document(html, None, appearance, false)
+}
+
+pub(crate) fn build_thread_body_document(html: &str, appearance: DocumentAppearance) -> Vec<u8> {
+    make_document(html, None, appearance, true)
 }
 
 pub(crate) fn build_document(
@@ -214,13 +218,14 @@ pub(crate) fn build_document(
     sender: &str,
     appearance: DocumentAppearance,
 ) -> Vec<u8> {
-    make_document(html, Some((subject, sender)), appearance)
+    make_document(html, Some((subject, sender)), appearance, false)
 }
 
 fn make_document(
     html: &str,
     header: Option<(&str, &str)>,
     appearance: DocumentAppearance,
+    in_thread: bool,
 ) -> Vec<u8> {
     let escape = |value: &str| {
         value
@@ -243,8 +248,13 @@ fn make_document(
     let bg = css_color(appearance.background);
     let fg = css_color(appearance.foreground);
     let scheme = if appearance.dark { "dark" } else { "light" };
+    let thread_css = if in_thread {
+        "html{display:flow-root!important;height:auto!important;min-height:0!important}body{height:auto!important;min-height:0!important}"
+    } else {
+        ""
+    };
     let style = format!(
-        "<style>:root{{color-scheme:{scheme};zoom:{}%}}:where(body){{background-color:{bg};color:{fg}}}</style>",
+        "<style>:root{{color-scheme:{scheme};zoom:{}%}}{thread_css}:where(body){{background-color:{bg};color:{fg}}}</style>",
         appearance.zoom_percent.clamp(50, 250)
     );
     let lower = html.to_ascii_lowercase();
@@ -300,6 +310,8 @@ struct State {
     capturing: bool,
     capture_seq: u64,
     snapshot: Option<(u64, PopupSnapshot)>,
+    content_height: Option<f32>,
+    height_updates: u8,
 }
 
 /// 将 top-down 32 位 BGRA 像素打包成 54 字节未压缩 BMP，供同步生成 `RenderImage`。
@@ -707,6 +719,10 @@ impl WebViewHost {
         };
         (state.version, view)
     }
+    pub(crate) fn content_height(&self) -> Option<f32> {
+        let state = self.0.borrow();
+        state.in_thread.then_some(state.content_height).flatten()
+    }
     pub(crate) fn take_links(&self) -> Vec<String> {
         let mut state = self.0.borrow_mut();
         let version = state.version;
@@ -1074,6 +1090,8 @@ impl WebViewHost {
         state.loaded = false;
         state.navigation_id = None;
         state.snapshot = None;
+        state.content_height = None;
+        state.height_updates = 0;
         let url = document_url(state.version);
         let controller = state.controller.clone();
         if controller.is_some() {
@@ -1125,6 +1143,33 @@ impl Drop for WebViewHost {
             let _ = DestroyWindow(clip_window);
         }
     }
+}
+
+fn content_height_message(message: &str) -> Option<f32> {
+    let height: f32 = message.strip_prefix("content-height:")?.parse().ok()?;
+    (height.is_finite() && height > 0.0).then(|| height.clamp(40.0, 4800.0))
+}
+
+fn record_content_height(state: &Rc<RefCell<State>>, source: &str, height: f32) -> bool {
+    let mut inner = state.borrow_mut();
+    if inner.closed
+        || !inner.loaded
+        || !inner.in_thread
+        || !allow_main_navigation(source, inner.version)
+        || inner.height_updates >= 24
+    {
+        return false;
+    }
+    if inner
+        .content_height
+        .is_some_and(|prev| (prev - height).abs() < 1.0)
+    {
+        return false;
+    }
+    inner.content_height = Some(height);
+    inner.height_updates = inner.height_updates.saturating_add(1);
+    inner.notify_ui();
+    true
 }
 
 fn thread_wheel_delta(message: &str) -> Option<f32> {
@@ -1278,6 +1323,8 @@ unsafe fn configure(
                 let source = webview2_com::take_pwstr(source);
                 if let Some(delta) = thread_wheel_delta(&message) {
                     forward_thread_wheel(state, source, delta)?;
+                } else if let Some(height) = content_height_message(&message) {
+                    record_content_height(&state, &source, height);
                 } else if let Some(url) = open_link_message(&message) {
                     record_script_link(&state, &source, url);
                 }
@@ -1916,5 +1963,50 @@ mod tests {
         assert!(!state.loaded);
         assert!(state.failed);
         assert_eq!(rx.try_recv().ok(), Some(()));
+    }
+
+    #[test]
+    fn thread_content_height_is_validated_clamped_and_deduped() {
+        assert_eq!(content_height_message("content-height:642.5"), Some(642.5));
+        assert_eq!(content_height_message("content-height:12"), Some(40.0));
+        assert_eq!(content_height_message("content-height:99999"), Some(4800.0));
+        for invalid in [
+            "content-height:",
+            "content-height:0",
+            "content-height:-10",
+            "content-height:NaN",
+            "content-height:inf",
+            "thread-wheel:10",
+        ] {
+            assert_eq!(content_height_message(invalid), None);
+        }
+
+        let (tx, mut rx) = futures_mpsc::channel::<()>(8);
+        let state = Rc::new(RefCell::new(State {
+            version: 2,
+            loaded: true,
+            in_thread: true,
+            notifier: Some(tx),
+            ..State::default()
+        }));
+        assert!(record_content_height(&state, &document_url(2), 512.0));
+        assert_eq!(WebViewHost(state.clone()).content_height(), Some(512.0));
+        assert_eq!(rx.try_recv().ok(), Some(()));
+
+        // Sub-pixel jitter and wrong version/source are ignored.
+        assert!(!record_content_height(&state, &document_url(2), 512.4));
+        assert!(!record_content_height(&state, &document_url(1), 700.0));
+        assert!(rx.try_recv().is_err());
+
+        let (background, foreground) = crate::theme::reader_body_colors(false);
+        let light = DocumentAppearance {
+            dark: false,
+            zoom_percent: 100,
+            background,
+            foreground,
+        };
+        let doc = String::from_utf8(build_thread_body_document("<p>Hi</p>", light)).unwrap();
+        assert!(doc.contains("display:flow-root!important"));
+        assert!(doc.contains("height:auto!important"));
     }
 }

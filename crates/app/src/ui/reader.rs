@@ -317,6 +317,94 @@ fn build_card_more_menu(
         .into_any_element()
 }
 
+#[cfg(windows)]
+fn render_webview_snapshot(
+    snapshot: crate::webview_host::PopupSnapshot,
+    scale_factor: f32,
+    height_px: Option<f32>,
+) -> gpui_kit::AnyElement {
+    use gpui_kit::StyledImage as _;
+
+    let img_el = if let Some((ox, oy, w, h)) = snapshot.clipped_rect_px {
+        gpui_kit::img(snapshot.image)
+            .absolute()
+            .left(px(ox as f32 / scale_factor))
+            .top(px(oy as f32 / scale_factor))
+            .w(px(w as f32 / scale_factor))
+            .h(px(h as f32 / scale_factor))
+            .object_fit(gpui_kit::ObjectFit::Fill)
+    } else {
+        gpui_kit::img(snapshot.image)
+            .absolute()
+            .inset_0()
+            .size_full()
+            .object_fit(gpui_kit::ObjectFit::Fill)
+    };
+    div()
+        .relative()
+        .overflow_hidden()
+        .w_full()
+        .when_some(height_px, |el, h| el.h(px(h)))
+        .when(height_px.is_none(), |el| el.flex_1().min_h_0())
+        .child(img_el)
+        .into_any_element()
+}
+
+#[cfg(windows)]
+fn compute_webview_rects(
+    bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
+    window: &gpui_kit::Window,
+    reserved_bottom: f32,
+) -> (windows::Win32::Foundation::RECT, windows::Win32::Foundation::RECT) {
+    let scale = window.scale_factor();
+    let rect = windows::Win32::Foundation::RECT {
+        left: (bounds.origin.x.as_f32() * scale).round() as i32,
+        top: (bounds.origin.y.as_f32() * scale).round() as i32,
+        right: ((bounds.origin.x + bounds.size.width).as_f32() * scale).round() as i32,
+        bottom: ((bounds.origin.y + bounds.size.height).as_f32() * scale).round() as i32,
+    };
+    let mask = window.content_mask().bounds;
+    let mut clip = windows::Win32::Foundation::RECT {
+        left: (mask.origin.x.as_f32() * scale).round() as i32,
+        top: (mask.origin.y.as_f32() * scale).round() as i32,
+        right: ((mask.origin.x + mask.size.width).as_f32() * scale).round() as i32,
+        bottom: ((mask.origin.y + mask.size.height).as_f32() * scale).round() as i32,
+    };
+    if reserved_bottom > 0.0 {
+        let max_bottom =
+            ((window.viewport_size().height.as_f32() - reserved_bottom) * scale).round() as i32;
+        clip.bottom = clip.bottom.min(max_bottom);
+    }
+    (rect, clip)
+}
+
+#[cfg(windows)]
+fn bounds_intersects_viewport(
+    bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
+    mask: gpui_kit::Bounds<gpui_kit::Pixels>,
+    margin_y: f32,
+) -> bool {
+    let b_top = bounds.origin.y.as_f32();
+    let b_bottom = b_top + bounds.size.height.as_f32();
+    let m_top = mask.origin.y.as_f32() - margin_y;
+    let m_bottom = mask.origin.y.as_f32() + mask.size.height.as_f32() + margin_y;
+    let b_left = bounds.origin.x.as_f32();
+    let b_right = b_left + bounds.size.width.as_f32();
+    let m_left = mask.origin.x.as_f32();
+    let m_right = m_left + mask.size.width.as_f32();
+    b_right > m_left && b_left < m_right && b_bottom > m_top && b_top < m_bottom
+}
+
+#[cfg(windows)]
+pub(super) struct ThreadCardWebView {
+    pub(super) host: Option<std::rc::Rc<crate::webview_host::WebViewHost>>,
+    pub(super) key: u64,
+    pub(super) height_px: f32,
+    pub(super) last_visible_tick: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+    pub(super) frame_tick: u64,
+    pub(super) visible: bool,
+}
+
 /// 渲染单张邮件正文卡片（既用于单封邮件，也用于会话线程中的多张叠放卡片）。
 ///
 /// `bg_pick` 为 B-5 的单封邮件亮 / 暗背景覆盖（`Some(false)` 强制亮色、
@@ -358,6 +446,7 @@ fn render_message_card(
     more_menu: gpui_kit::AnyElement,
     body_view: BodyView,
     webview_in_thread: bool,
+    #[cfg(windows)] thread_webview: Option<ThreadCardWebView>,
     scale_factor: f32,
     p: &theme::HylkiPalette,
     app: &mut HylkiApp,
@@ -1030,10 +1119,55 @@ fn render_message_card(
             })
         })
         .when(body_view == BodyView::Loading, |card| {
+            #[cfg(windows)]
+            if let Some(ref twv) = thread_webview {
+                let app_entity = cx.entity().downgrade();
+                let card_key = twv.key;
+                let frame_tick = twv.frame_tick;
+                let last_visible_tick = twv.last_visible_tick.clone();
+                let needs_activate = twv.host.is_none();
+                return card.child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .h(px(twv.height_px))
+                        .child(body_loading(body_bg, body_muted, body_pending).size_full())
+                        .child(
+                            gpui_kit::canvas(
+                                move |bounds, window, cx| {
+                                    let mask = window.content_mask().bounds;
+                                    if bounds_intersects_viewport(bounds, mask, 0.0) {
+                                        if let Some(ref tick) = last_visible_tick {
+                                            tick.set(frame_tick);
+                                        }
+                                    }
+                                    if needs_activate
+                                        && bounds_intersects_viewport(bounds, mask, 300.0)
+                                    {
+                                        let handle = window.window_handle();
+                                        let app_weak = app_entity.clone();
+                                        cx.defer(move |cx| {
+                                            let _ = handle.update(cx, |_, window, cx| {
+                                                let _ = app_weak.update(cx, |this, cx| {
+                                                    this.activate_thread_card_webview(
+                                                        msg_id, card_key, window, cx,
+                                                    );
+                                                });
+                                            });
+                                        });
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0(),
+                        ),
+                );
+            }
             card.child(
                 body_loading(body_bg, body_muted, body_pending)
                     .when(webview_in_thread, |el| {
-                        el.h(px(500.0)).justify_start().pt_4()
+                        el.h(px(420.0)).justify_start().pt_4()
                     })
                     .when(!webview_in_thread, |el| el.flex_1().min_h_0()),
             )
@@ -1041,68 +1175,41 @@ fn render_message_card(
         .when(body_view == BodyView::Html, |card| {
             #[cfg(windows)]
             {
-                let host = app.reader_webview.as_ref().unwrap().clone();
+                let (host, height_px, last_visible_tick, frame_tick, visible) =
+                    if let Some(twv) = thread_webview {
+                        (
+                            twv.host.unwrap(),
+                            Some(twv.height_px),
+                            twv.last_visible_tick,
+                            twv.frame_tick,
+                            twv.visible,
+                        )
+                    } else {
+                        (
+                            app.reader_webview.as_ref().unwrap().clone(),
+                            None,
+                            None,
+                            0,
+                            !app.reader_webview_yields_to_popup(),
+                        )
+                    };
                 let (version, _) = host.load_status();
-                let visible = !app.reader_webview_yields_to_popup();
                 if let Some(snapshot) = host.popup_snapshot() {
                     // 浮层打开期间：同一布局位置换成正文快照，尺寸与子窗口一致。
-                    use gpui_kit::StyledImage as _;
-
-                    let img_el = if let Some((ox, oy, w, h)) = snapshot.clipped_rect_px {
-                        gpui_kit::img(snapshot.image)
-                            .absolute()
-                            .left(px(ox as f32 / scale_factor))
-                            .top(px(oy as f32 / scale_factor))
-                            .w(px(w as f32 / scale_factor))
-                            .h(px(h as f32 / scale_factor))
-                            .object_fit(gpui_kit::ObjectFit::Fill)
-                    } else {
-                        gpui_kit::img(snapshot.image)
-                            .absolute()
-                            .inset_0()
-                            .size_full()
-                            .object_fit(gpui_kit::ObjectFit::Fill)
-                    };
-                    return card.child(
-                        div()
-                            .relative()
-                            .overflow_hidden()
-                            .w_full()
-                            .when(webview_in_thread, |el| el.h(px(500.0)))
-                            .when(!webview_in_thread, |el| el.flex_1().min_h_0())
-                            .child(img_el),
-                    );
+                    return card.child(render_webview_snapshot(snapshot, scale_factor, height_px));
                 }
                 let app_reserved_strip_px = app.reader_webview_bottom_clearance_px();
                 return card.child(
                     gpui_kit::canvas(
                         move |bounds, window, cx| {
-                            let scale = window.scale_factor();
-                            let rect = windows::Win32::Foundation::RECT {
-                                left: (bounds.origin.x.as_f32() * scale).round() as i32,
-                                top: (bounds.origin.y.as_f32() * scale).round() as i32,
-                                right: ((bounds.origin.x + bounds.size.width).as_f32() * scale)
-                                    .round() as i32,
-                                bottom: ((bounds.origin.y + bounds.size.height).as_f32() * scale)
-                                    .round() as i32,
-                            };
                             let mask = window.content_mask().bounds;
-                            let mut clip = windows::Win32::Foundation::RECT {
-                                left: (mask.origin.x.as_f32() * scale).round() as i32,
-                                top: (mask.origin.y.as_f32() * scale).round() as i32,
-                                right: ((mask.origin.x + mask.size.width).as_f32() * scale).round()
-                                    as i32,
-                                bottom: ((mask.origin.y + mask.size.height).as_f32() * scale)
-                                    .round() as i32,
-                            };
-                            let reserved_bottom = app_reserved_strip_px;
-                            if reserved_bottom > 0.0 {
-                                let max_bottom =
-                                    ((window.viewport_size().height.as_f32() - reserved_bottom)
-                                        * scale)
-                                        .round() as i32;
-                                clip.bottom = clip.bottom.min(max_bottom);
+                            if bounds_intersects_viewport(bounds, mask, 0.0) {
+                                if let Some(ref tick) = last_visible_tick {
+                                    tick.set(frame_tick);
+                                }
                             }
+                            let (rect, clip) =
+                                compute_webview_rects(bounds, window, app_reserved_strip_px);
                             cx.defer(move |_| {
                                 if host.load_status() == (version, BodyView::Html) {
                                     host.set_clipped_bounds(rect, clip);
@@ -1112,8 +1219,8 @@ fn render_message_card(
                         },
                         |_, _, _, _| {},
                     )
-                    .when(webview_in_thread, |el| el.h(px(500.0)))
-                    .when(!webview_in_thread, |el| el.flex_1().min_h_0())
+                    .when_some(height_px, |el, h| el.h(px(h)))
+                    .when(height_px.is_none(), |el| el.flex_1().min_h_0())
                     .w_full(),
                 );
             }
@@ -1323,23 +1430,25 @@ pub(crate) fn render_with_pane_top(
     // 占位详情：正文仍在远端加载中，显示加载提示而不是“加载完整正文”按钮。
     let body_pending = app.pending_body_message_id == Some(detail.id);
 
+    // 浮层打开期间正文由 WebView2 快照顶替（见 WebViewHost::set_popup_open），
+    // 这里只管其它会盖住正文或被正文盖住的界面状态。
+    let unobscured = app.active_modal == crate::app::ActiveModal::None
+        && app.print_preview.is_none()
+        && !app.reader_find_open
+        && !app.compose_split
+        && !app.sidebar_peek_open
+        && app.drawer_image_preview.is_none()
+        && !app.mail_dir_switching;
+
     #[cfg(windows)]
-    let body_view = {
+    let body_view = if thread_count <= 1 {
+        app.reader_thread_webviews.clear();
+        app.reader_thread_heights.clear();
+        app.reader_thread_overflow_ids.clear();
         use crate::webview_host::{build_body_document, DocumentAppearance};
         use std::hash::{Hash, Hasher};
 
-        let in_thread = thread_count > 1;
-        let anchor = detail
-            .thread_messages
-            .iter()
-            .find(|message| message.id == detail.id);
-        let html = if thread_count > 1 {
-            anchor.and_then(|message| message.body_html.as_deref())
-        } else {
-            detail.body_html.as_deref()
-        };
-        let body_pending = body_pending
-            || (thread_count > 1 && !anchor.is_some_and(|message| message.body_loaded));
+        let html = detail.body_html.as_deref();
         let block_remote = !app.remote_images_allowed(detail.id, &detail.sender);
         let eligible = webview_eligible(
             html,
@@ -1348,15 +1457,6 @@ pub(crate) fn render_with_pane_top(
             app.raw_source_message_ids.contains(&detail.id),
             app.collapsed_thread_cards.contains(&detail.id),
         );
-        // 浮层打开期间正文由 WebView2 快照顶替（见 WebViewHost::set_popup_open），
-        // 这里只管其它会盖住正文或被正文盖住的界面状态。
-        let unobscured = app.active_modal == crate::app::ActiveModal::None
-            && app.print_preview.is_none()
-            && !app.reader_find_open
-            && !app.compose_split
-            && !app.sidebar_peek_open
-            && app.drawer_image_preview.is_none()
-            && !app.mail_dir_switching;
         let forced_dark = app
             .message_bg_picks
             .get(&detail.id)
@@ -1377,7 +1477,7 @@ pub(crate) fn render_with_pane_top(
             detail.subject.hash(&mut hasher);
             appearance.hash(&mut hasher);
             block_remote.hash(&mut hasher);
-            in_thread.hash(&mut hasher);
+            false.hash(&mut hasher);
             hasher.finish()
         });
         if key.is_none() && app.reader_webview_key.take().is_some() {
@@ -1401,7 +1501,7 @@ pub(crate) fn render_with_pane_top(
                     return;
                 }
                 if let Some(host) = this.ensure_reader_webview(window, cx) {
-                    let _ = host.load_document(document, !block_remote, in_thread);
+                    let _ = host.load_document(document, !block_remote, false);
                 }
                 cx.notify();
             });
@@ -1417,10 +1517,54 @@ pub(crate) fn render_with_pane_top(
             }
         }
         view
+    } else {
+        if app.reader_webview_key.take().is_some() {
+            if let Some(host) = app.reader_webview.clone() {
+                cx.defer_in(window, move |this, _, _| {
+                    if this.reader_webview_key.is_none() {
+                        let _ = host.load(b"<!doctype html>".to_vec());
+                    }
+                });
+            }
+        } else if let Some(host) = app.reader_webview.clone() {
+            cx.defer_in(window, move |_, _, _| host.set_visible(false));
+        }
+        app.reader_thread_frame_tick = app.reader_thread_frame_tick.wrapping_add(1);
+        app.reader_thread_webviews.retain(|id, _| {
+            !prefer_plain
+                && !app.collapsed_thread_cards.contains(id)
+                && !app.raw_source_message_ids.contains(id)
+                && detail.thread_messages.iter().any(|tm| {
+                    tm.id == *id
+                        && tm.body_loaded
+                        && tm
+                            .body_html
+                            .as_deref()
+                            .is_some_and(crate::webview_host::supports_document)
+                })
+        });
+        app.reader_thread_heights
+            .retain(|id, _| detail.thread_messages.iter().any(|tm| tm.id == *id));
+        if app.reader_thread_webviews.len() < crate::app::MAX_THREAD_WEBVIEWS
+            || app
+                .reader_thread_webviews
+                .values()
+                .any(|e| e.last_visible_tick.get().saturating_add(1) < app.reader_thread_frame_tick)
+        {
+            app.reader_thread_overflow_ids.clear();
+        } else {
+            app.reader_thread_overflow_ids.retain(|id| {
+                !prefer_plain
+                    && !app.collapsed_thread_cards.contains(id)
+                    && !app.raw_source_message_ids.contains(id)
+                    && detail.thread_messages.iter().any(|tm| tm.id == *id)
+            });
+        }
+        BodyView::Native
     };
     #[cfg(not(windows))]
     let body_view = BodyView::Native;
-    let body_view = if body_pending {
+    let body_view = if thread_count <= 1 && body_pending {
         BodyView::Loading
     } else {
         body_view
@@ -1523,6 +1667,128 @@ pub(crate) fn render_with_pane_top(
                     eml_exporting,
                     cx,
                 );
+                let card_pending = is_current && body_pending;
+                #[cfg(windows)]
+                let (card_body_view, thread_webview) = {
+                    use crate::webview_host::{build_thread_body_document, DocumentAppearance};
+                    use std::hash::{Hash, Hasher};
+
+                    let card_eligible = tm.body_loaded
+                        && webview_eligible(
+                            tm.body_html.as_deref(),
+                            card_pending,
+                            prefer_plain,
+                            show_raw_source,
+                            is_collapsed,
+                        );
+                    if card_pending {
+                        (BodyView::Loading, None)
+                    } else if !card_eligible
+                        || !unobscured
+                        || app.reader_thread_webview_failed
+                        || (app.reader_thread_overflow_ids.contains(&tm.id)
+                            && !app.reader_thread_webviews.contains_key(&tm.id))
+                    {
+                        if let Some(entry) = app.reader_thread_webviews.get(&tm.id) {
+                            let host = entry.host.clone();
+                            cx.defer_in(window, move |_, _, _| host.set_visible(false));
+                        }
+                        (BodyView::Native, None)
+                    } else {
+                        let html = tm.body_html.as_deref().unwrap();
+                        let card_dark = app
+                            .message_bg_picks
+                            .get(&tm.id)
+                            .copied()
+                            .or(forced_theme_bg)
+                            .unwrap_or(app.dark_mode);
+                        let (background, foreground) = theme::reader_body_colors(card_dark);
+                        let appearance = DocumentAppearance {
+                            dark: card_dark,
+                            zoom_percent,
+                            background,
+                            foreground,
+                        };
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        tm.id.hash(&mut hasher);
+                        html.hash(&mut hasher);
+                        appearance.hash(&mut hasher);
+                        block_remote.hash(&mut hasher);
+                        let card_key = hasher.finish();
+
+                        let frame_tick = app.reader_thread_frame_tick;
+                        let mut reload_scheduled = false;
+                        if let Some(entry) = app.reader_thread_webviews.get_mut(&tm.id) {
+                            if entry.key != card_key {
+                                entry.key = card_key;
+                                reload_scheduled = true;
+                                app.reader_thread_heights.remove(&tm.id);
+                                let host = entry.host.clone();
+                                let doc = build_thread_body_document(html, appearance);
+                                let msg_id = tm.id;
+                                cx.defer_in(window, move |this, _, cx| {
+                                    if this
+                                        .reader_thread_webviews
+                                        .get(&msg_id)
+                                        .is_some_and(|e| e.key == card_key)
+                                    {
+                                        let _ = host.load_document(doc, !block_remote, true);
+                                        cx.notify();
+                                    }
+                                });
+                            } else if let Some(h) = entry.host.content_height() {
+                                app.reader_thread_heights.insert(tm.id, (card_key, h));
+                            }
+                        }
+
+                        let height_px = app
+                            .reader_thread_heights
+                            .get(&tm.id)
+                            .filter(|(k, _)| *k == card_key)
+                            .map(|(_, h)| *h)
+                            .unwrap_or(420.0);
+
+                        if let Some(entry) = app.reader_thread_webviews.get(&tm.id) {
+                            let host = entry.host.clone();
+                            let last_visible_tick = entry.last_visible_tick.clone();
+                            let view = BodyView::for_document(
+                                true,
+                                reload_scheduled,
+                                Some(&host),
+                            );
+                            let visible = !host.popup_settled();
+                            if view != BodyView::Html || !visible {
+                                let h = host.clone();
+                                cx.defer_in(window, move |_, _, _| h.set_visible(false));
+                            }
+                            (
+                                view,
+                                Some(ThreadCardWebView {
+                                    host: Some(host),
+                                    key: card_key,
+                                    height_px,
+                                    last_visible_tick: Some(last_visible_tick),
+                                    frame_tick,
+                                    visible,
+                                }),
+                            )
+                        } else {
+                            (
+                                BodyView::Loading,
+                                Some(ThreadCardWebView {
+                                    host: None,
+                                    key: card_key,
+                                    height_px,
+                                    last_visible_tick: None,
+                                    frame_tick,
+                                    visible: false,
+                                }),
+                            )
+                        }
+                    }
+                };
+                #[cfg(not(windows))]
+                let card_body_view = BodyView::Native;
                 render_message_card(
                     detail.account_id,
                     tm.id,
@@ -1543,7 +1809,7 @@ pub(crate) fn render_with_pane_top(
                     &tm.body_text,
                     tm.body_html.as_deref(),
                     tm.body_loaded,
-                    is_current && body_pending,
+                    card_pending,
                     prefer_plain,
                     block_remote,
                     clean_links,
@@ -1560,12 +1826,10 @@ pub(crate) fn render_with_pane_top(
                     &tm.attachments,
                     is_current,
                     menu,
-                    if is_current {
-                        body_view
-                    } else {
-                        BodyView::Native
-                    },
+                    card_body_view,
                     true,
+                    #[cfg(windows)]
+                    thread_webview,
                     window.scale_factor(),
                     &p,
                     app,
@@ -1620,6 +1884,8 @@ pub(crate) fn render_with_pane_top(
             menu,
             body_view,
             false,
+            #[cfg(windows)]
+            None,
             window.scale_factor(),
             &p,
             app,

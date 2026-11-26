@@ -64,6 +64,16 @@ use crate::ui::toast::{
 };
 use crate::ui::{compose, message_list, reader, sidebar, welcome, window_controls};
 
+#[cfg(windows)]
+pub(crate) struct ThreadWebViewEntry {
+    pub(crate) host: std::rc::Rc<crate::webview_host::WebViewHost>,
+    pub(crate) key: u64,
+    pub(crate) last_visible_tick: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+#[cfg(windows)]
+pub(crate) const MAX_THREAD_WEBVIEWS: usize = 6;
+
 pub(crate) const UNIFIED_INBOX_FOLDER_ID: u32 = 0;
 
 // ---- L-2：三栏宽度常量（对齐原版 app.rs L270-L341 与 list_header.rs）----
@@ -1048,6 +1058,16 @@ pub(crate) struct HylkiApp {
     pub(crate) reader_webview_key: Option<u64>,
     #[cfg(windows)]
     pub(crate) reader_webview_warmup_scheduled: bool,
+    #[cfg(windows)]
+    pub(crate) reader_thread_webviews: HashMap<u32, ThreadWebViewEntry>,
+    #[cfg(windows)]
+    pub(crate) reader_thread_heights: HashMap<u32, (u64, f32)>,
+    #[cfg(windows)]
+    pub(crate) reader_thread_overflow_ids: HashSet<u32>,
+    #[cfg(windows)]
+    pub(crate) reader_thread_webview_failed: bool,
+    #[cfg(windows)]
+    pub(crate) reader_thread_frame_tick: u64,
     pub(crate) reader_popup_open: bool,
     /// WP-09：打印预览浮层状态。
     pub(crate) print_preview: Option<PrintPreviewState>,
@@ -1567,6 +1587,16 @@ impl HylkiApp {
                 reader_webview_key: None,
                 #[cfg(windows)]
                 reader_webview_warmup_scheduled: false,
+                #[cfg(windows)]
+                reader_thread_webviews: HashMap::new(),
+                #[cfg(windows)]
+                reader_thread_heights: HashMap::new(),
+                #[cfg(windows)]
+                reader_thread_overflow_ids: HashSet::new(),
+                #[cfg(windows)]
+                reader_thread_webview_failed: false,
+                #[cfg(windows)]
+                reader_thread_frame_tick: 0,
                 reader_popup_open: false,
                 print_preview: None,
                 pending_row_action: None,
@@ -1841,6 +1871,16 @@ impl HylkiApp {
             reader_webview_key: None,
             #[cfg(windows)]
             reader_webview_warmup_scheduled: false,
+            #[cfg(windows)]
+            reader_thread_webviews: HashMap::new(),
+            #[cfg(windows)]
+            reader_thread_heights: HashMap::new(),
+            #[cfg(windows)]
+            reader_thread_overflow_ids: HashSet::new(),
+            #[cfg(windows)]
+            reader_thread_webview_failed: false,
+            #[cfg(windows)]
+            reader_thread_frame_tick: 0,
             reader_popup_open: false,
             print_preview: None,
             pending_row_action: None,
@@ -1978,12 +2018,19 @@ impl HylkiApp {
     pub(crate) fn set_reader_popup_open(&mut self, open: bool) {
         self.reader_popup_open = open;
         #[cfg(windows)]
-        if let Some(host) = self.reader_webview.clone() {
-            let restore_visible = !open
-                && self.reader_webview_base_visible()
-                && self.reader_webview_key.is_some()
-                && host.load_status().1 == crate::webview_host::BodyView::Html;
-            host.set_popup_open(open, restore_visible);
+        {
+            let base_visible = !open && self.reader_webview_base_visible();
+            if let Some(host) = self.reader_webview.clone() {
+                let restore_visible = base_visible
+                    && self.reader_webview_key.is_some()
+                    && host.load_status().1 == crate::webview_host::BodyView::Html;
+                host.set_popup_open(open, restore_visible);
+            }
+            for entry in self.reader_thread_webviews.values() {
+                let restore_visible = base_visible
+                    && entry.host.load_status().1 == crate::webview_host::BodyView::Html;
+                entry.host.set_popup_open(open, restore_visible);
+            }
         }
     }
 
@@ -2010,6 +2057,10 @@ impl HylkiApp {
         self.reader_webview
             .as_ref()
             .is_some_and(|host| host.popup_settled())
+            || self
+                .reader_thread_webviews
+                .values()
+                .any(|entry| entry.host.popup_settled())
     }
 
     pub(crate) fn push_settings_or_main_toast(
@@ -4416,6 +4467,201 @@ impl HylkiApp {
         })
         .detach();
         Some(host)
+    }
+
+    #[cfg(windows)]
+    fn spawn_thread_webview_listener(
+        &self,
+        host: &std::rc::Rc<crate::webview_host::WebViewHost>,
+        cx: &mut Context<Self>,
+    ) {
+        let (tx, mut rx) = futures::channel::mpsc::channel::<()>(16);
+        host.set_notifier(tx);
+        host.set_svg_renderer(cx.svg_renderer());
+        let weak_host = std::rc::Rc::downgrade(host);
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            let mut previous = None;
+            while rx.next().await.is_some() {
+                let Some(host) = weak_host.upgrade() else {
+                    break;
+                };
+                if this
+                    .update(cx, |this, cx| {
+                        let Some((msg_id, key)) = this
+                            .reader_thread_webviews
+                            .iter()
+                            .find(|(_, entry)| std::rc::Rc::ptr_eq(&entry.host, &host))
+                            .map(|(&id, entry)| (id, entry.key))
+                        else {
+                            return;
+                        };
+                        let content_height = host.content_height();
+                        if let Some(height) = content_height {
+                            this.reader_thread_heights.insert(msg_id, (key, height));
+                        }
+                        let status = Some((
+                            host.load_status(),
+                            host.popup_settled(),
+                            content_height.map(f32::to_bits),
+                        ));
+                        if status != previous {
+                            previous = status;
+                            cx.notify();
+                        }
+                        if this.active_modal == ActiveModal::None
+                            && !this.reader_find_open
+                            && !this.reader_popup_open
+                        {
+                            for link in host.take_links() {
+                                this.open_mail_link(&link, cx);
+                            }
+                        } else {
+                            let _ = host.take_links();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn activate_thread_card_webview(
+        &mut self,
+        msg_id: u32,
+        card_key: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        if self.reader_thread_webview_failed {
+            return;
+        }
+        if let Some(entry) = self.reader_thread_webviews.get(&msg_id) {
+            if entry.key == card_key {
+                entry.last_visible_tick.set(self.reader_thread_frame_tick);
+                return;
+            }
+        }
+        let Some(detail) = self.selected_message.as_ref() else {
+            return;
+        };
+        if detail.thread_messages.len() <= 1
+            || self.reader_prefer_plain
+            || self.raw_source_message_ids.contains(&msg_id)
+            || self.collapsed_thread_cards.contains(&msg_id)
+        {
+            return;
+        }
+        let Some(tm) = detail.thread_messages.iter().find(|m| m.id == msg_id) else {
+            return;
+        };
+        if !tm.body_loaded {
+            return;
+        }
+        let Some(html) = tm
+            .body_html
+            .as_deref()
+            .filter(|h| crate::webview_host::supports_document(h))
+        else {
+            return;
+        };
+        let forced_theme_bg = match self.prefs.message_theme.as_str() {
+            "light" => Some(false),
+            "dark" => Some(true),
+            _ => None,
+        };
+        let dark = self
+            .message_bg_picks
+            .get(&msg_id)
+            .copied()
+            .or(forced_theme_bg)
+            .unwrap_or(self.dark_mode);
+        let zoom_percent = self.prefs.reader_zoom_percent.clamp(50, 250);
+        let (background, foreground) = theme::reader_body_colors(dark);
+        let appearance = crate::webview_host::DocumentAppearance {
+            dark,
+            zoom_percent,
+            background,
+            foreground,
+        };
+        let block_remote = !self.remote_images_allowed(msg_id, &tm.sender);
+        let mut hasher = DefaultHasher::new();
+        msg_id.hash(&mut hasher);
+        html.hash(&mut hasher);
+        appearance.hash(&mut hasher);
+        block_remote.hash(&mut hasher);
+        if hasher.finish() != card_key {
+            return;
+        }
+
+        let document = crate::webview_host::build_thread_body_document(html, appearance);
+        let current_tick = self.reader_thread_frame_tick;
+
+        if let Some(entry) = self.reader_thread_webviews.get_mut(&msg_id) {
+            entry.key = card_key;
+            entry.last_visible_tick.set(current_tick);
+            let _ = entry.host.load_document(document, !block_remote, true);
+            cx.notify();
+            return;
+        }
+
+        let host = if self.reader_thread_webviews.len() >= MAX_THREAD_WEBVIEWS {
+            let evict_id = self
+                .reader_thread_webviews
+                .iter()
+                .filter(|(_, entry)| entry.last_visible_tick.get() < current_tick)
+                .min_by_key(|(_, entry)| entry.last_visible_tick.get())
+                .map(|(&id, _)| id);
+            let Some(evict_id) = evict_id else {
+                // Hard cap reached while every slot is actively visible on screen;
+                // fall back to native rendering for this overflow card.
+                if self.reader_thread_overflow_ids.insert(msg_id) {
+                    cx.notify();
+                }
+                return;
+            };
+            self.reader_thread_webviews
+                .remove(&evict_id)
+                .map(|entry| entry.host)
+        } else {
+            None
+        };
+        self.reader_thread_overflow_ids.remove(&msg_id);
+
+        let host = match host {
+            Some(reused) => reused,
+            None => {
+                let Some(created) = crate::webview_host::WebViewHost::for_window(
+                    window,
+                    Some(window.to_async(cx)),
+                ) else {
+                    self.reader_thread_webview_failed = true;
+                    cx.notify();
+                    return;
+                };
+                let host = std::rc::Rc::new(created);
+                self.spawn_thread_webview_listener(&host, cx);
+                host
+            }
+        };
+
+        let _ = host.load_document(document, !block_remote, true);
+        self.reader_thread_webviews.insert(
+            msg_id,
+            ThreadWebViewEntry {
+                host,
+                key: card_key,
+                last_visible_tick: std::rc::Rc::new(std::cell::Cell::new(current_tick)),
+            },
+        );
+        cx.notify();
     }
 
     pub(crate) fn select_message(
@@ -12201,21 +12447,35 @@ impl Render for HylkiApp {
             .detach();
         }
         #[cfg(windows)]
-        if self.selected_message.is_none() && self.reader_webview_key.take().is_some() {
-            if let Some(host) = self.reader_webview.clone() {
-                cx.defer_in(window, move |this, _, _| {
-                    if this.reader_webview_key.is_none() {
-                        let _ = host.load(b"<!doctype html>".to_vec());
-                    }
-                });
+        if self.selected_message.is_none() {
+            if self.reader_webview_key.take().is_some() {
+                if let Some(host) = self.reader_webview.clone() {
+                    cx.defer_in(window, move |this, _, _| {
+                        if this.reader_webview_key.is_none() {
+                            let _ = host.load(b"<!doctype html>".to_vec());
+                        }
+                    });
+                }
             }
+            self.reader_thread_webviews.clear();
+            self.reader_thread_heights.clear();
+            self.reader_thread_overflow_ids.clear();
         }
         #[cfg(windows)]
-        if let Some(host) = self.reader_webview.clone() {
-            let visible =
-                self.reader_webview_base_visible() && !self.reader_webview_yields_to_popup();
-            if !visible {
-                cx.defer_in(window, move |_, _, _| host.set_visible(false));
+        {
+            let base_visible = self.reader_webview_base_visible();
+            if let Some(host) = self.reader_webview.clone() {
+                let visible = base_visible && !self.reader_webview_yields_to_popup();
+                if !visible {
+                    cx.defer_in(window, move |_, _, _| host.set_visible(false));
+                }
+            }
+            for entry in self.reader_thread_webviews.values() {
+                let visible = base_visible && !entry.host.popup_settled();
+                if !visible {
+                    let host = entry.host.clone();
+                    cx.defer_in(window, move |_, _, _| host.set_visible(false));
+                }
             }
         }
         // 避坑清单第 4 条：先把语义色 Copy 成局部变量再构建 UI。

@@ -5,6 +5,20 @@
     const forwardWheel = Boolean(window.__kitemailForwardWheel);
     const boundDocs = new WeakSet();
     const foldedDocs = new WeakSet();
+    const observedDocs = new WeakSet();
+    let lastReportedHeight = 0;
+
+    function reportContentHeight(doc) {
+        if (!forwardWheel || !doc || !doc.documentElement || doc.URL === "about:blank") return;
+        const zoom = parseFloat(doc.defaultView.getComputedStyle(doc.documentElement).zoom) || 1;
+        const rectH = doc.documentElement.getBoundingClientRect().height || 0;
+        const bodyH = doc.body ? doc.body.scrollHeight * zoom : 0;
+        const height = Math.ceil(Math.max(rectH, bodyH));
+        if (height > 0 && Math.abs(height - lastReportedHeight) >= 2) {
+            lastReportedHeight = height;
+            window.chrome.webview.postMessage("content-height:" + height);
+        }
+    }
 
     function canScroll(element, delta) {
         const remaining = delta < 0
@@ -202,6 +216,7 @@
             const expanded = box.style.display !== "none";
             box.style.display = expanded ? "none" : "";
             btn.textContent = expanded ? "⋯ 显示引用内容" : "▾ 隐藏引用内容";
+            reportContentHeight(doc);
         });
     }
 
@@ -218,6 +233,7 @@
             boundDocs.add(doc);
             if (forwardWheel) {
                 doc.addEventListener("wheel", onWheel, { passive: false });
+                doc.addEventListener("load", () => reportContentHeight(doc), true);
             }
             doc.addEventListener("click", onMailtoClick, true);
             doc.addEventListener("auxclick", onMailtoClick, true);
@@ -228,6 +244,17 @@
             try {
                 foldReplyQuote(doc);
             } catch (_) {}
+        }
+
+        if (forwardWheel && doc.body && !observedDocs.has(doc)) {
+            observedDocs.add(doc);
+            reportContentHeight(doc);
+            if (typeof ResizeObserver === "function") {
+                const observer = new ResizeObserver(() => reportContentHeight(doc));
+                observer.observe(doc.documentElement);
+                observer.observe(doc.body);
+            }
+            requestAnimationFrame(() => reportContentHeight(doc));
         }
 
         return boundDocs.has(doc) && foldedDocs.has(doc);

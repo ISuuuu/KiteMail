@@ -2532,8 +2532,143 @@ fn clean_anchor_tag_href(raw_tag: &str) -> String {
     out
 }
 
+fn extract_style_attr(inner: &str) -> Option<&str> {
+    let lower = inner.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find("style") {
+        let pos = search_from + rel;
+        let before_ok = pos == 0 || inner.as_bytes()[pos - 1].is_ascii_whitespace();
+        let after = pos + 5;
+        if before_ok {
+            let rest = &inner[after..];
+            let trimmed = rest.trim_start();
+            if let Some(after_eq) = trimmed.strip_prefix('=') {
+                let after_eq = after_eq.trim_start();
+                if let Some(q) = after_eq.bytes().next().filter(|&b| b == b'"' || b == b'\'') {
+                    let content = &after_eq[1..];
+                    if let Some(end) = content.find(q as char) {
+                        return Some(&content[..end]);
+                    }
+                }
+            }
+        }
+        search_from = after;
+    }
+    None
+}
+
+fn style_prop<'a>(style: &'a str, prop: &str) -> Option<&'a str> {
+    for decl in style.split(';') {
+        let Some((name, val)) = decl.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case(prop) {
+            return Some(val.trim());
+        }
+    }
+    None
+}
+
+fn is_void_html_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "br" | "img" | "hr" | "meta" | "link" | "input" | "wbr" | "col" | "area" | "base"
+    )
+}
+
+fn has_hidden_attribute(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    // Skip tag name.
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'/' {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = &inner[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let has_eq = i < bytes.len() && bytes[i] == b'=';
+        if has_eq {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+        }
+        if name.eq_ignore_ascii_case("hidden") {
+            return true;
+        }
+    }
+    false
+}
+
+fn css_zero_value(val: &str) -> bool {
+    let v = val.trim().trim_end_matches("!important").trim();
+    matches!(
+        v.to_ascii_lowercase().as_str(),
+        "0" | "0px" | "0em" | "0rem" | "0pt" | "0%"
+    )
+}
+
+fn is_hidden_html_element(inner: &str) -> bool {
+    if has_hidden_attribute(inner) {
+        return true;
+    }
+    let Some(style) = extract_style_attr(inner) else {
+        return false;
+    };
+    if let Some(display) = style_prop(style, "display") {
+        let v = display.trim().trim_end_matches("!important").trim();
+        if v.eq_ignore_ascii_case("none") {
+            return true;
+        }
+    }
+    if let Some(vis) = style_prop(style, "visibility") {
+        let v = vis.trim().trim_end_matches("!important").trim();
+        if v.eq_ignore_ascii_case("hidden") {
+            return true;
+        }
+    }
+    if style_prop(style, "font-size").is_some_and(css_zero_value)
+        && (style_prop(style, "max-height").is_some_and(css_zero_value)
+            || style_prop(style, "opacity").is_some_and(css_zero_value))
+    {
+        return true;
+    }
+    false
+}
+
 /// Sanitize HTML email bodies for safe native display:
-/// strips `<script>`, `<style>`, `<head>`, `<iframe>`, and HTML comments,
+/// strips `<script>`, `<style>`, `<head>`, `<iframe>`, `<object>`, HTML comments,
+/// and elements hidden via `hidden` / `display: none` / `visibility: hidden`,
 /// optionally removes `<img>` elements referencing remote `http(s)://` URLs,
 /// and optionally strips tracking parameters from `<a href="...">` links.
 /// Returns `(sanitized_html, blocked_remote_image_count)`.
@@ -2545,6 +2680,7 @@ pub fn sanitize_html_for_display_with_options(
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut skip_block: Option<&'static str> = None;
+    let mut hidden_stack: Vec<String> = Vec::new();
     let mut tag_buf = String::new();
     let mut blocked_images = 0usize;
 
@@ -2564,6 +2700,7 @@ pub fn sanitize_html_for_display_with_options(
                 .next()
                 .unwrap_or("");
             let is_closing = lower.starts_with('/');
+            let self_closing = trimmed.ends_with('/') || is_void_html_tag(tag_name);
 
             if lower.starts_with("!--") {
                 continue;
@@ -2574,6 +2711,64 @@ pub fn sanitize_html_for_display_with_options(
                 }
                 continue;
             }
+            if !hidden_stack.is_empty() {
+                if is_closing {
+                    if let Some(pos) = hidden_stack.iter().rposition(|t| t == tag_name) {
+                        hidden_stack.truncate(pos);
+                        continue;
+                    }
+                    if matches!(
+                        tag_name,
+                        "body" | "html" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
+                    ) {
+                        hidden_stack.clear();
+                        // Container closed before malformed hidden tag; fall through to emit `</tag>`.
+                    } else {
+                        continue;
+                    }
+                } else {
+                    let auto_closed = match hidden_stack.last().map(String::as_str) {
+                        Some("p") => matches!(
+                            tag_name,
+                            "p" | "div"
+                                | "table"
+                                | "h1"
+                                | "h2"
+                                | "h3"
+                                | "h4"
+                                | "h5"
+                                | "h6"
+                                | "ul"
+                                | "ol"
+                                | "blockquote"
+                                | "hr"
+                                | "pre"
+                                | "section"
+                                | "article"
+                                | "header"
+                                | "footer"
+                        ),
+                        Some("td" | "th") => matches!(tag_name, "td" | "th" | "tr"),
+                        Some("tr") => tag_name == "tr",
+                        _ => false,
+                    };
+                    if auto_closed {
+                        hidden_stack.pop();
+                        if !hidden_stack.is_empty() {
+                            if !self_closing && !tag_name.is_empty() {
+                                hidden_stack.push(tag_name.to_string());
+                            }
+                            continue;
+                        }
+                        // Unclosed hidden tag was terminated by sibling/block boundary; fall through.
+                    } else {
+                        if !self_closing && !tag_name.is_empty() {
+                            hidden_stack.push(tag_name.to_string());
+                        }
+                        continue;
+                    }
+                }
+            }
             if !is_closing && matches!(tag_name, "script" | "style" | "head" | "iframe" | "object")
             {
                 skip_block = Some(match tag_name {
@@ -2583,6 +2778,12 @@ pub fn sanitize_html_for_display_with_options(
                     "iframe" => "iframe",
                     _ => "object",
                 });
+                continue;
+            }
+            if !is_closing && !tag_name.is_empty() && is_hidden_html_element(trimmed) {
+                if !self_closing {
+                    hidden_stack.push(tag_name.to_string());
+                }
                 continue;
             }
             if !is_closing
@@ -2606,7 +2807,7 @@ pub fn sanitize_html_for_display_with_options(
             tag_buf.push(ch);
             continue;
         }
-        if skip_block.is_none() {
+        if skip_block.is_none() && hidden_stack.is_empty() {
             out.push(ch);
         }
     }
@@ -2729,43 +2930,6 @@ fn normalize_layout_tables_for_display(html: &str) -> String {
         is_layout_table[meta.open_idx] = true;
     }
 
-    fn extract_style_attr(inner: &str) -> Option<&str> {
-        let lower = inner.to_ascii_lowercase();
-        let mut search_from = 0usize;
-        while let Some(rel) = lower[search_from..].find("style") {
-            let pos = search_from + rel;
-            let before_ok = pos == 0 || inner.as_bytes()[pos - 1].is_ascii_whitespace();
-            let after = pos + 5;
-            if before_ok {
-                let rest = &inner[after..];
-                let trimmed = rest.trim_start();
-                if let Some(after_eq) = trimmed.strip_prefix('=') {
-                    let after_eq = after_eq.trim_start();
-                    if let Some(q) = after_eq.bytes().next().filter(|&b| b == b'"' || b == b'\'') {
-                        let content = &after_eq[1..];
-                        if let Some(end) = content.find(q as char) {
-                            return Some(&content[..end]);
-                        }
-                    }
-                }
-            }
-            search_from = after;
-        }
-        None
-    }
-
-    fn style_prop<'a>(style: &'a str, prop: &str) -> Option<&'a str> {
-        for decl in style.split(';') {
-            let Some((name, val)) = decl.split_once(':') else {
-                continue;
-            };
-            if name.trim().eq_ignore_ascii_case(prop) {
-                return Some(val.trim());
-            }
-        }
-        None
-    }
-
     fn has_bold_font_weight(style: &str) -> bool {
         let Some(val) = style_prop(style, "font-weight") else {
             return false;
@@ -2797,13 +2961,6 @@ fn normalize_layout_tables_for_display(html: &str) -> String {
         }
     }
 
-    fn is_void_tag(tag: &str) -> bool {
-        matches!(
-            tag,
-            "br" | "img" | "hr" | "meta" | "link" | "input" | "wbr" | "col" | "area" | "base"
-        )
-    }
-
     struct OpenTagState {
         orig_tag: String,
         heading: Option<&'static str>,
@@ -2831,7 +2988,7 @@ fn normalize_layout_tables_for_display(html: &str) -> String {
                 let inner = raw[1..raw.len() - 1].trim();
                 let name_slice = inner.trim_start_matches('/');
                 let tag = name_slice[..name_end].to_ascii_lowercase();
-                let self_closing = inner.ends_with('/') || is_void_tag(&tag);
+                let self_closing = inner.ends_with('/') || is_void_html_tag(&tag);
 
                 if tag == "center" {
                     out.push_str(if is_closing { "</div>" } else { "<div>" });
@@ -3604,5 +3761,32 @@ mod tests {
                 ("Sent Messages", "已发送"),
             ]
         );
+    }
+
+    #[test]
+    fn sanitize_html_strips_hidden_preheader_elements() {
+        let raw = r#"<div style="display:none;max-height:0px;overflow:hidden;"><span>Hidden preheader</span></div><div style="visibility: hidden !important;">Also hidden</div><p hidden>Attr hidden</p><div style="font-size:0;opacity:0;">Zero hidden</div><p style="display:block;">Visible body</p>"#;
+        let (clean, _) = sanitize_html_for_display_with_options(raw, false, false);
+        assert!(!clean.contains("Hidden preheader"), "got: {clean}");
+        assert!(!clean.contains("Also hidden"), "got: {clean}");
+        assert!(!clean.contains("Attr hidden"), "got: {clean}");
+        assert!(!clean.contains("Zero hidden"), "got: {clean}");
+        assert!(clean.contains("Visible body"), "got: {clean}");
+    }
+
+    #[test]
+    fn sanitize_html_recovers_from_unclosed_hidden_tags_at_boundaries() {
+        let raw = concat!(
+            r#"<table><tr><td><div style="display:none">Preheader<span>unclosed</td><td><p>Cell body</p></td></tr></table>"#,
+            r#"<p style="display:none">Hidden p<p>Next p</p>"#,
+            r#"<div style="display:none"><span>unclosed inner</div><p>After outer div</p>"#,
+        );
+        let (clean, _) = sanitize_html_for_display_with_options(raw, false, false);
+        assert!(!clean.contains("Preheader"), "got: {clean}");
+        assert!(!clean.contains("unclosed"), "got: {clean}");
+        assert!(!clean.contains("Hidden p"), "got: {clean}");
+        assert!(clean.contains("Cell body"), "got: {clean}");
+        assert!(clean.contains("<p>Next p</p>"), "got: {clean}");
+        assert!(clean.contains("<p>After outer div</p>"), "got: {clean}");
     }
 }
