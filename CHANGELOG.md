@@ -1,91 +1,38 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-11-26
 
-- **Fixed: Fetch the sender's key found nothing for many addresses** (#690,
-  by James Reilly). gpg asks only the keyserver it is set up with,
-  keyserver.ubuntu.com by default, which lacks many keys, and its WKD lookup
-  refuses a redirect to another host. edward-en@fsf.org fails both ways.
-  When gpg finds nothing, **Fetch the sender's key** and **Fetch by
-  address…** now ask the provider's WKD again through Hylki's own HTTPS
-  client, then keys.openpgp.org by address and by key id. A key found by
-  address keeps only the user ids for that address and has to name it. One
-  found by key id has to carry that id.
+KiteMail for Windows 品牌切换与阅读器架构升级版本：正式更名为 **KiteMail** 并清理遗留 Linux 代码；将多封聚合会话收敛至单个 WebView2 容器以显著降低内存占用，补齐 HTML 签名与内联图片发送、安装版/便携版凭据互通，并修复多项阅读器渲染与文件夹同步问题。
 
-- **New: a shorter right-click menu on messages** (#692). The menu of a
-  message in the list and of a card in the reader keeps replying, starring,
-  read state, tags and filing (Archive, Move To…, Snooze, Spam, Delete) on
-  its first page. **Create** holds Create Event…, Create Task…, Create
-  Filter from Message… and Add Sender to Contacts. **More** holds Edit as
-  New Message, Copy To…, View Source and Save as File…, and on a card the
-  two print entries. A card's **View** holds remote content, the sender's
-  fonts and colors, and Expand All and Collapse All. Translate stays on the
-  first page when a service is set up. In the Inbox the card menu went from
-  26 entries to 15, and the list's from 19 to 13.
+### 品牌更名与升级说明
 
-- **Fixed: no window when GNOME Online Accounts or the desktop portal does
-  not answer** (#691, reported by thopanX). Startup asked GNOME Online
-  Accounts for its accounts, and the date column asked the settings portal
-  for the clock format, on the main thread with no time limit. One that never
-  answered held the window from ever appearing, and every later launch timed
-  out handing off to that instance. GOA now has 5 seconds at startup, and its
-  accounts are left as they are without an answer. Portal calls give up
-  after 2 seconds and are not tried again for 5 minutes. A launch that finds
-  an instance that does not answer says so, with the command that ends it,
-  instead of waiting a second time.
+- **正式更名为 KiteMail**：主程序更名为 `kitemail.exe`，发布产物调整为 `KiteMail_0.3.0_x64-setup.exe` 与 `KiteMail_v0.3.0_portable.zip`；应用内自更新源、「关于」页面与 Release 脚本同步切换至 `ISuuuu/KiteMail`。
+- **独立 Windows 工作区**：清理全部旧 Linux / GTK 代码与遗留图标资源，重构为根目录 `crates/` 标准布局，新增英文首页 `README.md` 与简体中文版 `README.zh-CN.md`。
+- **从 0.2.0 升级提示**：由于程序名及安装版默认配置目录已从 `%LOCALAPPDATA%\Hylki\` 变更为 `%LOCALAPPDATA%\KiteMail\`，建议旧版 `0.2.0`（`hylki.exe`）用户手动下载 `0.3.0` 安装包或便携包；首次启动后可在「设置 → 系统」中指向原有邮件存储目录，自动探测并导入关联账号且直接复用离线邮件缓存。
 
-- **Fixed: "entity not found" opening a conversation in On This Computer**
-  (#689, reported by samuel-edlmeier). With the empty Inbox left out of
-  the folder list, the cache numbered the folders one off from the ids
-  the app knew, so a conversation's messages in other folders were looked
-  for in the wrong one. The cache now keeps each folder's own id.
+### 阅读器与聚合会话
 
-- **New: contacts picked from the mail** (#677, requested by
-  DarkStarCrashes123). **From Mail…** in the Contacts view's import menu
-  lists everyone in the cached mail who is not a contact yet, with how many
-  messages each is on, most first. The list can be searched, narrowed to
-  one account or one folder, and ticked person by person or all at once; **Import** adds
-  the ones ticked to the book chosen. Your own addresses, no-reply and
-  bounce senders, and senders found only in Trash or Junk are left out.
+- **单 WebView2 会话容器**：多封聚合会话收敛为单个 WebView2 容器统一承载（每封正文使用沙箱 `iframe` 隔离，折叠卡片按需延迟水合），显著降低多封往来邮件场景的进程数与内存占用。
+- **挂起恢复与浮层防闪烁**：修复右侧阅读器挂起后空白的问题并优化渲染性能；打开菜单、弹窗等浮层时以正文快照替代隐藏的 WebView2，关闭后即时恢复。
+- **收件箱会话折叠与默认时间倒序**：收件箱支持按会话折叠去重显示并同步已读与选中状态，统一列表会话计数与阅读器归并规则；中栏内联展开的子邮件树与右侧阅读器会话卡片默认统一按时间倒序排列（最新在前，并自动对旧配置做一次性迁移，仍可在「设置 → 会话」切回正序）。
+- **正文排版修复**：修复会话历史卡片退回原生排版及隐藏预读文本外泄的问题；修复包含 `mailto:` 链接或 `cid:` 内联图片的 HTML 邮件误回退至原生渲染的问题。
 
-- **Fixed: m marked an unread conversation unread** (#679, reported by
-  mbetrifork). Opening a conversation reads its newest message, and **m**
-  toggled that message alone, so the first press made it unread while the
-  others stayed unread. On a conversation's row **m** now toggles the whole
-  conversation: any unread message makes it all read. A card picked in the
-  reader still toggles that card.
+### 写信、签名与应用内反馈
 
-- **New: contacts imported straight from Thunderbird** (#681, requested by
-  DarkStarCrashes123). The Contacts view's import button is a menu, and
-  **From Thunderbird…** finds Thunderbird's profiles (its own folder, the
-  Flatpak's and the Snap's) and lists each address book with a switch in
-  **Import Contacts**, Collected Addresses off. Cards keep Thunderbird's
-  IDs, so importing again updates them, and mailing lists become groups.
-  Without a profile in those places a folder chooser asks for it, and
-  **From Files…** takes an `abook.sqlite`. The Flatpak reads the
-  Thunderbird Flatpak's folder, read-only.
+- **HTML 签名全链路支持**：新增 HTML 签名安全清洗、从本地文件导入 HTML 签名以及按正文格式（纯文本 / 富文本 / HTML）自动插入；发信前自动将正文与签名中的 `data:` 图片转换为 `cid:` 内联附件，提升收件端兼容性。
+- **签名默认行为修复**：修复「默认不使用签名」不生效的问题，并对旧配置中的回复/转发签名位置进行一次性默认迁移（置于引用内容上方）。
+- **反馈体系与多令牌撤销发送**：重构应用内 Toast 反馈与 WebView2 防遮挡底部留白布局，支持连续发送多封邮件的独立多令牌撤销发送；移除「关于」弹窗更新说明截断并支持滚动查看完整日志。
 
-- **Fixed: a message could be lost when Hylki was closed before it went**
-  (#678, reported by DarkStarCrashes123). A message waited in memory between
-  Send and the server taking it, and on a slow server it could wait behind
-  minutes of other work; closing Hylki then lost it. Every message is now
-  written to the Outbox when Send is pressed and leaves it once the server
-  accepts it, so a failure, a quit or a crash leaves it there to be sent.
-  While a message is on its way the Outbox does not list it: the Outbox
-  appears only when a message could not be sent. A message the server
-  refused stays in the Outbox with the reason, where Edit opens it.
+### 账号、凭据与文件夹同步
 
-- **Fixed: a message could take minutes to send** (#678). Sending waited
-  behind folder syncs, flag checks and drafts downloaded in the background,
-  which on Yahoo with large drafts was two minutes. A message being sent now
-  goes ahead of them.
+- **切换目录自动导入账号**：在「设置 → 系统」切换或复用邮件存储目录时，自动探测目录内关联账号并支持一键导入，完善主窗体切换加载流程。
+- **跨实例凭据共享与保护**：便携版与安装版共享 Windows 系统凭据命名空间并按邮箱键复用授权；完善跨实例删号时的对称保护机制与 OAuth 刷新令牌双向轮换同步。
+- **IMAP / Graph 文件夹同步加固**：过滤 IMAP `\Noselect` 虚拟容器并支持 MUTF-7 解码与 `SPECIAL-USE` 角色映射；按 Microsoft Graph well-known ID 识别系统文件夹，避免自定义 `Trash` 重复显示为已删除；同步时自动清理远端已删除文件夹，并在 Graph 返回 404 时移除残留目录。
+- **侧边栏交互精简**：移除账号侧边栏多余的文件夹分组头，自定义文件夹直接平级展示；将账号行内刷新与设置入口统一收口至账号右键菜单。
 
-- **New: Empty Trash and Empty Junk say how many messages they erase**
-  (#676, requested by DarkStarCrashes123). The question asks the server for
-  the folder's count first: "47 messages will be erased from the server".
-  Emptying every account's Trash or Junk from the unified row gives the
-  total and each account's own count. A server that does not answer within
-  a second and a half leaves the question as it was, without a number.
+### 性能与工程改进
+
+- 优化栏宽拖拽重绘开销、列表与阅读器渲染性能；改进 dev 依赖编译配置及 Windows CI 缓存与发版触发流程。
 
 ## 0.2.0 — 2026-11-24
 
