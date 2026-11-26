@@ -1,0 +1,714 @@
+//! Setting up a composer: the From identities it offers and which one it opens
+//! with.
+
+use std::collections::HashMap;
+
+use adw::prelude::*;
+use relm4::prelude::*;
+
+use crate::config;
+use crate::config::{split_identity, AccountConfig};
+use crate::i18n::i18n;
+use crate::ui::compose::{Compose, ComposeInit, ComposeOutput};
+use crate::ui::compose::{ComposeAccount, ComposePrefill, Original};
+use crate::ui::preferences::PrefOutput;
+
+use super::model::AppModel;
+use super::msg::AppMsg;
+use super::palette::palette_key;
+
+/// Selectable "from" identities, in display order: each account, then
+/// one entry per send-as alias it defines (#34) — same transport and
+/// signature, a different From on the wire. Built from the CONFIG, not
+/// the live account list: launched cold by a mailto/file hand-off
+/// (Nautilus's "Send by email", #105) the composer opens before any
+/// worker has connected, and the live list is still empty — which
+/// hid the From row entirely.
+/// The demo's stand-in accounts count here too, so a demo reply
+/// carries a signature like a real one.
+fn compose_identities(
+    account_order: &[String],
+    config: &[AccountConfig],
+    server_identities: &HashMap<u32, Vec<(String, String)>>,
+) -> Vec<ComposeAccount> {
+    accounts_in_order(account_order, config)
+        .iter()
+        .flat_map(|email| account_identities(email, config, server_identities))
+        .collect()
+}
+
+/// The enabled accounts' addresses, in sidebar order, then any the order
+/// does not list. On This Computer (#552) sends nothing and is left out.
+fn accounts_in_order(account_order: &[String], config: &[AccountConfig]) -> Vec<String> {
+    let sends = |c: &&AccountConfig| c.enabled && !c.is_local();
+    let mut emails: Vec<String> = Vec::new();
+    for email in account_order {
+        if config.iter().filter(sends).any(|c| &c.email == email) && !emails.contains(email) {
+            emails.push(email.clone());
+        }
+    }
+    for c in config.iter().filter(sends) {
+        if !emails.contains(&c.email) {
+            emails.push(c.email.clone());
+        }
+    }
+    emails
+}
+
+/// One account's identities in the From list: its own address, its
+/// aliases, then its server's own identities. None for an address no
+/// account has.
+fn account_identities(
+    email: &str,
+    config: &[AccountConfig],
+    server_identities: &HashMap<u32, Vec<(String, String)>>,
+) -> Vec<ComposeAccount> {
+    let Some((idx, cfg)) = config.iter().enumerate().find(|(_, c)| c.email == email) else {
+        return Vec::new();
+    };
+    let id = idx as u32 + 1;
+    let label = if cfg.name.trim().is_empty() {
+        cfg.email.clone()
+    } else {
+        format!("{} <{}>", cfg.name, cfg.email)
+    };
+    let cfg = Some(cfg);
+    let (signatures, default) = cfg.map(|c| c.signature_set()).unwrap_or_default();
+    let signature = default
+        .map(|i| signatures[i].html.clone())
+        .unwrap_or_default();
+    // The default signature's sender name goes on the account's own
+    // address; the aliases below keep theirs.
+    let signed_as = default
+        .and_then(|i| signatures.get(i))
+        .map(|sig| sig.sender_from(&label))
+        .filter(|from| *from != label);
+    let pgp_key = cfg.and_then(|c| c.pgp_key.clone());
+    let sign_default = cfg.is_some_and(|c| c.sign_by_default);
+    let autocrypt_mutual = cfg.is_some_and(|c| c.autocrypt && c.autocrypt_mutual);
+    let mut identities = vec![ComposeAccount {
+        id,
+        label,
+        signature: signature.clone(),
+        signatures: signatures.clone(),
+        email: email.to_string(),
+        pgp_key: pgp_key.clone(),
+        sign_default,
+        autocrypt_mutual,
+        alias_from: None,
+        signed_as,
+        default_from: false,
+    }];
+    for alias in cfg.map(|c| c.aliases.as_slice()).unwrap_or_default() {
+        let (name, addr) = split_identity(&alias.identity);
+        if addr.is_empty() {
+            continue;
+        }
+        let display = if name.is_empty() {
+            addr.clone()
+        } else {
+            format!("{name} <{addr}>")
+        };
+        identities.push(ComposeAccount {
+            id,
+            label: display.clone(),
+            signature: signature.clone(),
+            signatures: signatures.clone(),
+            email: addr,
+            pgp_key: pgp_key.clone(),
+            sign_default,
+            autocrypt_mutual,
+            alias_from: Some(display),
+            signed_as: None,
+            default_from: alias.default_from,
+        });
+    }
+    // A JMAP server's own identities (#346), unless the account
+    // already lists the address. A catch-all (`*@domain`) is no
+    // address to send from; typing one into From uses it.
+    for (name, addr) in server_identities
+        .get(&id)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        if addr.starts_with("*@")
+            || identities
+                .iter()
+                .any(|i| i.email.eq_ignore_ascii_case(addr))
+        {
+            continue;
+        }
+        let display = if name.is_empty() || name.eq_ignore_ascii_case(addr) {
+            addr.clone()
+        } else {
+            format!("{name} <{addr}>")
+        };
+        identities.push(ComposeAccount {
+            id,
+            label: display.clone(),
+            signature: signature.clone(),
+            signatures: signatures.clone(),
+            email: addr.clone(),
+            pgp_key: pgp_key.clone(),
+            sign_default,
+            autocrypt_mutual,
+            alias_from: Some(display),
+            signed_as: None,
+            default_from: false,
+        });
+    }
+    identities
+}
+
+/// Default identity: for a reply, whichever of the account's addresses
+/// the original was sent to — mail to an alias is answered as the alias.
+/// For a new message, the default sender chosen in Settings (#157), if
+/// it is one of this account's addresses. Otherwise (and when nothing
+/// matches) the alias the account marks as its default, else the
+/// account's own address.
+/// A reply to a `+tag` address of one of the account's identities
+/// (#347) answers from that address, as typed, through the identity.
+///
+/// Returns the index into `accounts`; a `+tag` reply also sets
+/// `prefill.custom_from`.
+fn choose_identity(
+    accounts: &[ComposeAccount],
+    account_id: u32,
+    prefill: &mut ComposePrefill,
+) -> usize {
+    let plus = (prefill.custom_from.trim().is_empty())
+        .then(|| {
+            crate::worker::parse_recipients(&prefill.reply_addressed_to)
+                .into_iter()
+                .find_map(|(_, addr)| {
+                    let (user, host) = addr.split_once('@')?;
+                    let (base, _tag) = user.split_once('+')?;
+                    let plain = format!("{base}@{host}");
+                    let i = accounts
+                        .iter()
+                        .position(|c| c.id == account_id && c.email.eq_ignore_ascii_case(&plain))?;
+                    let (name, _) = crate::config::split_identity(
+                        &accounts[i]
+                            .alias_from
+                            .clone()
+                            .unwrap_or_else(|| accounts[i].label.clone()),
+                    );
+                    Some((i, crate::worker::format_recipient(&name, &addr)))
+                })
+        })
+        .flatten();
+    if let Some((_, from)) = &plus {
+        prefill.custom_from = from.clone();
+    }
+    // A draft saved from one of several names at one address reopens on
+    // that name, not on the first identity with the address.
+    let named = || {
+        let found = crate::worker::parse_recipients(&prefill.custom_from);
+        let [(name, addr)] = found.as_slice() else {
+            return None;
+        };
+        accounts.iter().position(|c| {
+            let display = c.alias_from.clone().unwrap_or_else(|| c.label.clone());
+            let (n, a) = crate::config::split_identity(&display);
+            c.id == account_id && n == *name && a.eq_ignore_ascii_case(addr)
+        })
+    };
+    let hay = prefill.reply_addressed_to.to_lowercase();
+    let want = prefill.from_address.trim().to_lowercase();
+    // An account with no From of its own (On This Computer, #552) answers
+    // from whichever account the original was addressed to.
+    let own = accounts.iter().any(|c| c.id == account_id);
+    let by_reply = || {
+        (!hay.is_empty())
+            .then(|| {
+                accounts.iter().position(|c| {
+                    (c.id == account_id || !own) && hay.contains(c.email.to_lowercase().as_str())
+                })
+            })
+            .flatten()
+    };
+    plus.map(|(i, _)| i)
+        .or_else(named)
+        .or_else(by_reply)
+        .or_else(|| {
+            (!want.is_empty())
+                .then(|| {
+                    accounts
+                        .iter()
+                        .position(|c| c.id == account_id && c.email.to_lowercase() == want)
+                })
+                .flatten()
+        })
+        .or_else(|| {
+            accounts
+                .iter()
+                .position(|c| c.id == account_id && c.default_from)
+        })
+        .or_else(|| {
+            accounts
+                .iter()
+                .position(|c| c.id == account_id && c.alias_from.is_none())
+        })
+        .unwrap_or(0)
+}
+
+impl AppModel {
+    /// The account and identity a NEW message opens from (#157). With a
+    /// default sender chosen in Settings → Composing, that identity — an
+    /// account's own address or one of its aliases — as long as its account
+    /// is still enabled; otherwise `fallback` (the open folder's or open
+    /// message's account, as before) from its own address. Replies never
+    /// come through here: they answer from the address written to.
+    pub(super) fn new_message_from(
+        &self,
+        fallback: u32,
+        mut prefill: ComposePrefill,
+    ) -> (u32, ComposePrefill) {
+        let want = self.compose_default_from.trim();
+        if want.is_empty() {
+            return (fallback, prefill);
+        }
+        let owner = self.config.iter().enumerate().find(|(_, c)| {
+            c.enabled
+                && (c.email.eq_ignore_ascii_case(want)
+                    || c.aliases.iter().any(|al| {
+                        crate::config::split_identity(&al.identity)
+                            .1
+                            .eq_ignore_ascii_case(want)
+                    }))
+        });
+        match owner {
+            Some((idx, _)) => {
+                prefill.from_address = want.to_string();
+                (idx as u32 + 1, prefill)
+            }
+            None => (fallback, prefill),
+        }
+    }
+
+    /// Assemble the `ComposeInit` for a composer (from-accounts + signatures,
+    /// autocomplete suggestions, a fresh id, host mode).
+    pub(super) fn build_compose_init(
+        &mut self,
+        account_id: u32,
+        prefill: ComposePrefill,
+        windowed: bool,
+        can_toggle: bool,
+    ) -> (u32, ComposeInit) {
+        let accounts = compose_identities(
+            &self.account_order,
+            self.effective_config(),
+            &self.server_identities,
+        );
+        let mut prefill = prefill;
+        let selected = choose_identity(&accounts, account_id, &mut prefill);
+        prefill.receipt.get_or_insert(self.request_receipts);
+
+        let format = opening_format(
+            self.compose_format,
+            self.follow_plain,
+            prefill.written_plain,
+            prefill.original,
+        );
+        // The user's own addresses, aliases included, go last in the
+        // recipient suggestions, and mail from them counts as sent.
+        let own: Vec<(String, String)> = self
+            .config
+            .iter()
+            .flat_map(|c| {
+                std::iter::once((c.name.clone(), c.email.clone())).chain(
+                    c.aliases
+                        .iter()
+                        .map(|alias| crate::config::split_identity(&alias.identity)),
+                )
+            })
+            .collect();
+        let id = self.next_compose_id;
+        self.next_compose_id += 1;
+        let init = ComposeInit {
+            compose_id: id,
+            prefill,
+            accounts,
+            selected,
+            own_addresses: own,
+            windowed,
+            can_toggle,
+            compact: false,
+            decorations: true,
+            format,
+            signature_position: self.signature_position,
+            has_templates: !self.templates_folders().is_empty(),
+        };
+        (id, init)
+    }
+
+    /// Launch a `Compose` component, forwarding its outputs into `AppMsg`.
+    pub(super) fn spawn_compose(
+        &self,
+        init: ComposeInit,
+        sender: &ComponentSender<Self>,
+    ) -> Controller<Compose> {
+        Compose::builder()
+            .launch(init)
+            .forward(sender.input_sender(), |out| match out {
+                ComposeOutput::Send { id, message } => AppMsg::SendMessage {
+                    from: id,
+                    out: message,
+                },
+                ComposeOutput::SendMerged { messages, interval } => {
+                    AppMsg::SendMerged { messages, interval }
+                }
+                ComposeOutput::SaveDraft(msg) => AppMsg::SaveDraftMessage(msg),
+                ComposeOutput::SaveTemplate(msg) => AppMsg::SaveTemplateMessage(msg),
+                ComposeOutput::PickTemplate { id } => AppMsg::PickTemplate { id },
+                ComposeOutput::AutoSave { id, message } => AppMsg::AutoSaveDraft { id, message },
+                ComposeOutput::DiscardAutosave { id, origin } => {
+                    AppMsg::DiscardAutosave { id, origin }
+                }
+                ComposeOutput::DeleteDraft { id, origin } => AppMsg::DeleteDraft { id, origin },
+                ComposeOutput::Discarded(message) => AppMsg::ComposeDiscarded(message),
+                ComposeOutput::ToggleWindow(id) => AppMsg::ComposeToggleWindow(id),
+                ComposeOutput::Close(id) => AppMsg::ComposeClosed(id),
+                ComposeOutput::History { id, undo, redo } => {
+                    AppMsg::ComposeHistory { id, undo, redo }
+                }
+                ComposeOutput::SetSpellcheckLangs(langs) => {
+                    AppMsg::Pref(PrefOutput::SetSpellcheckLangs(langs))
+                }
+                ComposeOutput::DirectoryError(text) => AppMsg::DirectoryError(text),
+                ComposeOutput::ShowContacts => AppMsg::ShowContactsPage,
+            })
+    }
+
+    /// Host a compose pane in a fresh standalone window, transient for the app.
+    pub(super) fn compose_window_host(
+        &self,
+        content: &impl IsA<gtk::Widget>,
+        id: u32,
+        sender: &ComponentSender<Self>,
+    ) -> adw::Window {
+        let win = self.compose_window(content, id, sender);
+        win.present();
+        win
+    }
+
+    /// That window, not yet shown: one an assistant's message opens in
+    /// may wait until the user asks for it.
+    pub(super) fn compose_window(
+        &self,
+        content: &impl IsA<gtk::Widget>,
+        id: u32,
+        sender: &ComponentSender<Self>,
+    ) -> adw::Window {
+        let win = adw::Window::builder()
+            .modal(false)
+            // Room for the full compose toolbar (Cancel, Save Draft, the
+            // action icons, Send) before it folds into its ⋯ menu.
+            .default_width(720)
+            .default_height(760)
+            .title(i18n("New Message"))
+            .transient_for(&self.window)
+            .build();
+        win.set_content(Some(content));
+        win.add_controller(palette_key(sender));
+        win.add_controller(crate::ui::close_key());
+        let s = sender.input_sender().clone();
+        win.connect_close_request(move |_| {
+            let _ = s.send(AppMsg::ComposeCloseRequested(id));
+            gtk::glib::Propagation::Stop
+        });
+        win.connect_is_active_notify(|w| {
+            if w.is_active() {
+                crate::desktop::notify::withdraw_compose_ready();
+            }
+        });
+        win
+    }
+}
+
+/// The format a composer opens in. Plain text picked up again stays plain
+/// (#634). With "Reply in the original's format" on, a reply or forward
+/// answers in kind (#436): plain text to plain-text mail, and rich text to
+/// formatted mail when new messages start in plain text (#646). Markdown and
+/// HTML source are kept, as both send formatted mail. Anything else starts
+/// in the chosen format.
+fn opening_format(
+    chosen: config::ComposeFormat,
+    follow: bool,
+    written_plain: bool,
+    original: Original,
+) -> config::ComposeFormat {
+    use config::ComposeFormat::{Plain, Rich};
+    match (written_plain, follow, original) {
+        (true, _, _) | (_, true, Original::Plain) => Plain,
+        (_, true, Original::Formatted) if chosen == Plain => Rich,
+        _ => chosen,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::demo::demo_account_configs;
+
+    fn identities_fixture() -> Vec<ComposeAccount> {
+        let mut config = demo_account_configs();
+        config.truncate(2);
+        config[0].email = "a@x.com".into();
+        config[0].name = "Ann".into();
+        config[0].aliases = vec![
+            toml::from_str("identity = \"Bea <ba@x.com>\"").unwrap(),
+            toml::from_str("identity = \"Nobody <>\"").unwrap(),
+        ];
+        config[1].email = "c@y.org".into();
+        config[1].name = " ".into();
+        let mut server = HashMap::new();
+        server.insert(
+            1,
+            vec![
+                ("".to_string(), "*@x.com".to_string()),
+                ("".to_string(), "BA@x.com".to_string()),
+                ("Ann".to_string(), "info@x.com".to_string()),
+            ],
+        );
+        server.insert(2, vec![("c@y.org".to_string(), "c2@y.org".to_string())]);
+        compose_identities(&["c@y.org".to_string()], &config, &server)
+    }
+
+    #[test]
+    fn compose_identities_follow_the_sidebar_order_then_aliases() {
+        let ids = identities_fixture();
+        let rows: Vec<(u32, &str, &str, Option<&str>)> = ids
+            .iter()
+            .map(|c| {
+                (
+                    c.id,
+                    c.label.as_str(),
+                    c.email.as_str(),
+                    c.alias_from.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (2, "c@y.org", "c@y.org", None),
+                (
+                    2,
+                    "c@y.org <c2@y.org>",
+                    "c2@y.org",
+                    Some("c@y.org <c2@y.org>")
+                ),
+                (1, "Ann <a@x.com>", "a@x.com", None),
+                (1, "Bea <ba@x.com>", "ba@x.com", Some("Bea <ba@x.com>")),
+                (
+                    1,
+                    "Ann <info@x.com>",
+                    "info@x.com",
+                    Some("Ann <info@x.com>")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_address_can_have_several_send_as_names() {
+        let mut config = demo_account_configs();
+        config.truncate(1);
+        config[0].email = "office@example.com".into();
+        config[0].name = "Office".into();
+        config[0].aliases = vec![
+            toml::from_str("identity = \"Boss <office@example.com>\"").unwrap(),
+            toml::from_str("identity = \"Manager <office@example.com>\"").unwrap(),
+        ];
+
+        let ids = compose_identities(&[], &config, &HashMap::new());
+        let rows: Vec<(&str, &str)> = ids
+            .iter()
+            .map(|c| (c.label.as_str(), c.email.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Office <office@example.com>", "office@example.com"),
+                ("Boss <office@example.com>", "office@example.com"),
+                ("Manager <office@example.com>", "office@example.com"),
+            ]
+        );
+
+        // A draft saved as one of them reopens on that name.
+        let mut draft = ComposePrefill {
+            from_address: "office@example.com".into(),
+            custom_from: "Manager <office@example.com>".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, ids[0].id, &mut draft), 2);
+    }
+
+    #[test]
+    fn the_default_signature_names_the_account_but_not_its_aliases() {
+        let mut config = demo_account_configs();
+        config.truncate(1);
+        config[0].email = "office@example.com".into();
+        config[0].name = "Office".into();
+        config[0].aliases =
+            vec![toml::from_str("identity = \"Boss <office@example.com>\"").unwrap()];
+        config[0].set_signatures(
+            vec![crate::config::NamedSignature {
+                name: "Director".into(),
+                sender_name: "Alex Morgan".into(),
+                html: "Alex Morgan".into(),
+            }],
+            Some(0),
+        );
+
+        let ids = compose_identities(&[], &config, &HashMap::new());
+        assert_eq!(ids[0].label, "Office <office@example.com>");
+        assert_eq!(ids[0].alias_from, None);
+        assert_eq!(
+            ids[0].signed_as.as_deref(),
+            Some("Alex Morgan <office@example.com>")
+        );
+        assert_eq!(
+            ids[1].alias_from.as_deref(),
+            Some("Boss <office@example.com>")
+        );
+        assert_eq!(ids[1].signed_as, None);
+        // A new message still opens on the account's own address.
+        assert_eq!(
+            choose_identity(&ids, ids[0].id, &mut ComposePrefill::default()),
+            0
+        );
+    }
+
+    #[test]
+    fn a_default_alias_opens_new_messages_but_not_replies_to_the_account() {
+        let mut config = demo_account_configs();
+        config.truncate(1);
+        config[0].email = "me@x.com".into();
+        config[0].aliases = vec![
+            toml::from_str("identity = \"Info <info@x.com>\"").unwrap(),
+            toml::from_str("identity = \"Sales <sales@x.com>\"\ndefault_from = true").unwrap(),
+        ];
+        let ids = compose_identities(&[], &config, &HashMap::new());
+        let id = ids[0].id;
+        assert_eq!(choose_identity(&ids, id, &mut ComposePrefill::default()), 2);
+        // Mail to one of the account's addresses is answered from it.
+        let mut reply = ComposePrefill {
+            reply_addressed_to: "me@x.com".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, id, &mut reply), 0);
+        // A list's mail, sent to none of them, gets the default.
+        let mut list = ComposePrefill {
+            reply_addressed_to: "list@lists.example".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, id, &mut list), 2);
+        // An address chosen elsewhere (Settings, a draft) still wins.
+        let mut chosen = ComposePrefill {
+            from_address: "me@x.com".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, id, &mut chosen), 0);
+    }
+
+    /// B5 in the map: the reply identity is found by substring, so mail to
+    /// the alias ba@x.com is answered from the account a@x.com, which comes
+    /// first and is contained in it.
+    #[test]
+    fn reply_identity_is_chosen_by_substring_of_the_recipients() {
+        let ids = identities_fixture();
+        let mut reply = ComposePrefill {
+            reply_addressed_to: "Bea <ba@x.com>, ".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, 1, &mut reply), 2);
+        assert!(reply.custom_from.is_empty());
+        let mut info = ComposePrefill {
+            reply_addressed_to: "info@x.com".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, 1, &mut info), 4);
+        let mut chosen = ComposePrefill {
+            from_address: " BA@x.com ".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, 1, &mut chosen), 3);
+        let mut plain = ComposePrefill::default();
+        assert_eq!(choose_identity(&ids, 1, &mut plain), 2);
+        assert_eq!(choose_identity(&ids, 9, &mut plain), 0);
+    }
+
+    #[test]
+    fn a_reply_to_a_plus_address_keeps_it_as_the_from() {
+        let ids = identities_fixture();
+        let mut reply = ComposePrefill {
+            reply_addressed_to: "ba+lists@x.com".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, 1, &mut reply), 3);
+        assert_eq!(reply.custom_from, "Bea <ba+lists@x.com>");
+        let mut typed = ComposePrefill {
+            reply_addressed_to: "ba+lists@x.com".into(),
+            custom_from: "Me <me@x.com>".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, 1, &mut typed), 2);
+        assert_eq!(typed.custom_from, "Me <me@x.com>");
+    }
+
+    /// On This Computer (#552) sends nothing: it offers no From, and a
+    /// reply to mail filed there answers from the account it was sent to.
+    #[test]
+    fn mail_on_this_computer_is_answered_from_the_account_it_came_to() {
+        let mut config = vec![
+            crate::config::local_account(),
+            crate::config::blank_account(),
+            crate::config::blank_account(),
+        ];
+        config[1].email = "a@x.com".into();
+        config[2].email = "c@y.org".into();
+        let ids = compose_identities(&[], &config, &HashMap::new());
+        let emails: Vec<(u32, &str)> = ids.iter().map(|c| (c.id, c.email.as_str())).collect();
+        assert_eq!(emails, [(2, "a@x.com"), (3, "c@y.org")]);
+        let mut reply = ComposePrefill {
+            reply_addressed_to: "C <c@y.org>".into(),
+            ..Default::default()
+        };
+        assert_eq!(choose_identity(&ids, 1, &mut reply), 1);
+        let mut fresh = ComposePrefill::default();
+        assert_eq!(choose_identity(&ids, 1, &mut fresh), 0);
+    }
+
+    #[test]
+    fn an_answer_opens_in_the_original_format_when_asked() {
+        use config::ComposeFormat::{Html, Markdown, Plain, Rich};
+        // Off: the chosen format, whatever the original was.
+        for original in [Original::Plain, Original::Formatted, Original::Unknown] {
+            assert_eq!(opening_format(Rich, false, false, original), Rich);
+            assert_eq!(opening_format(Plain, false, false, original), Plain);
+        }
+        // On: plain-text mail is answered in plain text (#436)...
+        assert_eq!(opening_format(Rich, true, false, Original::Plain), Plain);
+        assert_eq!(
+            opening_format(Markdown, true, false, Original::Plain),
+            Plain
+        );
+        // ...and formatted mail in rich text when the default is plain (#646).
+        assert_eq!(
+            opening_format(Plain, true, false, Original::Formatted),
+            Rich
+        );
+        assert_eq!(
+            opening_format(Markdown, true, false, Original::Formatted),
+            Markdown
+        );
+        assert_eq!(opening_format(Html, true, false, Original::Formatted), Html);
+        // A new message, or one whose original was not loaded.
+        assert_eq!(opening_format(Plain, true, false, Original::Unknown), Plain);
+        assert_eq!(opening_format(Rich, true, false, Original::Unknown), Rich);
+        // Plain text picked up again stays plain (#634).
+        assert_eq!(opening_format(Rich, true, true, Original::Formatted), Plain);
+    }
+}
