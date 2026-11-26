@@ -484,8 +484,12 @@ pub struct AppPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_folder: Option<(u32, u32)>,
     /// Show newest replies first in conversation threads (`true` = descending).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub thread_newest_first: bool,
+    /// One-time migration marker bringing pre-existing installs (`thread_newest_first = false`)
+    /// up to the default (`true`) without overriding subsequent user choices.
+    #[serde(default)]
+    pub thread_newest_first_default_applied: bool,
     /// Automatically fold older messages when opening a multi-message thread.
     #[serde(default)]
     pub fold_older_messages: bool,
@@ -1167,7 +1171,8 @@ impl Default for AppPreferences {
             default_view: "unified".to_string(),
             last_view: None,
             last_folder: None,
-            thread_newest_first: false,
+            thread_newest_first: true,
+            thread_newest_first_default_applied: true,
             fold_older_messages: false,
             fold_messages_mode: None,
             card_attachments: true,
@@ -2302,9 +2307,20 @@ pub fn load_preferences_in(dir: &Path) -> Result<AppPreferences, String> {
         toml::from_str(&text).map_err(|e| format!("解析偏好设置失败 ({}): {e}", path.display()))?;
     // WP-04 之前生成的配置文件会把旧默认值 signature_above_quote = false 落盘；
     // 仅迁移一次，之后用户显式改回「在引用内容下方」会保留。
+    let mut migrated = false;
     if !prefs.signature_above_quote_default_applied {
         prefs.signature_above_quote_default_applied = true;
         prefs.signature_above_quote = true;
+        migrated = true;
+    }
+    // 早期配置将旧默认值 thread_newest_first = false 落盘；仅迁移一次，
+    // 之后用户显式关闭「按最新回复置顶排列会话卡片」会保留。
+    if !prefs.thread_newest_first_default_applied {
+        prefs.thread_newest_first_default_applied = true;
+        prefs.thread_newest_first = true;
+        migrated = true;
+    }
+    if migrated {
         let _ = save_preferences_in(dir, &prefs);
     }
     Ok(prefs)
@@ -3028,8 +3044,8 @@ smtp_separate_credentials = false
     #[test]
     fn remote_sender_whitelist_and_zoom_clamping_work() {
         let mut prefs = AppPreferences::default();
-        // WP-04：对齐 Linux 默认值——旧邮件在上、不折叠会话。
-        assert!(!prefs.thread_newest_first);
+        // 默认值：按时间倒序排列会话卡片、不自动折叠会话。
+        assert!(prefs.thread_newest_first);
         assert!(!prefs.fold_older_messages);
         assert_eq!(prefs.reader_zoom_percent, 100);
         // 阶段 3：单键快捷键默认开启。
@@ -3089,8 +3105,8 @@ smtp_separate_credentials = false
         let parsed = load_preferences_in(&base).expect("load empty file");
         assert_eq!(parsed, AppPreferences::default());
 
-        // 1. 会话内旧邮件在上（最新不置顶）。
-        assert!(!parsed.thread_newest_first);
+        // 1. 会话内按时间倒序排列（最新回复置顶）。
+        assert!(parsed.thread_newest_first);
         // 2. 打开会话时不折叠较早邮件（"never"）。
         assert!(!parsed.fold_older_messages);
         assert_eq!(parsed.effective_fold_messages_mode(), "never");
@@ -3830,6 +3846,35 @@ smtp_separate_credentials = false
         let reloaded = load_preferences_in(&base).expect("reload user choice");
         assert!(!reloaded.signature_above_quote);
         assert!(reloaded.signature_above_quote_default_applied);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_thread_newest_first_false_migrates_once_then_preserves_choice() {
+        let base = std::env::temp_dir().join("hylki test 会话倒序一次性迁移");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // 模拟旧版配置：显式落盘了 thread_newest_first = false 且无迁移标记。
+        fs::write(
+            preferences_file_in(&base),
+            "theme_id = \"default\"\nthread_newest_first = false\n",
+        )
+        .expect("write legacy prefs");
+
+        let migrated = load_preferences_in(&base).expect("load legacy prefs");
+        assert!(migrated.thread_newest_first);
+        assert!(migrated.thread_newest_first_default_applied);
+
+        // 迁移后若用户再次显式关闭「按最新回复置顶排列会话卡片」，后续加载必须保留用户选择。
+        let mut user_oldest = migrated.clone();
+        user_oldest.thread_newest_first = false;
+        save_preferences_in(&base, &user_oldest).expect("save user choice");
+
+        let reloaded = load_preferences_in(&base).expect("reload user choice");
+        assert!(!reloaded.thread_newest_first);
+        assert!(reloaded.thread_newest_first_default_applied);
 
         let _ = fs::remove_dir_all(&base);
     }

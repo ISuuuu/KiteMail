@@ -3994,7 +3994,7 @@ impl AccountDb {
         local_head_id: u32,
         subject: &str,
     ) -> Result<Vec<MessageSummary>, String> {
-        let thread = self.list_thread_messages(local_head_id, subject, false)?;
+        let thread = self.list_thread_messages(local_head_id, subject, true)?;
         let mut local_ids: Vec<u32> = Vec::new();
         for m in thread {
             if let Some((_, lid)) = decode_scoped_id(m.id) {
@@ -4019,7 +4019,7 @@ impl AccountDb {
                 FROM messages m
                 JOIN folders f ON f.id = m.folder_id
                 WHERE m.id IN ({placeholders})
-                ORDER BY m.date_ts ASC, m.uid ASC
+                ORDER BY m.date_ts DESC, m.uid DESC, m.id DESC
                 "
             ))
             .map_err(|e| format!("准备会话子邮件查询失败: {e}"))?;

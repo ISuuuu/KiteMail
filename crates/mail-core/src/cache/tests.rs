@@ -4463,3 +4463,91 @@ fn inbox_collapses_threads_and_aggregates_flags_across_single_and_unified_inbox(
     assert_eq!(unified_rfc.importance, 1);
     assert!(unified_rfc.tags.contains(&"重要".to_string()));
 }
+
+#[test]
+fn list_thread_summaries_orders_descending_and_keeps_newest_when_truncated() {
+    let mut cache = CacheStore::open_in_memory().expect("open memory db");
+    let folders = cache
+        .sync_folders(1, &[folder("收件箱", "INBOX"), folder("已发送", "Sent")])
+        .unwrap();
+    let inbox_id = folders[0].id;
+    let sent_id = folders[1].id;
+
+    // 1. 同一会话跨文件夹且包含同时间戳多条记录，按 date_ts DESC, uid DESC, id DESC 排序
+    let mut h1 = sample_header(1, "排序验证主题");
+    h1.date_ts = 1_700_000_100;
+    let mut h2 = sample_header(2, "Re: 排序验证主题");
+    h2.date_ts = 1_700_000_200;
+    h2.in_reply_to = "<msg-1@example.com>".to_string();
+    let mut h3 = sample_header(3, "Re: 排序验证主题");
+    h3.date_ts = 1_700_000_200;
+    h3.in_reply_to = "<msg-2@example.com>".to_string();
+    let mut h4 = sample_header(4, "Re: 排序验证主题");
+    h4.date_ts = 1_700_000_400;
+    h4.in_reply_to = "<msg-3@example.com>".to_string();
+    cache
+        .commit_folder_headers(1, inbox_id, 100, &[h1, h2, h3, h4], None)
+        .unwrap();
+
+    let mut hs = sample_header(5, "Re: 排序验证主题");
+    hs.date_ts = 1_700_000_300;
+    hs.in_reply_to = "<msg-3@example.com>".to_string();
+    cache
+        .commit_folder_headers(1, sent_id, 200, &[hs], None)
+        .unwrap();
+
+    let page = cache.list_messages_page(inbox_id, "", 0, 10).unwrap();
+    assert_eq!(page.items.len(), 1);
+    let head = &page.items[0];
+    assert_eq!(head.uid, 4);
+
+    let children = cache
+        .list_thread_summaries(1, head.id, &head.subject)
+        .unwrap();
+    assert_eq!(
+        children
+            .iter()
+            .map(|c| (c.date_ts, c.uid))
+            .collect::<Vec<_>>(),
+        vec![
+            (1_700_000_300, 5),
+            (1_700_000_200, 3),
+            (1_700_000_200, 2),
+            (1_700_000_100, 1),
+        ]
+    );
+
+    // 2. 超长会话（45 封 > MAX_THREAD_MESSAGES=40）展开子邮件应保留最新的 39 封并按倒序返回
+    let mut long_headers = Vec::new();
+    for i in 1..=45u32 {
+        let uid = 100 + i;
+        let mut h = sample_header(uid, "超长倒序会话");
+        h.date_ts = 1_700_100_000 + i64::from(i) * 10;
+        if i > 1 {
+            h.in_reply_to = format!("<msg-{}@example.com>", uid - 1);
+            h.references_header = "<msg-101@example.com>".to_string();
+        }
+        long_headers.push(h);
+    }
+    cache
+        .commit_folder_headers(1, inbox_id, 300, &long_headers, None)
+        .unwrap();
+
+    let page2 = cache.list_messages_page(inbox_id, "", 0, 10).unwrap();
+    let long_head = page2
+        .items
+        .iter()
+        .find(|m| m.subject == "超长倒序会话")
+        .unwrap();
+    assert_eq!(long_head.uid, 145);
+
+    let long_children = cache
+        .list_thread_summaries(1, long_head.id, &long_head.subject)
+        .unwrap();
+    assert_eq!(long_children.len(), 39);
+    let expected_uids: Vec<u32> = (106..=144).rev().collect();
+    assert_eq!(
+        long_children.iter().map(|c| c.uid).collect::<Vec<_>>(),
+        expected_uids
+    );
+}
