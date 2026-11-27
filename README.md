@@ -57,9 +57,13 @@ To preview the UI without adding a real email account, launch `kitemail.exe` wit
 git clone https://github.com/ISuuuu/KiteMail.git
 cd KiteMail
 
-# Check and run unit tests
+# Format, check, and run unit tests
+cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo test --workspace --locked
+
+# Optional: enable pre-commit auto-formatting hook
+git config core.hooksPath .githooks
 
 # Run in development mode
 cargo run -p kitemail --bin kitemail

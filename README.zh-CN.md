@@ -57,9 +57,13 @@
 git clone https://github.com/ISuuuu/KiteMail.git
 cd KiteMail
 
-# 代码检查与单元测试
+# 格式检查、编译检查与单元测试
+cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo test --workspace --locked
+
+# 可选：启用提交前自动格式化钩子
+git config core.hooksPath .githooks
 
 # 启动开发版
 cargo run -p kitemail --bin kitemail

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Format the Rust workspace before every commit, so the formatting
+# check in CI cannot fail on code that was never run through rustfmt.
+#
+# Only the files already staged are re-added after formatting: running
+# `cargo fmt --all` may also touch a file you have not staged, and that change
+# stays in the working tree for you to keep or discard.
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+[ -f "$root/Cargo.toml" ] || exit 0
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.rs$' || true)
+[ -n "$staged" ] || exit 0
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-commit: cargo not on PATH, skipping rustfmt" >&2
+  exit 0
+fi
+
+cargo fmt --manifest-path "$root/Cargo.toml" --all
+
+printf '%s\n' "$staged" | while IFS= read -r file; do
+  [ -f "$root/$file" ] && git add -- "$file"
+done
