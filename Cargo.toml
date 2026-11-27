@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mail-core", "crates/app"]
+members = ["crates/mail-core", "crates/windows-mail-reader", "crates/app"]
 resolver = "2"
 
 [workspace.package]

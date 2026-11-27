@@ -11,6 +11,7 @@ data-url = "0.3"
 futures = { workspace = true }
 gpui-kit = { workspace = true }
 kitemail-mail-core = { path = "../mail-core" }
+kitemail-windows-mail-reader = { path = "../windows-mail-reader" }
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 rfd = { workspace = true }
