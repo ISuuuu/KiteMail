@@ -1943,6 +1943,233 @@ fn atomic_write_file(
     Ok(())
 }
 
+/// 隔离运行模式下经校验的资料目录与实际邮件存储目录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IsolatedDataPaths {
+    pub data_dir: PathBuf,
+    pub mail_data_dir: PathBuf,
+}
+
+fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+fn collapse_lexical_components(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = matches!(out.components().next_back(), Some(Component::Normal(_)));
+                if can_pop {
+                    out.pop();
+                }
+            }
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    out
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err("目录路径不能为空".to_string());
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("读取当前工作目录失败: {e}"))?
+            .join(path)
+    };
+    let lexical = collapse_lexical_components(&abs);
+    let resolved = if lexical.exists() {
+        fs::canonicalize(&lexical).unwrap_or(lexical)
+    } else {
+        let mut cursor = Some(lexical.as_path());
+        let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+        let mut base = None;
+        while let Some(cur) = cursor {
+            if cur.exists() {
+                if let Ok(canon) = fs::canonicalize(cur) {
+                    base = Some(canon);
+                    break;
+                }
+            }
+            if let Some(name) = cur.file_name() {
+                suffix.push(name.to_os_string());
+                cursor = cur.parent();
+            } else {
+                break;
+            }
+        }
+        if let Some(mut rebuilt) = base {
+            for comp in suffix.into_iter().rev() {
+                rebuilt.push(comp);
+            }
+            rebuilt
+        } else {
+            lexical
+        }
+    };
+    Ok(strip_windows_verbatim_prefix(resolved))
+}
+
+fn path_contains_or_equals_key(parent_key: &str, child_key: &str) -> bool {
+    if parent_key == child_key {
+        return true;
+    }
+    if child_key.len() <= parent_key.len() {
+        return false;
+    }
+    child_key.starts_with(parent_key) && child_key.as_bytes().get(parent_key.len()) == Some(&b'\\')
+}
+
+fn paths_overlap_key(a_key: &str, b_key: &str) -> bool {
+    path_contains_or_equals_key(a_key, b_key) || path_contains_or_equals_key(b_key, a_key)
+}
+
+fn official_kitemail_dirs() -> Vec<PathBuf> {
+    let mut dirs_out = Vec::new();
+    let mut push_official_root = |root: PathBuf| {
+        dirs_out.push(default_mail_data_dir_in(&root));
+        if storage_config_file_in(&root).exists() {
+            dirs_out.push(resolve_mail_data_dir_in(&root));
+        }
+        dirs_out.push(root);
+    };
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        push_official_root(resolve_data_dir(None, false, None, Some(&local_app_data)));
+    }
+    if crate::update::is_portable() {
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        {
+            push_official_root(resolve_data_dir(None, true, Some(&exe_dir), None));
+        }
+    }
+    dirs_out
+}
+
+fn validate_isolated_data_dir_against(
+    data_dir: &Path,
+    expected_root: Option<&Path>,
+    protected_dirs: &[PathBuf],
+) -> Result<IsolatedDataPaths, String> {
+    let norm_data_dir = normalize_absolute_path(data_dir)?;
+    let data_key = normalized_path_key(&norm_data_dir);
+
+    let normalized_protected: Vec<(PathBuf, String)> = protected_dirs
+        .iter()
+        .filter_map(|p| normalize_absolute_path(p).ok())
+        .map(|p| {
+            let key = normalized_path_key(&p);
+            (p, key)
+        })
+        .collect();
+
+    for (protected, protected_key) in &normalized_protected {
+        if paths_overlap_key(&data_key, protected_key) {
+            return Err(format!(
+                "隔离资料目录 ({}) 不能指向或位于正式 KiteMail 目录 ({}) 下",
+                norm_data_dir.display(),
+                protected.display()
+            ));
+        }
+    }
+
+    let norm_root = if let Some(root) = expected_root {
+        let norm = normalize_absolute_path(root)?;
+        let root_key = normalized_path_key(&norm);
+        for (protected, protected_key) in &normalized_protected {
+            if paths_overlap_key(&root_key, protected_key) {
+                return Err(format!(
+                    "隔离根目录 ({}) 不能指向或位于正式 KiteMail 目录 ({}) 下",
+                    norm.display(),
+                    protected.display()
+                ));
+            }
+        }
+        if !path_contains_or_equals_key(&root_key, &data_key) {
+            return Err(format!(
+                "隔离资料目录 ({}) 超出允许的隔离根目录 ({})",
+                norm_data_dir.display(),
+                norm.display()
+            ));
+        }
+        Some((norm, root_key))
+    } else {
+        None
+    };
+
+    let storage_cfg = load_storage_config_in(&norm_data_dir)?;
+    let custom_raw = storage_cfg
+        .mail_data_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let raw_mail_dir = match custom_raw {
+        Some(raw) => {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() {
+                p
+            } else {
+                norm_data_dir.join(p)
+            }
+        }
+        None => default_mail_data_dir_in(&norm_data_dir),
+    };
+    let norm_mail_dir = normalize_absolute_path(&raw_mail_dir)?;
+    let mail_key = normalized_path_key(&norm_mail_dir);
+
+    for (protected, protected_key) in &normalized_protected {
+        if paths_overlap_key(&mail_key, protected_key) {
+            return Err(format!(
+                "实际邮件目录 ({}) 不能指向或位于正式 KiteMail 目录 ({}) 下",
+                norm_mail_dir.display(),
+                protected.display()
+            ));
+        }
+    }
+
+    if let Some((ref root_path, ref root_key)) = norm_root {
+        if !path_contains_or_equals_key(root_key, &mail_key) {
+            return Err(format!(
+                "实际邮件目录 ({}) 超出允许的隔离根目录 ({})",
+                norm_mail_dir.display(),
+                root_path.display()
+            ));
+        }
+    }
+
+    Ok(IsolatedDataPaths {
+        data_dir: norm_data_dir,
+        mail_data_dir: norm_mail_dir,
+    })
+}
+
+/// 校验测试/预览隔离资料目录及其解析出的实际邮件存储目录：
+/// - `data_dir` 与 `resolve_mail_data_dir_in(data_dir)` 均不得与当前平台正式 KiteMail 默认资料目录/正式邮件目录重叠；
+/// - 若 `storage.toml` 中存在指向正式目录（或越界绝对路径）的配置，拒绝并返回明确错误；
+/// - 若指定了 `expected_root`，则要求 `data_dir` 与实际邮件目录均位于 `expected_root` 之内。
+pub fn validate_isolated_data_dir(
+    data_dir: &Path,
+    expected_root: Option<&Path>,
+) -> Result<IsolatedDataPaths, String> {
+    let protected = official_kitemail_dirs();
+    validate_isolated_data_dir_against(data_dir, expected_root, &protected)
+}
+
 /// 解析程序配置与全局数据根目录：
 /// `KITEMAIL_DATA_DIR` > 便携版（`<exe_dir>\data`）> 安装版（`%LOCALAPPDATA%\KiteMail`）。
 pub fn resolve_data_dir(
@@ -4206,6 +4433,111 @@ smtp_separate_credentials = false
         let exported = export_settings_bundle_in(&base).expect("export bundle");
         assert!(!exported.contains("passcode"));
         assert!(!exported.contains("hash"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn isolated_data_dir_validation_accepts_isolated_and_rejects_official_or_escape() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "hylki-isolated-dir-test-{}-{unique}",
+            std::process::id()
+        ));
+        let official_root = base.join("LocalAppData").join("KiteMail");
+        let official_mail = official_root.join("mail");
+        let official_custom_mail = base.join("OfficialCustomMail");
+        let expected_root = base.join("preview-root");
+        let isolated_dir = expected_root.join("session-a");
+        let sibling_similar = base.join("LocalAppData").join("KiteMail-Preview");
+        let outside_dir = base.join("outside-mail");
+        fs::create_dir_all(&official_mail).unwrap();
+        fs::create_dir_all(&official_custom_mail).unwrap();
+        fs::create_dir_all(&isolated_dir).unwrap();
+        fs::create_dir_all(&sibling_similar).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let protected = vec![
+            official_root.clone(),
+            official_mail.clone(),
+            official_custom_mail.clone(),
+        ];
+
+        // 1. 合法隔离目录（默认 `<data_dir>/mail`）通过校验。
+        let ok_default =
+            validate_isolated_data_dir_against(&isolated_dir, Some(&expected_root), &protected)
+                .expect("isolated dir with default mail subdir should pass");
+        assert_eq!(ok_default.data_dir, isolated_dir);
+        assert_eq!(ok_default.mail_data_dir, isolated_dir.join("mail"));
+
+        // 2. 前缀相似的兄弟目录（KiteMail-Preview）不应被误判为正式 KiteMail 目录。
+        let ok_sibling = validate_isolated_data_dir_against(&sibling_similar, None, &protected)
+            .expect("sibling dir with similar prefix should pass");
+        assert_eq!(ok_sibling.data_dir, sibling_similar);
+
+        // 3. 正式默认目录与正式子目录均被拦截。
+        assert!(validate_isolated_data_dir_against(&official_root, None, &protected).is_err());
+        assert!(validate_isolated_data_dir_against(&official_mail, None, &protected).is_err());
+        assert!(
+            validate_isolated_data_dir_against(&official_root.join("sub"), None, &protected)
+                .is_err()
+        );
+        // 正式目录的父目录（包含正式目录）也应被拦截。
+        assert!(
+            validate_isolated_data_dir_against(&base.join("LocalAppData"), None, &protected)
+                .is_err()
+        );
+
+        // 4. `storage.toml` 指向正式邮件目录的自定义绝对路径会被拒绝。
+        save_storage_config_in(
+            &isolated_dir,
+            &StorageConfig {
+                mail_data_dir: Some(official_custom_mail.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        let err_official_mail = validate_isolated_data_dir_against(&isolated_dir, None, &protected)
+            .expect_err("storage.toml pointing to official mail dir must fail");
+        assert!(err_official_mail.contains("正式 KiteMail"));
+
+        // 5. `storage.toml` 相对路径通过 `..` 逃逸到正式目录也会被拒绝。
+        save_storage_config_in(
+            &isolated_dir,
+            &StorageConfig {
+                mail_data_dir: Some(r"..\..\LocalAppData\KiteMail\mail".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(validate_isolated_data_dir_against(&isolated_dir, None, &protected).is_err());
+
+        // 6. `storage.toml` 自定义绝对路径超出 `expected_root` 时拒绝，但 `expected_root = None` 时允许非正式外部路径。
+        save_storage_config_in(
+            &isolated_dir,
+            &StorageConfig {
+                mail_data_dir: Some(outside_dir.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        assert!(validate_isolated_data_dir_against(
+            &isolated_dir,
+            Some(&expected_root),
+            &protected
+        )
+        .is_err());
+        let ok_unbounded = validate_isolated_data_dir_against(&isolated_dir, None, &protected)
+            .expect("non-official custom dir should pass when expected_root is None");
+        assert_eq!(ok_unbounded.mail_data_dir, outside_dir);
+
+        // 7. 真实平台默认正式目录在公开 API 中同样会被拦截。
+        if let Some(local_app_data) = dirs::data_local_dir() {
+            let platform_official = local_app_data.join("KiteMail");
+            assert!(validate_isolated_data_dir(&platform_official, None).is_err());
+            assert!(validate_isolated_data_dir(&platform_official.join("mail"), None).is_err());
+        }
+        assert!(validate_isolated_data_dir(Path::new(""), None).is_err());
 
         let _ = fs::remove_dir_all(&base);
     }

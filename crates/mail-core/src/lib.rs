@@ -34,8 +34,10 @@ pub mod update;
 pub mod verify;
 pub mod worker;
 
+pub use config::{validate_isolated_data_dir, IsolatedDataPaths};
 pub use search_query::SearchQuery;
 use serde::{Deserialize, Serialize};
+pub use worker::{MailWorkerEventReceiver, MailWorkerHandle, MailWorkerSender, PageQueryRequest};
 
 use crate::{
     cache::{CachedAttachment, CachedAttachmentInput, KnownContact},

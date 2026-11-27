@@ -12,9 +12,9 @@ use crate::search_query::SearchQuery;
 use crate::secrets::{self, AccountSecrets};
 use crate::smtp_client::SendOutcome;
 use crate::{
-    graph_client, imap_client, oauth, smtp_client, FetchedMessageBody, FolderSummary, MailRequest,
-    MessageDetail, MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus,
-    QuickFilterSet, UnifiedView, WorkerEvent,
+    graph_client, imap_client, oauth, smtp_client, FetchedMessageBody, FolderSummary, MailPage,
+    MailRequest, MessageDetail, MessageFilter, MessageSort, MessageSummary, OutboxItem,
+    OutboxStatus, QuickFilterSet, UnifiedView, WorkerEvent,
 };
 
 type TokenCache = HashMap<u32, (String, Instant, AccountConfig)>;
@@ -303,10 +303,124 @@ const BACKFILL_HISTORY_BATCH: usize = 25;
 /// `BACKFILL_TRIES`，避免对总是失败的文件夹紧循环；游标保留，重启后续跑）。
 const BACKFILL_HISTORY_TRIES: u32 = 3;
 
+/// List / search page query parameters accepted by [`MailWorkerSender::query_page`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageQueryRequest {
+    UnifiedInbox {
+        query: String,
+        filter: MessageFilter,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    },
+    UnifiedView {
+        view: UnifiedView,
+        query: String,
+        filter: MessageFilter,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    },
+    MessagesPage {
+        folder_id: u32,
+        query: String,
+        filter: MessageFilter,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    },
+    SearchAllFolders {
+        query: String,
+        quick_filters: QuickFilterSet,
+        sort: MessageSort,
+        offset: usize,
+        limit: usize,
+    },
+}
+
+enum WorkerCommand {
+    Request(MailRequest),
+    QueryPage {
+        request: PageQueryRequest,
+        reply: mpsc::SyncSender<Result<MailPage, String>>,
+    },
+}
+
+/// Shareable, thread-safe command sender for dispatching [`MailRequest`]s and
+/// running one-shot page queries without broadcasting events to [`MailWorkerEventReceiver`].
+#[derive(Clone)]
+pub struct MailWorkerSender {
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
+    data_dir: PathBuf,
+}
+
+impl MailWorkerSender {
+    /// Send a fire-and-forget request to the background mail worker.
+    pub fn send(&self, req: MailRequest) {
+        let _ = self.cmd_tx.send(WorkerCommand::Request(req));
+    }
+
+    /// Send a request to the background mail worker, returning an error if the worker has stopped.
+    pub fn send_checked(&self, req: MailRequest) -> Result<(), String> {
+        self.cmd_tx
+            .send(WorkerCommand::Request(req))
+            .map_err(|_| "邮件后台线程已停止".to_string())
+    }
+
+    /// Execute a list/search page query on the worker and await its result directly via a
+    /// one-shot reply channel without broadcasting events to [`MailWorkerEventReceiver`].
+    pub fn query_page(&self, request: PageQueryRequest) -> Result<MailPage, String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(WorkerCommand::QueryPage {
+                request,
+                reply: reply_tx,
+            })
+            .map_err(|_| "邮件后台线程已停止".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "邮件后台线程已停止".to_string())?
+    }
+
+    /// Return the configured data directory bound to this worker instance.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+}
+
+/// Exclusive receiver for broadcast [`WorkerEvent`]s emitted by the background mail worker.
+pub struct MailWorkerEventReceiver {
+    evt_rx: mpsc::Receiver<WorkerEvent>,
+}
+
+impl MailWorkerEventReceiver {
+    /// Non-blocking drain of all pending [`WorkerEvent`]s.
+    pub fn drain_events(&self) -> Vec<WorkerEvent> {
+        let mut out = Vec::new();
+        while let Ok(evt) = self.evt_rx.try_recv() {
+            out.push(evt);
+        }
+        out
+    }
+
+    /// Non-blocking attempt to receive the next [`WorkerEvent`].
+    pub fn try_recv(&self) -> Result<WorkerEvent, mpsc::TryRecvError> {
+        self.evt_rx.try_recv()
+    }
+
+    /// Wait up to `timeout` for the next [`WorkerEvent`].
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<WorkerEvent, mpsc::RecvTimeoutError> {
+        self.evt_rx.recv_timeout(timeout)
+    }
+}
+
 /// Handle owned by the UI to dispatch [`MailRequest`]s and poll [`WorkerEvent`]s.
 pub struct MailWorkerHandle {
-    req_tx: mpsc::Sender<MailRequest>,
-    evt_rx: mpsc::Receiver<WorkerEvent>,
+    sender: MailWorkerSender,
+    events: MailWorkerEventReceiver,
     /// 数据目录：退出时主线程直接打开缓存库落盘，不排队等待单线程 worker。
     data_dir: PathBuf,
     /// UI 线程只读 SQLite 连接：已缓存正文直接毫秒级读取，不进 worker 队列。
@@ -325,10 +439,15 @@ impl MailWorkerHandle {
         data_dir: PathBuf,
         on_event: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, String> {
-        let (req_tx, req_rx) = mpsc::channel::<MailRequest>();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
         let (raw_evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
         let evt_tx = EventSender::new(raw_evt_tx, on_event);
-        let worker_req_tx = req_tx.clone();
+        let sender = MailWorkerSender {
+            cmd_tx,
+            data_dir: data_dir.clone(),
+        };
+        let events = MailWorkerEventReceiver { evt_rx };
+        let worker_req_tx = sender.clone();
         let worker_data_dir = data_dir.clone();
 
         std::thread::Builder::new()
@@ -340,16 +459,27 @@ impl MailWorkerHandle {
                     .build()
                     .expect("failed to start Tokio runtime");
 
-                rt.block_on(worker_loop(worker_data_dir, worker_req_tx, req_rx, evt_tx));
+                rt.block_on(worker_loop(worker_data_dir, worker_req_tx, cmd_rx, evt_tx));
             })
             .map_err(|e| format!("启动邮件后台线程失败: {e}"))?;
 
         Ok(Self {
-            req_tx,
-            evt_rx,
+            sender,
+            events,
             data_dir,
             read_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Clone a shareable, thread-safe [`MailWorkerSender`] for concurrent callers.
+    pub fn sender(&self) -> MailWorkerSender {
+        self.sender.clone()
+    }
+
+    /// Split this handle into a shareable [`MailWorkerSender`] and an exclusive
+    /// [`MailWorkerEventReceiver`] for a single event consumer task.
+    pub fn split(self) -> (MailWorkerSender, MailWorkerEventReceiver) {
+        (self.sender, self.events)
     }
 
     /// Release the UI thread's read-only SQLite connections (e.g. before switching mail directory).
@@ -401,29 +531,29 @@ impl MailWorkerHandle {
 
     /// Send a request to the background mail worker.
     pub fn send(&self, req: MailRequest) {
-        let _ = self.req_tx.send(req);
+        self.sender.send(req);
     }
 
     pub fn send_checked(&self, req: MailRequest) -> Result<(), String> {
-        self.req_tx
-            .send(req)
-            .map_err(|_| "邮件后台线程已停止".to_string())
+        self.sender.send_checked(req)
+    }
+
+    /// Execute a list/search page query on the worker and await its result directly via a
+    /// one-shot reply channel without broadcasting events.
+    pub fn query_page(&self, request: PageQueryRequest) -> Result<MailPage, String> {
+        self.sender.query_page(request)
     }
 
     /// Non-blocking drain of all pending [`WorkerEvent`]s.
     pub fn drain_events(&self) -> Vec<WorkerEvent> {
-        let mut out = Vec::new();
-        while let Ok(evt) = self.evt_rx.try_recv() {
-            out.push(evt);
-        }
-        out
+        self.events.drain_events()
     }
 }
 
 async fn worker_loop(
     data_dir: PathBuf,
-    req_tx: mpsc::Sender<MailRequest>,
-    req_rx: mpsc::Receiver<MailRequest>,
+    req_tx: MailWorkerSender,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<WorkerCommand>,
     evt_tx: EventSender,
 ) {
     let initial_cache = match CacheStore::open_for_data_dir(&data_dir).and_then(|cache| {
@@ -496,14 +626,31 @@ async fn worker_loop(
             .as_ref()
             .map(next_outbox_wait)
             .unwrap_or(OUTBOX_TICK_MAX);
-        // 请求通道是标准库 mpsc（阻塞式），这里用 `recv_timeout` 替代直接
-        // `recv`：worker 独占自己的 runtime 线程，限时阻塞不影响 IDLE 推送。
-        let mut req = match req_rx.recv_timeout(wait) {
-            Ok(req) => Some(req),
-            // 没有新请求：落到下面做一次到期巡检。
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
+        let cmd = match tokio::time::timeout(wait, cmd_rx.recv()).await {
+            Ok(Some(cmd)) => Some(cmd),
             // 发送端已释放：退出主循环。
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(None) => break,
+            // 没有新请求：落到下面做一次到期巡检。
+            Err(_) => None,
+        };
+
+        if let Some(WorkerCommand::QueryPage { request, reply }) = cmd {
+            let result = match cache_opt.as_ref() {
+                Some(cache) => execute_page_query(&data_dir, cache, request),
+                None => Err("本地邮件缓存未就绪".to_string()),
+            };
+            let _ = reply.send(result);
+            if let Some(cache) = cache_opt.as_mut() {
+                deliver_due_outbox_tick(&data_dir, cache, &tokens, Some(&background), &evt_tx)
+                    .await;
+            }
+            continue;
+        }
+
+        let mut req = match cmd {
+            Some(WorkerCommand::Request(req)) => Some(req),
+            Some(WorkerCommand::QueryPage { .. }) => unreachable!(),
+            None => None,
         };
 
         // 5.2(3)：已收到的撤销请求优先于本轮到期巡检处理，避免临界秒被同一轮投递抢先。
@@ -598,7 +745,7 @@ async fn handle_change_mail_data_dir(
     async_cache: &SharedAsyncCache,
     background: &BackgroundTasks,
     watchers: &mut IdleWatchers,
-    req_tx: &mpsc::Sender<MailRequest>,
+    req_tx: &MailWorkerSender,
     target_dir: Option<PathBuf>,
     mode: crate::cache::MailDirSwitchMode,
     import_accounts: Vec<AccountConfig>,
@@ -1430,7 +1577,7 @@ fn spawn_account_idle_watcher(
     watchers: &mut IdleWatchers,
     data_dir: PathBuf,
     account: AccountConfig,
-    req_tx: mpsc::Sender<MailRequest>,
+    req_tx: MailWorkerSender,
 ) {
     if let Some(old) = watchers.remove(&account.id) {
         old.abort();
@@ -1532,7 +1679,7 @@ fn refresh_account_watcher(
     watchers: &mut IdleWatchers,
     data_dir: &std::path::Path,
     account: &AccountConfig,
-    req_tx: &mpsc::Sender<MailRequest>,
+    req_tx: &MailWorkerSender,
 ) {
     let global_push = config::load_preferences_in(data_dir)
         .map(|p| p.push_enabled)
@@ -1552,7 +1699,7 @@ fn refresh_account_watcher(
 async fn run_account_push_watcher(
     data_dir: PathBuf,
     account: AccountConfig,
-    req_tx: mpsc::Sender<MailRequest>,
+    req_tx: MailWorkerSender,
 ) {
     // Brief initial delay so startup sync finishes first without competing for connections.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1658,7 +1805,7 @@ async fn run_account_push_watcher(
 async fn run_graph_fast_poll_fallback(
     data_dir: &Path,
     account: &AccountConfig,
-    req_tx: &mpsc::Sender<MailRequest>,
+    req_tx: &MailWorkerSender,
 ) {
     let mut cached_graph_token: Option<(String, Instant)> = None;
     let mut last_inbox_sig: Option<(u32, usize)> = None;
@@ -1712,7 +1859,7 @@ async fn handle_request(
     in_flight_bodies: &Arc<std::sync::Mutex<HashSet<u32>>>,
     watchers: &mut IdleWatchers,
     background: &BackgroundTasks,
-    req_tx: &mpsc::Sender<MailRequest>,
+    req_tx: &MailWorkerSender,
     req: MailRequest,
     evt_tx: &EventSender,
 ) {
@@ -2292,11 +2439,18 @@ async fn handle_request(
             offset,
             limit,
         } => {
-            let effective = merge_filter_options(filter, quick_filters);
-            let allowed = unified_account_ids(data_dir);
-            match cache
-                .list_unified_inbox_for_accounts(&allowed, &query, effective, sort, offset, limit)
-            {
+            match execute_page_query(
+                data_dir,
+                cache,
+                PageQueryRequest::UnifiedInbox {
+                    query,
+                    filter,
+                    quick_filters,
+                    sort,
+                    offset,
+                    limit,
+                },
+            ) {
                 Ok(page) => {
                     let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
                 }
@@ -2318,10 +2472,19 @@ async fn handle_request(
             offset,
             limit,
         } => {
-            let effective = merge_filter_options(filter, quick_filters);
-            match cache
-                .list_messages_page_with_options(folder_id, &query, effective, sort, offset, limit)
-            {
+            match execute_page_query(
+                data_dir,
+                cache,
+                PageQueryRequest::MessagesPage {
+                    folder_id,
+                    query,
+                    filter,
+                    quick_filters,
+                    sort,
+                    offset,
+                    limit,
+                },
+            ) {
                 Ok(page) => {
                     let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
                 }
@@ -2341,21 +2504,16 @@ async fn handle_request(
             offset,
             limit,
         } => {
-            // 跨文件夹搜索只覆盖已启用账号（对齐 Linux `folder_select`），
-            // 禁用账号的本地缓存邮件不参与全局搜索。
-            let enabled_account_ids: Vec<u32> = config::load_accounts_in(data_dir)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|acc| acc.enabled)
-                .map(|acc| acc.id)
-                .collect();
-            match cache.search_all_folders(
-                &enabled_account_ids,
-                &query,
-                quick_filters,
-                sort,
-                offset,
-                limit,
+            match execute_page_query(
+                data_dir,
+                cache,
+                PageQueryRequest::SearchAllFolders {
+                    query,
+                    quick_filters,
+                    sort,
+                    offset,
+                    limit,
+                },
             ) {
                 Ok(page) => {
                     let _ = evt_tx.send(WorkerEvent::AllFoldersSearchLoaded(page));
@@ -3774,32 +3932,19 @@ async fn handle_request(
             offset,
             limit,
         } => {
-            let effective = merge_filter_options(filter, quick_filters);
-            let allowed = unified_account_ids(data_dir);
-            let result = match view {
-                UnifiedView::Unread => cache.list_unread_messages_for_accounts(
-                    &allowed, &query, effective, sort, offset, limit,
-                ),
-                UnifiedView::Starred => cache.list_starred_messages_for_accounts(
-                    &allowed, &query, effective, sort, offset, limit,
-                ),
-                UnifiedView::Sent => cache.list_sent_messages_for_accounts(
-                    &allowed, &query, effective, sort, offset, limit,
-                ),
-                UnifiedView::Archive => cache.list_archived_messages_for_accounts(
-                    &allowed, &query, effective, sort, offset, limit,
-                ),
-                UnifiedView::Junk => cache.list_junk_messages_for_accounts(
-                    &allowed, &query, effective, sort, offset, limit,
-                ),
-                UnifiedView::Trash => cache.list_trash_messages_for_accounts(
-                    &allowed, &query, effective, sort, offset, limit,
-                ),
-                UnifiedView::Snoozed => cache.list_snoozed_messages_for_accounts(
-                    &allowed, &query, effective, sort, offset, limit,
-                ),
-            };
-            match result {
+            match execute_page_query(
+                data_dir,
+                cache,
+                PageQueryRequest::UnifiedView {
+                    view,
+                    query,
+                    filter,
+                    quick_filters,
+                    sort,
+                    offset,
+                    limit,
+                },
+            ) {
                 Ok(page) => {
                     let _ = evt_tx.send(WorkerEvent::UnifiedViewLoaded { view, page });
                 }
@@ -5993,6 +6138,98 @@ fn merge_filter_options(
     }
 }
 
+fn execute_page_query(
+    data_dir: &Path,
+    cache: &CacheStore,
+    request: PageQueryRequest,
+) -> Result<MailPage, String> {
+    match request {
+        PageQueryRequest::UnifiedInbox {
+            query,
+            filter,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        } => {
+            let effective = merge_filter_options(filter, quick_filters);
+            let allowed = unified_account_ids(data_dir);
+            cache.list_unified_inbox_for_accounts(&allowed, &query, effective, sort, offset, limit)
+        }
+        PageQueryRequest::UnifiedView {
+            view,
+            query,
+            filter,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        } => {
+            let effective = merge_filter_options(filter, quick_filters);
+            let allowed = unified_account_ids(data_dir);
+            match view {
+                UnifiedView::Unread => cache.list_unread_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Starred => cache.list_starred_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Sent => cache.list_sent_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Archive => cache.list_archived_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Junk => cache.list_junk_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Trash => cache.list_trash_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+                UnifiedView::Snoozed => cache.list_snoozed_messages_for_accounts(
+                    &allowed, &query, effective, sort, offset, limit,
+                ),
+            }
+        }
+        PageQueryRequest::MessagesPage {
+            folder_id,
+            query,
+            filter,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        } => {
+            let effective = merge_filter_options(filter, quick_filters);
+            cache.list_messages_page_with_options(folder_id, &query, effective, sort, offset, limit)
+        }
+        PageQueryRequest::SearchAllFolders {
+            query,
+            quick_filters,
+            sort,
+            offset,
+            limit,
+        } => {
+            // 跨文件夹搜索只覆盖已启用账号（对齐 Linux `folder_select`），
+            // 禁用账号的本地缓存邮件不参与全局搜索。
+            let enabled_account_ids: Vec<u32> = config::load_accounts_in(data_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|acc| acc.enabled)
+                .map(|acc| acc.id)
+                .collect();
+            cache.search_all_folders(
+                &enabled_account_ids,
+                &query,
+                quick_filters,
+                sort,
+                offset,
+                limit,
+            )
+        }
+    }
+}
+
 /// F-7 RFC 8058 一键退订 POST（阻塞，须在后台线程执行）：
 /// 以 `application/x-www-form-urlencoded` 提交 `List-Unsubscribe=One-Click`，
 /// 仅 2xx 视为退订成功（对齐原版 `unsubscribe::action::one_click_post`）。
@@ -7227,5 +7464,364 @@ mod tests {
             resolve_move_dest_folder_id(&folders, &account, "NonExistent", None),
             None
         );
+    }
+
+    #[test]
+    fn query_page_supports_all_views_concurrently_without_broadcasting_events_and_preserves_mail_request(
+    ) {
+        use crate::cache::{CachedHeaderInput, RemoteFolder};
+
+        fn assert_sender_traits<T: Clone + Send + Sync>() {}
+        assert_sender_traits::<MailWorkerSender>();
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "hylki-worker-query-page-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut acc1 = account(1, "alice@example.invalid");
+        acc1.imap_host = String::new();
+        acc1.enabled = true;
+        acc1.in_unified = true;
+
+        let mut acc2 = account(2, "bob@example.invalid");
+        acc2.imap_host = String::new();
+        acc2.enabled = true;
+        acc2.in_unified = false;
+
+        let mut acc3 = account(3, "disabled@example.invalid");
+        acc3.imap_host = String::new();
+        acc3.enabled = false;
+        acc3.in_unified = true;
+
+        config::save_accounts_in(&dir, &[acc1.clone(), acc2.clone(), acc3.clone()]).unwrap();
+
+        let mut cache = CacheStore::open_for_data_dir(&dir).unwrap();
+        let f1 = cache
+            .sync_folders(
+                acc1.id,
+                &[
+                    RemoteFolder {
+                        name: "收件箱".to_string(),
+                        path: "INBOX".to_string(),
+                        unread_count: 1,
+                        total_count: 1,
+                    },
+                    RemoteFolder {
+                        name: "已发送".to_string(),
+                        path: "Sent".to_string(),
+                        unread_count: 0,
+                        total_count: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let f2 = cache
+            .sync_folders(
+                acc2.id,
+                &[RemoteFolder {
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 1,
+                    total_count: 1,
+                }],
+            )
+            .unwrap();
+        let f3 = cache
+            .sync_folders(
+                acc3.id,
+                &[RemoteFolder {
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 1,
+                    total_count: 1,
+                }],
+            )
+            .unwrap();
+
+        let inbox1 = f1.iter().find(|f| f.path == "INBOX").unwrap().id;
+        let sent1 = f1.iter().find(|f| f.path == "Sent").unwrap().id;
+        let inbox2 = f2[0].id;
+        let inbox3 = f3[0].id;
+
+        let mk_header =
+            |uid: u32, subject: &str, unread: bool, flagged: bool, ts: i64| CachedHeaderInput {
+                uid,
+                message_id: format!("<msg-{uid}-{ts}@example.invalid>"),
+                in_reply_to: String::new(),
+                references_header: String::new(),
+                sender: format!("Sender {uid} <s{uid}@example.invalid>"),
+                recipients: "alice@example.invalid".to_string(),
+                cc: String::new(),
+                subject: subject.to_string(),
+                preview: format!("preview {subject}"),
+                date_ts: ts,
+                date_display: "12:00".to_string(),
+                unread,
+                flagged,
+                has_attachment: false,
+            };
+
+        cache
+            .commit_folder_headers(
+                acc1.id,
+                inbox1,
+                1,
+                &[
+                    mk_header(1, "Alpha Unified Hit", true, true, 1_700_000_100),
+                    mk_header(2, "Beta Read Mail", false, false, 1_700_000_050),
+                ],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                acc1.id,
+                sent1,
+                1,
+                &[mk_header(3, "Sent Proposal", false, false, 1_700_000_080)],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                acc2.id,
+                inbox2,
+                1,
+                &[mk_header(
+                    4,
+                    "NonUnified Account Mail",
+                    true,
+                    false,
+                    1_700_000_090,
+                )],
+                None,
+            )
+            .unwrap();
+        cache
+            .commit_folder_headers(
+                acc3.id,
+                inbox3,
+                1,
+                &[mk_header(
+                    5,
+                    "Disabled Account Mail",
+                    true,
+                    true,
+                    1_700_000_120,
+                )],
+                None,
+            )
+            .unwrap();
+        cache.checkpoint_and_close_all();
+        drop(cache);
+
+        let handle = MailWorkerHandle::spawn(dir.clone()).unwrap();
+        let (sender, events) = handle.split();
+        assert_eq!(sender.data_dir(), dir.as_path());
+
+        // 1. UnifiedInbox 仅包含 enabled && in_unified 的账号 1（排除账号 2 in_unified=false 和账号 3 enabled=false）。
+        let unified_inbox = sender
+            .query_page(PageQueryRequest::UnifiedInbox {
+                query: String::new(),
+                filter: MessageFilter::All,
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(unified_inbox.total, 2);
+        assert_eq!(unified_inbox.items[0].subject, "Alpha Unified Hit");
+        assert_eq!(unified_inbox.items[1].subject, "Beta Read Mail");
+
+        // 2. UnifiedView（Starred / Sent）遵循相同过滤与账号范围。
+        let starred = sender
+            .query_page(PageQueryRequest::UnifiedView {
+                view: UnifiedView::Starred,
+                query: String::new(),
+                filter: MessageFilter::All,
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(starred.total, 1);
+        assert_eq!(starred.items[0].subject, "Alpha Unified Hit");
+
+        let sent = sender
+            .query_page(PageQueryRequest::UnifiedView {
+                view: UnifiedView::Sent,
+                query: String::new(),
+                filter: MessageFilter::All,
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(sent.total, 1);
+        assert_eq!(sent.items[0].subject, "Sent Proposal");
+
+        // 3. AccountFolder 分页查询（包括按 Unread 过滤与 offset/limit）。
+        let folder_page = sender
+            .query_page(PageQueryRequest::MessagesPage {
+                folder_id: inbox2,
+                query: String::new(),
+                filter: MessageFilter::Unread,
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(folder_page.total, 1);
+        assert_eq!(folder_page.items[0].subject, "NonUnified Account Mail");
+
+        // 4. SearchAllFolders 覆盖所有已启用账号（账号 1 和账号 2），排除已禁用账号 3。
+        let search_all = sender
+            .query_page(PageQueryRequest::SearchAllFolders {
+                query: "Account Mail".to_string(),
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(search_all.total, 1);
+        assert_eq!(search_all.items[0].subject, "NonUnified Account Mail");
+
+        // 确认单次回复查询期间未向事件通道广播任何列表事件。
+        assert!(
+            events.drain_events().is_empty(),
+            "query_page must not broadcast WorkerEvent"
+        );
+
+        // 5. 多线程并发调用 query_page 互不串扰。
+        let mut threads = Vec::new();
+        for i in 0..8 {
+            let s = sender.clone();
+            threads.push(std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    let page = s
+                        .query_page(PageQueryRequest::UnifiedInbox {
+                            query: String::new(),
+                            filter: MessageFilter::Unread,
+                            quick_filters: QuickFilterSet::default(),
+                            sort: MessageSort::DateNewest,
+                            offset: 0,
+                            limit: 10,
+                        })
+                        .unwrap();
+                    assert_eq!(page.total, 1);
+                    assert_eq!(page.items[0].subject, "Alpha Unified Hit");
+                } else {
+                    let page = s
+                        .query_page(PageQueryRequest::MessagesPage {
+                            folder_id: inbox2,
+                            query: String::new(),
+                            filter: MessageFilter::All,
+                            quick_filters: QuickFilterSet::default(),
+                            sort: MessageSort::DateNewest,
+                            offset: 0,
+                            limit: 10,
+                        })
+                        .unwrap();
+                    assert_eq!(page.total, 1);
+                    assert_eq!(page.items[0].subject, "NonUnified Account Mail");
+                }
+            }));
+        }
+        for th in threads {
+            th.join().unwrap();
+        }
+        assert!(
+            events.drain_events().is_empty(),
+            "concurrent query_page calls must not broadcast WorkerEvent"
+        );
+
+        // 6. 原有 MailRequest 广播路径仍完全兼容。
+        sender
+            .send_checked(MailRequest::LoadUnifiedInbox {
+                query: String::new(),
+                filter: MessageFilter::All,
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        sender
+            .send_checked(MailRequest::LoadUnifiedView {
+                view: UnifiedView::Sent,
+                query: String::new(),
+                filter: MessageFilter::All,
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        sender
+            .send_checked(MailRequest::SearchAllFolders {
+                query: "Proposal".to_string(),
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got_inbox_evt = false;
+        let mut got_sent_evt = false;
+        let mut got_search_evt = false;
+        while !(got_inbox_evt && got_sent_evt && got_search_evt) {
+            assert!(Instant::now() < deadline, "等待传统 MailRequest 事件超时");
+            for evt in events.drain_events() {
+                match evt {
+                    WorkerEvent::MessagesPageLoaded(page) if page.total == 2 => {
+                        got_inbox_evt = true;
+                    }
+                    WorkerEvent::UnifiedViewLoaded {
+                        view: UnifiedView::Sent,
+                        page,
+                    } if page.total == 1 => {
+                        got_sent_evt = true;
+                    }
+                    WorkerEvent::AllFoldersSearchLoaded(page) if page.total == 1 => {
+                        got_search_evt = true;
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        sender.send_checked(MailRequest::PrepareQuit).unwrap();
+        let quit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut prepared = false;
+            for evt in events.drain_events() {
+                if matches!(evt, WorkerEvent::QuitPrepared { result: Ok(()) }) {
+                    prepared = true;
+                }
+            }
+            if prepared || sender.send_checked(MailRequest::LoadAllCached).is_err() {
+                break;
+            }
+            assert!(Instant::now() < quit_deadline, "worker 未按预期停止");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(sender);
+        drop(events);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
