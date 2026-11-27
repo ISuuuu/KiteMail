@@ -1,11 +1,16 @@
 //! Tauri main-thread native reader lifecycle, layout/visibility coordinator,
 //! and shared `kitemail-windows-mail-reader` WebView2 host adapter.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
+use kitemail_mail_core::config::normalize_sender_email;
+use kitemail_mail_core::MessageDetail;
 use kitemail_windows_mail_reader::{
-    build_body_document, supports_document as reader_supports_document, DocumentAppearance,
+    build_body_document, build_thread_document, supports_document as reader_supports_document,
+    DocumentAppearance, DocumentMode, ThreadCardRenderInput, ThreadDocContext, ThreadPalette,
+    WebViewAction,
 };
 
 use crate::dto::{
@@ -31,6 +36,22 @@ impl ReaderAppearance {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadRenderOptions {
+    pub detail: MessageDetail,
+    pub collapsed_cards: HashSet<u32>,
+    pub raw_cards: HashSet<u32>,
+    pub allowed_remote_cards: HashSet<u32>,
+    pub allowed_remote_senders: Vec<String>,
+    pub ui_text_scale_percent: u32,
+    pub date_style: String,
+    pub clock_style: String,
+    pub always_show_recipients: bool,
+    pub demo_mode: bool,
+    pub read_receipt_policy: String,
+    pub initial_anchor: Option<(u32, i32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReaderDocumentSpec {
     pub session_id: String,
     pub account_id: u32,
@@ -40,6 +61,103 @@ pub struct ReaderDocumentSpec {
     pub plain_text: String,
     pub html_body: Option<String>,
     pub has_thread: bool,
+    pub thread: Option<ThreadRenderOptions>,
+}
+
+/// Callback handler invoked when the native thread reader emits a `WebViewAction`.
+pub trait ThreadActionHandler: Send + Sync {
+    fn handle_thread_action(&self, account_id: u32, message_id: u32, action: WebViewAction);
+}
+
+fn sender_in_allowlist(sender: &str, allowed_senders: &[String]) -> bool {
+    let email = normalize_sender_email(sender);
+    if email.is_empty() {
+        return false;
+    }
+    allowed_senders
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&email))
+}
+
+fn should_load_native_document(doc: &ReaderDocumentSpec) -> bool {
+    if doc
+        .thread
+        .as_ref()
+        .is_some_and(|t| t.detail.thread_messages.len() > 1)
+    {
+        return true;
+    }
+    doc.html_body.as_deref().is_some_and(supports_document)
+}
+
+/// Build the HTML bytes, remote-image flag, and WebView2 `DocumentMode` for a `ReaderDocumentSpec`.
+pub fn build_reader_document_bytes(
+    doc: &ReaderDocumentSpec,
+    appearance: &ReaderAppearance,
+) -> (Vec<u8>, bool, DocumentMode) {
+    let doc_appearance = appearance.to_document_appearance();
+    if let Some(ref thread) = doc.thread {
+        if thread.detail.thread_messages.len() > 1 {
+            let palette = ThreadPalette::from_appearance(&doc_appearance);
+            let cards: Vec<ThreadCardRenderInput<'_>> = thread
+                .detail
+                .thread_messages
+                .iter()
+                .map(|tm| {
+                    let is_current = tm.id == thread.detail.id;
+                    let is_collapsed = thread.collapsed_cards.contains(&tm.id);
+                    let show_raw_source = thread.raw_cards.contains(&tm.id);
+                    let sender_allowed =
+                        sender_in_allowlist(&tm.sender, &thread.allowed_remote_senders);
+                    let block_remote = appearance.block_remote_images
+                        && !sender_allowed
+                        && !thread.allowed_remote_cards.contains(&tm.id);
+                    ThreadCardRenderInput {
+                        message: tm,
+                        is_current,
+                        is_collapsed,
+                        show_raw_source,
+                        block_remote,
+                        card_dark: appearance.dark,
+                        card_pending: false,
+                        eml_exporting: false,
+                        auth_results: is_current
+                            .then_some(thread.detail.auth_results.as_deref())
+                            .flatten(),
+                        unsubscribe_url: is_current
+                            .then_some(thread.detail.unsubscribe_url.as_deref())
+                            .flatten(),
+                    }
+                })
+                .collect();
+            let ctx = ThreadDocContext {
+                detail: &thread.detail,
+                cards: &cards,
+                palette: &palette,
+                app_dark_mode: appearance.dark,
+                zoom_percent: appearance.zoom_percent,
+                ui_text_scale_percent: thread.ui_text_scale_percent,
+                date_style: &thread.date_style,
+                clock_style: &thread.clock_style,
+                show_remote_banner: true,
+                always_show_recipients: thread.always_show_recipients,
+                card_attachments: true,
+                demo_mode: thread.demo_mode,
+                read_receipt_policy: &thread.read_receipt_policy,
+                initial_anchor: thread.initial_anchor,
+            };
+            let (bytes, any_remote_allowed) = build_thread_document(&ctx);
+            return (bytes, any_remote_allowed, DocumentMode::ThreadContainer);
+        }
+    }
+
+    let html = doc.html_body.as_deref().unwrap_or("");
+    let bytes = build_body_document(html, &doc_appearance);
+    (
+        bytes,
+        !appearance.block_remote_images,
+        DocumentMode::SingleBody,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,12 +188,14 @@ pub trait ReaderPlatformSink: Send + Sync {
         message_id: u32,
         html_bytes: Vec<u8>,
         allow_remote_images: bool,
+        mode: DocumentMode,
     );
     fn apply_layout(&self, clip: PhysicalRect, bounds: PhysicalRect, visible: bool);
     fn set_visible(&self, visible: bool);
     fn set_zoom(&self, zoom_percent: u32);
     fn close(&self);
     fn emit_status(&self, event: ReaderStatusEvent);
+    fn set_action_handler(&self, _handler: Weak<dyn ThreadActionHandler>) {}
 }
 
 /// No-op sink used in unit tests or non-Windows/headless environments.
@@ -94,6 +214,7 @@ impl ReaderPlatformSink for NullReaderSink {
         _message_id: u32,
         _html_bytes: Vec<u8>,
         _allow_remote_images: bool,
+        _mode: DocumentMode,
     ) {
     }
 
@@ -128,6 +249,10 @@ impl ReaderManager {
         }
     }
 
+    pub fn set_action_handler(&self, handler: Weak<dyn ThreadActionHandler>) {
+        self.sink.set_action_handler(handler);
+    }
+
     /// Start a new reader session for a selected message, resetting the layout revision guard.
     pub fn begin_session(
         &self,
@@ -135,7 +260,7 @@ impl ReaderManager {
         appearance: &ReaderAppearance,
         reader_enabled: bool,
     ) -> BodyStatusDto {
-        let should_load_native = doc.html_body.as_deref().is_some_and(supports_document);
+        let should_load_native = should_load_native_document(&doc);
         let session_id = doc.session_id.clone();
         let account_id = doc.account_id;
         let message_id = doc.message_id;
@@ -164,21 +289,22 @@ impl ReaderManager {
                 message: None,
                 retryable: None,
                 plain_text: Some(doc.plain_text.clone()),
-                has_html: Some(doc.html_body.is_some()),
+                has_html: Some(doc.html_body.is_some() || should_load_native),
                 html_body: doc.html_body.clone(),
             });
             return status;
         }
 
         if should_load_native && self.sink.is_native_supported() {
-            let html = doc.html_body.as_deref().unwrap_or("");
-            let document_bytes = build_body_document(html, &appearance.to_document_appearance());
+            let (document_bytes, allow_remote, mode) =
+                build_reader_document_bytes(&doc, appearance);
             self.sink.load_html(
                 session_id.clone(),
                 account_id,
                 message_id,
                 document_bytes,
-                !appearance.block_remote_images,
+                allow_remote,
+                mode,
             );
             self.sink.set_zoom(appearance.zoom_percent);
             self.sink.emit_status(ReaderStatusEvent {
@@ -313,31 +439,117 @@ impl ReaderManager {
     }
 
     pub fn update_appearance(&self, appearance: &ReaderAppearance) {
-        let (doc, reader_enabled, locked) = {
+        let (doc, reader_enabled, locked, last_layout) = {
             let guard = self.state.lock().expect("reader mutex poisoned");
             (
                 guard.active_document.clone(),
                 !guard.reader_hidden_pref,
                 guard.locked,
+                guard.last_layout.clone(),
             )
         };
         if locked || !reader_enabled {
             return;
         }
         if let Some(doc) = doc {
-            if doc.html_body.as_deref().is_some_and(supports_document)
-                && self.sink.is_native_supported()
-            {
-                let html = doc.html_body.as_deref().unwrap_or("");
-                let bytes = build_body_document(html, &appearance.to_document_appearance());
+            if should_load_native_document(&doc) && self.sink.is_native_supported() {
+                let (bytes, allow_remote, mode) = build_reader_document_bytes(&doc, appearance);
                 self.sink.load_html(
                     doc.session_id,
                     doc.account_id,
                     doc.message_id,
                     bytes,
-                    !appearance.block_remote_images,
+                    allow_remote,
+                    mode,
                 );
                 self.sink.set_zoom(appearance.zoom_percent);
+                if let Some(layout) = last_layout {
+                    self.sink
+                        .apply_layout(layout.clip, layout.bounds, layout.visible);
+                }
+            }
+        }
+    }
+
+    /// Mutate the active document (if it matches `account_id` and `message_id` or its thread)
+    /// and trigger a WebView2 re-render while preserving the current layout.
+    pub fn rerender_matching_document<F>(
+        &self,
+        account_id: u32,
+        message_id: u32,
+        appearance: &ReaderAppearance,
+        mutator: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut ReaderDocumentSpec),
+    {
+        let (doc, last_layout, reader_enabled, locked) = {
+            let mut guard = self.state.lock().expect("reader mutex poisoned");
+            let reader_enabled = !guard.reader_hidden_pref;
+            let locked = guard.locked;
+            let last_layout = guard.last_layout.clone();
+            let doc = if !locked && reader_enabled {
+                if let Some(active) = guard.active_document.as_mut() {
+                    let matches = active.account_id == account_id
+                        && (active.message_id == message_id
+                            || active.thread.as_ref().is_some_and(|t| {
+                                t.detail.thread_messages.iter().any(|m| m.id == message_id)
+                            }));
+                    if matches {
+                        mutator(active);
+                        Some(active.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (doc, last_layout, reader_enabled, locked)
+        };
+
+        if locked || !reader_enabled {
+            return false;
+        }
+        let Some(doc) = doc else {
+            return false;
+        };
+        if should_load_native_document(&doc) && self.sink.is_native_supported() {
+            let (bytes, allow_remote, mode) = build_reader_document_bytes(&doc, appearance);
+            self.sink.load_html(
+                doc.session_id,
+                doc.account_id,
+                doc.message_id,
+                bytes,
+                allow_remote,
+                mode,
+            );
+            self.sink.set_zoom(appearance.zoom_percent);
+            if let Some(layout) = last_layout {
+                self.sink
+                    .apply_layout(layout.clip, layout.bounds, layout.visible);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn update_scroll_anchor(
+        &self,
+        account_id: u32,
+        message_id: u32,
+        msg_id: u32,
+        offset_px: i32,
+    ) {
+        let mut guard = self.state.lock().expect("reader mutex poisoned");
+        if let Some(active) = guard.active_document.as_mut() {
+            if active.account_id == account_id && active.message_id == message_id {
+                if let Some(ref mut thread) = active.thread {
+                    thread.initial_anchor = Some((msg_id, offset_px));
+                }
             }
         }
     }
@@ -458,9 +670,12 @@ pub mod platform_win {
         }
     }
 
+    type SharedActionHandler = Arc<Mutex<Option<Weak<dyn ThreadActionHandler>>>>;
+
     fn create_host_slot(
         app_handle: &tauri::AppHandle,
         user_data_dir: &PathBuf,
+        action_handler: &SharedActionHandler,
     ) -> Option<HostSlot> {
         let win = tauri::Manager::get_webview_window(app_handle, MAIN_WINDOW_LABEL)?;
         let raw = HasWindowHandle::window_handle(&win).ok()?;
@@ -471,6 +686,7 @@ pub mod platform_win {
         let meta = Rc::new(RefCell::new(ActiveSessionMeta::default()));
         let cb_meta = meta.clone();
         let cb_handle = app_handle.clone();
+        let cb_action_handler = Arc::clone(action_handler);
         host.set_event_callback(move |event| match event {
             ReaderEvent::StatusChanged { version, status } => {
                 let active = cb_meta.borrow();
@@ -534,9 +750,53 @@ pub mod platform_win {
             ReaderEvent::ExternalLink { url, .. } => {
                 open_external_url(&url);
             }
-            ReaderEvent::ThreadAction { .. }
-            | ReaderEvent::ScrollAnchor { .. }
-            | ReaderEvent::StateChanged => {}
+            ReaderEvent::ThreadAction { version, action } => {
+                let target = {
+                    let active = cb_meta.borrow();
+                    if version != active.expected_version || active.session_id.is_empty() {
+                        None
+                    } else {
+                        Some((active.account_id, active.message_id))
+                    }
+                };
+                if let Some((account_id, message_id)) = target {
+                    let handler = cb_action_handler
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().and_then(Weak::upgrade));
+                    if let Some(h) = handler {
+                        h.handle_thread_action(account_id, message_id, action);
+                    }
+                }
+            }
+            ReaderEvent::ScrollAnchor {
+                version,
+                msg_id,
+                offset_px,
+            } => {
+                let target = {
+                    let active = cb_meta.borrow();
+                    if version != active.expected_version || active.session_id.is_empty() {
+                        None
+                    } else {
+                        Some((active.account_id, active.message_id))
+                    }
+                };
+                if let Some((account_id, message_id)) = target {
+                    let handler = cb_action_handler
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().and_then(Weak::upgrade));
+                    if let Some(h) = handler {
+                        h.handle_thread_action(
+                            account_id,
+                            message_id,
+                            WebViewAction::ScrollAnchor { msg_id, offset_px },
+                        );
+                    }
+                }
+            }
+            ReaderEvent::StateChanged => {}
         });
         Some(HostSlot { host, meta })
     }
@@ -544,6 +804,7 @@ pub mod platform_win {
     pub struct TauriWindowsReaderSink {
         app_handle: tauri::AppHandle,
         user_data_dir: PathBuf,
+        action_handler: SharedActionHandler,
     }
 
     impl TauriWindowsReaderSink {
@@ -551,22 +812,26 @@ pub mod platform_win {
             Self {
                 app_handle,
                 user_data_dir,
+                action_handler: Arc::new(Mutex::new(None)),
             }
         }
 
         fn with_host_on_main_thread<F>(&self, f: F)
         where
-            F: FnOnce(&tauri::AppHandle, &PathBuf, &mut Option<HostSlot>) + Send + 'static,
+            F: FnOnce(&tauri::AppHandle, &PathBuf, &SharedActionHandler, &mut Option<HostSlot>)
+                + Send
+                + 'static,
         {
             let handle = self.app_handle.clone();
             let user_data_dir = self.user_data_dir.clone();
+            let action_handler = Arc::clone(&self.action_handler);
             let _ = self.app_handle.run_on_main_thread(move || {
                 MAIN_THREAD_HOST.with(|slot| {
                     let mut borrow = slot.borrow_mut();
                     if borrow.is_none() {
-                        *borrow = create_host_slot(&handle, &user_data_dir);
+                        *borrow = create_host_slot(&handle, &user_data_dir, &action_handler);
                     }
-                    f(&handle, &user_data_dir, &mut borrow);
+                    f(&handle, &user_data_dir, &action_handler, &mut borrow);
                 });
             });
         }
@@ -577,6 +842,13 @@ pub mod platform_win {
             true
         }
 
+        fn set_action_handler(&self, handler: Weak<dyn ThreadActionHandler>) {
+            *self
+                .action_handler
+                .lock()
+                .expect("action_handler mutex poisoned") = Some(handler);
+        }
+
         fn load_html(
             &self,
             session_id: String,
@@ -584,12 +856,13 @@ pub mod platform_win {
             message_id: u32,
             html_bytes: Vec<u8>,
             allow_remote_images: bool,
+            mode: DocumentMode,
         ) {
-            self.with_host_on_main_thread(move |handle, user_data_dir, slot| {
+            self.with_host_on_main_thread(move |handle, user_data_dir, action_handler, slot| {
                 if let Some(current) = slot.as_ref() {
                     if current.host.retire_for_remote_reload(allow_remote_images) {
                         current.host.close();
-                        *slot = create_host_slot(handle, user_data_dir);
+                        *slot = create_host_slot(handle, user_data_dir, action_handler);
                     }
                 }
                 let Some(current) = slot.as_ref() else {
@@ -602,9 +875,10 @@ pub mod platform_win {
                     meta.account_id = account_id;
                     meta.message_id = message_id;
                 }
-                if let Ok(version) = current
-                    .host
-                    .load_with_remote(html_bytes, allow_remote_images)
+                if let Ok(version) =
+                    current
+                        .host
+                        .load_document(html_bytes, allow_remote_images, mode)
                 {
                     current.meta.borrow_mut().expected_version = version;
                 }
@@ -612,7 +886,7 @@ pub mod platform_win {
         }
 
         fn apply_layout(&self, clip: PhysicalRect, bounds: PhysicalRect, visible: bool) {
-            self.with_host_on_main_thread(move |_, _, slot| {
+            self.with_host_on_main_thread(move |_, _, _, slot| {
                 let Some(current) = slot.as_ref() else {
                     return;
                 };
@@ -633,7 +907,7 @@ pub mod platform_win {
         }
 
         fn set_visible(&self, visible: bool) {
-            self.with_host_on_main_thread(move |_, _, slot| {
+            self.with_host_on_main_thread(move |_, _, _, slot| {
                 if let Some(current) = slot.as_ref() {
                     current.host.set_visible(visible);
                 }
@@ -642,7 +916,7 @@ pub mod platform_win {
 
         fn set_zoom(&self, zoom_percent: u32) {
             let factor = f64::from(zoom_percent.clamp(50, 250)) / 100.0;
-            self.with_host_on_main_thread(move |_, _, slot| {
+            self.with_host_on_main_thread(move |_, _, _, slot| {
                 if let Some(current) = slot.as_ref() {
                     current.host.set_zoom(factor);
                 }
@@ -675,6 +949,7 @@ mod tests {
     struct RecordingSink {
         events: Mutex<Vec<ReaderStatusEvent>>,
         layouts: Mutex<Vec<(PhysicalRect, PhysicalRect, bool)>>,
+        loads: Mutex<Vec<(Vec<u8>, bool, DocumentMode)>>,
     }
 
     impl ReaderPlatformSink for RecordingSink {
@@ -682,7 +957,17 @@ mod tests {
             true
         }
 
-        fn load_html(&self, _: String, _: u32, _: u32, _: Vec<u8>, _: bool) {}
+        fn load_html(
+            &self,
+            _: String,
+            _: u32,
+            _: u32,
+            bytes: Vec<u8>,
+            allow_remote: bool,
+            mode: DocumentMode,
+        ) {
+            self.loads.lock().unwrap().push((bytes, allow_remote, mode));
+        }
 
         fn apply_layout(&self, clip: PhysicalRect, bounds: PhysicalRect, visible: bool) {
             self.layouts.lock().unwrap().push((clip, bounds, visible));
@@ -728,6 +1013,7 @@ mod tests {
                 plain_text: "body".to_string(),
                 html_body: Some("<p>Hi</p>".to_string()),
                 has_thread: false,
+                thread: None,
             },
             &appearance,
             true,
@@ -792,6 +1078,7 @@ mod tests {
                 plain_text: "plain".to_string(),
                 html_body: None,
                 has_thread: false,
+                thread: None,
             },
             &appearance,
             true,
@@ -849,6 +1136,7 @@ mod tests {
                 plain_text: "body".to_string(),
                 html_body: Some("<p>body</p>".to_string()),
                 has_thread: false,
+                thread: None,
             },
             &appearance,
             true,
@@ -869,5 +1157,154 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, "INVALID_INPUT");
         assert_eq!(mgr.snapshot_test_state().1, None);
+    }
+
+    #[test]
+    fn thread_document_renders_with_thread_container_mode_and_supports_rerender() {
+        use kitemail_mail_core::ThreadMessage;
+
+        let sink = Arc::new(RecordingSink::default());
+        let mgr = ReaderManager::new(sink.clone());
+        let appearance = ReaderAppearance {
+            theme_id: "system".to_string(),
+            dark: false,
+            zoom_percent: 100,
+            block_remote_images: true,
+        };
+        let detail = MessageDetail {
+            id: 1,
+            account_id: 1,
+            folder_id: 1,
+            folder_path: "INBOX".to_string(),
+            uid: 1,
+            rfc_message_id: "<m1@example.com>".to_string(),
+            sender: "Alice <alice@example.com>".to_string(),
+            recipients: "bob@example.com".to_string(),
+            cc: String::new(),
+            subject: "Re: Thread".to_string(),
+            date_ts: 1_700_000_100,
+            date_display: "10:05".to_string(),
+            body_text: "Head".to_string(),
+            body_html: Some("<p>Head <img src=\"https://tracker.example/p.png\"></p>".to_string()),
+            flagged: false,
+            attachments: Vec::new(),
+            thread_messages: vec![
+                ThreadMessage {
+                    id: 1,
+                    rfc_message_id: "<m1@example.com>".to_string(),
+                    subject: "Re: Thread".to_string(),
+                    sender: "Alice <alice@example.com>".to_string(),
+                    recipients: "bob@example.com".to_string(),
+                    cc: String::new(),
+                    date_ts: 1_700_000_100,
+                    date_display: "10:05".to_string(),
+                    body_text: "Head".to_string(),
+                    body_html: Some(
+                        "<p>Head <img src=\"https://tracker.example/p.png\"></p>".to_string(),
+                    ),
+                    body_loaded: true,
+                    unread: false,
+                    flagged: false,
+                    attachments: Vec::new(),
+                    uid: 1,
+                    folder_path: "INBOX".to_string(),
+                },
+                ThreadMessage {
+                    id: 2,
+                    rfc_message_id: "<m2@example.com>".to_string(),
+                    subject: "Thread".to_string(),
+                    sender: "Bob <bob@example.com>".to_string(),
+                    recipients: "alice@example.com".to_string(),
+                    cc: String::new(),
+                    date_ts: 1_700_000_000,
+                    date_display: "09:00".to_string(),
+                    body_text: "Older".to_string(),
+                    body_html: Some("<p>Older</p>".to_string()),
+                    body_loaded: true,
+                    unread: false,
+                    flagged: false,
+                    attachments: Vec::new(),
+                    uid: 2,
+                    folder_path: "INBOX".to_string(),
+                },
+            ],
+            unsubscribe_url: None,
+            unsubscribe_one_click: false,
+            auth_results: None,
+        };
+
+        let status = mgr.begin_session(
+            ReaderDocumentSpec {
+                session_id: "sess-thread".to_string(),
+                account_id: 1,
+                message_id: 1,
+                subject: detail.subject.clone(),
+                sender: detail.sender.clone(),
+                plain_text: detail.body_text.clone(),
+                html_body: detail.body_html.clone(),
+                has_thread: true,
+                thread: Some(ThreadRenderOptions {
+                    detail,
+                    collapsed_cards: HashSet::from([2]),
+                    raw_cards: HashSet::new(),
+                    allowed_remote_cards: HashSet::new(),
+                    allowed_remote_senders: Vec::new(),
+                    ui_text_scale_percent: 100,
+                    date_style: "system".to_string(),
+                    clock_style: "system".to_string(),
+                    always_show_recipients: false,
+                    demo_mode: true,
+                    read_receipt_policy: "ask".to_string(),
+                    initial_anchor: None,
+                }),
+            },
+            &appearance,
+            true,
+        );
+        assert_eq!(status, BodyStatusDto::Loading);
+
+        {
+            let loads = sink.loads.lock().unwrap();
+            assert_eq!(loads.len(), 1);
+            assert_eq!(loads[0].2, DocumentMode::ThreadContainer);
+            assert!(!loads[0].1);
+            let html = String::from_utf8_lossy(&loads[0].0);
+            assert!(html.contains("<section class=\"km-card km-current\" data-msg-id=\"1\""));
+            assert!(html.contains("<section class=\"km-card km-folded\" data-msg-id=\"2\""));
+            assert!(html.contains("已拦截 1 张远程图片以保护隐私"));
+        }
+
+        // Apply layout, then unfold card #2 and allow remote images on card #1.
+        mgr.apply_layout(
+            &SetReaderLayoutInput {
+                reader_session_id: "sess-thread".to_string(),
+                layout_revision: 1,
+                content_rect: rect(400.0, 48.0, 600.0, 600.0),
+                clip_rect: rect(400.0, 48.0, 600.0, 600.0),
+                visible: true,
+                device_pixel_ratio: Some(1.0),
+            },
+            1.0,
+        )
+        .unwrap();
+
+        let rerendered = mgr.rerender_matching_document(1, 1, &appearance, |spec| {
+            if let Some(ref mut thread) = spec.thread {
+                thread.collapsed_cards.remove(&2);
+                thread.allowed_remote_cards.insert(1);
+            }
+        });
+        assert!(rerendered);
+
+        let loads = sink.loads.lock().unwrap();
+        assert_eq!(loads.len(), 2);
+        assert_eq!(loads[1].2, DocumentMode::ThreadContainer);
+        assert!(loads[1].1);
+        let html2 = String::from_utf8_lossy(&loads[1].0);
+        assert!(html2.contains("<section class=\"km-card\" data-msg-id=\"2\""));
+        assert!(!html2.contains("<section class=\"km-card km-folded\""));
+        assert!(html2.contains("https://tracker.example/p.png"));
+        // Re-render also re-applied last layout so a recreated host stays visible.
+        assert_eq!(sink.layouts.lock().unwrap().len(), 2);
     }
 }

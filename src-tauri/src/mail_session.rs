@@ -9,42 +9,52 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use kitemail_mail_core::app_lock::{
     self, AutoLockTickInput, AutoLockTracker, AutoLockTrigger, BackgroundLockPolicy,
 };
 use kitemail_mail_core::cache::CacheStore;
-use kitemail_mail_core::config::{self, AccountConfig};
+use kitemail_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend};
 use kitemail_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_INBOX_TOTAL, DEMO_SENT_ID,
 };
+use kitemail_mail_core::imap_client::strip_remote_images_for_webview;
 use kitemail_mail_core::search_query::SearchQuery;
 use kitemail_mail_core::worker::{MailWorkerHandle, MailWorkerSender, PageQueryRequest};
 use kitemail_mail_core::{
     secrets, start_of_today_ts, MailPage, MailRequest, MessageDetail, MessageFilter, MessageSort,
     MessageSummary, QuickFilterSet, UnifiedView, WorkerEvent,
 };
+use kitemail_windows_mail_reader::WebViewAction;
 use tauri::Emitter;
 
 use crate::dto::{
-    AccountSummaryDto, AppMode, AttachmentMetaDto, BodyStatusDto, FolderSummaryDto, IpcError,
-    ListMessagesInput, ListMessagesOutput, LockAppOutput, LockStateEvent, MailChangedEvent,
-    MainBootstrapDto, MainViewDto, MessageFilterDto, MessageSummaryDto, OpenMessageInput,
-    OpenMessageOutput, ReaderPositionDto, ReaderStatusEvent, RefreshMailInput, RefreshMailOutput,
-    SearchScopeDto, SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput,
-    SetMessageSeenOutput, SyncStatusDto, SyncStatusEvent, ThreadMessageDto, UnlockAppInput,
-    UnlockAppOutput, EVENT_LOCK_STATE, EVENT_MAIL_CHANGED, EVENT_SYNC_STATUS, MAIN_WINDOW_LABEL,
+    AccountSummaryDto, AllowRemoteImagesInput, AllowRemoteImagesOutput, AppMode, AttachmentMetaDto,
+    BodyStatusDto, FolderSummaryDto, IpcError, ListMessagesInput, ListMessagesOutput,
+    LoadOlderMessagesInput, LoadOlderMessagesOutput, LockAppOutput, LockStateEvent,
+    MailChangedEvent, MainBootstrapDto, MainViewDto, MessageActionInput, MessageFilterDto,
+    MessageMoveOutput, MessageSummaryDto, MoveMessageInput, OpenMessageInput, OpenMessageOutput,
+    ReaderPositionDto, ReaderStatusEvent, RefreshMailInput, RefreshMailOutput, SearchScopeDto,
+    SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput, SetMessageSeenOutput,
+    SyncStatusDto, SyncStatusEvent, ThreadMessageDto, UndoMessageMoveInput, UndoMessageMoveOutput,
+    UnlockAppInput, UnlockAppOutput, EVENT_LOCK_STATE, EVENT_MAIL_CHANGED, EVENT_SYNC_STATUS,
+    MAIN_WINDOW_LABEL,
 };
 use crate::preferences::{view_from_last_str, PreferencesStore};
-use crate::reader::{ReaderAppearance, ReaderDocumentSpec, ReaderManager};
+use crate::reader::{
+    ReaderAppearance, ReaderDocumentSpec, ReaderManager, ThreadActionHandler, ThreadRenderOptions,
+};
 
 pub const MAX_PAGE_LIMIT: usize = 500;
 pub const MAX_QUERY_LEN: usize = 1000;
 const BODY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_BODY_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_READ_MARK_DELAY: Duration = Duration::from_secs(2);
+const AUTO_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const DEMO_JUNK_ID: u32 = 5;
+const DEMO_TRASH_ID: u32 = 6;
 
 /// Abstraction for emitting main-window scoped events (`main://*`).
 pub trait MainEventEmitter: Send + Sync {
@@ -128,13 +138,34 @@ struct DemoSessionState {
     sent: Vec<MessageSummary>,
     drafts: Vec<MessageSummary>,
     archive: Vec<MessageSummary>,
+    junk: Vec<MessageSummary>,
+    trash: Vec<MessageSummary>,
 }
 
 impl DemoSessionState {
     fn new() -> Self {
         let store = DemoStore::new();
         let accounts = store.accounts.iter().map(AccountSummaryDto::from).collect();
-        let base_folders = store.folders.iter().map(FolderSummaryDto::from).collect();
+        let mut base_folders: Vec<FolderSummaryDto> =
+            store.folders.iter().map(FolderSummaryDto::from).collect();
+        base_folders.push(FolderSummaryDto {
+            id: DEMO_JUNK_ID,
+            account_id: 1,
+            name: "垃圾邮件".to_string(),
+            path: "Junk".to_string(),
+            unread_count: 0,
+            total_count: 0,
+            has_more_remote: false,
+        });
+        base_folders.push(FolderSummaryDto {
+            id: DEMO_TRASH_ID,
+            account_id: 1,
+            name: "已删除".to_string(),
+            path: "Trash".to_string(),
+            unread_count: 0,
+            total_count: 0,
+            has_more_remote: false,
+        });
         let inbox = store
             .list_messages_page(DEMO_INBOX_ID, "", 0, DEMO_INBOX_TOTAL)
             .items;
@@ -151,6 +182,8 @@ impl DemoSessionState {
             sent,
             drafts,
             archive,
+            junk: Vec::new(),
+            trash: Vec::new(),
         }
     }
 
@@ -164,6 +197,8 @@ impl DemoSessionState {
                     DEMO_SENT_ID => &self.sent,
                     DEMO_DRAFTS_ID => &self.drafts,
                     DEMO_ARCHIVE_ID => &self.archive,
+                    DEMO_JUNK_ID => &self.junk,
+                    DEMO_TRASH_ID => &self.trash,
                     _ => &[],
                 };
                 cloned.unread_count = slice.iter().filter(|m| m.unread).count() as u32;
@@ -272,13 +307,17 @@ impl DemoSessionState {
                 MainViewDto::Archive => {
                     self.filter_slice(&self.archive, &parsed, quick, today_start)
                 }
-                MainViewDto::Junk | MainViewDto::Trash | MainViewDto::Snoozed => Vec::new(),
+                MainViewDto::Junk => self.filter_slice(&self.junk, &parsed, quick, today_start),
+                MainViewDto::Trash => self.filter_slice(&self.trash, &parsed, quick, today_start),
+                MainViewDto::Snoozed => Vec::new(),
                 MainViewDto::AccountFolder { folder_id, .. } => {
                     let slice: &[MessageSummary] = match folder_id {
                         DEMO_INBOX_ID => &self.inbox,
                         DEMO_SENT_ID => &self.sent,
                         DEMO_DRAFTS_ID => &self.drafts,
                         DEMO_ARCHIVE_ID => &self.archive,
+                        DEMO_JUNK_ID => &self.junk,
+                        DEMO_TRASH_ID => &self.trash,
                         _ => &[],
                     };
                     self.filter_slice(slice, &parsed, quick, today_start)
@@ -327,6 +366,8 @@ impl DemoSessionState {
             .chain(self.sent.iter())
             .chain(self.drafts.iter())
             .chain(self.archive.iter())
+            .chain(self.junk.iter())
+            .chain(self.trash.iter())
             .find(|m| m.account_id == account_id && m.id == message_id)
     }
 
@@ -340,20 +381,165 @@ impl DemoSessionState {
             .chain(self.sent.iter_mut())
             .chain(self.drafts.iter_mut())
             .chain(self.archive.iter_mut())
+            .chain(self.junk.iter_mut())
+            .chain(self.trash.iter_mut())
             .find(|m| m.account_id == account_id && m.id == message_id)
     }
 
     fn get_detail(&self, account_id: u32, message_id: u32) -> Option<MessageDetail> {
         let summary = self.find_summary(account_id, message_id)?;
         let mut detail = self.store.get_message_detail(message_id)?;
+        detail.folder_id = summary.folder_id;
+        detail.folder_path = summary.folder_path.clone();
         detail.flagged = summary.flagged;
         if let Some(first) = detail.thread_messages.first_mut() {
             if first.id == summary.id {
                 first.unread = summary.unread;
                 first.flagged = summary.flagged;
+                first.folder_path = summary.folder_path.clone();
             }
         }
         Some(detail)
+    }
+
+    fn resolve_folder_by_path(&self, target: &str) -> Option<(u32, String)> {
+        let trimmed = target.trim();
+        self.base_folders
+            .iter()
+            .find(|f| f.path.eq_ignore_ascii_case(trimmed) || f.name.eq_ignore_ascii_case(trimmed))
+            .map(|f| (f.id, f.path.clone()))
+    }
+
+    fn slice_mut_for_folder_id(&mut self, folder_id: u32) -> Option<&mut Vec<MessageSummary>> {
+        match folder_id {
+            DEMO_INBOX_ID => Some(&mut self.inbox),
+            DEMO_SENT_ID => Some(&mut self.sent),
+            DEMO_DRAFTS_ID => Some(&mut self.drafts),
+            DEMO_ARCHIVE_ID => Some(&mut self.archive),
+            DEMO_JUNK_ID => Some(&mut self.junk),
+            DEMO_TRASH_ID => Some(&mut self.trash),
+            _ => None,
+        }
+    }
+
+    fn take_message_from_any(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        rfc_message_id: Option<&str>,
+        preferred_folder_path: Option<&str>,
+    ) -> Option<MessageSummary> {
+        let preferred_fid = preferred_folder_path
+            .and_then(|p| self.resolve_folder_by_path(p))
+            .map(|(fid, _)| fid);
+        let mut order = vec![
+            DEMO_INBOX_ID,
+            DEMO_SENT_ID,
+            DEMO_DRAFTS_ID,
+            DEMO_ARCHIVE_ID,
+            DEMO_JUNK_ID,
+            DEMO_TRASH_ID,
+        ];
+        if let Some(fid) = preferred_fid {
+            order.retain(|&id| id != fid);
+            order.insert(0, fid);
+        }
+        for fid in order {
+            if let Some(list) = self.slice_mut_for_folder_id(fid) {
+                if let Some(idx) = list.iter().position(|m| {
+                    m.account_id == account_id
+                        && (m.id == message_id
+                            || rfc_message_id
+                                .is_some_and(|rfc| format!("<demo-{}@hylki.example>", m.id) == rfc))
+                }) {
+                    return Some(list.remove(idx));
+                }
+            }
+        }
+        None
+    }
+
+    fn move_message_to(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        target_folder_path: Option<&str>,
+    ) -> Result<(String, String, String, Option<u32>), IpcError> {
+        let Some(existing) = self.find_summary(account_id, message_id).cloned() else {
+            return Err(IpcError::message_not_found(message_id, None));
+        };
+        let rfc_message_id = format!("<demo-{message_id}@hylki.example>");
+        let original_folder_path = existing.folder_path.clone();
+
+        let Some(dest_raw) = target_folder_path else {
+            let _ = self.take_message_from_any(account_id, message_id, None, None);
+            return Ok((
+                rfc_message_id,
+                original_folder_path,
+                String::new(),
+                Some(existing.folder_id),
+            ));
+        };
+
+        let Some((dest_fid, dest_path)) = self.resolve_folder_by_path(dest_raw) else {
+            return Err(IpcError::invalid_input(
+                format!("无效的目标文件夹: {dest_raw}"),
+                None,
+            ));
+        };
+        if dest_path.eq_ignore_ascii_case(&original_folder_path) {
+            return Ok((
+                rfc_message_id,
+                original_folder_path,
+                dest_path,
+                Some(dest_fid),
+            ));
+        }
+
+        let mut msg = self
+            .take_message_from_any(account_id, message_id, None, Some(&original_folder_path))
+            .ok_or_else(|| IpcError::message_not_found(message_id, None))?;
+        msg.folder_id = dest_fid;
+        msg.folder_path = dest_path.clone();
+        if let Some(dest_list) = self.slice_mut_for_folder_id(dest_fid) {
+            dest_list.push(msg);
+        }
+        Ok((
+            rfc_message_id,
+            original_folder_path,
+            dest_path,
+            Some(dest_fid),
+        ))
+    }
+
+    fn undo_move(
+        &mut self,
+        account_id: u32,
+        message_id: u32,
+        rfc_message_id: &str,
+        current_folder_path: &str,
+        original_folder_path: &str,
+    ) -> Result<(bool, Option<u32>), IpcError> {
+        let Some((orig_fid, orig_path)) = self.resolve_folder_by_path(original_folder_path) else {
+            return Err(IpcError::invalid_input(
+                format!("无效的原文件夹: {original_folder_path}"),
+                None,
+            ));
+        };
+        let Some(mut msg) = self.take_message_from_any(
+            account_id,
+            message_id,
+            Some(rfc_message_id),
+            Some(current_folder_path),
+        ) else {
+            return Ok((false, None));
+        };
+        msg.folder_id = orig_fid;
+        msg.folder_path = orig_path;
+        if let Some(dest_list) = self.slice_mut_for_folder_id(orig_fid) {
+            dest_list.push(msg);
+        }
+        Ok((true, Some(orig_fid)))
     }
 }
 
@@ -443,6 +629,19 @@ impl LiveSessionState {
         }
         self.body_cache_order.push_back(key);
         self.body_cache.insert(key, detail);
+    }
+
+    fn remove_cached_detail(&mut self, account_id: u32, message_id: u32) {
+        let key = (account_id, message_id);
+        self.body_cache.remove(&key);
+        self.body_cache_order.retain(|k| *k != key);
+        if self
+            .active_reader_target
+            .as_ref()
+            .is_some_and(|(_, acc, msg)| *acc == account_id && *msg == message_id)
+        {
+            self.active_reader_target = None;
+        }
     }
 
     fn clear_sensitive_caches(&mut self) {
@@ -654,12 +853,73 @@ fn resolve_initial_live_view(
     view_from_last_str(prefs.last_view.as_deref()).unwrap_or(MainViewDto::UnifiedInbox)
 }
 
+fn html_has_remote_images(html: &str) -> bool {
+    strip_remote_images_for_webview(html).1 > 0
+}
+
+fn is_message_remote_images_blocked(
+    detail: &MessageDetail,
+    raw_prefs: &AppPreferences,
+    allowed_msgs: &HashSet<(u32, u32)>,
+) -> bool {
+    if !raw_prefs.block_remote_images {
+        return false;
+    }
+    if detail.thread_messages.len() > 1 {
+        return detail.thread_messages.iter().any(|tm| {
+            let allowed = raw_prefs.is_remote_sender_allowed(&tm.sender)
+                || allowed_msgs.contains(&(detail.account_id, tm.id))
+                || allowed_msgs.contains(&(detail.account_id, detail.id));
+            !allowed && tm.body_html.as_deref().is_some_and(html_has_remote_images)
+        });
+    }
+    let allowed = raw_prefs.is_remote_sender_allowed(&detail.sender)
+        || allowed_msgs.contains(&(detail.account_id, detail.id));
+    !allowed
+        && detail
+            .body_html
+            .as_deref()
+            .is_some_and(html_has_remote_images)
+}
+
+fn compute_default_collapsed_cards(
+    detail: &MessageDetail,
+    thread_newest_first: bool,
+    fold_mode: &str,
+) -> HashSet<u32> {
+    if fold_mode == "never" || detail.thread_messages.len() < 2 {
+        return HashSet::new();
+    }
+    let newest_id = if thread_newest_first {
+        detail.thread_messages.first().map(|m| m.id)
+    } else {
+        detail.thread_messages.last().map(|m| m.id)
+    };
+    detail
+        .thread_messages
+        .iter()
+        .filter(|m| {
+            let keep_open = m.id == detail.id || Some(m.id) == newest_id;
+            if keep_open {
+                return false;
+            }
+            if fold_mode == "read" {
+                !m.unread
+            } else {
+                true
+            }
+        })
+        .map(|m| m.id)
+        .collect()
+}
+
 fn build_open_message_output(
     request_id: String,
     reader_session_id: String,
     detail: &MessageDetail,
     body_status: BodyStatusDto,
     include_body: bool,
+    remote_images_blocked: Option<bool>,
 ) -> OpenMessageOutput {
     let attachments = detail
         .attachments
@@ -671,6 +931,9 @@ fn build_open_message_output(
         .iter()
         .map(|tm| ThreadMessageDto::from_core(detail.account_id, tm))
         .collect();
+    let rfc_message_id =
+        (!detail.rfc_message_id.trim().is_empty()).then(|| detail.rfc_message_id.clone());
+    let folder_path = (!detail.folder_path.trim().is_empty()).then(|| detail.folder_path.clone());
 
     OpenMessageOutput {
         request_id,
@@ -688,7 +951,7 @@ fn build_open_message_output(
         } else {
             String::new()
         },
-        has_html: include_body && detail.body_html.is_some(),
+        has_html: include_body && (detail.body_html.is_some() || detail.thread_messages.len() > 1),
         html_body: if include_body {
             detail.body_html.clone()
         } else {
@@ -697,15 +960,22 @@ fn build_open_message_output(
         flagged: detail.flagged,
         attachments,
         thread_messages,
+        remote_images_blocked,
+        rfc_message_id,
+        folder_path,
     }
 }
 
 pub struct MailSession {
     mode: AppMode,
     locked: AtomicBool,
+    quitting: AtomicBool,
     state_version: AtomicU64,
     read_mark_gen: AtomicU64,
     active_selected_msg: Mutex<Option<(u32, u32)>>,
+    allowed_remote_messages: Mutex<HashSet<(u32, u32)>>,
+    thread_collapsed_cards: Mutex<(Option<(u32, u32)>, HashSet<u32>)>,
+    thread_raw_cards: Mutex<(Option<(u32, u32)>, HashSet<u32>)>,
     current_view: Mutex<MainViewDto>,
     sync_status: Mutex<SyncStatusDto>,
     lock_state: Mutex<AppLockState>,
@@ -716,6 +986,8 @@ pub struct MailSession {
     emitter: Arc<dyn MainEventEmitter>,
     self_weak: Mutex<Weak<MailSession>>,
     tray: Mutex<Option<Arc<crate::tray::TrayHandle>>>,
+    auto_sync_signal: Arc<(Mutex<bool>, Condvar)>,
+    last_auto_sync_at: Mutex<Instant>,
     body_fetch_timeout: Duration,
     read_mark_delay: Duration,
 }
@@ -742,9 +1014,13 @@ impl MailSession {
         Self {
             mode,
             locked: AtomicBool::new(false),
+            quitting: AtomicBool::new(false),
             state_version: AtomicU64::new(1),
             read_mark_gen: AtomicU64::new(0),
             active_selected_msg: Mutex::new(None),
+            allowed_remote_messages: Mutex::new(HashSet::new()),
+            thread_collapsed_cards: Mutex::new((None, HashSet::new())),
+            thread_raw_cards: Mutex::new((None, HashSet::new())),
             current_view: Mutex::new(MainViewDto::UnifiedInbox),
             sync_status: Mutex::new(sync_status),
             lock_state: Mutex::new(AppLockState::new(None, false, None)),
@@ -755,6 +1031,8 @@ impl MailSession {
             emitter,
             self_weak: Mutex::new(Weak::new()),
             tray: Mutex::new(None),
+            auto_sync_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            last_auto_sync_at: Mutex::new(Instant::now()),
             body_fetch_timeout: DEFAULT_BODY_FETCH_TIMEOUT,
             read_mark_delay: DEFAULT_READ_MARK_DELAY,
         }
@@ -837,9 +1115,13 @@ impl MailSession {
         let session = Arc::new(Self {
             mode: AppMode::Live,
             locked: AtomicBool::new(initial_locked),
+            quitting: AtomicBool::new(false),
             state_version: AtomicU64::new(1),
             read_mark_gen: AtomicU64::new(0),
             active_selected_msg: Mutex::new(None),
+            allowed_remote_messages: Mutex::new(HashSet::new()),
+            thread_collapsed_cards: Mutex::new((None, HashSet::new())),
+            thread_raw_cards: Mutex::new((None, HashSet::new())),
             current_view: Mutex::new(initial_view),
             sync_status: Mutex::new(sync_status),
             lock_state: Mutex::new(AppLockState::new(
@@ -854,6 +1136,8 @@ impl MailSession {
             emitter,
             self_weak: Mutex::new(Weak::new()),
             tray: Mutex::new(None),
+            auto_sync_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            last_auto_sync_at: Mutex::new(Instant::now()),
             body_fetch_timeout: DEFAULT_BODY_FETCH_TIMEOUT,
             read_mark_delay: DEFAULT_READ_MARK_DELAY,
         });
@@ -911,12 +1195,13 @@ impl MailSession {
             .lock()
             .expect("self_weak mutex poisoned")
             .clone();
+        let weak_for_events = weak_session.clone();
         let _ = std::thread::Builder::new()
             .name("kitemail-tauri-worker-events".to_string())
             .spawn(move || loop {
                 let events = events_rx.drain_events();
                 if !events.is_empty() {
-                    if let Some(session) = weak_session.upgrade() {
+                    if let Some(session) = weak_for_events.upgrade() {
                         session.process_worker_events(events);
                     } else {
                         break;
@@ -927,6 +1212,72 @@ impl MailSession {
                     break;
                 }
             });
+
+        let auto_sync_signal = Arc::clone(&self.auto_sync_signal);
+        let _ = std::thread::Builder::new()
+            .name("kitemail-tauri-auto-sync".to_string())
+            .spawn(move || loop {
+                let (lock, cvar) = &*auto_sync_signal;
+                let guard = lock.lock().expect("auto_sync_signal mutex poisoned");
+                if *guard {
+                    break;
+                }
+                let (guard, _) = cvar
+                    .wait_timeout(guard, AUTO_SYNC_CHECK_INTERVAL)
+                    .expect("auto_sync_signal mutex poisoned");
+                if *guard {
+                    break;
+                }
+                drop(guard);
+
+                let Some(session) = weak_session.upgrade() else {
+                    break;
+                };
+                if session.quitting.load(Ordering::SeqCst) {
+                    break;
+                }
+                session.try_auto_sync_at(Instant::now());
+            });
+    }
+
+    pub fn try_auto_sync_at(&self, now: Instant) -> bool {
+        if self.mode != AppMode::Live || self.quitting.load(Ordering::SeqCst) || self.is_locked() {
+            return false;
+        }
+        let minutes = self.prefs.snapshot_raw().auto_sync_minutes;
+        if minutes == 0 {
+            *self
+                .last_auto_sync_at
+                .lock()
+                .expect("last_auto_sync_at mutex poisoned") = now;
+            return false;
+        }
+        let interval = Duration::from_secs(u64::from(minutes) * 60);
+        {
+            let mut last = self
+                .last_auto_sync_at
+                .lock()
+                .expect("last_auto_sync_at mutex poisoned");
+            if now.saturating_duration_since(*last) < interval {
+                return false;
+            }
+            *last = now;
+        }
+
+        let (worker, has_enabled) = {
+            let live = self.live.lock().expect("live mutex poisoned");
+            (live.worker.clone(), !live.enabled_account_ids().is_empty())
+        };
+        if !has_enabled {
+            return false;
+        }
+        if let Some(w) = worker {
+            w.send(MailRequest::SyncAllAccounts {
+                user_initiated: false,
+            });
+            return true;
+        }
+        false
     }
 
     pub fn is_locked(&self) -> bool {
@@ -1326,6 +1677,96 @@ impl MailSession {
         res.map_err(|e| IpcError::internal(format!("查询缓存列表失败: {e}"), req_id))
     }
 
+    fn build_reader_spec(
+        &self,
+        reader_session_id: String,
+        detail: &MessageDetail,
+        raw_prefs: &AppPreferences,
+        base_appearance: &ReaderAppearance,
+    ) -> (ReaderDocumentSpec, ReaderAppearance, bool) {
+        let allowed_msgs = self
+            .allowed_remote_messages
+            .lock()
+            .expect("allowed_remote_messages mutex poisoned")
+            .clone();
+        let remote_blocked = is_message_remote_images_blocked(detail, raw_prefs, &allowed_msgs);
+        let has_thread = detail.thread_messages.len() > 1;
+        let mut effective_appearance = base_appearance.clone();
+
+        let thread = if has_thread {
+            let key = (detail.account_id, detail.id);
+            let collapsed_cards = {
+                let mut guard = self
+                    .thread_collapsed_cards
+                    .lock()
+                    .expect("thread_collapsed_cards mutex poisoned");
+                if guard.0 != Some(key) {
+                    guard.0 = Some(key);
+                    guard.1 = compute_default_collapsed_cards(
+                        detail,
+                        raw_prefs.thread_newest_first,
+                        raw_prefs.effective_fold_messages_mode(),
+                    );
+                }
+                guard.1.clone()
+            };
+            let raw_cards = {
+                let mut guard = self
+                    .thread_raw_cards
+                    .lock()
+                    .expect("thread_raw_cards mutex poisoned");
+                if guard.0 != Some(key) {
+                    guard.0 = Some(key);
+                    guard.1.clear();
+                }
+                guard.1.clone()
+            };
+            let allowed_remote_cards: HashSet<u32> = detail
+                .thread_messages
+                .iter()
+                .filter(|tm| {
+                    allowed_msgs.contains(&(detail.account_id, tm.id))
+                        || allowed_msgs.contains(&(detail.account_id, detail.id))
+                })
+                .map(|tm| tm.id)
+                .collect();
+            effective_appearance.block_remote_images = raw_prefs.block_remote_images;
+            Some(ThreadRenderOptions {
+                detail: detail.clone(),
+                collapsed_cards,
+                raw_cards,
+                allowed_remote_cards,
+                allowed_remote_senders: raw_prefs.allowed_remote_senders.clone(),
+                ui_text_scale_percent: raw_prefs.ui_text_scale_percent,
+                date_style: raw_prefs.date_style.clone(),
+                clock_style: raw_prefs.clock_style.clone(),
+                always_show_recipients: raw_prefs.always_show_recipients,
+                demo_mode: self.mode == AppMode::Demo,
+                read_receipt_policy: raw_prefs.read_receipt_policy.clone(),
+                initial_anchor: None,
+            })
+        } else {
+            let msg_allowed = raw_prefs.is_remote_sender_allowed(&detail.sender)
+                || allowed_msgs.contains(&(detail.account_id, detail.id));
+            effective_appearance.block_remote_images =
+                raw_prefs.block_remote_images && !msg_allowed;
+            None
+        };
+
+        let spec = ReaderDocumentSpec {
+            session_id: reader_session_id,
+            account_id: detail.account_id,
+            message_id: detail.id,
+            subject: detail.subject.clone(),
+            sender: detail.sender.clone(),
+            plain_text: detail.body_text.clone(),
+            html_body: detail.body_html.clone(),
+            has_thread,
+            thread,
+        };
+        (spec, effective_appearance, remote_blocked)
+    }
+
     pub fn open_message(
         &self,
         input: &OpenMessageInput,
@@ -1358,7 +1799,7 @@ impl MailSession {
                 input,
                 reader_session_id,
                 gen,
-                &raw_prefs.read_mark_mode,
+                &raw_prefs,
                 reader_enabled,
                 &appearance,
             ),
@@ -1366,8 +1807,7 @@ impl MailSession {
                 input,
                 reader_session_id,
                 gen,
-                raw_prefs.thread_newest_first,
-                &raw_prefs.read_mark_mode,
+                &raw_prefs,
                 reader_enabled,
                 appearance,
             ),
@@ -1379,7 +1819,7 @@ impl MailSession {
         input: &OpenMessageInput,
         reader_session_id: String,
         gen: u64,
-        read_mark_mode: &str,
+        raw_prefs: &AppPreferences,
         reader_enabled: bool,
         appearance: &ReaderAppearance,
     ) -> Result<OpenMessageOutput, IpcError> {
@@ -1394,7 +1834,7 @@ impl MailSession {
                 .find_summary(input.account_id, input.message_id)
                 .is_some_and(|s| s.unread);
             let mut changed_info = None;
-            if reader_enabled && read_mark_mode == "shown" && was_unread {
+            if reader_enabled && raw_prefs.read_mark_mode == "shown" && was_unread {
                 if let Some(summary) = demo.find_summary_mut(input.account_id, input.message_id) {
                     summary.unread = false;
                     changed_info = Some((summary.account_id, summary.folder_id, summary.id));
@@ -1413,7 +1853,7 @@ impl MailSession {
                 message_id: Some(message_id),
             });
             self.refresh_tray_tooltip();
-        } else if reader_enabled && read_mark_mode == "delay" && unread_now {
+        } else if reader_enabled && raw_prefs.read_mark_mode == "delay" && unread_now {
             self.schedule_delayed_read_mark(
                 gen,
                 detail.account_id,
@@ -1423,20 +1863,11 @@ impl MailSession {
             );
         }
 
-        let body_status = self.reader.begin_session(
-            ReaderDocumentSpec {
-                session_id: reader_session_id.clone(),
-                account_id: detail.account_id,
-                message_id: detail.id,
-                subject: detail.subject.clone(),
-                sender: detail.sender.clone(),
-                plain_text: detail.body_text.clone(),
-                html_body: detail.body_html.clone(),
-                has_thread: detail.thread_messages.len() > 1,
-            },
-            appearance,
-            reader_enabled,
-        );
+        let (spec, effective_appearance, remote_blocked) =
+            self.build_reader_spec(reader_session_id.clone(), &detail, raw_prefs, appearance);
+        let body_status = self
+            .reader
+            .begin_session(spec, &effective_appearance, reader_enabled);
 
         Ok(build_open_message_output(
             input.request_id.clone(),
@@ -1444,6 +1875,7 @@ impl MailSession {
             &detail,
             body_status,
             true,
+            Some(remote_blocked),
         ))
     }
 
@@ -1453,8 +1885,7 @@ impl MailSession {
         input: &OpenMessageInput,
         reader_session_id: String,
         gen: u64,
-        newest_first: bool,
-        read_mark_mode: &str,
+        raw_prefs: &AppPreferences,
         reader_enabled: bool,
         appearance: ReaderAppearance,
     ) -> Result<OpenMessageOutput, IpcError> {
@@ -1480,7 +1911,7 @@ impl MailSession {
                 IpcError::unavailable(format!("本地邮件缓存暂不可用: {e}"), req_id.clone())
             })?;
             let Some((detail, _uid, body_loaded)) = cache
-                .get_message_detail_ordered(input.message_id, newest_first)
+                .get_message_detail_ordered(input.message_id, raw_prefs.thread_newest_first)
                 .map_err(|e| {
                     IpcError::internal(format!("读取邮件详情失败: {e}"), req_id.clone())
                 })?
@@ -1509,30 +1940,22 @@ impl MailSession {
                 gen,
                 &detail,
                 is_unread,
-                read_mark_mode,
+                &raw_prefs.read_mark_mode,
                 reader_enabled,
                 true,
             );
-            let body_status = self.reader.begin_session(
-                ReaderDocumentSpec {
-                    session_id: reader_session_id.clone(),
-                    account_id: detail.account_id,
-                    message_id: detail.id,
-                    subject: detail.subject.clone(),
-                    sender: detail.sender.clone(),
-                    plain_text: detail.body_text.clone(),
-                    html_body: detail.body_html.clone(),
-                    has_thread: detail.thread_messages.len() > 1,
-                },
-                &appearance,
-                reader_enabled,
-            );
+            let (spec, effective_appearance, remote_blocked) =
+                self.build_reader_spec(reader_session_id.clone(), &detail, raw_prefs, &appearance);
+            let body_status =
+                self.reader
+                    .begin_session(spec, &effective_appearance, reader_enabled);
             return Ok(build_open_message_output(
                 input.request_id.clone(),
                 reader_session_id,
                 &detail,
                 body_status,
                 true,
+                Some(remote_blocked),
             ));
         }
 
@@ -1541,7 +1964,7 @@ impl MailSession {
             let mut live = self.live.lock().expect("live mutex poisoned");
             live.active_reader_target =
                 Some((reader_session_id.clone(), detail.account_id, detail.id));
-            if reader_enabled && read_mark_mode == "shown" && is_unread {
+            if reader_enabled && raw_prefs.read_mark_mode == "shown" && is_unread {
                 live.pending_mark_thread_seen = Some(detail.id);
             } else {
                 live.pending_mark_thread_seen = None;
@@ -1581,7 +2004,7 @@ impl MailSession {
             gen,
             &detail,
             is_unread,
-            read_mark_mode,
+            &raw_prefs.read_mark_mode,
             reader_enabled,
             false,
         );
@@ -1592,6 +2015,7 @@ impl MailSession {
             &detail,
             BodyStatusDto::Loading,
             false,
+            None,
         ))
     }
 
@@ -1985,6 +2409,67 @@ impl MailSession {
                 } => {
                     self.handle_worker_body_failed(account_id, message_id, message);
                 }
+                WorkerEvent::OlderMessagesLoaded {
+                    folder_id,
+                    fetched_count: _,
+                    has_more_remote,
+                } => {
+                    {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        live.cache_ready = true;
+                        for folders in live.folders_by_account.values_mut() {
+                            for f in folders.iter_mut() {
+                                if folder_id == 0 {
+                                    if f.path.eq_ignore_ascii_case("INBOX") {
+                                        f.has_more_remote = has_more_remote;
+                                    }
+                                } else if f.id == folder_id {
+                                    f.has_more_remote = has_more_remote;
+                                }
+                            }
+                        }
+                    }
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: ver,
+                        reason: "olderMessagesLoaded".to_string(),
+                        account_id: None,
+                        folder_id: (folder_id != 0).then_some(folder_id),
+                        message_id: None,
+                    });
+                }
+                WorkerEvent::MessageArchived {
+                    account_id,
+                    message_id,
+                    ..
+                } => {
+                    self.handle_live_message_moved_event(account_id, message_id, "messageArchived");
+                }
+                WorkerEvent::MessageDeleted {
+                    account_id,
+                    message_id,
+                    ..
+                } => {
+                    self.handle_live_message_moved_event(account_id, message_id, "messageDeleted");
+                }
+                WorkerEvent::MessageMoved {
+                    account_id,
+                    message_id,
+                    ..
+                } => {
+                    self.handle_live_message_moved_event(account_id, message_id, "messageMoved");
+                }
+                WorkerEvent::MessageMarkedSpam {
+                    account_id,
+                    message_id,
+                    ..
+                } => {
+                    self.handle_live_message_moved_event(
+                        account_id,
+                        message_id,
+                        "messageMarkedSpam",
+                    );
+                }
                 WorkerEvent::Error {
                     account_id: _,
                     message,
@@ -2005,6 +2490,33 @@ impl MailSession {
                 _ => {}
             }
         }
+    }
+
+    fn handle_live_message_moved_event(&self, account_id: u32, message_id: u32, reason: &str) {
+        let data_dir = {
+            let mut live = self.live.lock().expect("live mutex poisoned");
+            live.remove_cached_detail(account_id, message_id);
+            live.data_dir.clone()
+        };
+        if config::global_db_in(&data_dir).exists() {
+            if let Ok(cache) = CacheStore::open_for_data_dir_read_only(&data_dir) {
+                if let Ok(folders) = cache.list_folders(account_id) {
+                    let dtos: Vec<FolderSummaryDto> =
+                        folders.iter().map(FolderSummaryDto::from).collect();
+                    let mut live = self.live.lock().expect("live mutex poisoned");
+                    live.folders_by_account.insert(account_id, dtos);
+                }
+            }
+        }
+        self.refresh_tray_tooltip();
+        let ver = self.bump_state_version();
+        self.emitter.emit_mail_changed(MailChangedEvent {
+            state_version: ver,
+            reason: reason.to_string(),
+            account_id: Some(account_id),
+            folder_id: None,
+            message_id: Some(message_id),
+        });
     }
 
     fn handle_worker_body_loaded(&self, detail: MessageDetail) {
@@ -2044,20 +2556,15 @@ impl MailSession {
             return;
         };
 
-        self.reader.begin_session(
-            ReaderDocumentSpec {
-                session_id: entry.reader_session_id,
-                account_id: detail.account_id,
-                message_id: detail.id,
-                subject: detail.subject,
-                sender: detail.sender,
-                plain_text: detail.body_text,
-                html_body: detail.body_html,
-                has_thread: detail.thread_messages.len() > 1,
-            },
+        let raw_prefs = self.prefs.snapshot_raw();
+        let (spec, effective_appearance, _) = self.build_reader_spec(
+            entry.reader_session_id,
+            &detail,
+            &raw_prefs,
             &entry.appearance,
-            entry.reader_enabled,
         );
+        self.reader
+            .begin_session(spec, &effective_appearance, entry.reader_enabled);
     }
 
     fn handle_worker_body_failed(&self, account_id: u32, message_id: u32, message: String) {
@@ -2432,6 +2939,18 @@ impl MailSession {
             .active_selected_msg
             .lock()
             .expect("active_selected_msg mutex poisoned") = None;
+        self.allowed_remote_messages
+            .lock()
+            .expect("allowed_remote_messages mutex poisoned")
+            .clear();
+        *self
+            .thread_collapsed_cards
+            .lock()
+            .expect("thread_collapsed_cards mutex poisoned") = (None, HashSet::new());
+        *self
+            .thread_raw_cards
+            .lock()
+            .expect("thread_raw_cards mutex poisoned") = (None, HashSet::new());
         if self.mode == AppMode::Live {
             self.live
                 .lock()
@@ -2590,16 +3109,38 @@ impl MailSession {
             self.read_mark_gen.fetch_add(1, Ordering::SeqCst);
         }
         self.reader.set_reader_enabled(enabled);
+        let active = *self
+            .active_selected_msg
+            .lock()
+            .expect("active_selected_msg mutex poisoned");
+        let block_remote_images = match active {
+            Some(key)
+                if self
+                    .allowed_remote_messages
+                    .lock()
+                    .expect("allowed_remote_messages mutex poisoned")
+                    .contains(&key) =>
+            {
+                false
+            }
+            _ => raw_prefs.block_remote_images,
+        };
         self.reader.update_appearance(&ReaderAppearance {
             theme_id: dto.theme_id,
             dark: dto.dark_mode.unwrap_or(false),
             zoom_percent: dto.reader_zoom_percent,
-            block_remote_images: raw_prefs.block_remote_images,
+            block_remote_images,
         });
     }
 
     pub fn prepare_quit(&self) {
+        self.quitting.store(true, Ordering::SeqCst);
         self.read_mark_gen.fetch_add(1, Ordering::SeqCst);
+        {
+            let (lock, cvar) = &*self.auto_sync_signal;
+            *lock.lock().expect("auto_sync_signal mutex poisoned") = true;
+            cvar.notify_all();
+        }
         if self.mode == AppMode::Live {
             let worker = self
                 .live
@@ -2610,6 +3151,726 @@ impl MailSession {
             if let Some(w) = worker {
                 w.prepare_quit();
             }
+        }
+    }
+
+    fn current_reader_appearance(&self, block_remote_images: bool) -> ReaderAppearance {
+        let dto = self.prefs.snapshot_dto();
+        ReaderAppearance {
+            theme_id: dto.theme_id,
+            dark: dto.dark_mode.unwrap_or(false),
+            zoom_percent: dto.reader_zoom_percent,
+            block_remote_images,
+        }
+    }
+
+    fn load_detail_for_action(
+        &self,
+        account_id: u32,
+        message_id: u32,
+    ) -> Result<MessageDetail, IpcError> {
+        match self.mode {
+            AppMode::Demo => self
+                .demo
+                .lock()
+                .expect("demo mutex poisoned")
+                .get_detail(account_id, message_id)
+                .ok_or_else(|| IpcError::message_not_found(message_id, None)),
+            AppMode::Live => {
+                let (data_dir, cached) = {
+                    let live = self.live.lock().expect("live mutex poisoned");
+                    (
+                        live.data_dir.clone(),
+                        live.body_cache.get(&(account_id, message_id)).cloned(),
+                    )
+                };
+                if let Some(detail) = cached {
+                    return Ok(detail);
+                }
+                let cache = CacheStore::open_for_data_dir_read_only(&data_dir)
+                    .map_err(|e| IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None))?;
+                let raw_prefs = self.prefs.snapshot_raw();
+                let Some((detail, _, _)) = cache
+                    .get_message_detail_ordered(message_id, raw_prefs.thread_newest_first)
+                    .map_err(|e| IpcError::internal(format!("读取邮件详情失败: {e}"), None))?
+                else {
+                    return Err(IpcError::message_not_found(message_id, None));
+                };
+                if detail.account_id != account_id {
+                    return Err(IpcError::message_not_found(message_id, None));
+                }
+                Ok(detail)
+            }
+        }
+    }
+
+    pub fn allow_remote_images(
+        &self,
+        input: &AllowRemoteImagesInput,
+    ) -> Result<AllowRemoteImagesOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if input.account_id == 0 || input.message_id == 0 {
+            return Err(IpcError::invalid_input(
+                "accountId 与 messageId 必须为正整数",
+                None,
+            ));
+        }
+
+        let detail = self.load_detail_for_action(input.account_id, input.message_id)?;
+        let target_sender = detail
+            .thread_messages
+            .iter()
+            .find(|tm| tm.id == input.message_id)
+            .map(|tm| tm.sender.clone())
+            .unwrap_or_else(|| detail.sender.clone());
+
+        {
+            let mut allowed = self
+                .allowed_remote_messages
+                .lock()
+                .expect("allowed_remote_messages mutex poisoned");
+            allowed.insert((input.account_id, input.message_id));
+            if input.message_id == detail.id && detail.thread_messages.len() > 1 {
+                for tm in &detail.thread_messages {
+                    allowed.insert((input.account_id, tm.id));
+                }
+            }
+        }
+
+        let mut sender_trusted = false;
+        if input.trust_sender {
+            let mut persisted_trusted = false;
+            self.prefs
+                .mutate_and_save(|prefs| {
+                    let prev_len = prefs.allowed_remote_senders.len();
+                    if prefs.allow_remote_sender(&target_sender).is_some() {
+                        persisted_trusted = true;
+                    }
+                    prefs.allowed_remote_senders.len() != prev_len
+                })
+                .map_err(|e| IpcError::internal(format!("保存信任发件人失败: {e}"), None))?;
+            sender_trusted = persisted_trusted;
+        }
+
+        let raw_prefs = self.prefs.snapshot_raw();
+        let allowed_senders = raw_prefs.allowed_remote_senders.clone();
+        let is_thread = detail.thread_messages.len() > 1;
+        let thread_ids: Vec<u32> = detail.thread_messages.iter().map(|tm| tm.id).collect();
+        let appearance = self.current_reader_appearance(if is_thread {
+            raw_prefs.block_remote_images
+        } else {
+            false
+        });
+        self.reader
+            .rerender_matching_document(input.account_id, detail.id, &appearance, |spec| {
+                if let Some(ref mut thread) = spec.thread {
+                    thread.allowed_remote_cards.insert(input.message_id);
+                    if input.message_id == detail.id {
+                        for id in &thread_ids {
+                            thread.allowed_remote_cards.insert(*id);
+                        }
+                    }
+                    thread.allowed_remote_senders = allowed_senders.clone();
+                }
+            });
+
+        let ver = self.bump_state_version();
+        Ok(AllowRemoteImagesOutput {
+            allowed: true,
+            sender_trusted,
+            state_version: ver,
+        })
+    }
+
+    pub fn load_older_messages(
+        &self,
+        input: &LoadOlderMessagesInput,
+    ) -> Result<LoadOlderMessagesOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if input.limit == 0 {
+            return Err(IpcError::invalid_input("limit 必须大于 0", None));
+        }
+
+        match self.mode {
+            AppMode::Demo => {
+                self.demo
+                    .lock()
+                    .expect("demo mutex poisoned")
+                    .validate_view(input.view, None)?;
+                Ok(LoadOlderMessagesOutput {
+                    accepted: false,
+                    has_more_remote: false,
+                    state_version: self.state_version(),
+                })
+            }
+            AppMode::Live => {
+                let (worker, target_folder_id, has_more_remote) = {
+                    let live = self.live.lock().expect("live mutex poisoned");
+                    match input.view {
+                        MainViewDto::UnifiedInbox => {
+                            let more =
+                                live.folders_by_account.values().flatten().any(|f| {
+                                    f.path.eq_ignore_ascii_case("INBOX") && f.has_more_remote
+                                });
+                            (live.worker.clone(), Some(0u32), more)
+                        }
+                        MainViewDto::AccountFolder {
+                            account_id,
+                            folder_id,
+                        } => {
+                            let folder = live
+                                .folders_by_account
+                                .get(&account_id)
+                                .and_then(|fs| fs.iter().find(|f| f.id == folder_id))
+                                .ok_or_else(|| {
+                                    IpcError::invalid_input(
+                                        format!(
+                                            "无效的账号或文件夹: accountId={account_id}, folderId={folder_id}"
+                                        ),
+                                        None,
+                                    )
+                                })?;
+                            (live.worker.clone(), Some(folder_id), folder.has_more_remote)
+                        }
+                        _ => (live.worker.clone(), None, false),
+                    }
+                };
+
+                let Some(folder_id) = target_folder_id else {
+                    return Ok(LoadOlderMessagesOutput {
+                        accepted: false,
+                        has_more_remote: false,
+                        state_version: self.state_version(),
+                    });
+                };
+
+                let accepted = if let Some(w) = worker {
+                    w.send(MailRequest::LoadOlderMessages {
+                        folder_id,
+                        limit: input.limit.min(MAX_PAGE_LIMIT),
+                    });
+                    true
+                } else {
+                    false
+                };
+
+                Ok(LoadOlderMessagesOutput {
+                    accepted,
+                    has_more_remote,
+                    state_version: self.state_version(),
+                })
+            }
+        }
+    }
+
+    pub fn archive_message(
+        &self,
+        input: &MessageActionInput,
+    ) -> Result<MessageMoveOutput, IpcError> {
+        self.execute_message_move(input.account_id, input.message_id, LiveMoveKind::Archive)
+    }
+
+    pub fn delete_message(
+        &self,
+        input: &MessageActionInput,
+    ) -> Result<MessageMoveOutput, IpcError> {
+        self.execute_message_move(input.account_id, input.message_id, LiveMoveKind::Delete)
+    }
+
+    pub fn mark_message_spam(
+        &self,
+        input: &MessageActionInput,
+    ) -> Result<MessageMoveOutput, IpcError> {
+        self.execute_message_move(input.account_id, input.message_id, LiveMoveKind::Spam)
+    }
+
+    pub fn move_message(&self, input: &MoveMessageInput) -> Result<MessageMoveOutput, IpcError> {
+        if input.target_folder_path.trim().is_empty() {
+            return Err(IpcError::invalid_input("targetFolderPath 不能为空", None));
+        }
+        self.execute_message_move(
+            input.account_id,
+            input.message_id,
+            LiveMoveKind::Folder(input.target_folder_path.trim().to_string()),
+        )
+    }
+
+    fn execute_message_move(
+        &self,
+        account_id: u32,
+        message_id: u32,
+        kind: LiveMoveKind,
+    ) -> Result<MessageMoveOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if account_id == 0 || message_id == 0 {
+            return Err(IpcError::invalid_input(
+                "accountId 与 messageId 必须为正整数",
+                None,
+            ));
+        }
+
+        match self.mode {
+            AppMode::Demo => {
+                let (rfc_message_id, original_folder_path, target_folder_path, folder_id) = {
+                    let mut demo = self.demo.lock().expect("demo mutex poisoned");
+                    let target = match &kind {
+                        LiveMoveKind::Archive => Some("Archive"),
+                        LiveMoveKind::Spam => Some("Junk"),
+                        LiveMoveKind::Delete => {
+                            let in_trash = demo
+                                .find_summary(account_id, message_id)
+                                .is_some_and(|m| m.folder_path.eq_ignore_ascii_case("Trash"));
+                            if in_trash {
+                                None
+                            } else {
+                                Some("Trash")
+                            }
+                        }
+                        LiveMoveKind::Folder(path) => Some(path.as_str()),
+                    };
+                    demo.move_message_to(account_id, message_id, target)?
+                };
+                let reason = match &kind {
+                    LiveMoveKind::Archive => "messageArchived",
+                    LiveMoveKind::Delete => "messageDeleted",
+                    LiveMoveKind::Spam => "messageMarkedSpam",
+                    LiveMoveKind::Folder(_) => "messageMoved",
+                };
+                let ver = self.bump_state_version();
+                self.emitter.emit_mail_changed(MailChangedEvent {
+                    state_version: ver,
+                    reason: reason.to_string(),
+                    account_id: Some(account_id),
+                    folder_id,
+                    message_id: Some(message_id),
+                });
+                self.refresh_tray_tooltip();
+                Ok(MessageMoveOutput {
+                    account_id,
+                    message_id,
+                    rfc_message_id,
+                    original_folder_path,
+                    target_folder_path,
+                    state_version: ver,
+                })
+            }
+            AppMode::Live => {
+                let (data_dir, auth_backend, worker) = {
+                    let live = self.live.lock().expect("live mutex poisoned");
+                    let auth = live
+                        .account_configs
+                        .iter()
+                        .find(|a| a.id == account_id)
+                        .map(|a| a.auth_backend)
+                        .unwrap_or(AuthBackend::Password);
+                    (live.data_dir.clone(), auth, live.worker.clone())
+                };
+                let cache = CacheStore::open_for_data_dir_read_only(&data_dir)
+                    .map_err(|e| IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None))?;
+                let Some((detail, _, _)) = cache
+                    .get_message_detail(message_id)
+                    .map_err(|e| IpcError::internal(format!("查询邮件详情失败: {e}"), None))?
+                else {
+                    return Err(IpcError::message_not_found(message_id, None));
+                };
+                if detail.account_id != account_id {
+                    return Err(IpcError::message_not_found(message_id, None));
+                }
+
+                let target_folder_path = match &kind {
+                    LiveMoveKind::Archive => match cache.find_archive_folder(account_id) {
+                        Ok(Some((_, path))) => path,
+                        Ok(None) => {
+                            return Err(IpcError::unavailable(
+                                "该账号没有归档文件夹，无法归档邮件",
+                                None,
+                            ))
+                        }
+                        Err(e) => {
+                            return Err(IpcError::internal(
+                                format!("查询归档文件夹失败: {e}"),
+                                None,
+                            ))
+                        }
+                    },
+                    LiveMoveKind::Delete => match cache.find_trash_folder(account_id) {
+                        Ok(Some((_, path))) => path,
+                        Ok(None) => {
+                            if auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                                "deleteditems".to_string()
+                            } else {
+                                String::new()
+                            }
+                        }
+                        Err(e) => {
+                            return Err(IpcError::internal(format!("查询废纸篓失败: {e}"), None))
+                        }
+                    },
+                    LiveMoveKind::Spam => match cache.find_spam_folder(account_id) {
+                        Ok(Some((_, path))) => path,
+                        Ok(None) => {
+                            if auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+                                "junkemail".to_string()
+                            } else {
+                                return Err(IpcError::unavailable(
+                                    "该账号没有垃圾邮件文件夹，无法标记为垃圾邮件",
+                                    None,
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            return Err(IpcError::internal(
+                                format!("查询垃圾邮件文件夹失败: {e}"),
+                                None,
+                            ))
+                        }
+                    },
+                    LiveMoveKind::Folder(path) => path.clone(),
+                };
+
+                {
+                    let mut live = self.live.lock().expect("live mutex poisoned");
+                    live.remove_cached_detail(account_id, message_id);
+                }
+
+                let req = match kind {
+                    LiveMoveKind::Archive => MailRequest::ArchiveMessage {
+                        account_id,
+                        message_id,
+                    },
+                    LiveMoveKind::Delete => MailRequest::DeleteMessage {
+                        account_id,
+                        message_id,
+                    },
+                    LiveMoveKind::Spam => MailRequest::MarkSpam {
+                        account_id,
+                        message_id,
+                    },
+                    LiveMoveKind::Folder(ref path) => MailRequest::MoveMessage {
+                        account_id,
+                        message_id,
+                        target_folder_path: path.clone(),
+                    },
+                };
+                if let Some(w) = worker {
+                    w.send(req);
+                }
+
+                let ver = self.bump_state_version();
+                Ok(MessageMoveOutput {
+                    account_id,
+                    message_id,
+                    rfc_message_id: detail.rfc_message_id,
+                    original_folder_path: detail.folder_path,
+                    target_folder_path,
+                    state_version: ver,
+                })
+            }
+        }
+    }
+
+    pub fn undo_message_move(
+        &self,
+        input: &UndoMessageMoveInput,
+    ) -> Result<UndoMessageMoveOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if input.account_id == 0 || input.message_id == 0 {
+            return Err(IpcError::invalid_input(
+                "accountId 与 messageId 必须为正整数",
+                None,
+            ));
+        }
+        if input.current_folder_path.trim().is_empty()
+            || input.original_folder_path.trim().is_empty()
+        {
+            return Err(IpcError::invalid_input(
+                "currentFolderPath 与 originalFolderPath 不能为空",
+                None,
+            ));
+        }
+
+        match self.mode {
+            AppMode::Demo => {
+                let (accepted, folder_id) = {
+                    let mut demo = self.demo.lock().expect("demo mutex poisoned");
+                    demo.undo_move(
+                        input.account_id,
+                        input.message_id,
+                        &input.rfc_message_id,
+                        &input.current_folder_path,
+                        &input.original_folder_path,
+                    )?
+                };
+                let ver = if accepted {
+                    let v = self.bump_state_version();
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: v,
+                        reason: "undoMove".to_string(),
+                        account_id: Some(input.account_id),
+                        folder_id,
+                        message_id: Some(input.message_id),
+                    });
+                    self.refresh_tray_tooltip();
+                    v
+                } else {
+                    self.state_version()
+                };
+                Ok(UndoMessageMoveOutput {
+                    accepted,
+                    state_version: ver,
+                })
+            }
+            AppMode::Live => {
+                let worker = {
+                    let live = self.live.lock().expect("live mutex poisoned");
+                    live.worker.clone()
+                };
+                let accepted = if let Some(w) = worker {
+                    w.send(MailRequest::UndoMessageMove {
+                        account_id: input.account_id,
+                        message_id: input.message_id,
+                        rfc_message_id: input.rfc_message_id.clone(),
+                        current_folder_path: input.current_folder_path.clone(),
+                        original_folder_path: input.original_folder_path.clone(),
+                    });
+                    true
+                } else {
+                    false
+                };
+                let ver = self.bump_state_version();
+                Ok(UndoMessageMoveOutput {
+                    accepted,
+                    state_version: ver,
+                })
+            }
+        }
+    }
+}
+
+enum LiveMoveKind {
+    Archive,
+    Delete,
+    Spam,
+    Folder(String),
+}
+
+impl ThreadActionHandler for MailSession {
+    fn handle_thread_action(&self, account_id: u32, message_id: u32, action: WebViewAction) {
+        if self.is_locked() {
+            return;
+        }
+        match action {
+            WebViewAction::ScrollAnchor { msg_id, offset_px } => {
+                self.reader
+                    .update_scroll_anchor(account_id, message_id, msg_id, offset_px);
+            }
+            WebViewAction::CardFold { msg_id, collapsed } => {
+                {
+                    let mut guard = self
+                        .thread_collapsed_cards
+                        .lock()
+                        .expect("thread_collapsed_cards mutex poisoned");
+                    if guard.0 != Some((account_id, message_id)) {
+                        guard.0 = Some((account_id, message_id));
+                        guard.1.clear();
+                    }
+                    if collapsed {
+                        guard.1.insert(msg_id);
+                    } else {
+                        guard.1.remove(&msg_id);
+                    }
+                }
+                let raw_prefs = self.prefs.snapshot_raw();
+                let appearance = self.current_reader_appearance(raw_prefs.block_remote_images);
+                self.reader.rerender_matching_document(
+                    account_id,
+                    message_id,
+                    &appearance,
+                    |spec| {
+                        if let Some(ref mut thread) = spec.thread {
+                            if collapsed {
+                                thread.collapsed_cards.insert(msg_id);
+                            } else {
+                                thread.collapsed_cards.remove(&msg_id);
+                            }
+                        }
+                    },
+                );
+            }
+            WebViewAction::CardToggleRaw(msg_id) => {
+                let show_raw = {
+                    let mut guard = self
+                        .thread_raw_cards
+                        .lock()
+                        .expect("thread_raw_cards mutex poisoned");
+                    if guard.0 != Some((account_id, message_id)) {
+                        guard.0 = Some((account_id, message_id));
+                        guard.1.clear();
+                    }
+                    if !guard.1.remove(&msg_id) {
+                        guard.1.insert(msg_id);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if show_raw {
+                    let mut guard = self
+                        .thread_collapsed_cards
+                        .lock()
+                        .expect("thread_collapsed_cards mutex poisoned");
+                    if guard.0 == Some((account_id, message_id)) {
+                        guard.1.remove(&msg_id);
+                    }
+                }
+                let raw_prefs = self.prefs.snapshot_raw();
+                let appearance = self.current_reader_appearance(raw_prefs.block_remote_images);
+                self.reader.rerender_matching_document(
+                    account_id,
+                    message_id,
+                    &appearance,
+                    |spec| {
+                        if let Some(ref mut thread) = spec.thread {
+                            if show_raw {
+                                thread.raw_cards.insert(msg_id);
+                                thread.collapsed_cards.remove(&msg_id);
+                            } else {
+                                thread.raw_cards.remove(&msg_id);
+                            }
+                        }
+                    },
+                );
+            }
+            WebViewAction::CardAllowRemote(msg_id) => {
+                let _ = self.allow_remote_images(&AllowRemoteImagesInput {
+                    account_id,
+                    message_id: msg_id,
+                    trust_sender: false,
+                });
+            }
+            WebViewAction::CardToggleFlag(msg_id) => {
+                let current_flagged = self
+                    .load_detail_for_action(account_id, message_id)
+                    .ok()
+                    .and_then(|d| {
+                        d.thread_messages
+                            .iter()
+                            .find(|tm| tm.id == msg_id)
+                            .map(|tm| tm.flagged)
+                            .or_else(|| (d.id == msg_id).then_some(d.flagged))
+                    })
+                    .unwrap_or(false);
+                let next_flagged = !current_flagged;
+                if self
+                    .set_message_flagged(&SetMessageFlaggedInput {
+                        account_id,
+                        message_id: msg_id,
+                        flagged: next_flagged,
+                    })
+                    .is_ok()
+                {
+                    let raw_prefs = self.prefs.snapshot_raw();
+                    let appearance = self.current_reader_appearance(raw_prefs.block_remote_images);
+                    self.reader.rerender_matching_document(
+                        account_id,
+                        message_id,
+                        &appearance,
+                        |spec| {
+                            if let Some(ref mut thread) = spec.thread {
+                                if thread.detail.id == msg_id {
+                                    thread.detail.flagged = next_flagged;
+                                }
+                                for tm in &mut thread.detail.thread_messages {
+                                    if tm.id == msg_id {
+                                        tm.flagged = next_flagged;
+                                    }
+                                }
+                            }
+                        },
+                    );
+                }
+            }
+            WebViewAction::CardMarkUnread(msg_id) => {
+                let _ = self.set_message_seen(&SetMessageSeenInput {
+                    account_id,
+                    message_id: msg_id,
+                    seen: false,
+                });
+            }
+            WebViewAction::CardArchive(msg_id) => {
+                let _ = self.archive_message(&MessageActionInput {
+                    account_id,
+                    message_id: msg_id,
+                });
+            }
+            WebViewAction::CardDelete(msg_id) => {
+                let _ = self.delete_message(&MessageActionInput {
+                    account_id,
+                    message_id: msg_id,
+                });
+            }
+            WebViewAction::CardLoadBody(msg_id) => {
+                if self.mode == AppMode::Live {
+                    if let Some(w) = self
+                        .live
+                        .lock()
+                        .expect("live mutex poisoned")
+                        .worker
+                        .clone()
+                    {
+                        w.send(MailRequest::LoadMessageBody {
+                            account_id,
+                            message_id: msg_id,
+                        });
+                    }
+                }
+            }
+            WebViewAction::CardUnsubscribe(msg_id) => {
+                if self.mode == AppMode::Live && msg_id == message_id {
+                    if let Ok(detail) = self.load_detail_for_action(account_id, message_id) {
+                        if detail.unsubscribe_one_click {
+                            if let Some(url) = detail.unsubscribe_url {
+                                if let Some(w) = self
+                                    .live
+                                    .lock()
+                                    .expect("live mutex poisoned")
+                                    .worker
+                                    .clone()
+                                {
+                                    w.send(MailRequest::UnsubscribeOneClick { url });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            WebViewAction::CardIcsReply { msg_id, status } => {
+                if let Ok(detail) = self.load_detail_for_action(account_id, message_id) {
+                    if let Some(tm) = detail.thread_messages.iter().find(|m| m.id == msg_id) {
+                        if tm.body_text.contains("BEGIN:VCALENDAR") {
+                            if let Some(inv) = kitemail_mail_core::invite::parse(&tm.body_text) {
+                                let _ = kitemail_mail_core::invite::reply_ics(&inv, "", "", status);
+                            }
+                        }
+                    }
+                }
+            }
+            WebViewAction::CardReply(_)
+            | WebViewAction::CardReplyAll(_)
+            | WebViewAction::CardForward(_)
+            | WebViewAction::CardExportEml(_)
+            | WebViewAction::CardCopyBody(_)
+            | WebViewAction::CardSaveAttachment(_)
+            | WebViewAction::CardSaveAllAttachments(_)
+            | WebViewAction::CardMdn { .. } => {}
         }
     }
 }
@@ -2732,7 +3993,16 @@ mod tests {
         fn is_native_supported(&self) -> bool {
             false
         }
-        fn load_html(&self, _: String, _: u32, _: u32, _: Vec<u8>, _: bool) {}
+        fn load_html(
+            &self,
+            _: String,
+            _: u32,
+            _: u32,
+            _: Vec<u8>,
+            _: bool,
+            _: kitemail_windows_mail_reader::DocumentMode,
+        ) {
+        }
         fn apply_layout(
             &self,
             _: crate::window_lifecycle::PhysicalRect,
@@ -2901,9 +4171,13 @@ mod tests {
         let session = Arc::new(MailSession {
             mode: AppMode::Live,
             locked: AtomicBool::new(persisted_lock),
+            quitting: AtomicBool::new(false),
             state_version: AtomicU64::new(1),
             read_mark_gen: AtomicU64::new(0),
             active_selected_msg: Mutex::new(None),
+            allowed_remote_messages: Mutex::new(HashSet::new()),
+            thread_collapsed_cards: Mutex::new((None, HashSet::new())),
+            thread_raw_cards: Mutex::new((None, HashSet::new())),
             current_view: Mutex::new(MainViewDto::UnifiedInbox),
             sync_status: Mutex::new(SyncStatusDto::default()),
             lock_state: Mutex::new(AppLockState::new(
@@ -2918,6 +4192,8 @@ mod tests {
             emitter: emitter.clone(),
             self_weak: Mutex::new(Weak::new()),
             tray: Mutex::new(None),
+            auto_sync_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            last_auto_sync_at: Mutex::new(Instant::now()),
             body_fetch_timeout: Duration::from_millis(120),
             read_mark_delay: Duration::from_millis(80),
         });
@@ -3661,6 +4937,568 @@ mod tests {
         });
         assert!(!during_cooldown.unlocked);
         assert!(during_cooldown.retry_after_secs.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn demo_archive_delete_spam_move_and_undo_update_counts_and_emit_events() {
+        let (session, emitter, dir) = make_test_session();
+
+        // Archive unread message #1 from INBOX -> Archive.
+        let archived = session
+            .archive_message(&MessageActionInput {
+                account_id: 1,
+                message_id: 1,
+            })
+            .expect("archive #1");
+        assert_eq!(archived.original_folder_path, "INBOX");
+        assert_eq!(archived.target_folder_path, "Archive");
+        assert_eq!(archived.rfc_message_id, "<demo-1@hylki.example>");
+
+        let boot_arch = session.bootstrap();
+        assert_eq!(boot_arch.folders[0].total_count, 9_999);
+        assert_eq!(boot_arch.folders[0].unread_count, 125);
+        assert_eq!(boot_arch.folders[3].total_count, 25);
+
+        // Undo archive -> INBOX counts restored.
+        let undo_arch = session
+            .undo_message_move(&UndoMessageMoveInput {
+                account_id: 1,
+                message_id: 1,
+                rfc_message_id: archived.rfc_message_id.clone(),
+                current_folder_path: archived.target_folder_path.clone(),
+                original_folder_path: archived.original_folder_path.clone(),
+            })
+            .expect("undo archive #1");
+        assert!(undo_arch.accepted);
+        let boot_restored = session.bootstrap();
+        assert_eq!(boot_restored.folders[0].total_count, 10_000);
+        assert_eq!(boot_restored.folders[0].unread_count, 126);
+
+        // Delete #2 -> moves to Trash, then delete again -> permanently removed.
+        let deleted = session
+            .delete_message(&MessageActionInput {
+                account_id: 1,
+                message_id: 2,
+            })
+            .expect("delete #2");
+        assert_eq!(deleted.target_folder_path, "Trash");
+        let trash_page = session
+            .list_messages(&ListMessagesInput {
+                request_id: "trash-1".to_string(),
+                view: MainViewDto::Trash,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("list trash");
+        assert_eq!(trash_page.total, 1);
+        assert_eq!(trash_page.items[0].id, 2);
+
+        let perm_deleted = session
+            .delete_message(&MessageActionInput {
+                account_id: 1,
+                message_id: 2,
+            })
+            .expect("permanent delete #2");
+        assert_eq!(perm_deleted.target_folder_path, "");
+
+        // Mark #3 as spam -> Junk folder.
+        let spammed = session
+            .mark_message_spam(&MessageActionInput {
+                account_id: 1,
+                message_id: 3,
+            })
+            .expect("spam #3");
+        assert_eq!(spammed.target_folder_path, "Junk");
+        let junk_page = session
+            .list_messages(&ListMessagesInput {
+                request_id: "junk-1".to_string(),
+                view: MainViewDto::Junk,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("list junk");
+        assert_eq!(junk_page.total, 1);
+
+        // Move #4 -> Sent, then undo back to INBOX.
+        let moved = session
+            .move_message(&MoveMessageInput {
+                account_id: 1,
+                message_id: 4,
+                target_folder_path: "Sent".to_string(),
+            })
+            .expect("move #4");
+        assert_eq!(moved.target_folder_path, "Sent");
+        let undo_move = session
+            .undo_message_move(&UndoMessageMoveInput {
+                account_id: 1,
+                message_id: 4,
+                rfc_message_id: moved.rfc_message_id,
+                current_folder_path: "Sent".to_string(),
+                original_folder_path: "INBOX".to_string(),
+            })
+            .expect("undo move #4");
+        assert!(undo_move.accepted);
+
+        assert!(emitter.mail_changed.lock().unwrap().len() >= 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allow_remote_images_detects_blocked_images_and_persists_allowed_remote_senders() {
+        let (session, _, dir) = make_test_session();
+
+        let opened = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-remote-1".to_string(),
+                    account_id: 1,
+                    message_id: 1,
+                },
+                "rs-remote-1".to_string(),
+            )
+            .expect("open #1");
+        assert_eq!(opened.remote_images_blocked, Some(true));
+        assert_eq!(
+            opened.rfc_message_id.as_deref(),
+            Some("<demo-1@hylki.example>")
+        );
+        assert_eq!(opened.folder_path.as_deref(), Some("INBOX"));
+
+        // Allow once (trustSender = false) unblocks for session without persisting sender.
+        let once = session
+            .allow_remote_images(&AllowRemoteImagesInput {
+                account_id: 1,
+                message_id: 1,
+                trust_sender: false,
+            })
+            .expect("allow once");
+        assert!(once.allowed);
+        assert!(!once.sender_trusted);
+        assert!(PreferencesStore::open_in(dir.clone())
+            .snapshot_raw()
+            .allowed_remote_senders
+            .is_empty());
+
+        let reopened_once = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-remote-2".to_string(),
+                    account_id: 1,
+                    message_id: 1,
+                },
+                "rs-remote-2".to_string(),
+            )
+            .expect("reopen #1");
+        assert_eq!(reopened_once.remote_images_blocked, Some(false));
+
+        // Trust sender (trustSender = true) persists normalized email into preferences.toml.
+        let trusted = session
+            .allow_remote_images(&AllowRemoteImagesInput {
+                account_id: 1,
+                message_id: 1,
+                trust_sender: true,
+            })
+            .expect("trust sender");
+        assert!(trusted.allowed);
+        assert!(trusted.sender_trusted);
+
+        let reloaded_prefs = PreferencesStore::open_in(dir.clone());
+        assert_eq!(
+            reloaded_prefs.snapshot_raw().allowed_remote_senders,
+            vec!["xiaoming@example.com".to_string()]
+        );
+
+        // Fresh session using same preferences dir sees sender already trusted.
+        let fresh_session = MailSession::new(
+            AppMode::Demo,
+            Arc::new(reloaded_prefs),
+            Arc::new(ReaderManager::new(Arc::new(NullReaderSink))),
+            Arc::new(TestEmitter::default()),
+        );
+        let opened_fresh = fresh_session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-remote-3".to_string(),
+                    account_id: 1,
+                    message_id: 1,
+                },
+                "rs-remote-3".to_string(),
+            )
+            .expect("open #1 in fresh session");
+        assert_eq!(opened_fresh.remote_images_blocked, Some(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_move_archive_spam_delete_undo_and_load_older_dispatch_and_handle_events() {
+        let (session, emitter, _, worker, dir) = make_live_test_session(true, Some("1234"));
+
+        // Seed Archive/Trash/Junk folders and mark INBOX has_more_remote = true.
+        {
+            let mut store = CacheStore::open_for_data_dir(&dir).unwrap();
+            let folders = store
+                .sync_folders(
+                    1,
+                    &[
+                        RemoteFolder {
+                            name: "收件箱".to_string(),
+                            path: "INBOX".to_string(),
+                            unread_count: 2,
+                            total_count: 2,
+                        },
+                        RemoteFolder {
+                            name: "归档".to_string(),
+                            path: "Archive".to_string(),
+                            unread_count: 0,
+                            total_count: 0,
+                        },
+                        RemoteFolder {
+                            name: "已删除".to_string(),
+                            path: "Trash".to_string(),
+                            unread_count: 0,
+                            total_count: 0,
+                        },
+                        RemoteFolder {
+                            name: "垃圾邮件".to_string(),
+                            path: "Junk".to_string(),
+                            unread_count: 0,
+                            total_count: 0,
+                        },
+                    ],
+                )
+                .unwrap();
+            store.checkpoint_and_close_all();
+            let mut dtos: Vec<FolderSummaryDto> =
+                folders.iter().map(FolderSummaryDto::from).collect();
+            dtos[0].has_more_remote = true;
+            session
+                .live
+                .lock()
+                .unwrap()
+                .folders_by_account
+                .insert(1, dtos);
+        }
+
+        let list = session
+            .list_messages(&ListMessagesInput {
+                request_id: "l-ops".to_string(),
+                view: MainViewDto::UnifiedInbox,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        let msg_b_id = list
+            .items
+            .iter()
+            .find(|m| m.subject.contains("邮件 B"))
+            .unwrap()
+            .id;
+        let inbox_id = session.bootstrap().folders[0].id;
+
+        // Lock check: all new commands reject when locked.
+        session.lock_app(Some("manual"));
+        assert_eq!(
+            session
+                .archive_message(&MessageActionInput {
+                    account_id: 1,
+                    message_id: msg_b_id
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .delete_message(&MessageActionInput {
+                    account_id: 1,
+                    message_id: msg_b_id
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .mark_message_spam(&MessageActionInput {
+                    account_id: 1,
+                    message_id: msg_b_id
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .move_message(&MoveMessageInput {
+                    account_id: 1,
+                    message_id: msg_b_id,
+                    target_folder_path: "Archive".to_string()
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .undo_message_move(&UndoMessageMoveInput {
+                    account_id: 1,
+                    message_id: msg_b_id,
+                    rfc_message_id: "<m11@example.com>".to_string(),
+                    current_folder_path: "Archive".to_string(),
+                    original_folder_path: "INBOX".to_string()
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .load_older_messages(&LoadOlderMessagesInput {
+                    view: MainViewDto::UnifiedInbox,
+                    limit: 50
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .allow_remote_images(&AllowRemoteImagesInput {
+                    account_id: 1,
+                    message_id: msg_b_id,
+                    trust_sender: false
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+
+        session.unlock_app(&UnlockAppInput {
+            passcode: "1234".to_string(),
+        });
+
+        let arch_out = session
+            .archive_message(&MessageActionInput {
+                account_id: 1,
+                message_id: msg_b_id,
+            })
+            .expect("live archive");
+        assert_eq!(arch_out.original_folder_path, "INBOX");
+        assert_eq!(arch_out.target_folder_path, "Archive");
+        assert_eq!(arch_out.rfc_message_id, "<m11@example.com>");
+
+        let del_out = session
+            .delete_message(&MessageActionInput {
+                account_id: 1,
+                message_id: msg_b_id,
+            })
+            .expect("live delete");
+        assert_eq!(del_out.target_folder_path, "Trash");
+
+        let spam_out = session
+            .mark_message_spam(&MessageActionInput {
+                account_id: 1,
+                message_id: msg_b_id,
+            })
+            .expect("live spam");
+        assert_eq!(spam_out.target_folder_path, "Junk");
+
+        let move_out = session
+            .move_message(&MoveMessageInput {
+                account_id: 1,
+                message_id: msg_b_id,
+                target_folder_path: "Custom/Work".to_string(),
+            })
+            .expect("live move");
+        assert_eq!(move_out.target_folder_path, "Custom/Work");
+
+        let undo_out = session
+            .undo_message_move(&UndoMessageMoveInput {
+                account_id: 1,
+                message_id: msg_b_id,
+                rfc_message_id: "<m11@example.com>".to_string(),
+                current_folder_path: "Archive".to_string(),
+                original_folder_path: "INBOX".to_string(),
+            })
+            .expect("live undo");
+        assert!(undo_out.accepted);
+
+        let older_unified = session
+            .load_older_messages(&LoadOlderMessagesInput {
+                view: MainViewDto::UnifiedInbox,
+                limit: 50,
+            })
+            .expect("load older unified");
+        assert!(older_unified.accepted);
+        assert!(older_unified.has_more_remote);
+
+        let older_folder = session
+            .load_older_messages(&LoadOlderMessagesInput {
+                view: MainViewDto::AccountFolder {
+                    account_id: 1,
+                    folder_id: inbox_id,
+                },
+                limit: 30,
+            })
+            .expect("load older folder");
+        assert!(older_folder.accepted);
+
+        {
+            let reqs = worker.requests.lock().unwrap();
+            assert!(reqs
+                .iter()
+                .any(|r| matches!(r, MailRequest::ArchiveMessage { message_id, .. } if *message_id == msg_b_id)));
+            assert!(reqs
+                .iter()
+                .any(|r| matches!(r, MailRequest::DeleteMessage { message_id, .. } if *message_id == msg_b_id)));
+            assert!(reqs.iter().any(
+                |r| matches!(r, MailRequest::MarkSpam { message_id, .. } if *message_id == msg_b_id)
+            ));
+            assert!(reqs.iter().any(|r| matches!(
+                r,
+                MailRequest::MoveMessage { message_id, target_folder_path, .. }
+                if *message_id == msg_b_id && target_folder_path == "Custom/Work"
+            )));
+            assert!(reqs.iter().any(|r| matches!(
+                r,
+                MailRequest::UndoMessageMove { current_folder_path, original_folder_path, .. }
+                if current_folder_path == "Archive" && original_folder_path == "INBOX"
+            )));
+            assert!(reqs.iter().any(|r| matches!(
+                r,
+                MailRequest::LoadOlderMessages {
+                    folder_id: 0,
+                    limit: 50
+                }
+            )));
+            assert!(reqs.iter().any(|r| matches!(
+                r,
+                MailRequest::LoadOlderMessages {
+                    folder_id,
+                    limit: 30
+                } if *folder_id == inbox_id
+            )));
+        }
+
+        session.process_worker_events(vec![
+            WorkerEvent::OlderMessagesLoaded {
+                folder_id: 0,
+                fetched_count: 10,
+                has_more_remote: false,
+            },
+            WorkerEvent::MessageArchived {
+                account_id: 1,
+                message_id: msg_b_id,
+                dest_folder_path: "Archive".to_string(),
+                rfc_message_id: "<m11@example.com>".to_string(),
+            },
+            WorkerEvent::MessageDeleted {
+                account_id: 1,
+                message_id: msg_b_id,
+                dest_folder_path: "Trash".to_string(),
+                rfc_message_id: "<m11@example.com>".to_string(),
+            },
+            WorkerEvent::MessageMoved {
+                account_id: 1,
+                message_id: msg_b_id,
+                target_folder_path: "Custom/Work".to_string(),
+                rfc_message_id: "<m11@example.com>".to_string(),
+            },
+            WorkerEvent::MessageMarkedSpam {
+                account_id: 1,
+                message_id: msg_b_id,
+                dest_folder_path: "Junk".to_string(),
+                rfc_message_id: "<m11@example.com>".to_string(),
+            },
+        ]);
+
+        let boot_after = session.bootstrap();
+        assert!(!boot_after.folders[0].has_more_remote);
+        let reasons: Vec<String> = emitter
+            .mail_changed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.reason.clone())
+            .collect();
+        assert!(reasons.contains(&"olderMessagesLoaded".to_string()));
+        assert!(reasons.contains(&"messageArchived".to_string()));
+        assert!(reasons.contains(&"messageDeleted".to_string()));
+        assert!(reasons.contains(&"messageMoved".to_string()));
+        assert!(reasons.contains(&"messageMarkedSpam".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_auto_sync_respects_interval_lock_and_quit_signal() {
+        let (session, _, _, worker, dir) = make_live_test_session(true, Some("1234"));
+        let start = *session.last_auto_sync_at.lock().unwrap();
+
+        // Not elapsed yet -> no sync.
+        assert!(!session.try_auto_sync_at(start + Duration::from_secs(60)));
+
+        // Elapsed past default 5 minutes -> dispatches SyncAllAccounts { user_initiated: false }.
+        assert!(session.try_auto_sync_at(start + Duration::from_secs(301)));
+        assert_eq!(
+            worker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(
+                    r,
+                    MailRequest::SyncAllAccounts {
+                        user_initiated: false
+                    }
+                ))
+                .count(),
+            1
+        );
+
+        // auto_sync_minutes == 0 -> disabled.
+        session
+            .prefs
+            .mutate_and_save(|p| {
+                p.auto_sync_minutes = 0;
+                true
+            })
+            .unwrap();
+        assert!(!session.try_auto_sync_at(start + Duration::from_secs(900)));
+
+        // Re-enable to 1 minute, but lock app -> no sync while locked.
+        session
+            .prefs
+            .mutate_and_save(|p| {
+                p.auto_sync_minutes = 1;
+                true
+            })
+            .unwrap();
+        session.lock_app(Some("manual"));
+        assert!(!session.try_auto_sync_at(start + Duration::from_secs(1_000)));
+
+        // prepare_quit wakes quit signal and stops auto-sync.
+        session.unlock_app(&UnlockAppInput {
+            passcode: "1234".to_string(),
+        });
+        session.prepare_quit();
+        assert!(*session.auto_sync_signal.0.lock().unwrap());
+        assert!(!session.try_auto_sync_at(start + Duration::from_secs(1_200)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

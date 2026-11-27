@@ -512,6 +512,12 @@ pub struct OpenMessageOutput {
     pub flagged: bool,
     pub attachments: Vec<AttachmentMetaDto>,
     pub thread_messages: Vec<ThreadMessageDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_images_blocked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rfc_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -628,6 +634,80 @@ pub struct SetMessageFlaggedOutput {
     pub account_id: u32,
     pub message_id: u32,
     pub flagged: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllowRemoteImagesInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub trust_sender: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllowRemoteImagesOutput {
+    pub allowed: bool,
+    pub sender_trusted: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadOlderMessagesInput {
+    pub view: MainViewDto,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadOlderMessagesOutput {
+    pub accepted: bool,
+    pub has_more_remote: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageActionInput {
+    pub account_id: u32,
+    pub message_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveMessageInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub target_folder_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageMoveOutput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub rfc_message_id: String,
+    pub original_folder_path: String,
+    pub target_folder_path: String,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoMessageMoveInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub rfc_message_id: String,
+    pub current_folder_path: String,
+    pub original_folder_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoMessageMoveOutput {
+    pub accepted: bool,
     pub state_version: u64,
 }
 
@@ -851,5 +931,124 @@ mod tests {
         assert_eq!(lock_val["locked"], true);
         assert_eq!(lock_val["hasPasscode"], true);
         assert_eq!(lock_val["lockedReason"], "idle");
+    }
+
+    #[test]
+    fn wave1_seven_new_command_dtos_match_frozen_contract() {
+        let allow_in: AllowRemoteImagesInput = serde_json::from_value(json!({
+            "accountId": 1,
+            "messageId": 42,
+            "trustSender": true
+        }))
+        .expect("AllowRemoteImagesInput");
+        assert!(allow_in.trust_sender);
+
+        let allow_out = serde_json::to_value(AllowRemoteImagesOutput {
+            allowed: true,
+            sender_trusted: true,
+            state_version: 9,
+        })
+        .expect("AllowRemoteImagesOutput");
+        assert_eq!(
+            allow_out,
+            json!({ "allowed": true, "senderTrusted": true, "stateVersion": 9 })
+        );
+
+        let older_in: LoadOlderMessagesInput = serde_json::from_value(json!({
+            "view": { "kind": "accountFolder", "accountId": 1, "folderId": 3 },
+            "limit": 50
+        }))
+        .expect("LoadOlderMessagesInput");
+        assert_eq!(older_in.limit, 50);
+
+        let older_out = serde_json::to_value(LoadOlderMessagesOutput {
+            accepted: true,
+            has_more_remote: true,
+            state_version: 10,
+        })
+        .expect("LoadOlderMessagesOutput");
+        assert_eq!(
+            older_out,
+            json!({ "accepted": true, "hasMoreRemote": true, "stateVersion": 10 })
+        );
+
+        let action_in: MessageActionInput = serde_json::from_value(json!({
+            "accountId": 1,
+            "messageId": 7
+        }))
+        .expect("MessageActionInput");
+        assert_eq!(action_in.message_id, 7);
+
+        let move_in: MoveMessageInput = serde_json::from_value(json!({
+            "accountId": 1,
+            "messageId": 7,
+            "targetFolderPath": "Archive"
+        }))
+        .expect("MoveMessageInput");
+        assert_eq!(move_in.target_folder_path, "Archive");
+
+        let move_out = serde_json::to_value(MessageMoveOutput {
+            account_id: 1,
+            message_id: 7,
+            rfc_message_id: "<m7@example.com>".to_string(),
+            original_folder_path: "INBOX".to_string(),
+            target_folder_path: "Archive".to_string(),
+            state_version: 11,
+        })
+        .expect("MessageMoveOutput");
+        assert_eq!(
+            move_out,
+            json!({
+                "accountId": 1,
+                "messageId": 7,
+                "rfcMessageId": "<m7@example.com>",
+                "originalFolderPath": "INBOX",
+                "targetFolderPath": "Archive",
+                "stateVersion": 11
+            })
+        );
+
+        let undo_in: UndoMessageMoveInput = serde_json::from_value(json!({
+            "accountId": 1,
+            "messageId": 7,
+            "rfcMessageId": "<m7@example.com>",
+            "currentFolderPath": "Archive",
+            "originalFolderPath": "INBOX"
+        }))
+        .expect("UndoMessageMoveInput");
+        assert_eq!(undo_in.original_folder_path, "INBOX");
+
+        let undo_out = serde_json::to_value(UndoMessageMoveOutput {
+            accepted: true,
+            state_version: 12,
+        })
+        .expect("UndoMessageMoveOutput");
+        assert_eq!(undo_out, json!({ "accepted": true, "stateVersion": 12 }));
+
+        let open_out = serde_json::to_value(OpenMessageOutput {
+            request_id: "r1".to_string(),
+            reader_session_id: "s1".to_string(),
+            account_id: 1,
+            message_id: 7,
+            subject: "Subj".to_string(),
+            sender: "a@b.com".to_string(),
+            recipients: "c@d.com".to_string(),
+            cc: String::new(),
+            date_display: "10:00".to_string(),
+            body_status: BodyStatusDto::Ready,
+            plain_text: "hi".to_string(),
+            has_html: true,
+            html_body: Some("<p>hi</p>".to_string()),
+            flagged: false,
+            attachments: Vec::new(),
+            thread_messages: Vec::new(),
+            remote_images_blocked: Some(true),
+            rfc_message_id: Some("<m7@example.com>".to_string()),
+            folder_path: Some("INBOX".to_string()),
+        })
+        .expect("OpenMessageOutput");
+        assert_eq!(open_out["remoteImagesBlocked"], true);
+        assert_eq!(open_out["rfcMessageId"], "<m7@example.com>");
+        assert_eq!(open_out["folderPath"], "INBOX");
     }
 }

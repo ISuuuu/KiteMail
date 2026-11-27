@@ -17,6 +17,13 @@
     "allow-lock-app",
     "allow-set-message-seen",
     "allow-set-message-flagged",
+    "allow-allow-remote-images",
+    "allow-load-older-messages",
+    "allow-archive-message",
+    "allow-delete-message",
+    "allow-mark-message-spam",
+    "allow-move-message",
+    "allow-undo-message-move",
     "allow-quit-app"
   ]
 }
