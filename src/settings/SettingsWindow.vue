@@ -103,6 +103,9 @@
             @goto-privacy="selectTab('privacy')"
           />
           <PgpKeysPage v-else-if="activeTab.id === 'openPgp'" />
+          <CloudStoragePage v-else-if="activeTab.id === 'cloudStorage'" />
+          <TranslationPage v-else-if="activeTab.id === 'translation'" />
+          <ContactsSourcesPage v-else-if="activeTab.id === 'contactsSources'" />
           <AppearancePage v-else-if="activeTab.id === 'appearance'" :state="state" />
           <FocusPage v-else-if="activeTab.id === 'focusMode'" :state="state" />
           <SidebarPage v-else-if="activeTab.id === 'sidebar'" :state="state" />
@@ -139,7 +142,9 @@ import { usePreferences } from "../preferences/usePreferences";
 import AccountsPage from "./AccountsPage.vue";
 import AppearancePage from "./AppearancePage.vue";
 import BackupPage from "./BackupPage.vue";
+import CloudStoragePage from "./CloudStoragePage.vue";
 import ComposingPage from "./ComposingPage.vue";
+import ContactsSourcesPage from "./ContactsSourcesPage.vue";
 import ConversationsPage from "./ConversationsPage.vue";
 import DateTimePage from "./DateTimePage.vue";
 import FilterPage from "./FilterPage.vue";
@@ -156,6 +161,7 @@ import PlaceholderPage from "./PlaceholderPage.vue";
 import SendersPage from "./SendersPage.vue";
 import SmartFolderPage from "./SmartFolderPage.vue";
 import TagPage from "./TagPage.vue";
+import TranslationPage from "./TranslationPage.vue";
 import SettingsIcon from "./SettingsIcon.vue";
 import WindowControls from "./WindowControls.vue";
 import {

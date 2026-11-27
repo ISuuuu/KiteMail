@@ -37,8 +37,10 @@ import {
   registerPgpKey,
   removeFromBlocklist,
   saveTag,
+  serviceEntrySubtitle,
   smartFolderSubtitle,
   tagShortcutLabel,
+  cloudThresholdLabel,
   type FilterRuleItem,
 } from "../src/settings/extraTabsLogic.ts";
 
@@ -541,4 +543,14 @@ test("registerPgpKey 邮箱必填、指纹自动生成与标题说明", () => {
   assert.equal(pgpKeyTitle(ok.keys[0]), "张三 <zhang@corp.com>");
   assert.equal(pgpKeyTitle({ name: "", email: "a@b.com" }), "a@b.com");
   assert.equal(pgpKeySubtitle({ fingerprint: "ABC", hasSecret: false }), "指纹: ABC · 仅公钥");
+});
+
+test("cloudThresholdLabel 与 serviceEntrySubtitle 对齐 GPUI 行说明", () => {
+  assert.equal(cloudThresholdLabel(25), "超过 25 MB（推荐）");
+  assert.equal(cloudThresholdLabel(0), "关闭自动上传");
+  assert.equal(cloudThresholdLabel(99), "超过 25 MB（推荐）");
+  assert.equal(
+    serviceEntrySubtitle("Nextcloud", "https://cloud.example.com", "alice"),
+    "Nextcloud · https://cloud.example.com (alice)"
+  );
 });
