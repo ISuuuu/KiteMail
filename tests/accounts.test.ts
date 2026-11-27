@@ -8,6 +8,13 @@ import {
   resetMockAccounts,
 } from "../src/accounts/ipc.ts";
 import {
+  ACCOUNT_ACCENT_COLORS,
+  accountAccentHex,
+  brandForAccountFields,
+  senderInitials,
+} from "../src/accounts/brand.ts";
+import { buildSignaturePreviewHtml } from "../src/accounts/signature.ts";
+import {
   buildSaveAccountInput,
   createEmptyAccountForm,
   extractEmailDomain,
@@ -279,4 +286,54 @@ test("编辑已有账号留空密码保留原凭据，以及 LOCKED 状态触发
 
   mgr.dispose();
   resetMockAccounts();
+});
+
+test("brandForAccountFields 按主机/域名/认证方式匹配品牌图标", () => {
+  const oauth = brandForAccountFields("microsoftGraphOAuth2", "", 993, "user@anywhere.org");
+  assert.equal(oauth, "outlook");
+
+  assert.equal(brandForAccountFields("password", "imap.qq.com", 993, "a@corp.cn"), "qq");
+  assert.equal(brandForAccountFields("password", "mail.corp.internal", 993, "a@foxmail.com"), "qq");
+  assert.equal(brandForAccountFields("password", "imap.163.com", 993, ""), "netease163");
+  assert.equal(brandForAccountFields("password", "imap.qiye.aliyun.com", 993, ""), "aliyun_qiye");
+  assert.equal(brandForAccountFields("password", "outlook.office365.com", 993, ""), "outlook");
+  assert.equal(brandForAccountFields("password", "mail.corp.internal", 993, "u@hotmail.com"), "outlook");
+  assert.equal(brandForAccountFields("password", "imap.gmail.com", 993, ""), "gmail");
+  assert.equal(brandForAccountFields("password", "imap.mail.me.com", 993, ""), "icloud");
+  assert.equal(brandForAccountFields("password", "127.0.0.1", 1143, "u@bridge.local"), "proton");
+  assert.equal(brandForAccountFields("password", "mail.corp.internal", 993, "u@corp.internal"), null);
+});
+
+test("senderInitials 中文取 1 字、英文取首末词首字母，与 GPUI 规则一致", () => {
+  assert.equal(senderInitials("张三"), "张");
+  assert.equal(senderInitials("Marcus Chen"), "MC");
+  assert.equal(senderInitials("alice <alice@example.com>"), "A");
+  assert.equal(senderInitials("单字"), "单");
+  assert.equal(senderInitials("   "), "?");
+});
+
+test("accountAccentHex 自定义色优先，否则按邮箱 FNV-1a 稳定取色", () => {
+  assert.equal(accountAccentHex("a@qq.com", "#337FDC"), "#337fdc");
+  const stable = accountAccentHex("stable@example.com");
+  assert.equal(accountAccentHex("stable@example.com"), stable);
+  assert.ok(ACCOUNT_ACCENT_COLORS.some(([hex]) => hex === stable));
+  assert.equal(
+    accountAccentHex("stable@example.com", "not-a-color"),
+    stable
+  );
+});
+
+test("签名预览：纯文本转义换行，HTML 清洗脚本与事件属性，纯文本模式不预览", () => {
+  assert.equal(buildSignaturePreviewHtml("Ada & Co\nCEO", true), "Ada &amp; Co<br>CEO");
+
+  const sanitized = buildSignaturePreviewHtml(
+    `<p onclick="x()">Ada</p><script>alert(1)</script>`,
+    true
+  );
+  assert.ok(sanitized.includes("Ada"), sanitized);
+  assert.ok(!sanitized.includes("script"), sanitized);
+  assert.ok(!sanitized.includes("onclick"), sanitized);
+
+  assert.equal(buildSignaturePreviewHtml("<p>x</p>", false), "");
+  assert.equal(buildSignaturePreviewHtml("  ", true), "");
 });

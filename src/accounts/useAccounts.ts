@@ -276,6 +276,9 @@ export interface UseAccountsOptions {
   onOAuthAuthorized?: (account: AccountConfigDto | null, event: AccountEvent) => void;
 }
 
+/** useAccounts 返回的共享状态类型，供账号域组件 props 使用。 */
+export type AccountsStore = ReturnType<typeof useAccounts>;
+
 export function useAccounts(options: UseAccountsOptions = {}) {
   const accounts = ref<AccountConfigDto[]>([]);
   const presets = ref<ProviderPresetDto[]>([...BUILTIN_PROVIDER_PRESETS]);
