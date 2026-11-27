@@ -206,3 +206,69 @@ pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
 在当前仓库实施 **A 和 B**。先读 `crates/app/src/main.rs`、`app.rs` 的启动与事件处理、`webview_host.rs`、`reader_thread_doc.rs`、`crates/mail-core/src/demo.rs`。先搭独立 Tauri 入口并验证阅读器，再按第 3 节抽取共享代码和 Vue 主窗口组件。保留 GPUI 调用入口，用 `--demo` 交付可运行的三栏预览。
 
 首批完成条件是 **选文件夹 → 分页或搜索 → 打开邮件** 全链路可运行，窗口布局和主题可切换，Windows 阅读器挂载路径有实测结论，原 Rust 工作区和 Tauri 构建都有检查记录。真实账号接入从 C 开始。
+
+## 9. 当前迁移进展与 Wave 1 增量契约
+
+### 9.1 里程碑落地状态与目录调整
+
+截至本轮更新，主窗口迁移的 **里程碑 A、B、C 已落地**，正式发布入口仍保持为 GPUI（`.github/workflows/windows.yml` 维持不变），待里程碑 D 全量窗口迁完后统一切换。
+
+- **目录结构调整**：前端与 Tauri 宿主已从原规划的 `apps/desktop/` 直接收口到仓库根目录，采用 `pnpm` 管理依赖与构建：
+  - 根目录：`package.json`、`pnpm-lock.yaml`、`vite.config.ts`、`src/`（Vue 3 主窗口与 IPC 层）、`tests/`（前端单元测试）
+  - 独立 Rust 工作区：`src-tauri/`（Tauri 2 宿主与平台生命周期），产物为 `kitemail-tauri-preview.exe`
+  - 共享 Rust 核心：`crates/mail-core/`、`crates/windows-mail-reader/`（位于根 Cargo 工作区）
+- **已完成核心能力**：
+  - **里程碑 A**：独立 Tauri 2 窗口、`kitemail-windows-mail-reader` 提取与同窗 WebView2 HWND 挂载验证。
+  - **里程碑 B**：`--demo` 模式 10,000 封示例收件箱、三栏分栏、主题切换、虚拟列表分页与搜索。
+  - **里程碑 C**：`Live` 模式双层目录隔离校验、只读缓存首屏、后台 `MailWorkerHandle` 单次回复分页查询（`MailWorkerSender::query_page`）、正文在途去重与超时重试、自动已读规则、PBKDF2 应用锁与冷却退避、系统托盘、单实例互斥量与空闲锁定。
+  - **三态主题偏好对齐**：`MainPreferencesDto.darkMode` 为 `boolean | null`（`null` 表示跟随系统，前端按 `prefers-color-scheme` 渲染且不覆写 `null`）。
+
+### 9.2 里程碑 C 与 Wave 1 新增 IPC 契约
+
+在原第 4 节首批 6 个命令之外，主窗口已按阶段补充注册以下冻结 IPC 命令（所有带参命令均通过 `{ input }` 包装，结构体字段统一 `camelCase`，锁定时敏感命令统一返回 `IpcError.code = "LOCKED"`）：
+
+| 阶段 | 命令 | 输入与输出 | 说明 |
+| --- | --- | --- | --- |
+| C | `unlock_app` | `{ passcode }` → `{ unlocked, locked, error?, retryAfterSecs? }` | PBKDF2 解锁校验与冷却退避 |
+| C | `lock_app` | 无参 → `{ locked }` | 手动锁屏并隐藏/销毁原生阅读器 |
+| C | `set_message_seen` | `{ accountId, messageId, seen }` → `{ accountId, messageId, unread, stateVersion }` | 标记单封邮件已读/未读 |
+| C | `set_message_flagged` | `{ accountId, messageId, flagged }` → `{ accountId, messageId, flagged, stateVersion }` | 切换星标状态 |
+| C | `quit_app` | 无参 → `void` | 托盘或菜单显式退出 |
+| Wave 1 | `allow_remote_images` | `{ accountId, messageId, trustSender }` → `{ allowed, senderTrusted, stateVersion }` | 本次放行远程图片；`trustSender` 为 `true` 时持久化发件人到 `allowed_remote_senders` 并重载阅读器 |
+| Wave 1 | `load_older_messages` | `{ view, limit }` → `{ accepted, hasMoreRemote, stateVersion }` | 触发当前文件夹远端历史邮件回填，更新 `hasMoreRemote` 并推送 `main://mail-changed` |
+| Wave 1 | `archive_message` | `{ accountId, messageId }` → `{ accountId, messageId, rfcMessageId, originalFolderPath, targetFolderPath, stateVersion }` | 归档邮件并返回撤销所需元数据 |
+| Wave 1 | `delete_message` | `{ accountId, messageId }` → `{ accountId, messageId, rfcMessageId, originalFolderPath, targetFolderPath, stateVersion }` | 删除邮件（移入已删除/废纸篓） |
+| Wave 1 | `mark_message_spam` | `{ accountId, messageId }` → `{ accountId, messageId, rfcMessageId, originalFolderPath, targetFolderPath, stateVersion }` | 标记为垃圾邮件 |
+| Wave 1 | `move_message` | `{ accountId, messageId, targetFolderPath }` → `{ accountId, messageId, rfcMessageId, originalFolderPath, targetFolderPath, stateVersion }` | 移动邮件到指定目标文件夹 |
+| Wave 1 | `undo_message_move` | `{ accountId, messageId, rfcMessageId, currentFolderPath, originalFolderPath }` → `{ accepted, stateVersion }` | 撤销最近一次归档/删除/标垃圾/移动操作 |
+
+补充字段说明：
+- `OpenMessageOutput` 新增可选字段 `remoteImagesBlocked?: boolean`、`rfcMessageId?: string`、`folderPath?: string`，用于驱动阅读区远程图片隐私提示条与撤销操作上下文。
+- 多封会话正文在后端调用 `kitemail_windows_mail_reader::build_thread_document` 渲染，并通过 `ReaderEvent::ThreadAction` 转发折叠展开、远程图放行、星标与已读动作。
+
+### 9.3 开发脚本、同机基准与 Windows CI 用法
+
+1. **多 Worktree 动态端口开发脚本（`scripts/dev-tauri.mjs`）**
+   - 用途：避免多 worktree 并行开发时默认开发端口冲突，自动在 `127.0.0.1` 探测空闲回环端口并注入 `KITEMAIL_DEV_PORT` 与 Tauri `--config '{"build":{"devUrl":"http://127.0.0.1:<port>"}}'`，端口被抢占时自动切换端口重试。
+   - 常用命令：
+     ```powershell
+     pnpm dev:wt --demo
+     pnpm dev:wt --port 1432 --demo
+     pnpm dev:wt --max-retries 8
+     ```
+2. **同机 `--demo` 性能对比脚本（`scripts/benchmark-demo.ps1`）**
+   - 用途：落实第 7 节 B.2 要求，使用临时隔离数据目录分别以 `--demo` 启动 GPUI（默认 `target/x86_64-pc-windows-msvc/release/kitemail.exe`）与 Tauri+Vue（默认 `src-tauri/target/x86_64-pc-windows-msvc/release/kitemail-tauri-preview.exe`），等待主窗口句柄就绪（`MainWindowHandle -ne 0`）后测量冷启动耗时，并在 `-SampleSeconds` 秒内采样主进程及子进程树（含 WebView2）的工作集与私有内存，最后优雅关闭并输出 Markdown 对比表与 JSON 结果；任一可执行文件缺失时会给出提示与构建命令而不崩溃。
+   - 常用命令：
+     ```powershell
+     pwsh -File .\scripts\benchmark-demo.ps1
+     pwsh -File .\scripts\benchmark-demo.ps1 -SampleSeconds 8 -JsonOutPath .\temp\bench-demo.json
+     pwsh -File .\scripts\benchmark-demo.ps1 -GpuiExe .\path\to\kitemail.exe -TauriExe .\path\to\kitemail-tauri-preview.exe
+     ```
+3. **Tauri + Vue Windows CI 工作流（`.github/workflows/tauri-windows.yml`）**
+   - 与 GPUI 工作流（`.github/workflows/windows.yml`）并行存在、互不修改。
+   - 在 `push`（`main`）、`pull_request`（命中 `src/**`、`src-tauri/**`、`crates/mail-core/**`、`crates/windows-mail-reader/**`、`package.json`、`pnpm-lock.yaml`、`vite.config.ts`、`.github/workflows/tauri-windows.yml`）以及 `workflow_dispatch` 时于 `windows-latest` 执行：
+     - `pnpm install --frozen-lockfile` → `pnpm build` → `pnpm test`
+     - `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
+     - `cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked`
+     - `cargo check --workspace --target x86_64-pc-windows-msvc --locked`
+     - `pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle`
