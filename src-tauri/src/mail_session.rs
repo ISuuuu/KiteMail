@@ -24,23 +24,26 @@ use kitemail_mail_core::imap_client::strip_remote_images_for_webview;
 use kitemail_mail_core::search_query::SearchQuery;
 use kitemail_mail_core::worker::{MailWorkerHandle, MailWorkerSender, PageQueryRequest};
 use kitemail_mail_core::{
-    secrets, start_of_today_ts, MailPage, MailRequest, MessageDetail, MessageFilter, MessageSort,
-    MessageSummary, QuickFilterSet, UnifiedView, WorkerEvent,
+    secrets, start_of_today_ts, LocalDraft, MailPage, MailRequest, MessageDetail, MessageFilter,
+    MessageSort, MessageSummary, OutboxItem, QuickFilterSet, UndoOutboxOutcome, UnifiedView,
+    WorkerEvent,
 };
 use kitemail_windows_mail_reader::WebViewAction;
 use tauri::Emitter;
 
 use crate::dto::{
-    AccountSummaryDto, AllowRemoteImagesInput, AllowRemoteImagesOutput, AppMode, AttachmentMetaDto,
-    BodyStatusDto, FolderSummaryDto, IpcError, ListMessagesInput, ListMessagesOutput,
-    LoadOlderMessagesInput, LoadOlderMessagesOutput, LockAppOutput, LockStateEvent,
-    MailChangedEvent, MainBootstrapDto, MainViewDto, MessageActionInput, MessageFilterDto,
-    MessageMoveOutput, MessageSummaryDto, MoveMessageInput, OpenMessageInput, OpenMessageOutput,
-    ReaderPositionDto, ReaderStatusEvent, RefreshMailInput, RefreshMailOutput, SearchScopeDto,
-    SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput, SetMessageSeenOutput,
-    SyncStatusDto, SyncStatusEvent, ThreadMessageDto, UndoMessageMoveInput, UndoMessageMoveOutput,
-    UnlockAppInput, UnlockAppOutput, EVENT_LOCK_STATE, EVENT_MAIL_CHANGED, EVENT_SYNC_STATUS,
-    MAIN_WINDOW_LABEL,
+    AccountEvent, AccountEventKindDto, AccountSummaryDto, AllowRemoteImagesInput,
+    AllowRemoteImagesOutput, AppMode, AttachmentMetaDto, BodyStatusDto, DraftSavedEvent,
+    FolderSummaryDto, IpcError, ListMessagesInput, ListMessagesOutput, LoadOlderMessagesInput,
+    LoadOlderMessagesOutput, LockAppOutput, LockStateEvent, MailChangedEvent, MainBootstrapDto,
+    MainViewDto, MessageActionInput, MessageFilterDto, MessageMoveOutput, MessageSummaryDto,
+    MoveMessageInput, OpenMessageInput, OpenMessageOutput, OutboxEventKindDto, OutboxItemDto,
+    OutboxUpdatedEvent, ReaderPositionDto, ReaderStatusEvent, RefreshMailInput, RefreshMailOutput,
+    SearchScopeDto, SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput,
+    SetMessageSeenOutput, SyncStatusDto, SyncStatusEvent, ThreadMessageDto, UndoMessageMoveInput,
+    UndoMessageMoveOutput, UnlockAppInput, UnlockAppOutput, VerifyAccountOutput,
+    EVENT_ACCOUNT_EVENT, EVENT_DRAFT_SAVED, EVENT_LOCK_STATE, EVENT_MAIL_CHANGED,
+    EVENT_OUTBOX_UPDATED, EVENT_SYNC_STATUS, MAIN_WINDOW_LABEL,
 };
 use crate::preferences::{view_from_last_str, PreferencesStore};
 use crate::reader::{
@@ -61,6 +64,9 @@ pub trait MainEventEmitter: Send + Sync {
     fn emit_mail_changed(&self, event: MailChangedEvent);
     fn emit_sync_status(&self, event: SyncStatusEvent);
     fn emit_lock_state(&self, event: LockStateEvent);
+    fn emit_outbox_updated(&self, event: OutboxUpdatedEvent);
+    fn emit_draft_saved(&self, event: DraftSavedEvent);
+    fn emit_account_event(&self, event: AccountEvent);
 }
 
 pub struct TauriMainEventEmitter {
@@ -91,6 +97,24 @@ impl MainEventEmitter for TauriMainEventEmitter {
             .app_handle
             .emit_to(MAIN_WINDOW_LABEL, EVENT_LOCK_STATE, event);
     }
+
+    fn emit_outbox_updated(&self, event: OutboxUpdatedEvent) {
+        let _ = self
+            .app_handle
+            .emit_to(MAIN_WINDOW_LABEL, EVENT_OUTBOX_UPDATED, event);
+    }
+
+    fn emit_draft_saved(&self, event: DraftSavedEvent) {
+        let _ = self
+            .app_handle
+            .emit_to(MAIN_WINDOW_LABEL, EVENT_DRAFT_SAVED, event);
+    }
+
+    fn emit_account_event(&self, event: AccountEvent) {
+        let _ = self
+            .app_handle
+            .emit_to(MAIN_WINDOW_LABEL, EVENT_ACCOUNT_EVENT, event);
+    }
 }
 
 /// Abstraction over `MailWorkerHandle` so Live session logic can be tested deterministically.
@@ -99,6 +123,9 @@ pub trait LiveWorkerSink: Send + Sync {
     fn prepare_quit(&self);
     fn query_page(&self, _req: PageQueryRequest) -> Option<Result<MailPage, String>> {
         None
+    }
+    fn is_async_worker(&self) -> bool {
+        false
     }
 }
 
@@ -118,6 +145,10 @@ impl LiveWorkerSink for RealMailWorkerSink {
     fn query_page(&self, req: PageQueryRequest) -> Option<Result<MailPage, String>> {
         Some(self.sender.query_page(req))
     }
+
+    fn is_async_worker(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -128,23 +159,63 @@ impl MainEventEmitter for NullEventEmitter {
     fn emit_mail_changed(&self, _: MailChangedEvent) {}
     fn emit_sync_status(&self, _: SyncStatusEvent) {}
     fn emit_lock_state(&self, _: LockStateEvent) {}
+    fn emit_outbox_updated(&self, _: OutboxUpdatedEvent) {}
+    fn emit_draft_saved(&self, _: DraftSavedEvent) {}
+    fn emit_account_event(&self, _: AccountEvent) {}
 }
 
-struct DemoSessionState {
-    store: DemoStore,
-    accounts: Vec<AccountSummaryDto>,
-    base_folders: Vec<FolderSummaryDto>,
-    inbox: Vec<MessageSummary>,
-    sent: Vec<MessageSummary>,
-    drafts: Vec<MessageSummary>,
-    archive: Vec<MessageSummary>,
-    junk: Vec<MessageSummary>,
-    trash: Vec<MessageSummary>,
+pub(crate) struct DemoOutboxEntry {
+    pub(crate) item: OutboxItem,
+    pub(crate) undo_token: u64,
+}
+
+pub(crate) struct DemoSessionState {
+    pub(crate) store: DemoStore,
+    pub(crate) account_configs: Vec<AccountConfig>,
+    pub(crate) account_has_password: HashMap<u32, bool>,
+    pub(crate) next_account_id: u32,
+    pub(crate) accounts: Vec<AccountSummaryDto>,
+    pub(crate) base_folders: Vec<FolderSummaryDto>,
+    pub(crate) inbox: Vec<MessageSummary>,
+    pub(crate) sent: Vec<MessageSummary>,
+    pub(crate) drafts: Vec<MessageSummary>,
+    pub(crate) archive: Vec<MessageSummary>,
+    pub(crate) junk: Vec<MessageSummary>,
+    pub(crate) trash: Vec<MessageSummary>,
+    pub(crate) local_drafts: Vec<LocalDraft>,
+    pub(crate) next_local_draft_id: u32,
+    pub(crate) outbox: Vec<DemoOutboxEntry>,
+    pub(crate) next_outbox_id: u32,
+    pub(crate) next_undo_token: u64,
+    pub(crate) next_sent_msg_id: u32,
 }
 
 impl DemoSessionState {
     fn new() -> Self {
         let store = DemoStore::new();
+        let account_configs: Vec<AccountConfig> = store
+            .accounts
+            .iter()
+            .map(|a| AccountConfig {
+                id: a.id,
+                display_name: a.display_name.clone(),
+                email: a.email.clone(),
+                imap_host: "imap.hylki.example".to_string(),
+                imap_port: 993,
+                imap_username: a.email.clone(),
+                smtp_host: "smtp.hylki.example".to_string(),
+                smtp_port: 465,
+                smtp_username: a.email.clone(),
+                ..AccountConfig::default()
+            })
+            .collect();
+        let account_has_password = account_configs.iter().map(|a| (a.id, true)).collect();
+        let next_account_id = account_configs
+            .iter()
+            .map(|a| a.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let accounts = store.accounts.iter().map(AccountSummaryDto::from).collect();
         let mut base_folders: Vec<FolderSummaryDto> =
             store.folders.iter().map(FolderSummaryDto::from).collect();
@@ -176,6 +247,9 @@ impl DemoSessionState {
             .items;
         Self {
             store,
+            account_configs,
+            account_has_password,
+            next_account_id,
             accounts,
             base_folders,
             inbox,
@@ -184,7 +258,36 @@ impl DemoSessionState {
             archive,
             junk: Vec::new(),
             trash: Vec::new(),
+            local_drafts: Vec::new(),
+            next_local_draft_id: 1,
+            outbox: Vec::new(),
+            next_outbox_id: 1,
+            next_undo_token: 1,
+            next_sent_msg_id: 100_000,
         }
+    }
+
+    pub(crate) fn sync_account_summaries(&mut self) {
+        self.accounts = self
+            .account_configs
+            .iter()
+            .filter(|a| a.enabled)
+            .map(AccountSummaryDto::from)
+            .collect();
+    }
+
+    pub(crate) fn outbox_dtos(&self) -> Vec<OutboxItemDto> {
+        let mut items: Vec<OutboxItemDto> = self
+            .outbox
+            .iter()
+            .map(|e| OutboxItemDto::from(&e.item))
+            .collect();
+        items.sort_by(|a, b| {
+            let aid: u32 = a.id.parse().unwrap_or(0);
+            let bid: u32 = b.id.parse().unwrap_or(0);
+            bid.cmp(&aid)
+        });
+        items
     }
 
     fn folders(&self) -> Vec<FolderSummaryDto> {
@@ -550,14 +653,30 @@ struct InFlightBodyEntry {
     reader_enabled: bool,
 }
 
-struct LiveSessionState {
-    data_dir: PathBuf,
-    worker: Option<Arc<dyn LiveWorkerSink>>,
-    account_configs: Vec<AccountConfig>,
-    accounts: Vec<AccountSummaryDto>,
-    folders_by_account: HashMap<u32, Vec<FolderSummaryDto>>,
-    cache_ready: bool,
-    syncing_accounts: HashSet<u32>,
+#[derive(Default)]
+pub(crate) struct LiveWaiters {
+    pub(crate) draft_saved: VecDeque<mpsc::Sender<Result<u32, String>>>,
+    pub(crate) send_enqueued: HashMap<u64, mpsc::Sender<Result<(u32, Option<i64>, bool), String>>>,
+    pub(crate) undo_result: HashMap<u64, mpsc::Sender<Result<UndoOutboxOutcome, String>>>,
+    pub(crate) verify_account: VecDeque<mpsc::Sender<VerifyAccountOutput>>,
+    pub(crate) save_account: HashMap<u32, mpsc::Sender<Result<AccountConfig, String>>>,
+    pub(crate) delete_account: HashMap<u32, mpsc::Sender<()>>,
+    pub(crate) set_account_enabled: VecDeque<mpsc::Sender<()>>,
+}
+
+pub(crate) struct LiveSessionState {
+    pub(crate) data_dir: PathBuf,
+    pub(crate) worker: Option<Arc<dyn LiveWorkerSink>>,
+    pub(crate) account_configs: Vec<AccountConfig>,
+    pub(crate) accounts: Vec<AccountSummaryDto>,
+    pub(crate) folders_by_account: HashMap<u32, Vec<FolderSummaryDto>>,
+    pub(crate) drafts_cache: Vec<LocalDraft>,
+    pub(crate) outbox_cache: HashMap<u32, Vec<OutboxItem>>,
+    pub(crate) known_has_password: HashMap<u32, bool>,
+    pub(crate) next_undo_token: u64,
+    pub(crate) waiters: LiveWaiters,
+    pub(crate) cache_ready: bool,
+    pub(crate) syncing_accounts: HashSet<u32>,
     in_flight_bodies: HashMap<(u32, u32), InFlightBodyEntry>,
     in_flight_gen: u64,
     body_cache: HashMap<(u32, u32), MessageDetail>,
@@ -567,13 +686,18 @@ struct LiveSessionState {
 }
 
 impl LiveSessionState {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             data_dir: PathBuf::new(),
             worker: None,
             account_configs: Vec::new(),
             accounts: Vec::new(),
             folders_by_account: HashMap::new(),
+            drafts_cache: Vec::new(),
+            outbox_cache: HashMap::new(),
+            known_has_password: HashMap::new(),
+            next_undo_token: 1,
+            waiters: LiveWaiters::default(),
             cache_ready: false,
             syncing_accounts: HashSet::new(),
             in_flight_bodies: HashMap::new(),
@@ -582,6 +706,32 @@ impl LiveSessionState {
             body_cache_order: VecDeque::new(),
             active_reader_target: None,
             pending_mark_thread_seen: None,
+        }
+    }
+
+    pub(crate) fn combined_outbox_dtos(&self) -> Vec<OutboxItemDto> {
+        let mut items: Vec<&OutboxItem> = self.outbox_cache.values().flatten().collect();
+        items.sort_by(|a, b| b.id.cmp(&a.id));
+        items.into_iter().map(OutboxItemDto::from).collect()
+    }
+
+    pub(crate) fn refresh_account_outbox_from_db(&mut self, account_id: u32) {
+        if config::global_db_in(&self.data_dir).exists() {
+            if let Ok(cache) = CacheStore::open_for_data_dir_read_only(&self.data_dir) {
+                if let Ok(items) = cache.list_outbox(account_id) {
+                    self.outbox_cache.insert(account_id, items);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn refresh_drafts_from_db(&mut self) {
+        if config::global_db_in(&self.data_dir).exists() {
+            if let Ok(cache) = CacheStore::open_for_data_dir_read_only(&self.data_dir) {
+                if let Ok(drafts) = cache.list_drafts() {
+                    self.drafts_cache = drafts;
+                }
+            }
         }
     }
 
@@ -967,9 +1117,9 @@ fn build_open_message_output(
 }
 
 pub struct MailSession {
-    mode: AppMode,
+    pub(crate) mode: AppMode,
     locked: AtomicBool,
-    quitting: AtomicBool,
+    pub(crate) quitting: AtomicBool,
     state_version: AtomicU64,
     read_mark_gen: AtomicU64,
     active_selected_msg: Mutex<Option<(u32, u32)>>,
@@ -979,12 +1129,12 @@ pub struct MailSession {
     current_view: Mutex<MainViewDto>,
     sync_status: Mutex<SyncStatusDto>,
     lock_state: Mutex<AppLockState>,
-    demo: Mutex<DemoSessionState>,
-    live: Mutex<LiveSessionState>,
-    prefs: Arc<PreferencesStore>,
+    pub(crate) demo: Mutex<DemoSessionState>,
+    pub(crate) live: Mutex<LiveSessionState>,
+    pub(crate) prefs: Arc<PreferencesStore>,
     reader: Arc<ReaderManager>,
-    emitter: Arc<dyn MainEventEmitter>,
-    self_weak: Mutex<Weak<MailSession>>,
+    pub(crate) emitter: Arc<dyn MainEventEmitter>,
+    pub(crate) self_weak: Mutex<Weak<MailSession>>,
     tray: Mutex<Option<Arc<crate::tray::TrayHandle>>>,
     auto_sync_signal: Arc<(Mutex<bool>, Condvar)>,
     last_auto_sync_at: Mutex<Instant>,
@@ -1065,6 +1215,8 @@ impl MailSession {
         }
 
         let mut folders_by_account: HashMap<u32, Vec<FolderSummaryDto>> = HashMap::new();
+        let mut drafts_cache: Vec<LocalDraft> = Vec::new();
+        let mut outbox_cache: HashMap<u32, Vec<OutboxItem>> = HashMap::new();
         let cache_ready = if config::global_db_in(&data_dir).exists() {
             match CacheStore::open_for_data_dir_read_only(&data_dir) {
                 Ok(cache) => {
@@ -1075,6 +1227,12 @@ impl MailSession {
                                 folders.iter().map(FolderSummaryDto::from).collect(),
                             );
                         }
+                        if let Ok(items) = cache.list_outbox(acc.id) {
+                            outbox_cache.insert(acc.id, items);
+                        }
+                    }
+                    if let Ok(drafts) = cache.list_drafts() {
+                        drafts_cache = drafts;
                     }
                     true
                 }
@@ -1109,6 +1267,8 @@ impl MailSession {
         live_state.account_configs = accounts;
         live_state.accounts = account_dtos;
         live_state.folders_by_account = folders_by_account;
+        live_state.drafts_cache = drafts_cache;
+        live_state.outbox_cache = outbox_cache;
         live_state.cache_ready = cache_ready;
         live_state.syncing_accounts = enabled_ids;
 
@@ -1302,7 +1462,7 @@ impl MailSession {
         self.state_version.load(Ordering::SeqCst)
     }
 
-    fn bump_state_version(&self) -> u64 {
+    pub(crate) fn bump_state_version(&self) -> u64 {
         self.state_version.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -1323,7 +1483,7 @@ impl MailSession {
         }
     }
 
-    fn refresh_tray_tooltip(&self) {
+    pub(crate) fn refresh_tray_tooltip(&self) {
         if let Some(ref tray) = *self.tray.lock().expect("tray mutex poisoned") {
             tray.set_tooltip(crate::tray::format_tray_tooltip(self.total_unread_count()));
         }
@@ -2270,6 +2430,126 @@ impl MailSession {
     pub fn process_worker_events(&self, events: Vec<WorkerEvent>) {
         for evt in events {
             match evt {
+                WorkerEvent::AccountVerified { ok, message } => {
+                    {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if let Some(tx) = live.waiters.verify_account.pop_front() {
+                            let _ = tx.send(VerifyAccountOutput {
+                                ok,
+                                message: message.clone(),
+                            });
+                        }
+                    }
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_account_event(AccountEvent {
+                        state_version: ver,
+                        kind: AccountEventKindDto::Verified,
+                        ok,
+                        account_id: None,
+                        email: None,
+                        message,
+                    });
+                }
+                WorkerEvent::AccountSaved { account } => {
+                    let acc_id = account.id;
+                    let email = account.email.clone();
+                    {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if let Some(existing) =
+                            live.account_configs.iter_mut().find(|a| a.id == acc_id)
+                        {
+                            *existing = account.clone();
+                        } else {
+                            live.account_configs.push(account.clone());
+                        }
+                        live.accounts = live
+                            .account_configs
+                            .iter()
+                            .map(AccountSummaryDto::from)
+                            .collect();
+                        live.cache_ready = true;
+                        if let Some(tx) = live.waiters.save_account.remove(&acc_id) {
+                            let _ = tx.send(Ok(account));
+                        }
+                    }
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_account_event(AccountEvent {
+                        state_version: ver,
+                        kind: AccountEventKindDto::Saved,
+                        ok: true,
+                        account_id: Some(acc_id.to_string()),
+                        email: Some(email),
+                        message: "账号配置已保存".to_string(),
+                    });
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: ver,
+                        reason: "accountsUpdated".to_string(),
+                        account_id: Some(acc_id),
+                        folder_id: None,
+                        message_id: None,
+                    });
+                }
+                WorkerEvent::AccountDeleted { account_id } => {
+                    {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        live.account_configs.retain(|a| a.id != account_id);
+                        live.accounts = live
+                            .account_configs
+                            .iter()
+                            .map(AccountSummaryDto::from)
+                            .collect();
+                        live.folders_by_account.remove(&account_id);
+                        live.outbox_cache.remove(&account_id);
+                        live.known_has_password.remove(&account_id);
+                        if let Some(tx) = live.waiters.delete_account.remove(&account_id) {
+                            let _ = tx.send(());
+                        }
+                    }
+                    self.refresh_tray_tooltip();
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_account_event(AccountEvent {
+                        state_version: ver,
+                        kind: AccountEventKindDto::Deleted,
+                        ok: true,
+                        account_id: Some(account_id.to_string()),
+                        email: None,
+                        message: "账号已删除".to_string(),
+                    });
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: ver,
+                        reason: "accountsUpdated".to_string(),
+                        account_id: Some(account_id),
+                        folder_id: None,
+                        message_id: None,
+                    });
+                }
+                WorkerEvent::OAuthReauthorized { account_id, email } => {
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_account_event(AccountEvent {
+                        state_version: ver,
+                        kind: AccountEventKindDto::OauthReauthorized,
+                        ok: true,
+                        account_id: Some(account_id.to_string()),
+                        email: Some(email),
+                        message: "Microsoft OAuth2 重新授权成功".to_string(),
+                    });
+                }
+                WorkerEvent::OAuthRebindRejected {
+                    account_id,
+                    returned_email,
+                } => {
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_account_event(AccountEvent {
+                        state_version: ver,
+                        kind: AccountEventKindDto::OauthRebindRejected,
+                        ok: false,
+                        account_id: account_id.map(|id| id.to_string()),
+                        email: Some(returned_email.clone()),
+                        message: format!(
+                            "授权邮箱 {returned_email} 与当前编辑账号不匹配，已拒绝重绑"
+                        ),
+                    });
+                }
                 WorkerEvent::AccountsUpdated { accounts } => {
                     let dtos: Vec<AccountSummaryDto> =
                         accounts.iter().map(AccountSummaryDto::from).collect();
@@ -2278,12 +2558,258 @@ impl MailSession {
                         live.account_configs = accounts;
                         live.accounts = dtos;
                         live.cache_ready = true;
+                        if let Some(tx) = live.waiters.set_account_enabled.pop_front() {
+                            let _ = tx.send(());
+                        }
                     }
                     let ver = self.bump_state_version();
+                    self.emitter.emit_account_event(AccountEvent {
+                        state_version: ver,
+                        kind: AccountEventKindDto::Updated,
+                        ok: true,
+                        account_id: None,
+                        email: None,
+                        message: "账号状态已更新".to_string(),
+                    });
                     self.emitter.emit_mail_changed(MailChangedEvent {
                         state_version: ver,
                         reason: "accountsUpdated".to_string(),
                         account_id: None,
+                        folder_id: None,
+                        message_id: None,
+                    });
+                }
+                WorkerEvent::DraftsUpdated { drafts } => {
+                    {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        live.drafts_cache = drafts;
+                        live.cache_ready = true;
+                    }
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: ver,
+                        reason: "draftsUpdated".to_string(),
+                        account_id: None,
+                        folder_id: None,
+                        message_id: None,
+                    });
+                }
+                WorkerEvent::DraftSaved { draft_id } => {
+                    {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if let Some(tx) = live.waiters.draft_saved.pop_front() {
+                            let _ = tx.send(Ok(draft_id));
+                        }
+                    }
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_draft_saved(DraftSavedEvent {
+                        state_version: ver,
+                        draft_id: draft_id.to_string(),
+                    });
+                }
+                WorkerEvent::OutboxEnqueued {
+                    token,
+                    account_id,
+                    outbox_id,
+                    send_at,
+                    scheduled,
+                } => {
+                    let items = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        live.refresh_account_outbox_from_db(account_id);
+                        if let Some(tx) = live.waiters.send_enqueued.remove(&token) {
+                            let _ = tx.send(Ok((outbox_id, send_at, scheduled)));
+                        }
+                        live.combined_outbox_dtos()
+                    };
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
+                        state_version: ver,
+                        items,
+                        event_kind: OutboxEventKindDto::Enqueued,
+                        undo_token: Some(token.to_string()),
+                        outbox_id: Some(outbox_id.to_string()),
+                        message: None,
+                    });
+                }
+                WorkerEvent::OutboxUpdated { account_id, items } => {
+                    let all_items = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        live.outbox_cache.insert(account_id, items);
+                        live.combined_outbox_dtos()
+                    };
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
+                        state_version: ver,
+                        items: all_items,
+                        event_kind: OutboxEventKindDto::Updated,
+                        undo_token: None,
+                        outbox_id: None,
+                        message: None,
+                    });
+                }
+                WorkerEvent::OutboxUndoResult {
+                    token,
+                    account_id,
+                    outbox_id,
+                    result,
+                } => {
+                    let restored_draft_id = match &result {
+                        Ok(UndoOutboxOutcome::Restored { draft_id, .. }) => Some(*draft_id),
+                        _ => None,
+                    };
+                    let items = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if restored_draft_id.is_some() {
+                            live.refresh_account_outbox_from_db(account_id);
+                            live.refresh_drafts_from_db();
+                        }
+                        if let Some(tx) = live.waiters.undo_result.remove(&token) {
+                            let _ = tx.send(result);
+                        }
+                        live.combined_outbox_dtos()
+                    };
+                    if let Some(draft_id) = restored_draft_id {
+                        let ver = self.bump_state_version();
+                        self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
+                            state_version: ver,
+                            items,
+                            event_kind: OutboxEventKindDto::Undone,
+                            undo_token: Some(token.to_string()),
+                            outbox_id: Some(outbox_id.to_string()),
+                            message: Some("已撤销发送，邮件已恢复为草稿".to_string()),
+                        });
+                        self.emitter.emit_draft_saved(DraftSavedEvent {
+                            state_version: ver,
+                            draft_id: draft_id.to_string(),
+                        });
+                    }
+                }
+                WorkerEvent::OutboxEnqueueFailed {
+                    token,
+                    message,
+                    recovered_draft_id,
+                } => {
+                    let items = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if recovered_draft_id.is_some() {
+                            live.refresh_drafts_from_db();
+                        }
+                        if let Some(tx) = live.waiters.send_enqueued.remove(&token) {
+                            let _ = tx.send(Err(message.clone()));
+                        }
+                        live.combined_outbox_dtos()
+                    };
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
+                        state_version: ver,
+                        items,
+                        event_kind: OutboxEventKindDto::Failed,
+                        undo_token: Some(token.to_string()),
+                        outbox_id: None,
+                        message: Some(message),
+                    });
+                    if let Some(draft_id) = recovered_draft_id {
+                        self.emitter.emit_draft_saved(DraftSavedEvent {
+                            state_version: ver,
+                            draft_id: draft_id.to_string(),
+                        });
+                    }
+                }
+                WorkerEvent::DraftSent {
+                    account_id,
+                    outbox_id,
+                    subject,
+                } => {
+                    let items = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if let Some(list) = live.outbox_cache.get_mut(&account_id) {
+                            list.retain(|item| item.id != outbox_id);
+                        }
+                        live.refresh_account_outbox_from_db(account_id);
+                        live.combined_outbox_dtos()
+                    };
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
+                        state_version: ver,
+                        items,
+                        event_kind: OutboxEventKindDto::Sent,
+                        undo_token: None,
+                        outbox_id: Some(outbox_id.to_string()),
+                        message: Some(format!("邮件「{subject}」已发送")),
+                    });
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: ver,
+                        reason: "draftSent".to_string(),
+                        account_id: Some(account_id),
+                        folder_id: None,
+                        message_id: None,
+                    });
+                }
+                WorkerEvent::SentCopySaveFailed {
+                    account_id,
+                    outbox_id,
+                    subject,
+                    message,
+                } => {
+                    let items = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if let Some(list) = live.outbox_cache.get_mut(&account_id) {
+                            list.retain(|item| item.id != outbox_id);
+                        }
+                        live.refresh_account_outbox_from_db(account_id);
+                        live.combined_outbox_dtos()
+                    };
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
+                        state_version: ver,
+                        items,
+                        event_kind: OutboxEventKindDto::Sent,
+                        undo_token: None,
+                        outbox_id: Some(outbox_id.to_string()),
+                        message: Some(format!(
+                            "邮件「{subject}」已发送，但保存到已发送文件夹失败: {message}"
+                        )),
+                    });
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: ver,
+                        reason: "sentCopySaveFailed".to_string(),
+                        account_id: Some(account_id),
+                        folder_id: None,
+                        message_id: None,
+                    });
+                }
+                WorkerEvent::OutboxDeliveryFailed {
+                    account_id,
+                    outbox_id,
+                    status,
+                    subject,
+                    message,
+                } => {
+                    let items = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if let Some(list) = live.outbox_cache.get_mut(&account_id) {
+                            if let Some(entry) = list.iter_mut().find(|i| i.id == outbox_id) {
+                                entry.status = status;
+                                entry.last_error = message.clone();
+                            }
+                        }
+                        live.refresh_account_outbox_from_db(account_id);
+                        live.combined_outbox_dtos()
+                    };
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
+                        state_version: ver,
+                        items,
+                        event_kind: OutboxEventKindDto::Failed,
+                        undo_token: None,
+                        outbox_id: Some(outbox_id.to_string()),
+                        message: Some(format!("发送「{subject}」失败: {message}")),
+                    });
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: ver,
+                        reason: "outboxDeliveryFailed".to_string(),
+                        account_id: Some(account_id),
                         folder_id: None,
                         message_id: None,
                     });
@@ -2471,10 +2997,33 @@ impl MailSession {
                     );
                 }
                 WorkerEvent::Error {
-                    account_id: _,
+                    account_id,
                     message,
                 } => {
+                    let handled_save_waiter = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if let Some(acc_id) = account_id {
+                            if let Some(tx) = live.waiters.save_account.remove(&acc_id) {
+                                let _ = tx.send(Err(message.clone()));
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
                     let ver = self.bump_state_version();
+                    if handled_save_waiter {
+                        self.emitter.emit_account_event(AccountEvent {
+                            state_version: ver,
+                            kind: AccountEventKindDto::Saved,
+                            ok: false,
+                            account_id: account_id.map(|id| id.to_string()),
+                            email: None,
+                            message: message.clone(),
+                        });
+                    }
                     let next_status = {
                         let mut status =
                             self.sync_status.lock().expect("sync_status mutex poisoned");
@@ -3956,7 +4505,7 @@ fn list_live_drafts_page(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::dto::{MainPreferencesPatch, MessageSortDto};
     use crate::reader::NullReaderSink;
@@ -3964,10 +4513,13 @@ mod tests {
     use kitemail_mail_core::config::{save_accounts_in, AccountConfig};
 
     #[derive(Default)]
-    struct TestEmitter {
-        mail_changed: Mutex<Vec<MailChangedEvent>>,
-        sync_status: Mutex<Vec<SyncStatusEvent>>,
-        lock_state: Mutex<Vec<LockStateEvent>>,
+    pub(crate) struct TestEmitter {
+        pub(crate) mail_changed: Mutex<Vec<MailChangedEvent>>,
+        pub(crate) sync_status: Mutex<Vec<SyncStatusEvent>>,
+        pub(crate) lock_state: Mutex<Vec<LockStateEvent>>,
+        pub(crate) outbox_updated: Mutex<Vec<OutboxUpdatedEvent>>,
+        pub(crate) draft_saved: Mutex<Vec<DraftSavedEvent>>,
+        pub(crate) account_events: Mutex<Vec<AccountEvent>>,
     }
 
     impl MainEventEmitter for TestEmitter {
@@ -3982,11 +4534,23 @@ mod tests {
         fn emit_lock_state(&self, event: LockStateEvent) {
             self.lock_state.lock().unwrap().push(event);
         }
+
+        fn emit_outbox_updated(&self, event: OutboxUpdatedEvent) {
+            self.outbox_updated.lock().unwrap().push(event);
+        }
+
+        fn emit_draft_saved(&self, event: DraftSavedEvent) {
+            self.draft_saved.lock().unwrap().push(event);
+        }
+
+        fn emit_account_event(&self, event: AccountEvent) {
+            self.account_events.lock().unwrap().push(event);
+        }
     }
 
     #[derive(Default)]
-    struct RecordingReaderSink {
-        events: Mutex<Vec<ReaderStatusEvent>>,
+    pub(crate) struct RecordingReaderSink {
+        pub(crate) events: Mutex<Vec<ReaderStatusEvent>>,
     }
 
     impl crate::reader::ReaderPlatformSink for RecordingReaderSink {
@@ -4019,8 +4583,8 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingWorkerSink {
-        requests: Mutex<Vec<MailRequest>>,
+    pub(crate) struct RecordingWorkerSink {
+        pub(crate) requests: Mutex<Vec<MailRequest>>,
     }
 
     impl LiveWorkerSink for RecordingWorkerSink {
@@ -4030,7 +4594,7 @@ mod tests {
         fn prepare_quit(&self) {}
     }
 
-    fn make_test_session() -> (MailSession, Arc<TestEmitter>, PathBuf) {
+    pub(crate) fn make_test_session() -> (MailSession, Arc<TestEmitter>, PathBuf) {
         let dir =
             std::env::temp_dir().join(format!("kitemail-tauri-session-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4041,7 +4605,7 @@ mod tests {
         (session, emitter, dir)
     }
 
-    fn make_live_test_session(
+    pub(crate) fn make_live_test_session(
         with_cache: bool,
         passcode: Option<&str>,
     ) -> (

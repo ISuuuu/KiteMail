@@ -1,8 +1,8 @@
 //! Frozen IPC DTOs and event payloads for the KiteMail Tauri main window.
 
 use kitemail_mail_core::{
-    AccountSummary, AttachmentMeta, FolderSummary, MessageSort, MessageSummary, SearchScope,
-    ThreadMessage,
+    AccountSummary, AttachmentMeta, FolderSummary, LocalDraft, MessageSort, MessageSummary,
+    OutboxItem, OutboxStatus, SearchScope, ThreadMessage,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -11,6 +11,9 @@ pub const EVENT_MAIL_CHANGED: &str = "main://mail-changed";
 pub const EVENT_SYNC_STATUS: &str = "main://sync-status";
 pub const EVENT_READER_STATUS: &str = "main://reader-status";
 pub const EVENT_LOCK_STATE: &str = "main://lock-state";
+pub const EVENT_OUTBOX_UPDATED: &str = "main://outbox-updated";
+pub const EVENT_DRAFT_SAVED: &str = "main://draft-saved";
+pub const EVENT_ACCOUNT_EVENT: &str = "main://account-event";
 
 /// Structured IPC error returned by all main-window Tauri commands.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -742,6 +745,709 @@ pub struct LockStateEvent {
     pub locked_reason: Option<String>,
 }
 
+/// Deserialize either a JSON string or integer into a `String` ID.
+pub fn deserialize_id_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct IdVisitor;
+    impl<'de> serde::de::Visitor<'de> for IdVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or non-negative integer ID")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v.to_string())
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v)
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v.to_string())
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if v < 0 {
+                return Err(E::custom("ID cannot be negative"));
+            }
+            Ok(v.to_string())
+        }
+    }
+    deserializer.deserialize_any(IdVisitor)
+}
+
+/// Deserialize `null`, omitted, string, or integer into `Option<String>`.
+pub fn deserialize_opt_id_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptIdVisitor;
+    impl<'de> serde::de::Visitor<'de> for OptIdVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("null, a string, or non-negative integer ID")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserialize_id_string(deserializer).map(Some)
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(v))
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if v < 0 {
+                return Err(E::custom("ID cannot be negative"));
+            }
+            Ok(Some(v.to_string()))
+        }
+    }
+    deserializer.deserialize_option(OptIdVisitor)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BodyFormatDto {
+    #[default]
+    Plain,
+    Markdown,
+    Html,
+}
+
+impl BodyFormatDto {
+    pub fn as_core_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Markdown => "markdown",
+            Self::Html => "html",
+        }
+    }
+
+    pub fn from_core_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "markdown" | "md" => Self::Markdown,
+            "html" | "rich" => Self::Html,
+            _ => Self::Plain,
+        }
+    }
+}
+
+fn non_empty_opt(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDraftDto {
+    pub id: String,
+    pub account_id: String,
+    pub to_addr: String,
+    pub cc_addr: String,
+    pub bcc_addr: String,
+    pub subject: String,
+    pub body_text: String,
+    pub in_reply_to: Option<String>,
+    pub from_addr: Option<String>,
+    pub reply_to: Option<String>,
+    pub body_format: BodyFormatDto,
+    pub attachment_paths: Vec<String>,
+    pub updated_at: i64,
+}
+
+impl From<&LocalDraft> for LocalDraftDto {
+    fn from(value: &LocalDraft) -> Self {
+        Self {
+            id: value.id.to_string(),
+            account_id: value.account_id.to_string(),
+            to_addr: value.to_addr.clone(),
+            cc_addr: value.cc_addr.clone(),
+            bcc_addr: value.bcc_addr.clone(),
+            subject: value.subject.clone(),
+            body_text: value.body_text.clone(),
+            in_reply_to: non_empty_opt(&value.in_reply_to),
+            from_addr: non_empty_opt(&value.from_addr),
+            reply_to: non_empty_opt(&value.reply_to),
+            body_format: BodyFormatDto::from_core_str(&value.body_format),
+            attachment_paths: value.attachment_paths.clone(),
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDraftsOutput {
+    pub drafts: Vec<LocalDraftDto>,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDraftInput {
+    #[serde(default, deserialize_with = "deserialize_opt_id_string")]
+    pub id: Option<String>,
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub account_id: String,
+    #[serde(default)]
+    pub to_addr: String,
+    #[serde(default)]
+    pub cc_addr: String,
+    #[serde(default)]
+    pub bcc_addr: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body_text: String,
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub from_addr: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub body_format: Option<BodyFormatDto>,
+    #[serde(default)]
+    pub attachment_paths: Vec<String>,
+    #[serde(default)]
+    pub silent: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDraftOutput {
+    pub draft: LocalDraftDto,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteDraftInput {
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub draft_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteDraftOutput {
+    pub deleted: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMailInput {
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub account_id: String,
+    pub to: String,
+    #[serde(default)]
+    pub cc: String,
+    #[serde(default)]
+    pub bcc: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub from_addr: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub body_format: Option<BodyFormatDto>,
+    #[serde(default)]
+    pub body_html: Option<String>,
+    #[serde(default)]
+    pub attachment_paths: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_id_string")]
+    pub local_draft_id: Option<String>,
+    #[serde(default)]
+    pub undo_delay_secs: Option<u32>,
+    #[serde(default)]
+    pub scheduled_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMailOutput {
+    pub accepted: bool,
+    pub undo_token: String,
+    pub outbox_id: String,
+    pub undo_window_secs: u32,
+    pub scheduled_at: Option<i64>,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoSendMailInput {
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub account_id: String,
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub outbox_id: String,
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub undo_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoSendMailOutput {
+    pub undone: bool,
+    pub message: String,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutboxStatusDto {
+    Queued,
+    Sending,
+    Uncertain,
+    Failed,
+}
+
+impl From<OutboxStatus> for OutboxStatusDto {
+    fn from(value: OutboxStatus) -> Self {
+        match value {
+            OutboxStatus::Queued => Self::Queued,
+            OutboxStatus::Sending => Self::Sending,
+            OutboxStatus::Uncertain => Self::Uncertain,
+            OutboxStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxItemDto {
+    pub id: String,
+    pub account_id: String,
+    pub to_addr: String,
+    pub subject: String,
+    pub status: OutboxStatusDto,
+    pub last_error: Option<String>,
+    pub send_at: i64,
+}
+
+impl From<&OutboxItem> for OutboxItemDto {
+    fn from(value: &OutboxItem) -> Self {
+        Self {
+            id: value.id.to_string(),
+            account_id: value.account_id.to_string(),
+            to_addr: value.to_addr.clone(),
+            subject: value.subject.clone(),
+            status: OutboxStatusDto::from(value.status),
+            last_error: non_empty_opt(&value.last_error),
+            send_at: value.send_at.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListOutboxOutput {
+    pub items: Vec<OutboxItemDto>,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxItemActionInput {
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub account_id: String,
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub outbox_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxItemActionOutput {
+    pub accepted: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutboxEventKindDto {
+    Enqueued,
+    Sent,
+    Failed,
+    Undone,
+    Updated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxUpdatedEvent {
+    pub state_version: u64,
+    pub items: Vec<OutboxItemDto>,
+    pub event_kind: OutboxEventKindDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbox_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftSavedEvent {
+    pub state_version: u64,
+    pub draft_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AuthBackendDto {
+    #[default]
+    Password,
+    #[serde(rename = "microsoftGraphOAuth2")]
+    MicrosoftGraphOAuth2,
+}
+
+impl From<kitemail_mail_core::config::AuthBackend> for AuthBackendDto {
+    fn from(value: kitemail_mail_core::config::AuthBackend) -> Self {
+        match value {
+            kitemail_mail_core::config::AuthBackend::Password => Self::Password,
+            kitemail_mail_core::config::AuthBackend::MicrosoftGraphOAuth2 => {
+                Self::MicrosoftGraphOAuth2
+            }
+        }
+    }
+}
+
+impl From<AuthBackendDto> for kitemail_mail_core::config::AuthBackend {
+    fn from(value: AuthBackendDto) -> Self {
+        match value {
+            AuthBackendDto::Password => Self::Password,
+            AuthBackendDto::MicrosoftGraphOAuth2 => Self::MicrosoftGraphOAuth2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SecurityModeDto {
+    #[default]
+    Tls,
+    StartTls,
+}
+
+impl From<kitemail_mail_core::config::SecurityMode> for SecurityModeDto {
+    fn from(value: kitemail_mail_core::config::SecurityMode) -> Self {
+        match value {
+            kitemail_mail_core::config::SecurityMode::Tls => Self::Tls,
+            kitemail_mail_core::config::SecurityMode::StartTls => Self::StartTls,
+        }
+    }
+}
+
+impl From<SecurityModeDto> for kitemail_mail_core::config::SecurityMode {
+    fn from(value: SecurityModeDto) -> Self {
+        match value {
+            SecurityModeDto::Tls => Self::Tls,
+            SecurityModeDto::StartTls => Self::StartTls,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountConfigDto {
+    pub id: String,
+    pub auth_backend: AuthBackendDto,
+    pub oauth_client_id: Option<String>,
+    pub display_name: String,
+    pub email: String,
+    pub label: String,
+    pub enabled: bool,
+    pub in_unified: bool,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_security: SecurityModeDto,
+    pub imap_username: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: SecurityModeDto,
+    pub smtp_username: String,
+    pub smtp_separate_credentials: bool,
+    pub signature: String,
+    pub has_password: bool,
+}
+
+impl AccountConfigDto {
+    pub fn from_config(
+        cfg: &kitemail_mail_core::config::AccountConfig,
+        has_password: bool,
+    ) -> Self {
+        Self {
+            id: cfg.id.to_string(),
+            auth_backend: AuthBackendDto::from(cfg.auth_backend),
+            oauth_client_id: non_empty_opt(&cfg.oauth_client_id),
+            display_name: cfg.display_name.clone(),
+            email: cfg.email.clone(),
+            label: cfg.label.clone().unwrap_or_default(),
+            enabled: cfg.enabled,
+            in_unified: cfg.in_unified,
+            imap_host: cfg.imap_host.clone(),
+            imap_port: cfg.imap_port,
+            imap_security: SecurityModeDto::from(cfg.imap_security),
+            imap_username: cfg.imap_username.clone(),
+            smtp_host: cfg.smtp_host.clone(),
+            smtp_port: cfg.smtp_port,
+            smtp_security: SecurityModeDto::from(cfg.smtp_security),
+            smtp_username: cfg.smtp_username.clone(),
+            smtp_separate_credentials: cfg.smtp_separate_credentials,
+            signature: cfg.signature.clone(),
+            has_password,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPresetDto {
+    pub id: String,
+    pub name: String,
+    pub domains: Vec<String>,
+    pub auth_backend: AuthBackendDto,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_security: SecurityModeDto,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: SecurityModeDto,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListAccountsOutput {
+    pub accounts: Vec<AccountConfigDto>,
+    pub presets: Vec<ProviderPresetDto>,
+    pub state_version: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAccountInput {
+    #[serde(default, deserialize_with = "deserialize_opt_id_string")]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub auth_backend: AuthBackendDto,
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    #[serde(default)]
+    pub display_name: String,
+    pub email: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub in_unified: Option<bool>,
+    #[serde(default)]
+    pub imap_host: String,
+    #[serde(default)]
+    pub imap_port: u16,
+    #[serde(default)]
+    pub imap_security: SecurityModeDto,
+    #[serde(default)]
+    pub imap_username: String,
+    #[serde(default)]
+    pub smtp_host: String,
+    #[serde(default)]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub smtp_security: SecurityModeDto,
+    #[serde(default)]
+    pub smtp_username: String,
+    #[serde(default)]
+    pub smtp_separate_credentials: bool,
+    #[serde(default)]
+    pub signature: String,
+    #[serde(default)]
+    pub imap_password: Option<String>,
+    #[serde(default)]
+    pub smtp_password: Option<String>,
+}
+
+impl std::fmt::Debug for SaveAccountInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaveAccountInput")
+            .field("id", &self.id)
+            .field("auth_backend", &self.auth_backend)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("display_name", &self.display_name)
+            .field("email", &self.email)
+            .field("label", &self.label)
+            .field("enabled", &self.enabled)
+            .field("in_unified", &self.in_unified)
+            .field("imap_host", &self.imap_host)
+            .field("imap_port", &self.imap_port)
+            .field("imap_security", &self.imap_security)
+            .field("imap_username", &self.imap_username)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_security", &self.smtp_security)
+            .field("smtp_username", &self.smtp_username)
+            .field("smtp_separate_credentials", &self.smtp_separate_credentials)
+            .field("signature", &self.signature)
+            .field(
+                "imap_password",
+                &self.imap_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "smtp_password",
+                &self.smtp_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyAccountOutput {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAccountOutput {
+    pub account: AccountConfigDto,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAccountInput {
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub account_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAccountOutput {
+    pub deleted: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountEnabledInput {
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub account_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountEnabledOutput {
+    pub account_id: String,
+    pub enabled: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartMicrosoftOAuthInput {
+    #[serde(default)]
+    pub custom_client_id: Option<String>,
+    #[serde(default)]
+    pub login_hint_email: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_id_string")]
+    pub editing_account_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartMicrosoftOAuthOutput {
+    pub started: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountEventKindDto {
+    Verified,
+    Saved,
+    Deleted,
+    Updated,
+    OauthReauthorized,
+    OauthRebindRejected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountEvent {
+    pub state_version: u64,
+    pub kind: AccountEventKindDto,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,5 +1756,95 @@ mod tests {
         assert_eq!(open_out["remoteImagesBlocked"], true);
         assert_eq!(open_out["rfcMessageId"], "<m7@example.com>");
         assert_eq!(open_out["folderPath"], "INBOX");
+    }
+
+    #[test]
+    fn wave2_compose_and_accounts_dtos_match_frozen_contract() {
+        let draft_in: SaveDraftInput = serde_json::from_value(json!({
+            "id": 3,
+            "accountId": "1",
+            "toAddr": "a@example.com",
+            "subject": "主题",
+            "bodyText": "正文",
+            "bodyFormat": "markdown",
+            "silent": true
+        }))
+        .expect("SaveDraftInput");
+        assert_eq!(draft_in.id.as_deref(), Some("3"));
+        assert_eq!(draft_in.account_id, "1");
+        assert!(draft_in.silent);
+        assert_eq!(draft_in.body_format, Some(BodyFormatDto::Markdown));
+
+        let draft_dto = serde_json::to_value(LocalDraftDto {
+            id: "3".to_string(),
+            account_id: "1".to_string(),
+            to_addr: "a@example.com".to_string(),
+            cc_addr: String::new(),
+            bcc_addr: String::new(),
+            subject: "主题".to_string(),
+            body_text: "正文".to_string(),
+            in_reply_to: None,
+            from_addr: None,
+            reply_to: None,
+            body_format: BodyFormatDto::Markdown,
+            attachment_paths: vec![],
+            updated_at: 1_700_000_000,
+        })
+        .expect("LocalDraftDto");
+        assert_eq!(draft_dto["id"], "3");
+        assert_eq!(draft_dto["accountId"], "1");
+        assert_eq!(draft_dto["bodyFormat"], "markdown");
+
+        let outbox_ev = serde_json::to_value(OutboxUpdatedEvent {
+            state_version: 5,
+            items: vec![OutboxItemDto {
+                id: "9".to_string(),
+                account_id: "1".to_string(),
+                to_addr: "b@example.com".to_string(),
+                subject: "Sub".to_string(),
+                status: OutboxStatusDto::Queued,
+                last_error: None,
+                send_at: 1_700_000_050,
+            }],
+            event_kind: OutboxEventKindDto::Enqueued,
+            undo_token: Some("42".to_string()),
+            outbox_id: Some("9".to_string()),
+            message: None,
+        })
+        .expect("OutboxUpdatedEvent");
+        assert_eq!(outbox_ev["eventKind"], "enqueued");
+        assert_eq!(outbox_ev["undoToken"], "42");
+        assert_eq!(outbox_ev["items"][0]["status"], "queued");
+
+        let acc_in: SaveAccountInput = serde_json::from_value(json!({
+            "id": 2,
+            "authBackend": "microsoftGraphOAuth2",
+            "displayName": "Work",
+            "email": "me@outlook.com",
+            "imapHost": "outlook.office365.com",
+            "imapPort": 993,
+            "imapSecurity": "tls",
+            "imapUsername": "me@outlook.com",
+            "smtpHost": "smtp.office365.com",
+            "smtpPort": 587,
+            "smtpSecurity": "startTls",
+            "smtpUsername": "me@outlook.com"
+        }))
+        .expect("SaveAccountInput");
+        assert_eq!(acc_in.id.as_deref(), Some("2"));
+        assert_eq!(acc_in.auth_backend, AuthBackendDto::MicrosoftGraphOAuth2);
+        assert_eq!(acc_in.smtp_security, SecurityModeDto::StartTls);
+
+        let acc_ev = serde_json::to_value(AccountEvent {
+            state_version: 8,
+            kind: AccountEventKindDto::OauthReauthorized,
+            ok: true,
+            account_id: Some("2".to_string()),
+            email: Some("me@outlook.com".to_string()),
+            message: "ok".to_string(),
+        })
+        .expect("AccountEvent");
+        assert_eq!(acc_ev["kind"], "oauthReauthorized");
+        assert_eq!(acc_ev["accountId"], "2");
     }
 }

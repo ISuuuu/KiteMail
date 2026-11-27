@@ -2,7 +2,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod commands;
+mod compose;
 mod dto;
 mod mail_session;
 mod preferences;
@@ -324,6 +326,20 @@ fn main() {
             commands::move_message,
             commands::undo_message_move,
             commands::quit_app,
+            compose::list_drafts,
+            compose::save_draft,
+            compose::delete_draft,
+            compose::send_mail,
+            compose::undo_send_mail,
+            compose::list_outbox,
+            compose::retry_outbox_item,
+            compose::delete_outbox_item,
+            accounts::list_accounts,
+            accounts::verify_account,
+            accounts::save_account,
+            accounts::delete_account,
+            accounts::set_account_enabled,
+            accounts::start_microsoft_oauth,
         ])
         .run(tauri::generate_context!())
         .expect("error while running KiteMail Tauri preview");

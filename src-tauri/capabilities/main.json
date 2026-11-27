@@ -24,6 +24,20 @@
     "allow-mark-message-spam",
     "allow-move-message",
     "allow-undo-message-move",
-    "allow-quit-app"
+    "allow-quit-app",
+    "allow-list-drafts",
+    "allow-save-draft",
+    "allow-delete-draft",
+    "allow-send-mail",
+    "allow-undo-send-mail",
+    "allow-list-outbox",
+    "allow-retry-outbox-item",
+    "allow-delete-outbox-item",
+    "allow-list-accounts",
+    "allow-verify-account",
+    "allow-save-account",
+    "allow-delete-account",
+    "allow-set-account-enabled",
+    "allow-start-microsoft-oauth"
   ]
 }
