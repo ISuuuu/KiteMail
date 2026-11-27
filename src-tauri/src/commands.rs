@@ -6,11 +6,13 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::dto::{
-    IpcError, ListMessagesInput, ListMessagesOutput, LockAppOutput, MainBootstrapDto,
-    MainPreferencesDto, MainPreferencesPatch, OpenMessageInput, OpenMessageOutput,
-    RefreshMailInput, RefreshMailOutput, SetMessageFlaggedInput, SetMessageFlaggedOutput,
-    SetMessageSeenInput, SetMessageSeenOutput, SetReaderLayoutInput, SetReaderLayoutOutput,
-    UnlockAppInput, UnlockAppOutput, MAIN_WINDOW_LABEL,
+    AllowRemoteImagesInput, AllowRemoteImagesOutput, IpcError, ListMessagesInput,
+    ListMessagesOutput, LoadOlderMessagesInput, LoadOlderMessagesOutput, LockAppOutput,
+    MainBootstrapDto, MainPreferencesDto, MainPreferencesPatch, MessageActionInput,
+    MessageMoveOutput, MoveMessageInput, OpenMessageInput, OpenMessageOutput, RefreshMailInput,
+    RefreshMailOutput, SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput,
+    SetMessageSeenOutput, SetReaderLayoutInput, SetReaderLayoutOutput, UndoMessageMoveInput,
+    UndoMessageMoveOutput, UnlockAppInput, UnlockAppOutput, MAIN_WINDOW_LABEL,
 };
 use crate::mail_session::{MailSession, MAX_QUERY_LEN};
 use crate::preferences::PreferencesStore;
@@ -135,6 +137,62 @@ pub fn set_message_flagged(
     input: SetMessageFlaggedInput,
 ) -> Result<SetMessageFlaggedOutput, IpcError> {
     state.session.set_message_flagged(&input)
+}
+
+#[tauri::command]
+pub fn allow_remote_images(
+    state: State<'_, AppState>,
+    input: AllowRemoteImagesInput,
+) -> Result<AllowRemoteImagesOutput, IpcError> {
+    state.session.allow_remote_images(&input)
+}
+
+#[tauri::command]
+pub fn load_older_messages(
+    state: State<'_, AppState>,
+    input: LoadOlderMessagesInput,
+) -> Result<LoadOlderMessagesOutput, IpcError> {
+    state.session.load_older_messages(&input)
+}
+
+#[tauri::command]
+pub fn archive_message(
+    state: State<'_, AppState>,
+    input: MessageActionInput,
+) -> Result<MessageMoveOutput, IpcError> {
+    state.session.archive_message(&input)
+}
+
+#[tauri::command]
+pub fn delete_message(
+    state: State<'_, AppState>,
+    input: MessageActionInput,
+) -> Result<MessageMoveOutput, IpcError> {
+    state.session.delete_message(&input)
+}
+
+#[tauri::command]
+pub fn mark_message_spam(
+    state: State<'_, AppState>,
+    input: MessageActionInput,
+) -> Result<MessageMoveOutput, IpcError> {
+    state.session.mark_message_spam(&input)
+}
+
+#[tauri::command]
+pub fn move_message(
+    state: State<'_, AppState>,
+    input: MoveMessageInput,
+) -> Result<MessageMoveOutput, IpcError> {
+    state.session.move_message(&input)
+}
+
+#[tauri::command]
+pub fn undo_message_move(
+    state: State<'_, AppState>,
+    input: UndoMessageMoveInput,
+) -> Result<UndoMessageMoveOutput, IpcError> {
+    state.session.undo_message_move(&input)
 }
 
 #[tauri::command]

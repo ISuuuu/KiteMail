@@ -30,6 +30,26 @@ use crate::tray::{TrayCommand, TrayHandle};
 
 const TRAY_ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
 
+#[cfg(windows)]
+fn show_startup_error_dialog(title: &str, message: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_msg: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(wide_msg.as_ptr()),
+            PCWSTR(wide_title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_startup_error_dialog(_title: &str, _message: &str) {}
+
 fn parse_launch_mode<I, S>(args: I, demo_env: Option<&str>) -> AppMode
 where
     I: IntoIterator<Item = S>,
@@ -67,16 +87,19 @@ fn main() {
             }
             Err(err) => {
                 eprintln!("{err}");
+                show_startup_error_dialog("KiteMail 启动失败", &err);
                 return;
             }
         },
     };
 
     let Some(_data_dir_guard) = single_instance::acquire_data_dir_lock(&data_dir) else {
-        eprintln!(
+        let msg = format!(
             "资料目录 {} 正被另一个 KiteMail 进程占用，禁止并发写入。",
             data_dir.display()
         );
+        eprintln!("{msg}");
+        show_startup_error_dialog("KiteMail 启动失败", &msg);
         return;
     };
 
@@ -122,6 +145,10 @@ fn main() {
                     emitter,
                 ),
             };
+            {
+                let handler: Arc<dyn crate::reader::ThreadActionHandler> = session.clone();
+                reader.set_action_handler(Arc::downgrade(&handler));
+            }
 
             if let Some(ref t) = tray_for_setup {
                 session.attach_tray(Arc::clone(t));
@@ -289,6 +316,13 @@ fn main() {
             commands::lock_app,
             commands::set_message_seen,
             commands::set_message_flagged,
+            commands::allow_remote_images,
+            commands::load_older_messages,
+            commands::archive_message,
+            commands::delete_message,
+            commands::mark_message_spam,
+            commands::move_message,
+            commands::undo_message_move,
             commands::quit_app,
         ])
         .run(tauri::generate_context!())

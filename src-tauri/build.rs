@@ -13,6 +13,13 @@ fn main() {
             "lock_app",
             "set_message_seen",
             "set_message_flagged",
+            "allow_remote_images",
+            "load_older_messages",
+            "archive_message",
+            "delete_message",
+            "mark_message_spam",
+            "move_message",
+            "undo_message_move",
             "quit_app",
         ]),
     ))
