@@ -272,3 +272,37 @@ pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
      - `cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked`
      - `cargo check --workspace --target x86_64-pc-windows-msvc --locked`
      - `pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle`
+
+
+## 10. Wave 2 / Wave 3 交付汇总与 P4 正式发行切换清单
+
+### 10.1 Wave 2 与 Wave 3 新增功能与 IPC 全景
+
+在 Wave 1 基础之上，Wave 2（P1）与 Wave 3（P2/P3/P4 准备）已将里程碑 D 规划的其余主窗口、弹窗与工具全量迁移至 Tauri 2 + Vue 3（所有新增有参命令继续遵循 `{ input }` 外层包装、`camelCase` DTO、锁态返回 `IpcError.code = "LOCKED"` 及凭据/口令脱敏）：
+
+1. **Wave 2：写信、草稿、发件箱撤销与多账号引导（14 个命令 + 3 个事件）**
+   - 写信与发件箱（`src-tauri/src/compose.rs`、`src/compose/`）：`list_drafts`、`save_draft`（支持 1.5s 防抖静默自动保存）、`delete_draft`、`send_mail`（含即时入队可撤销窗口与定时发送）、`undo_send_mail`、`list_outbox`、`retry_outbox_item`、`delete_outbox_item`，配套事件 `main://outbox-updated`、`main://draft-saved`，以及附件关键词忘带提醒检测。
+   - 多账号管理与首次欢迎页（`src-tauri/src/accounts.rs`、`src/accounts/`）：`list_accounts`（含 QQ / 163 / Gmail / Outlook / iCloud / 通用预设，只暴露 `hasPassword` 不回传明文密码）、`verify_account`、`save_account`、`delete_account`、`set_account_enabled`、`start_microsoft_oauth`，配套事件 `main://account-event`。
+2. **Wave 3：附件图库、独立读信打印、通讯录、完整偏好与命令面板（17 个命令）**
+   - 附件、图库、打印与独立读信（`src-tauri/src/attachments.rs`、`src/reader-tools/`）：`list_cached_attachments`、`fetch_attachment_preview`（10MB 上限与 base64 dataUrl）、`save_attachment`（防路径穿越校验）、`save_all_attachments`、`get_message_print_html`（严格转义与脚本清理 + `@media print` 样式）、`open_message_window`（搭配 `StandaloneMessageModal.vue` / `AttachmentDrawer.vue` / `AttachmentGalleryModal.vue`）。
+   - 通讯录（`src-tauri/src/contacts.rs`、`src/contacts/`）：`list_contacts`、`save_contact`、`delete_contact`、`import_contacts`、`export_contacts`（复用 `kitemail_mail_core::contacts_io` 支持 vCard 3.0 与 CSV，一键直连写信）。
+   - 完整偏好设置、安全锁、远图白名单、缓存与更新（`src-tauri/src/settings.rs`、`src/preferences/`）：`get_full_preferences`、`update_full_preferences`、`set_app_lock_passcode`（PBKDF2 校验与脱敏）、`manage_trusted_senders`、`clear_body_caches`、`check_app_update`（复用 `kitemail_mail_core::update::check`）。
+   - 命令面板与单键快捷键（`src/command-palette/`）：`Ctrl+K` 命令面板、`?` 快捷键帮助、`/` 搜索及受 `singleKeyShortcuts` 与 IME / 输入焦 / 弹窗守卫控制的单键操作（`c/r/a/f/e/s/u/j/k/#`）。
+
+### 10.2 P4 正式发行切换核对清单（切换 `kitemail.exe` 前执行）
+
+在正式将发布入口从 GPUI 切换到 Tauri 2 之前（当前 [Windows 发布流程](../.github/workflows/windows.yml) 仍保持 GPUI 构建不变），须逐项完成并签署以下检查：
+
+1. **产物标识与二进制命名对齐**
+   - [ ] 更新 `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml`：`productName` / 二进制名改为 `kitemail`（产出 `kitemail.exe`），应用标识符、图标与版本与原发行一致。
+2. **安装程序、便携包与自动更新清单**
+   - [ ] 核对 [NSIS 安装脚本](../.github/nsis/kitemail.nsi)：静默/被动更新参数 `/P` `/UPDATE` `/R` `/PID=`、注册表 `Software\KiteMail` 安装目录继承与互斥量 `Local\KiteMail.Setup`。
+   - [ ] 核对便携模式 `portable.flag` 判定及升级兼容：验证 `portable.flag` 存在时数据目录落在 `<exe_dir>\data`，安装版落在 `%LOCALAPPDATA%\KiteMail`（或 `KITEMAIL_DATA_DIR`）。
+   - [ ] 核对 [更新器](../crates/mail-core/src/update.rs) 与 `latest.json` 平台键（`windows-x86_64` / `windows-x86_64-portable`）下载校验与覆盖升级流程。
+3. **存量数据与隔离目录升级回滚实测**
+   - [ ] 使用老版本 GPUI 真实数据副本（含 `accounts.toml`、`preferences.toml`、Windows Credential Manager 凭据、自定义 `mail_data_dir`、草稿箱 `local_drafts` 与待发队列 `outbox`、应用锁 `passcode`）在隔离目录升级启动 Tauri 版 `kitemail.exe`，验证账号、邮件缓存、草稿与解锁零丢失。
+   - [ ] 验证从 Tauri 新版回滚回原 GPUI 版本的数据库与配置文件前向/后向兼容性。
+4. **Windows 真机端到端与性能验收**
+   - [ ] 执行 `pwsh -File .\scripts\benchmark-demo.ps1` 比对 GPUI 与 Tauri 版本冷启动耗时及含 WebView2 进程树内存占用。
+   - [ ] 实机验证 WebView2 阅读器遮挡隐藏、DPI 缩放、系统托盘最小化/关闭、自动锁定与邮件通知点击唤醒。
+   - [ ] 切换 `.github/workflows/windows.yml`（或合并 `.github/workflows/tauri-windows.yml`）完成正式签发归档。

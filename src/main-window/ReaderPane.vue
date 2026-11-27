@@ -102,6 +102,32 @@
             删除
           </button>
 
+          <button
+            type="button"
+            class="km-action-btn"
+            title="独立窗口阅读此邮件"
+            @click="emit('openStandalone')"
+          >
+            独立阅读
+          </button>
+          <button
+            type="button"
+            class="km-action-btn"
+            title="打印预览 / 打印"
+            @click="emit('print')"
+          >
+            打印
+          </button>
+          <button
+            v-if="message.attachments.length > 0"
+            type="button"
+            class="km-action-btn"
+            title="展开邮件附件抽屉"
+            @click="emit('openAttachments')"
+          >
+            📎 附件 ({{ message.attachments.length }})
+          </button>
+
           <!-- 移动到文件夹弹出菜单 -->
           <div ref="moveWrapRef" class="km-popover-wrap">
             <button
@@ -280,15 +306,18 @@
         </div>
 
         <div v-if="message.attachments.length > 0" class="km-attachments-strip">
-          <div
+          <button
             v-for="(att, idx) in message.attachments"
             :key="att.id ?? `${att.filename}-${idx}`"
+            type="button"
             class="km-attachment-pill"
+            title="打开附件抽屉保存或预览"
+            @click="emit('openAttachments')"
           >
             <span aria-hidden="true">📎</span>
             <span class="km-att-name">{{ att.filename }}</span>
             <span class="km-att-size">{{ formatBytes(att.sizeBytes) }}</span>
-          </div>
+          </button>
         </div>
       </div>
 
@@ -381,6 +410,9 @@ const emit = defineEmits<{
   markSpam: [];
   delete: [];
   moveToFolder: [targetFolderPath: string];
+  openStandalone: [];
+  print: [];
+  openAttachments: [];
   overlayChange: [id: string, open: boolean];
 }>();
 
@@ -919,7 +951,14 @@ onUnmounted(() => {
   border-radius: 999px;
   border: 1px solid var(--km-border);
   background: var(--km-surface-raised);
+  color: var(--km-text);
   font-size: 12px;
+  cursor: pointer;
+}
+
+.km-attachment-pill:hover {
+  border-color: var(--km-accent);
+  background: var(--km-accent-soft);
 }
 
 .km-att-name {

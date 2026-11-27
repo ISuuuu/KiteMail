@@ -93,6 +93,47 @@
         </button>
       </nav>
 
+      <!-- 工作区工具入口（附件图库 / 通讯录 / 命令面板 / 设置） -->
+      <nav v-if="!isRail" class="km-nav-section km-tools-nav" aria-label="工作区工具">
+        <button
+          type="button"
+          class="km-nav-row"
+          title="查看全局附件与图片预览"
+          @click="emit('openAttachments')"
+        >
+          <span class="km-nav-icon" aria-hidden="true">📎</span>
+          <span class="km-nav-label">附件图库</span>
+        </button>
+        <button
+          type="button"
+          class="km-nav-row"
+          title="通讯录与 vCard/CSV 导入导出"
+          @click="emit('openContacts')"
+        >
+          <span class="km-nav-icon" aria-hidden="true">👥</span>
+          <span class="km-nav-label">通讯录</span>
+        </button>
+        <button
+          type="button"
+          class="km-nav-row"
+          title="打开命令面板 (Ctrl+K)"
+          @click="emit('openCommandPalette')"
+        >
+          <span class="km-nav-icon" aria-hidden="true">⌘</span>
+          <span class="km-nav-label">命令面板</span>
+          <span class="km-shortcut-hint">Ctrl+K</span>
+        </button>
+        <button
+          type="button"
+          class="km-nav-row"
+          title="偏好设置、安全锁与缓存管理"
+          @click="emit('openPreferences')"
+        >
+          <span class="km-nav-icon" aria-hidden="true">⚙</span>
+          <span class="km-nav-label">设置与偏好</span>
+        </button>
+      </nav>
+
       <!-- 账号文件夹树 -->
       <div v-if="!isRail" class="km-accounts-section">
         <div class="km-accounts-section-head">
@@ -163,6 +204,43 @@
           @click="emit('selectView', { kind: 'accountFolder', accountId: folder.accountId, folderId: folder.id })"
         >
           <span class="km-nav-icon" aria-hidden="true">{{ folderIcon(folder.path, folder.name) }}</span>
+        </button>
+        <div class="km-rail-divider" />
+        <button
+          type="button"
+          class="km-nav-row rail-row"
+          title="附件图库"
+          aria-label="附件图库"
+          @click="emit('openAttachments')"
+        >
+          <span class="km-nav-icon" aria-hidden="true">📎</span>
+        </button>
+        <button
+          type="button"
+          class="km-nav-row rail-row"
+          title="通讯录"
+          aria-label="通讯录"
+          @click="emit('openContacts')"
+        >
+          <span class="km-nav-icon" aria-hidden="true">👥</span>
+        </button>
+        <button
+          type="button"
+          class="km-nav-row rail-row"
+          title="命令面板 (Ctrl+K)"
+          aria-label="命令面板"
+          @click="emit('openCommandPalette')"
+        >
+          <span class="km-nav-icon" aria-hidden="true">⌘</span>
+        </button>
+        <button
+          type="button"
+          class="km-nav-row rail-row"
+          title="设置与偏好"
+          aria-label="设置与偏好"
+          @click="emit('openPreferences')"
+        >
+          <span class="km-nav-icon" aria-hidden="true">⚙</span>
         </button>
       </div>
     </div>
@@ -238,6 +316,10 @@ const emit = defineEmits<{
   toggleDarkMode: [];
   compose: [];
   openAccounts: [];
+  openAttachments: [];
+  openContacts: [];
+  openCommandPalette: [];
+  openPreferences: [];
 }>();
 
 const colorModeShortLabel = computed(() => {
@@ -534,6 +616,27 @@ function avatarInitial(name: string): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.km-tools-nav {
+  border-top: 1px solid var(--km-border);
+  padding-top: 8px;
+}
+
+.km-shortcut-hint {
+  font-size: 10px;
+  color: var(--km-text-muted);
+  border: 1px solid var(--km-border);
+  border-radius: 4px;
+  padding: 1px 4px;
+  flex-shrink: 0;
+}
+
+.km-rail-divider {
+  width: 24px;
+  height: 1px;
+  margin: 4px auto;
+  background: var(--km-border);
 }
 
 .km-count-pill {
