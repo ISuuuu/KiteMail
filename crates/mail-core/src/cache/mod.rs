@@ -448,16 +448,23 @@ impl CacheStore {
     /// Open a read-only split cache connection for fast UI-thread lookups.
     pub fn open_for_data_dir_read_only(app_data_dir: &Path) -> Result<Self, String> {
         let global_path = config::global_db_in(app_data_dir);
+        if !global_path.is_file() {
+            return Err(format!("缓存数据库尚未初始化 ({})", global_path.display()));
+        }
         let mail_data_dir = config::resolve_mail_data_dir_in(app_data_dir);
         let global = GlobalDb::open_read_only(&global_path)?;
-        Self::from_parts(
+        let mut store = Self::from_parts(
             StoreMode::Disk {
                 app_data_dir: app_data_dir.to_path_buf(),
                 mail_data_dir,
                 read_only: true,
             },
             global,
-        )
+        )?;
+        if let Ok(accounts) = config::load_accounts_in(app_data_dir) {
+            store.set_own_emails(accounts.into_iter().map(|a| a.email).collect());
+        }
+        Ok(store)
     }
 
     /// Open or create a split cache store using explicit `(app_data_dir, mail_data_dir)`.

@@ -4974,3 +4974,88 @@ fn list_thread_summaries_orders_descending_and_keeps_newest_when_truncated() {
         expected_uids
     );
 }
+
+#[test]
+fn open_for_data_dir_read_only_handles_empty_and_populated_dirs_safely() {
+    let empty_dir = temp_cache_dir("ro-empty");
+    let _ = std::fs::remove_dir_all(&empty_dir);
+    std::fs::create_dir_all(&empty_dir).unwrap();
+
+    // 1. 空目录尚未建库：只读打开返回 Err，且不创建任何数据库或目录文件。
+    assert!(CacheStore::open_for_data_dir_read_only(&empty_dir).is_err());
+    assert!(!config::global_db_in(&empty_dir).exists());
+    assert!(!config::default_mail_data_dir_in(&empty_dir).exists());
+    assert_eq!(std::fs::read_dir(&empty_dir).unwrap().count(), 0);
+
+    // 不存在的目录同样安全返回 Err，不创建目录。
+    let missing_dir = empty_dir.join("missing");
+    assert!(CacheStore::open_for_data_dir_read_only(&missing_dir).is_err());
+    assert!(!missing_dir.exists());
+
+    // 2. 初始化全局库但账号尚未同步任何 mail.db 时，只读打开应正常返回空列表。
+    let mut acc = AccountConfig::default();
+    acc.id = 1;
+    acc.email = "ro-user@example.com".to_string();
+    config::save_accounts_in(&empty_dir, &[acc]).unwrap();
+    let mut store = CacheStore::open_for_data_dir(&empty_dir).unwrap();
+    let ro_no_mail = CacheStore::open_for_data_dir_read_only(&empty_dir).unwrap();
+    assert!(ro_no_mail.list_folders(1).unwrap().is_empty());
+    assert_eq!(
+        ro_no_mail
+            .list_unified_inbox_for_accounts(
+                &[1],
+                "",
+                QuickFilterSet::default(),
+                MessageSort::DateNewest,
+                0,
+                20
+            )
+            .unwrap()
+            .total,
+        0
+    );
+    drop(ro_no_mail);
+
+    // 3. 写入文件夹与邮件后，只读打开可正常读取，且任何写入调用都会被拒绝。
+    let folders = store
+        .sync_folders(
+            1,
+            &[RemoteFolder {
+                name: "收件箱".to_string(),
+                path: "INBOX".to_string(),
+                unread_count: 1,
+                total_count: 1,
+            }],
+        )
+        .unwrap();
+    let inbox_id = folders[0].id;
+    let mut header = sample_header(1, "只读模式校验");
+    header.recipients = "ro-user@example.com".to_string();
+    store
+        .commit_folder_headers(1, inbox_id, 10, &[header], None)
+        .unwrap();
+    let msg_id = store.list_messages_page(inbox_id, "", 0, 10).unwrap().items[0].id;
+    store.checkpoint_and_close_all();
+    drop(store);
+
+    let mut ro = CacheStore::open_for_data_dir_read_only(&empty_dir).unwrap();
+    let page = ro
+        .list_unified_inbox_for_accounts(
+            &[1],
+            "",
+            QuickFilterSet {
+                to_me: true,
+                ..Default::default()
+            },
+            MessageSort::DateNewest,
+            0,
+            20,
+        )
+        .unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].subject, "只读模式校验");
+    assert!(ro.set_message_seen(msg_id, false).is_err());
+
+    drop(ro);
+    let _ = std::fs::remove_dir_all(&empty_dir);
+}
