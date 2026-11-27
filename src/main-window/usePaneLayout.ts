@@ -68,10 +68,19 @@ export function clampBelowHeight(height: number, maxBelowHeight?: number): numbe
   return minClamped;
 }
 
+export function resolveDarkMode(darkMode: boolean | null): boolean {
+  if (darkMode === true) return true;
+  if (darkMode === false) return false;
+  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    return window.matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+  return false;
+}
+
 export function usePaneLayout() {
   const prefs = ref<MainPreferencesDto>({
     themeId: "system",
-    darkMode: false,
+    darkMode: null,
     readerPosition: "right",
     sidebarWidth: SIDEBAR_DEFAULT_WIDTH,
     listWidth: LIST_DEFAULT_WIDTH,
@@ -87,8 +96,8 @@ export function usePaneLayout() {
   const windowWidth = ref(typeof window !== "undefined" ? window.innerWidth : 1280);
   const windowHeight = ref(typeof window !== "undefined" ? window.innerHeight : 800);
 
-  // `system` 主题下是否跟随 OS prefers-color-scheme
-  const followSystemScheme = ref(true);
+  // darkMode === null 时跟随 OS prefers-color-scheme
+  const followSystemScheme = computed(() => prefs.value.darkMode === null);
 
   // 浮层遮挡状态：菜单/下拉打开时为 true，通知原生 WebView2 隐藏
   const activeOverlays = ref<Set<string>>(new Set());
@@ -157,17 +166,14 @@ export function usePaneLayout() {
   }
 
   function syncDocumentTheme() {
-    if (typeof document === "undefined") return;
-    const root = document.documentElement;
     const id = KNOWN_THEMES.includes(prefs.value.themeId as (typeof KNOWN_THEMES)[number])
       ? prefs.value.themeId
       : "system";
 
-    let dark = prefs.value.darkMode;
-    if (id === "system" && followSystemScheme.value && typeof window !== "undefined" && window.matchMedia) {
-      dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    }
+    const dark = resolveDarkMode(prefs.value.darkMode);
     effectiveDark.value = dark;
+    if (typeof document === "undefined") return;
+    const root = document.documentElement;
     root.setAttribute("data-theme", id);
     root.setAttribute("data-color-mode", dark ? "dark" : "light");
   }
@@ -175,7 +181,7 @@ export function usePaneLayout() {
   // 监听系统深浅色变更
   let mediaQuery: MediaQueryList | null = null;
   function onSystemSchemeChange() {
-    if (prefs.value.themeId === "system" && followSystemScheme.value) {
+    if (prefs.value.darkMode === null) {
       syncDocumentTheme();
     }
   }
@@ -202,12 +208,15 @@ export function usePaneLayout() {
 
   function applyPrefs(p: MainPreferencesDto) {
     const nextListWidth = clampListWidth(p.listWidth ?? LIST_DEFAULT_WIDTH);
+    const normalizedDarkMode: boolean | null =
+      p.darkMode === true ? true : p.darkMode === false ? false : null;
     prefs.value = {
       ...prefs.value,
       ...p,
       themeId: KNOWN_THEMES.includes(p.themeId as (typeof KNOWN_THEMES)[number])
         ? p.themeId
         : "system",
+      darkMode: normalizedDarkMode,
       sidebarWidth: clampSidebarWidth(p.sidebarWidth ?? SIDEBAR_DEFAULT_WIDTH),
       listWidth: nextListWidth,
       listBelowHeight: clampBelowHeight(p.listBelowHeight ?? BELOW_LIST_DEFAULT_HEIGHT),
@@ -215,7 +224,6 @@ export function usePaneLayout() {
       readerZoomPercent: Math.min(250, Math.max(50, p.readerZoomPercent ?? 100)),
     };
     listWide.value = prefs.value.listWidth >= LIST_WIDE_ON;
-    followSystemScheme.value = prefs.value.themeId === "system";
     syncDocumentTheme();
   }
 
@@ -273,19 +281,18 @@ export function usePaneLayout() {
     });
   }
 
-  function setTheme(themeId: string, darkMode?: boolean) {
+  function setTheme(themeId: string, darkMode?: boolean | null) {
     const validTheme = KNOWN_THEMES.includes(themeId as (typeof KNOWN_THEMES)[number])
       ? themeId
       : "system";
     if (darkMode !== undefined) {
-      followSystemScheme.value = false;
-      prefs.value = { ...prefs.value, themeId: validTheme, darkMode };
+      const normalized = darkMode === true ? true : darkMode === false ? false : null;
+      prefs.value = { ...prefs.value, themeId: validTheme, darkMode: normalized };
       syncDocumentTheme();
-      updateMainPreferences({ themeId: validTheme, darkMode }).catch(() => {
+      updateMainPreferences({ themeId: validTheme, darkMode: normalized }).catch(() => {
         /* 忽略 */
       });
     } else {
-      followSystemScheme.value = validTheme === "system";
       prefs.value = { ...prefs.value, themeId: validTheme };
       syncDocumentTheme();
       updateMainPreferences({ themeId: validTheme }).catch(() => {
@@ -294,23 +301,23 @@ export function usePaneLayout() {
     }
   }
 
-  function toggleDarkMode() {
-    followSystemScheme.value = false;
-    const nextDark = !effectiveDark.value;
-    prefs.value = { ...prefs.value, darkMode: nextDark };
+  function setDarkMode(mode: boolean | null) {
+    const normalized: boolean | null = mode === true ? true : mode === false ? false : null;
+    prefs.value = { ...prefs.value, darkMode: normalized };
     syncDocumentTheme();
-    updateMainPreferences({ darkMode: nextDark }).catch(() => {
+    updateMainPreferences({ darkMode: normalized }).catch(() => {
       /* 忽略 */
     });
   }
 
+  function toggleDarkMode() {
+    const next: boolean | null =
+      prefs.value.darkMode === null ? false : prefs.value.darkMode === false ? true : null;
+    setDarkMode(next);
+  }
+
   function toggleFollowSystem() {
-    followSystemScheme.value = true;
-    prefs.value = { ...prefs.value, themeId: "system" };
-    syncDocumentTheme();
-    updateMainPreferences({ themeId: "system" }).catch(() => {
-      /* 忽略 */
-    });
+    setDarkMode(null);
   }
 
   function setWindowSize(width: number, height: number) {
@@ -344,6 +351,7 @@ export function usePaneLayout() {
     toggleSidebarCollapsed,
     setReaderPosition,
     setTheme,
+    setDarkMode,
     toggleDarkMode,
     toggleFollowSystem,
     setWindowWidth,

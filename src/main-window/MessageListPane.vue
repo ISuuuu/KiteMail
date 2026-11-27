@@ -206,6 +206,17 @@
       <div v-if="loading && messages.length > 0" class="km-loading-more">
         正在加载更多邮件…
       </div>
+
+      <div v-if="hasMoreRemote && !loading" class="km-load-older-bar">
+        <button
+          type="button"
+          class="km-load-older-btn"
+          :disabled="loadingOlder"
+          @click="emit('loadOlder')"
+        >
+          {{ loadingOlder ? "正在拉取更早邮件…" : "加载更早邮件" }}
+        </button>
+      </div>
     </div>
   </section>
 </template>
@@ -244,6 +255,8 @@ const props = defineProps<{
   loading: boolean;
   error: string | null;
   hasMore: boolean;
+  hasMoreRemote?: boolean;
+  loadingOlder?: boolean;
   searchQuery: string;
   searchScope: SearchScope;
   sortMode: MessageSort;
@@ -268,6 +281,7 @@ const emit = defineEmits<{
   setFilter: [filter: MessageFilterDto];
   refresh: [];
   loadMore: [];
+  loadOlder: [];
   overlayChange: [id: string, open: boolean];
 }>();
 
@@ -461,8 +475,12 @@ function onScroll() {
     if (!el) return;
     scrollTop.value = el.scrollTop;
     viewportHeight.value = el.clientHeight;
-    if (props.hasMore && !props.loading && el.scrollTop + el.clientHeight >= el.scrollHeight - 400) {
-      emit("loadMore");
+    if (!props.loading && el.scrollTop + el.clientHeight >= el.scrollHeight - 400) {
+      if (props.hasMore) {
+        emit("loadMore");
+      } else if (props.hasMoreRemote && !props.loadingOlder) {
+        emit("loadOlder");
+      }
     }
   });
 }
@@ -880,5 +898,31 @@ onUnmounted(() => {
   text-align: center;
   font-size: 12px;
   color: var(--km-text-muted);
+}
+
+.km-load-older-bar {
+  padding: 10px 12px 14px;
+  display: flex;
+  justify-content: center;
+}
+
+.km-load-older-btn {
+  padding: 6px 14px;
+  border-radius: var(--km-radius-sm);
+  border: 1px solid var(--km-border);
+  background: var(--km-surface-raised);
+  color: var(--km-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.km-load-older-btn:hover:not(:disabled) {
+  border-color: var(--km-accent);
+  color: var(--km-accent);
+}
+
+.km-load-older-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 </style>

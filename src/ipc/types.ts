@@ -63,7 +63,7 @@ export interface FolderSummaryDto {
 
 export interface MainPreferencesDto {
   themeId: ThemeId | string;
-  darkMode: boolean;
+  darkMode: boolean | null;
   readerPosition: ReaderPosition;
   sidebarWidth: number;
   listWidth: number;
@@ -246,6 +246,65 @@ export interface OpenMessageOutput {
   flagged: boolean;
   attachments: AttachmentDto[];
   threadMessages: ThreadMessageDto[];
+  remoteImagesBlocked?: boolean;
+  rfcMessageId?: string;
+  folderPath?: string;
+}
+
+export interface AllowRemoteImagesInput {
+  accountId: number;
+  messageId: number;
+  trustSender: boolean;
+}
+
+export interface AllowRemoteImagesOutput {
+  allowed: boolean;
+  senderTrusted: boolean;
+  stateVersion: number;
+}
+
+export interface LoadOlderMessagesInput {
+  view: ViewDto;
+  limit: number;
+}
+
+export interface LoadOlderMessagesOutput {
+  accepted: boolean;
+  hasMoreRemote: boolean;
+  stateVersion: number;
+}
+
+export interface MessageActionInput {
+  accountId: number;
+  messageId: number;
+}
+
+export interface MoveMessageInput {
+  accountId: number;
+  messageId: number;
+  targetFolderPath: string;
+}
+
+export interface MessageMoveOutput {
+  accountId: number;
+  messageId: number;
+  rfcMessageId: string;
+  originalFolderPath: string;
+  targetFolderPath: string;
+  stateVersion: number;
+}
+
+export interface UndoMessageMoveInput {
+  accountId: number;
+  messageId: number;
+  rfcMessageId: string;
+  currentFolderPath: string;
+  originalFolderPath: string;
+}
+
+export interface UndoMessageMoveOutput {
+  accepted: boolean;
+  stateVersion: number;
 }
 
 export interface RectDto {

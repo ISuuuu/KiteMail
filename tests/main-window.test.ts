@@ -17,6 +17,8 @@ import {
   clampListWidth,
   clampSidebarWidth,
   listWideNext,
+  resolveDarkMode,
+  usePaneLayout,
   validateReaderPosition,
 } from "../src/main-window/usePaneLayout.ts";
 import {
@@ -29,18 +31,25 @@ import {
   useMainWindow,
 } from "../src/main-window/useMainWindow.ts";
 import {
+  allowRemoteImages,
+  archiveMessage,
+  deleteMessage,
   emitMockEvent,
   extractErrorMessage,
   getMockRecordedReaderLayouts,
   isLockedError,
   listMessages,
+  loadOlderMessages,
   mainBootstrap,
+  markMessageSpam,
+  moveMessage,
   normalizeSyncStatusEvent,
   openMessage,
   resetMockSession,
   setMessageFlagged,
   setMessageSeen,
   setReaderLayout,
+  undoMessageMove,
   updateMainPreferences,
 } from "../src/ipc/main-window.ts";
 import type { MessageSummaryDto } from "../src/ipc/types.ts";
@@ -525,4 +534,227 @@ test("dev-tauri 多 worktree 参数解析、配置构造与空闲回环端口探
   } finally {
     await new Promise<void>((resolve) => busyServer.close(() => resolve()));
   }
+});
+
+test("三态 darkMode (null/false/true) 保留与系统 prefers-color-scheme 联动", async () => {
+  resetMockSession({ locked: false, darkMode: null });
+
+  const listeners = new Set<() => void>();
+  let systemDark = true;
+  const originalWindow = (globalThis as Record<string, unknown>).window;
+  (globalThis as Record<string, unknown>).window = {
+    innerWidth: 1280,
+    innerHeight: 800,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    matchMedia: (query: string) => ({
+      media: query,
+      get matches() {
+        return systemDark;
+      },
+      addEventListener: (_type: string, cb: () => void) => listeners.add(cb),
+      removeEventListener: (_type: string, cb: () => void) => listeners.delete(cb),
+    }),
+  };
+
+  try {
+    assert.equal(resolveDarkMode(false), false);
+    assert.equal(resolveDarkMode(true), true);
+    assert.equal(resolveDarkMode(null), true);
+
+    const layout = usePaneLayout();
+    const boot = await mainBootstrap();
+    assert.equal(boot.preferences.darkMode, null);
+
+    // 非 system 主题下 darkMode === null 仍应遵循系统暗色，且不覆写 prefs.darkMode 为布尔值
+    layout.applyPrefs({ ...boot.preferences, themeId: "midnight", darkMode: null });
+    assert.equal(layout.prefs.value.darkMode, null);
+    assert.equal(layout.followSystemScheme.value, true);
+    assert.equal(layout.effectiveDark.value, true);
+
+    // 系统切换为浅色时实时联动，且 prefs.darkMode 依然保持 null
+    systemDark = false;
+    for (const cb of listeners) cb();
+    assert.equal(layout.effectiveDark.value, false);
+    assert.equal(layout.prefs.value.darkMode, null);
+
+    // 循环切换三态：null -> false -> true -> null，并持久化到 Mock 偏好
+    layout.toggleDarkMode();
+    assert.equal(layout.prefs.value.darkMode, false);
+    assert.equal(layout.effectiveDark.value, false);
+    assert.equal(layout.followSystemScheme.value, false);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal((await mainBootstrap()).preferences.darkMode, false);
+
+    layout.toggleDarkMode();
+    assert.equal(layout.prefs.value.darkMode, true);
+    assert.equal(layout.effectiveDark.value, true);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal((await mainBootstrap()).preferences.darkMode, true);
+
+    layout.toggleDarkMode();
+    assert.equal(layout.prefs.value.darkMode, null);
+    assert.equal(layout.followSystemScheme.value, true);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal((await mainBootstrap()).preferences.darkMode, null);
+  } finally {
+    if (originalWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = originalWindow;
+    }
+    resetMockSession();
+  }
+});
+
+test("allow_remote_images 放行单封与信任发件人并清除拦截提示", async () => {
+  resetMockSession({ locked: false });
+  const win = useMainWindow();
+  await win.init();
+
+  // 消息 #2 默认拦截远程图片
+  win.selectMessage({ accountId: 1, messageId: 2 });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(win.openedMessage.value?.messageId, 2);
+  assert.equal(win.openedMessage.value?.remoteImagesBlocked, true);
+  assert.equal(win.openedMessage.value?.folderPath, "INBOX");
+  assert.ok(win.openedMessage.value?.rfcMessageId);
+
+  // 仅本次显示：当前消息解除拦截
+  await win.allowOpenedRemoteImages(false);
+  assert.equal(win.openedMessage.value?.remoteImagesBlocked, false);
+
+  // 消息 #7（7 % 5 === 2）验证 trustSender=true 会放行同一发件人的其他邮件
+  const resTrust = await allowRemoteImages({ accountId: 1, messageId: 7, trustSender: true });
+  assert.equal(resTrust.allowed, true);
+  assert.equal(resTrust.senderTrusted, true);
+  const detail7 = await openMessage({ requestId: "open-7", accountId: 1, messageId: 7 });
+  assert.equal(detail7.remoteImagesBlocked, false);
+
+  // 第 2 封（同组）与第 127 封同为 sender3@example.com（(126 % 120)+1 = 7，(6 % 120)+1 = 7）
+  const detail127 = await openMessage({ requestId: "open-127", accountId: 1, messageId: 127 });
+  assert.equal(detail127.remoteImagesBlocked, false);
+
+  win.dispose();
+  resetMockSession();
+});
+
+test("load_older_messages 拉取更早邮件并更新 hasMoreRemote 状态", async () => {
+  resetMockSession({ locked: false, inboxHasMoreRemote: true });
+  const win = useMainWindow();
+  await win.init();
+
+  assert.equal(win.currentFolderHasMoreRemote.value, true);
+  const beforeTotal = win.folders.value.find((f) => f.id === 1)?.totalCount ?? 0;
+  assert.equal(beforeTotal, 10000);
+
+  await win.loadOlderMessages(15);
+  await new Promise((r) => setTimeout(r, 15));
+
+  const afterTotal = win.folders.value.find((f) => f.id === 1)?.totalCount ?? 0;
+  assert.equal(afterTotal, 10015);
+  assert.equal(win.currentFolderHasMoreRemote.value, false);
+  assert.equal(win.listTotal.value, 10015);
+
+  // 再次调用返回 accepted: false
+  const second = await loadOlderMessages({ view: { kind: "unifiedInbox" }, limit: 15 });
+  assert.equal(second.accepted, false);
+  assert.equal(second.hasMoreRemote, false);
+
+  win.dispose();
+  resetMockSession();
+});
+
+test("归档/删除/标垃圾/移动自动选中下一封并支持撤销状态回滚", async () => {
+  resetMockSession({ locked: false });
+  const win = useMainWindow();
+  await win.init();
+
+  const initialInboxCount = win.folders.value.find((f) => f.id === 1)?.totalCount ?? 0;
+  const initialArchiveCount = win.folders.value.find((f) => f.id === 4)?.totalCount ?? 0;
+
+  // 选中第 1 封并归档：自动平滑选中第 2 封并展示撤销 Toast
+  win.selectMessage({ accountId: 1, messageId: 1 });
+  await new Promise((r) => setTimeout(r, 15));
+  await win.archiveSelectedMessage();
+  await new Promise((r) => setTimeout(r, 15));
+
+  assert.deepEqual(win.selectedId.value, { accountId: 1, messageId: 2 });
+  assert.equal(win.undoToast.value?.originalFolderPath, "INBOX");
+  assert.equal(win.undoToast.value?.currentFolderPath, "Archive");
+  assert.equal(win.folders.value.find((f) => f.id === 1)?.totalCount, initialInboxCount - 1);
+  assert.equal(win.folders.value.find((f) => f.id === 4)?.totalCount, initialArchiveCount + 1);
+  assert.equal(findMessageByRef(win.messages.value, { accountId: 1, messageId: 1 }), null);
+
+  // 点击撤销：触发 undo_message_move 并恢复文件夹计数与列表
+  const undone = await win.undoLastMove();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(undone, true);
+  assert.equal(win.undoToast.value, null);
+  assert.equal(win.folders.value.find((f) => f.id === 1)?.totalCount, initialInboxCount);
+  assert.equal(win.folders.value.find((f) => f.id === 4)?.totalCount, initialArchiveCount);
+  assert.ok(findMessageByRef(win.messages.value, { accountId: 1, messageId: 1 }));
+
+  // 删除、标垃圾与移动到指定文件夹 + 撤销验证
+  win.selectMessage({ accountId: 1, messageId: 2 });
+  await new Promise((r) => setTimeout(r, 15));
+  await win.deleteSelectedMessage();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.deepEqual(win.selectedId.value, { accountId: 1, messageId: 3 });
+  assert.equal(win.undoToast.value?.currentFolderPath, "Trash");
+  await win.undoLastMove();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(findMessageByRef(win.messages.value, { accountId: 1, messageId: 2 }));
+
+  const spamOut = await markMessageSpam({ accountId: 1, messageId: 3 });
+  assert.equal(spamOut.targetFolderPath, "Junk");
+  await undoMessageMove({
+    accountId: spamOut.accountId,
+    messageId: spamOut.messageId,
+    rfcMessageId: spamOut.rfcMessageId,
+    currentFolderPath: spamOut.targetFolderPath,
+    originalFolderPath: spamOut.originalFolderPath,
+  });
+
+  const moveOut = await moveMessage({ accountId: 1, messageId: 4, targetFolderPath: "Sent" });
+  assert.equal(moveOut.targetFolderPath, "Sent");
+  await undoMessageMove({
+    accountId: moveOut.accountId,
+    messageId: moveOut.messageId,
+    rfcMessageId: moveOut.rfcMessageId,
+    currentFolderPath: moveOut.targetFolderPath,
+    originalFolderPath: moveOut.originalFolderPath,
+  });
+
+  // 锁屏状态下 Wave 1 新命令均返回 LOCKED
+  resetMockSession({ locked: true });
+  await assert.rejects(() => archiveMessage({ accountId: 1, messageId: 1 }), isLockedError);
+  await assert.rejects(() => deleteMessage({ accountId: 1, messageId: 1 }), isLockedError);
+  await assert.rejects(() => markMessageSpam({ accountId: 1, messageId: 1 }), isLockedError);
+  await assert.rejects(
+    () => moveMessage({ accountId: 1, messageId: 1, targetFolderPath: "Archive" }),
+    isLockedError
+  );
+  await assert.rejects(
+    () =>
+      undoMessageMove({
+        accountId: 1,
+        messageId: 1,
+        rfcMessageId: "<mock-1-1@kitemail.example>",
+        currentFolderPath: "Archive",
+        originalFolderPath: "INBOX",
+      }),
+    isLockedError
+  );
+  await assert.rejects(
+    () => allowRemoteImages({ accountId: 1, messageId: 2, trustSender: false }),
+    isLockedError
+  );
+  await assert.rejects(
+    () => loadOlderMessages({ view: { kind: "unifiedInbox" }, limit: 20 }),
+    isLockedError
+  );
+
+  win.dispose();
+  resetMockSession();
 });

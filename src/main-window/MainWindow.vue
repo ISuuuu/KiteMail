@@ -9,10 +9,13 @@
       :syncing="state.syncStatus.value.syncing"
       :mode="state.mode.value"
       :hasPasscode="state.hasPasscode.value"
+      :darkMode="state.layout.prefs.value.darkMode"
+      :effectiveDark="state.layout.effectiveDark.value"
       @selectView="state.selectView"
       @toggleCollapse="state.layout.toggleSidebarCollapsed"
       @refresh="state.refresh"
       @lock="state.lock"
+      @toggleDarkMode="state.layout.toggleDarkMode"
     />
 
     <!-- 侧栏分隔把手 -->
@@ -39,6 +42,8 @@
           :loading="state.listLoading.value"
           :error="state.listError.value"
           :hasMore="state.hasMore.value"
+          :hasMoreRemote="state.currentFolderHasMoreRemote.value"
+          :loadingOlder="state.loadingOlder.value"
           :searchQuery="state.searchQuery.value"
           :searchScope="state.searchScope.value"
           :sortMode="state.sortMode.value"
@@ -60,6 +65,7 @@
           @setFilter="state.setFilter"
           @refresh="state.refresh"
           @loadMore="state.loadMore"
+          @loadOlder="state.loadOlderMessages()"
           @overlayChange="state.layout.setOverlayOpen"
         />
       </div>
@@ -84,17 +90,27 @@
           :selectedUnread="state.selectedUnread.value"
           :readerPosition="state.layout.prefs.value.readerPosition"
           :themeId="state.layout.prefs.value.themeId"
+          :darkMode="state.layout.prefs.value.darkMode"
           :effectiveDark="state.layout.effectiveDark.value"
           :followSystem="state.layout.followSystemScheme.value"
           :overlayOccluded="state.layout.overlayOccluded.value"
           :zoomPercent="state.layout.prefs.value.readerZoomPercent"
+          :folders="state.folders.value"
+          :allowingRemoteImages="state.allowingRemoteImages.value"
+          :movingMessage="state.movingMessage.value"
           @retry="state.retryOpen"
           @toggleSeen="(seen) => state.selectedId.value && state.toggleMessageSeen(state.selectedId.value, seen)"
           @toggleFlagged="(flagged) => state.selectedId.value && state.toggleMessageFlagged(state.selectedId.value, flagged)"
           @setReaderPosition="state.layout.setReaderPosition"
           @setTheme="state.layout.setTheme"
+          @setDarkMode="state.layout.setDarkMode"
           @toggleDarkMode="state.layout.toggleDarkMode"
           @toggleFollowSystem="state.layout.toggleFollowSystem"
+          @allowRemoteImages="state.allowOpenedRemoteImages"
+          @archive="state.archiveSelectedMessage()"
+          @markSpam="state.markSelectedSpam()"
+          @delete="state.deleteSelectedMessage()"
+          @moveToFolder="state.moveSelectedMessage"
           @overlayChange="state.layout.setOverlayOpen"
         />
       </template>
@@ -120,20 +136,57 @@
         :selectedUnread="state.selectedUnread.value"
         :readerPosition="state.layout.prefs.value.readerPosition"
         :themeId="state.layout.prefs.value.themeId"
+        :darkMode="state.layout.prefs.value.darkMode"
         :effectiveDark="state.layout.effectiveDark.value"
         :followSystem="state.layout.followSystemScheme.value"
         :overlayOccluded="state.layout.overlayOccluded.value"
         :zoomPercent="state.layout.prefs.value.readerZoomPercent"
+        :folders="state.folders.value"
+        :allowingRemoteImages="state.allowingRemoteImages.value"
+        :movingMessage="state.movingMessage.value"
         @retry="state.retryOpen"
         @toggleSeen="(seen) => state.selectedId.value && state.toggleMessageSeen(state.selectedId.value, seen)"
         @toggleFlagged="(flagged) => state.selectedId.value && state.toggleMessageFlagged(state.selectedId.value, flagged)"
         @setReaderPosition="state.layout.setReaderPosition"
         @setTheme="state.layout.setTheme"
+        @setDarkMode="state.layout.setDarkMode"
         @toggleDarkMode="state.layout.toggleDarkMode"
         @toggleFollowSystem="state.layout.toggleFollowSystem"
+        @allowRemoteImages="state.allowOpenedRemoteImages"
+        @archive="state.archiveSelectedMessage()"
+        @markSpam="state.markSelectedSpam()"
+        @delete="state.deleteSelectedMessage()"
+        @moveToFolder="state.moveSelectedMessage"
         @overlayChange="state.layout.setOverlayOpen"
       />
     </template>
+
+    <!-- 底部操作撤销 Toast -->
+    <div
+      v-if="state.undoToast.value"
+      class="km-undo-toast"
+      role="status"
+      aria-live="polite"
+    >
+      <span class="km-undo-toast-text">{{ state.undoToast.value.label }}</span>
+      <button
+        type="button"
+        class="km-undo-toast-btn"
+        :disabled="state.undoPending.value"
+        @click="state.undoLastMove()"
+      >
+        {{ state.undoPending.value ? "撤销中…" : "撤销" }}
+      </button>
+      <button
+        type="button"
+        class="km-undo-toast-close"
+        title="关闭提示"
+        aria-label="关闭提示"
+        @click="state.dismissUndoToast()"
+      >
+        ✕
+      </button>
+    </div>
 
     <!-- Off 模式浮动入口：允许在隐藏阅读区时切回阅读位置或主题 -->
     <div v-if="state.layout.prefs.value.readerPosition === 'off'" class="km-off-bar">
@@ -280,7 +333,7 @@ function onKeyDown(e: KeyboardEvent) {
     }
   }
 
-  // 上/下键选邮件（输入控件聚焦时不拦截）
+  // 上/下键选邮件 & Delete 删除选中邮件（输入控件聚焦时不拦截）
   if (isEditableFocused()) return;
   if (!e.ctrlKey && !e.altKey && !e.shiftKey) {
     if (e.key === "ArrowUp") {
@@ -291,6 +344,13 @@ function onKeyDown(e: KeyboardEvent) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
       state.selectNext();
+      return;
+    }
+    if (e.key === "Delete") {
+      if (state.selectedId.value) {
+        e.preventDefault();
+        void state.deleteSelectedMessage();
+      }
       return;
     }
   }
@@ -342,5 +402,56 @@ function onKeyDown(e: KeyboardEvent) {
 .km-off-chip:hover {
   border-color: var(--km-accent);
   color: var(--km-accent);
+}
+
+.km-undo-toast {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  z-index: 50;
+  max-width: calc(100% - 32px);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: var(--km-radius-md);
+  border: 1px solid var(--km-border);
+  background: var(--km-surface-raised);
+  color: var(--km-text);
+  box-shadow: var(--km-shadow-popover);
+  font-size: 12px;
+}
+
+.km-undo-toast-text {
+  font-weight: 500;
+}
+
+.km-undo-toast-btn {
+  border: none;
+  border-radius: var(--km-radius-sm);
+  padding: 4px 10px;
+  background: var(--km-accent);
+  color: var(--km-accent-fg);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.km-undo-toast-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.km-undo-toast-close {
+  border: none;
+  background: transparent;
+  color: var(--km-text-muted);
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 11px;
+}
+
+.km-undo-toast-close:hover {
+  color: var(--km-text);
 }
 </style>
