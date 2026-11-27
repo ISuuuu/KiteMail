@@ -1703,9 +1703,14 @@ impl HylkiApp {
             Ok(hash) => (hash, None),
             Err(err) => (None, Some(err)),
         };
-        let initial_app_locked = initial_app_lock_hash.is_some();
+        let initial_app_locked = if initial_app_lock_hash.is_some() {
+            app_lock::is_lock_persisted_in(&data_dir)
+        } else {
+            let _ = app_lock::set_lock_persisted_in(&data_dir, false);
+            false
+        };
         if let Some(ref tray_handle) = tray {
-            tray_handle.set_lock_enabled(initial_app_locked);
+            tray_handle.set_lock_enabled(initial_app_lock_hash.is_some());
         }
 
         let (worker_evt_tx, mut worker_evt_rx) = futures::channel::mpsc::channel::<()>(16);
@@ -2065,6 +2070,9 @@ impl HylkiApp {
         duration: Duration,
         cx: &mut Context<Self>,
     ) {
+        let key = key.into();
+        let message: SharedString = message.into();
+        crate::app_log::log_toast("main", &key, kind, message.as_ref(), None);
         self.toasts
             .push_with_duration(key, kind, message, action, duration);
         self.ensure_toast_expiry_tick(cx);
@@ -2080,6 +2088,9 @@ impl HylkiApp {
         action: Option<ToastAction>,
         cx: &mut Context<Self>,
     ) {
+        let key = key.into();
+        let message: SharedString = message.into();
+        crate::app_log::log_toast("main", &key, kind, message.as_ref(), detail.as_deref());
         self.toasts
             .push_recovery(key, kind, message, detail, action);
         cx.notify();
@@ -2145,6 +2156,9 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) {
         if self.has_open_settings_window() {
+            let key = key.into();
+            let message: SharedString = message.into();
+            crate::app_log::log_toast("settings", &key, kind, message.as_ref(), None);
             self.settings_toasts
                 .push_transient(key, kind, message, action);
             self.ensure_toast_expiry_tick(cx);
@@ -2164,6 +2178,9 @@ impl HylkiApp {
         cx: &mut Context<Self>,
     ) {
         if self.has_open_settings_window() {
+            let key = key.into();
+            let message: SharedString = message.into();
+            crate::app_log::log_toast("settings", &key, kind, message.as_ref(), detail.as_deref());
             self.settings_toasts
                 .push_recovery(key, kind, message, detail, action);
             cx.notify();
@@ -2180,10 +2197,14 @@ impl HylkiApp {
         action: Option<ToastAction>,
         cx: &mut Context<Self>,
     ) {
+        let key = key.into();
+        let message: SharedString = message.into();
         if self.compose_detached && self.compose_window.is_some() {
+            crate::app_log::log_toast("compose", &key, kind, message.as_ref(), None);
             self.compose_toasts
                 .push_transient(key, kind, message, action);
         } else {
+            crate::app_log::log_toast("main", &key, kind, message.as_ref(), None);
             self.toasts.push_transient(key, kind, message, action);
         }
         self.ensure_toast_expiry_tick(cx);
@@ -4190,6 +4211,9 @@ impl HylkiApp {
             self.app_locked = false;
             self.lock_error = None;
             self.lock_verifying = false;
+            if !self.demo_mode {
+                let _ = app_lock::set_lock_persisted_in(&config::data_dir(), false);
+            }
         }
         cx.notify();
     }
@@ -4236,7 +4260,15 @@ impl HylkiApp {
                 &self.prefs.app_lock_background_timeout,
             ),
         });
-        if trigger.is_some() {
+        if let Some(trigger) = trigger {
+            crate::app_log::log(
+                "INFO",
+                "app_lock",
+                &format!(
+                    "自动锁定触发: reason={trigger:?}, in_foreground={in_foreground}, idle_minutes={}, bg_timeout={}",
+                    self.prefs.app_lock_idle_minutes, self.prefs.app_lock_background_timeout
+                ),
+            );
             self.lock_app(cx);
         }
     }
@@ -4278,6 +4310,12 @@ impl HylkiApp {
         }
 
         self.app_locked = true;
+        crate::app_log::log("INFO", "app_lock", "应用已进入锁定状态");
+        if !self.demo_mode {
+            if let Err(err) = app_lock::set_lock_persisted_in(&config::data_dir(), true) {
+                crate::app_log::log("WARN", "app_lock", &err);
+            }
+        }
         self.lock_error = None;
         self.lock_verifying = false;
         self.lock_input_needs_focus = true;
@@ -4359,6 +4397,13 @@ impl HylkiApp {
                 });
                 if matched {
                     app.app_locked = false;
+                    if !app.demo_mode {
+                        if let Err(err) =
+                            app_lock::set_lock_persisted_in(&config::data_dir(), false)
+                        {
+                            crate::app_log::log("WARN", "app_lock", &err);
+                        }
+                    }
                     app.lock_failed_attempts = 0;
                     app.lock_cooldown_until = None;
                     app.lock_error = None;

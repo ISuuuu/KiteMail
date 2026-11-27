@@ -9,6 +9,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod app_log;
 mod autostart;
 mod compose_schedule;
 mod reader_thread_doc;
@@ -279,11 +280,19 @@ impl gpui_kit::http_client::HttpClient for HylkiHttpClient {
 }
 
 fn main() {
+    app_log::install_panic_hook();
+
     // 单实例：已有 Hylki 在运行时把它的窗口还原到前台（含隐藏到托盘的情况），
     // 本进程直接退出，不再启动第二个实例。守卫持有到进程结束。
     let Some(_instance_guard) = single_instance::acquire_or_activate() else {
         return;
     };
+
+    app_log::log(
+        "INFO",
+        "startup",
+        &format!("KiteMail 启动 (pid={})", std::process::id()),
+    );
 
     ui::print_preview::cleanup_print_temp_files();
 
