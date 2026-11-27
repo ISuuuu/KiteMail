@@ -39,12 +39,32 @@
           v-if="narrow && narrowShowContent"
           type="button"
           class="km-set-back-btn"
-          @click="narrowShowContent = false"
+          @click="onNarrowBack"
         >
           ← 返回
         </button>
         <div class="km-set-drag km-set-header-drag" data-tauri-drag-region>
-          <span class="km-set-header-title">{{ activeTab.label }}</span>
+          <span class="km-set-header-title">{{ headerTitle }}</span>
+        </div>
+        <!-- 账号编辑态单顶栏（WP-07）：移除 / 保存上提到壳层（GPUI mod.rs#L2465） -->
+        <div v-if="accountChrome.editorActive" class="km-set-editor-actions">
+          <button
+            v-if="accountChrome.canRemove"
+            type="button"
+            class="km-set-editor-btn km-set-editor-danger"
+            :disabled="accountChrome.busy"
+            @click="accountsPageRef?.toggleRemoveConfirm()"
+          >
+            移除
+          </button>
+          <button
+            type="button"
+            class="km-set-editor-btn km-set-editor-primary"
+            :disabled="accountChrome.busy"
+            @click="accountsPageRef?.saveFromChrome()"
+          >
+            {{ accountChrome.busy ? "正在保存…" : "保存" }}
+          </button>
         </div>
         <WindowControls />
       </header>
@@ -68,7 +88,12 @@
         </div>
         <template v-else>
           <GeneralPage v-if="activeTab.id === 'general'" :state="state" />
-          <AccountsPage v-else-if="activeTab.id === 'mailAccounts'" />
+          <AccountsPage
+            v-else-if="activeTab.id === 'mailAccounts'"
+            ref="accountsPageRef"
+            hostChrome
+            @chrome="onAccountChrome"
+          />
           <TagPage v-else-if="activeTab.id === 'tags'" />
           <FilterPage v-else-if="activeTab.id === 'filters'" />
           <SmartFolderPage v-else-if="activeTab.id === 'smartFolders'" />
@@ -85,15 +110,11 @@
           <ConversationsPage v-else-if="activeTab.id === 'conversations'" :state="state" />
           <ReadingPage v-else-if="activeTab.id === 'reading'" :state="state" />
           <ComposingPage v-else-if="activeTab.id === 'composing'" :state="state" />
-          <template v-else-if="activeTab.id === 'privacy'">
-            <PrivacyPanel :state="state" />
-          </template>
-          <template v-else-if="activeTab.id === 'system'">
-            <div class="km-panels-wide km-system-panels">
-              <StoragePanel :state="state" />
-              <AboutPanel :state="state" />
-            </div>
-          </template>
+          <PrivacyPage v-else-if="activeTab.id === 'privacy'" :state="state" />
+          <McpPage v-else-if="activeTab.id === 'mcp'" :state="state" />
+          <DateTimePage v-else-if="activeTab.id === 'dateTime'" :state="state" />
+          <SystemPage v-else-if="activeTab.id === 'system'" :state="state" />
+          <BackupPage v-else-if="activeTab.id === 'backup'" :state="state" />
           <PlaceholderPage v-else :label="activeTab.label" />
         </template>
 
@@ -111,26 +132,26 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { KNOWN_THEMES, resolveDarkMode } from "../main-window/usePaneLayout";
 import type { FullPreferencesDto } from "../preferences/types";
-import {
-  AboutPanel,
-  PrivacyPanel,
-  StoragePanel,
-} from "../preferences/panels";
 import { usePreferences } from "../preferences/usePreferences";
 import AccountsPage from "./AccountsPage.vue";
 import AppearancePage from "./AppearancePage.vue";
+import BackupPage from "./BackupPage.vue";
 import ComposingPage from "./ComposingPage.vue";
 import ConversationsPage from "./ConversationsPage.vue";
+import DateTimePage from "./DateTimePage.vue";
 import FilterPage from "./FilterPage.vue";
 import FocusPage from "./FocusPage.vue";
 import GeneralPage from "./GeneralPage.vue";
+import McpPage from "./McpPage.vue";
 import MessageListPage from "./MessageListPage.vue";
 import PgpKeysPage from "./PgpKeysPage.vue";
+import PrivacyPage from "./PrivacyPage.vue";
 import ReadingPage from "./ReadingPage.vue";
 import SidebarPage from "./SidebarPage.vue";
+import SystemPage from "./SystemPage.vue";
 import PlaceholderPage from "./PlaceholderPage.vue";
 import SendersPage from "./SendersPage.vue";
 import SmartFolderPage from "./SmartFolderPage.vue";
@@ -169,6 +190,36 @@ const narrowOnlySidebar = computed(() => narrow.value && !narrowShowContent.valu
 const showSidebar = computed(() => !narrow.value || !narrowShowContent.value);
 const showContent = computed(() => !narrow.value || narrowShowContent.value);
 const activeTab = computed(() => findSettingsTab(activeTabId.value));
+
+// ---- 账号编辑态单顶栏（WP-07）：AccountsPage 上抛状态，壳层承载 返回/移除/保存 ----
+const accountsPageRef = ref<InstanceType<typeof AccountsPage> | null>(null);
+const accountChrome = reactive({
+  editorActive: false,
+  title: "编辑账号",
+  canRemove: false,
+  busy: false,
+});
+
+function onAccountChrome(
+  chrome: { editorActive: boolean; title: string; canRemove: boolean; busy: boolean }
+) {
+  Object.assign(accountChrome, chrome);
+}
+
+const headerTitle = computed(() =>
+  activeTab.value.id === "mailAccounts" && accountChrome.editorActive
+    ? accountChrome.title
+    : activeTab.value.label
+);
+
+/** 窄窗「返回」：账号编辑态先回账号列表，列表态再回导航（GPUI 语义）。 */
+function onNarrowBack() {
+  if (activeTab.value.id === "mailAccounts" && accountChrome.editorActive) {
+    accountsPageRef.value?.backToAccountList();
+    return;
+  }
+  narrowShowContent.value = false;
+}
 
 function selectTab(id: SettingsTabId) {
   activeTabId.value = id;
@@ -396,6 +447,51 @@ onBeforeUnmount(() => {
 
 .km-set-back-btn:hover {
   background: var(--km-hover-bg);
+}
+
+/* 账号编辑态单顶栏动作按钮（对齐 GPUI danger/primary compact） */
+.km-set-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.km-set-editor-btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: var(--km-radius-md);
+  border: 1px solid transparent;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.km-set-editor-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.km-set-editor-danger {
+  border-color: color-mix(in srgb, var(--km-danger) 50%, var(--km-border));
+  background: transparent;
+  color: var(--km-danger);
+}
+
+.km-set-editor-danger:hover:not(:disabled) {
+  background: var(--km-danger-soft);
+}
+
+.km-set-editor-primary {
+  border-color: var(--km-accent);
+  background: var(--km-accent);
+  color: var(--km-accent-fg);
+}
+
+.km-set-editor-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--km-accent) 88%, var(--km-accent-fg));
 }
 
 .km-set-subtitle {
