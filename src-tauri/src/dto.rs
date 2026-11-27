@@ -10,7 +10,6 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 pub const EVENT_MAIL_CHANGED: &str = "main://mail-changed";
 pub const EVENT_SYNC_STATUS: &str = "main://sync-status";
 pub const EVENT_READER_STATUS: &str = "main://reader-status";
-#[allow(dead_code)]
 pub const EVENT_LOCK_STATE: &str = "main://lock-state";
 
 /// Structured IPC error returned by all main-window Tauri commands.
@@ -103,6 +102,13 @@ impl From<&AccountSummary> for AccountSummaryDto {
             display_name: value.display_name.clone(),
             email: value.email.clone(),
         }
+    }
+}
+
+impl From<&kitemail_mail_core::config::AccountConfig> for AccountSummaryDto {
+    fn from(cfg: &kitemail_mail_core::config::AccountConfig) -> Self {
+        let summary = AccountSummary::from(cfg);
+        Self::from(&summary)
     }
 }
 
@@ -233,6 +239,8 @@ pub struct SyncStatusDto {
 pub struct MainBootstrapDto {
     pub mode: AppMode,
     pub locked: bool,
+    pub has_passcode: bool,
+    pub cache_ready: bool,
     pub state_version: u64,
     pub accounts: Vec<AccountSummaryDto>,
     pub folders: Vec<FolderSummaryDto>,
@@ -418,6 +426,7 @@ impl From<&AttachmentMeta> for AttachmentMetaDto {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadMessageDto {
     pub id: u32,
+    pub account_id: u32,
     pub rfc_message_id: String,
     pub subject: String,
     pub sender: String,
@@ -425,7 +434,9 @@ pub struct ThreadMessageDto {
     pub cc: String,
     pub date_ts: i64,
     pub date_display: String,
+    pub preview: String,
     pub body_text: String,
+    pub plain_text: String,
     pub has_html: bool,
     pub html_body: Option<String>,
     pub body_loaded: bool,
@@ -436,10 +447,20 @@ pub struct ThreadMessageDto {
     pub folder_path: String,
 }
 
-impl From<&ThreadMessage> for ThreadMessageDto {
-    fn from(value: &ThreadMessage) -> Self {
+impl ThreadMessageDto {
+    pub fn from_core(account_id: u32, value: &ThreadMessage) -> Self {
+        let preview = value
+            .body_text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect();
         Self {
             id: value.id,
+            account_id,
             rfc_message_id: value.rfc_message_id.clone(),
             subject: value.subject.clone(),
             sender: value.sender.clone(),
@@ -447,7 +468,9 @@ impl From<&ThreadMessage> for ThreadMessageDto {
             cc: value.cc.clone(),
             date_ts: value.date_ts,
             date_display: value.date_display.clone(),
+            preview,
             body_text: value.body_text.clone(),
+            plain_text: value.body_text.clone(),
             has_html: value.body_html.is_some(),
             html_body: value.body_html.clone(),
             body_loaded: value.body_loaded,
@@ -461,6 +484,12 @@ impl From<&ThreadMessage> for ThreadMessageDto {
             uid: value.uid,
             folder_path: value.folder_path.clone(),
         }
+    }
+}
+
+impl From<&ThreadMessage> for ThreadMessageDto {
+    fn from(value: &ThreadMessage) -> Self {
+        Self::from_core(0, value)
     }
 }
 
@@ -549,6 +578,61 @@ pub struct SyncStatusEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UnlockAppInput {
+    pub passcode: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlockAppOutput {
+    pub unlocked: bool,
+    pub locked: bool,
+    pub error: Option<String>,
+    pub retry_after_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockAppOutput {
+    pub locked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMessageSeenInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub seen: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMessageSeenOutput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub unread: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMessageFlaggedInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub flagged: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMessageFlaggedOutput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub flagged: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReaderStatusEvent {
     pub reader_session_id: String,
     pub account_id: u32,
@@ -556,14 +640,26 @@ pub struct ReaderStatusEvent {
     pub body_status: BodyStatusDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plain_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_html: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_body: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LockStateEvent {
     pub state_version: u64,
     pub locked: bool,
+    pub has_passcode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked_reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -576,6 +672,8 @@ mod tests {
         let dto = MainBootstrapDto {
             mode: AppMode::Demo,
             locked: false,
+            has_passcode: true,
+            cache_ready: true,
             state_version: 3,
             accounts: vec![AccountSummaryDto {
                 id: 1,
@@ -617,6 +715,8 @@ mod tests {
 
         let val = serde_json::to_value(&dto).expect("serialize bootstrap");
         assert_eq!(val["mode"], "demo");
+        assert_eq!(val["hasPasscode"], true);
+        assert_eq!(val["cacheReady"], true);
         assert_eq!(val["stateVersion"], 3);
         assert_eq!(val["accounts"][0]["displayName"], "测试工作邮箱");
         assert_eq!(val["folders"][0]["accountId"], 1);
@@ -700,5 +800,56 @@ mod tests {
         let unknown =
             serde_json::from_value::<MainPreferencesPatch>(json!({ "unknownField": 123 }));
         assert!(unknown.is_err(), "non-whitelisted patch field must fail");
+    }
+
+    #[test]
+    fn milestone_c_lock_and_flag_dtos_match_frozen_contract() {
+        let unlock_in: UnlockAppInput =
+            serde_json::from_value(json!({ "passcode": "1234" })).expect("UnlockAppInput");
+        assert_eq!(unlock_in.passcode, "1234");
+
+        let unlock_out = UnlockAppOutput {
+            unlocked: false,
+            locked: true,
+            error: Some("密码错误".to_string()),
+            retry_after_secs: Some(5),
+        };
+        let unlock_val = serde_json::to_value(&unlock_out).expect("UnlockAppOutput");
+        assert_eq!(unlock_val["unlocked"], false);
+        assert_eq!(unlock_val["locked"], true);
+        assert_eq!(unlock_val["retryAfterSecs"], 5);
+
+        let seen_in: SetMessageSeenInput =
+            serde_json::from_value(json!({ "accountId": 1, "messageId": 99, "seen": true }))
+                .expect("SetMessageSeenInput");
+        assert!(seen_in.seen);
+
+        let seen_out = SetMessageSeenOutput {
+            account_id: 1,
+            message_id: 99,
+            unread: false,
+            state_version: 12,
+        };
+        let seen_val = serde_json::to_value(&seen_out).expect("SetMessageSeenOutput");
+        assert_eq!(seen_val["accountId"], 1);
+        assert_eq!(seen_val["messageId"], 99);
+        assert_eq!(seen_val["unread"], false);
+        assert_eq!(seen_val["stateVersion"], 12);
+
+        let flag_in: SetMessageFlaggedInput =
+            serde_json::from_value(json!({ "accountId": 2, "messageId": 50, "flagged": true }))
+                .expect("SetMessageFlaggedInput");
+        assert!(flag_in.flagged);
+
+        let lock_ev = LockStateEvent {
+            state_version: 4,
+            locked: true,
+            has_passcode: true,
+            locked_reason: Some("idle".to_string()),
+        };
+        let lock_val = serde_json::to_value(&lock_ev).expect("LockStateEvent");
+        assert_eq!(lock_val["locked"], true);
+        assert_eq!(lock_val["hasPasscode"], true);
+        assert_eq!(lock_val["lockedReason"], "idle");
     }
 }

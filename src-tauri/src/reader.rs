@@ -161,6 +161,11 @@ impl ReaderManager {
                 message_id,
                 body_status: status,
                 detail: None,
+                message: None,
+                retryable: None,
+                plain_text: Some(doc.plain_text.clone()),
+                has_html: Some(doc.html_body.is_some()),
+                html_body: doc.html_body.clone(),
             });
             return status;
         }
@@ -182,6 +187,11 @@ impl ReaderManager {
                 message_id,
                 body_status: BodyStatusDto::Loading,
                 detail: None,
+                message: None,
+                retryable: None,
+                plain_text: Some(doc.plain_text.clone()),
+                has_html: Some(true),
+                html_body: doc.html_body.clone(),
             });
             BodyStatusDto::Loading
         } else {
@@ -192,6 +202,11 @@ impl ReaderManager {
                 message_id,
                 body_status: BodyStatusDto::Ready,
                 detail: None,
+                message: None,
+                retryable: None,
+                plain_text: Some(doc.plain_text.clone()),
+                has_html: Some(doc.html_body.is_some()),
+                html_body: doc.html_body.clone(),
             });
             BodyStatusDto::Ready
         }
@@ -327,7 +342,6 @@ impl ReaderManager {
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_locked(&self, locked: bool) {
         let mut guard = self.state.lock().expect("reader mutex poisoned");
         guard.locked = locked;
@@ -338,7 +352,12 @@ impl ReaderManager {
             guard.last_layout = None;
             drop(guard);
             self.sink.set_visible(false);
+            self.sink.close();
         }
+    }
+
+    pub fn emit_reader_status(&self, event: ReaderStatusEvent) {
+        self.sink.emit_status(event);
     }
 
     pub fn close(&self) {
@@ -458,16 +477,18 @@ pub mod platform_win {
                 if version != active.expected_version || active.session_id.is_empty() {
                     return;
                 }
-                let (body_status, detail) = match status {
-                    ReaderLoadStatus::Loading => (BodyStatusDto::Loading, None),
-                    ReaderLoadStatus::Ready => (BodyStatusDto::Ready, None),
+                let (body_status, detail, retryable) = match status {
+                    ReaderLoadStatus::Loading => (BodyStatusDto::Loading, None, None),
+                    ReaderLoadStatus::Ready => (BodyStatusDto::Ready, None, None),
                     ReaderLoadStatus::Unavailable => (
                         BodyStatusDto::Unavailable,
                         Some("邮件正文加载失败".to_string()),
+                        Some(true),
                     ),
                     ReaderLoadStatus::ProcessFailed => (
                         BodyStatusDto::Unavailable,
                         Some("WebView2 阅读进程异常退出".to_string()),
+                        Some(true),
                     ),
                 };
                 let _ = cb_handle.emit_to(
@@ -478,7 +499,12 @@ pub mod platform_win {
                         account_id: active.account_id,
                         message_id: active.message_id,
                         body_status,
-                        detail,
+                        detail: detail.clone(),
+                        message: detail,
+                        retryable,
+                        plain_text: None,
+                        has_html: None,
+                        html_body: None,
                     },
                 );
             }
@@ -487,6 +513,7 @@ pub mod platform_win {
                 if version != active.expected_version || active.session_id.is_empty() {
                     return;
                 }
+                let detail = Some("WebView2 阅读进程异常退出".to_string());
                 let _ = cb_handle.emit_to(
                     MAIN_WINDOW_LABEL,
                     EVENT_READER_STATUS,
@@ -495,7 +522,12 @@ pub mod platform_win {
                         account_id: active.account_id,
                         message_id: active.message_id,
                         body_status: BodyStatusDto::Unavailable,
-                        detail: Some("WebView2 阅读进程异常退出".to_string()),
+                        detail: detail.clone(),
+                        message: detail,
+                        retryable: Some(true),
+                        plain_text: None,
+                        has_html: None,
+                        html_body: None,
                     },
                 );
             }

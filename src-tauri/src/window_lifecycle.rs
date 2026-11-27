@@ -115,11 +115,7 @@ pub fn compute_clipped_rects(
         right: content.right.min(clip_viewport.right),
         bottom: content.bottom.min(clip_viewport.bottom),
     };
-    if clip.right <= clip.left
-        || clip.bottom <= clip.top
-        || content.right <= content.left
-        || content.bottom <= content.top
-    {
+    if clip.width() <= 0 || clip.height() <= 0 || content.width() <= 0 || content.height() <= 0 {
         return None;
     }
     let bounds = PhysicalRect {
@@ -238,6 +234,8 @@ mod tests {
             height: 752.0,
         };
         let phys_100 = logical_rect_to_physical(rect, 1.0);
+        assert_eq!(phys_100.width(), 680);
+        assert_eq!(phys_100.height(), 752);
         assert_eq!(
             phys_100,
             PhysicalRect {

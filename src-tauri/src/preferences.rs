@@ -3,9 +3,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use kitemail_mail_core::config::{load_preferences_in, save_preferences_in, AppPreferences};
+use kitemail_mail_core::config::{
+    default_mail_data_dir_in, load_preferences_in, resolve_data_dir, resolve_mail_data_dir_in,
+    save_preferences_in, AppPreferences,
+};
 
-use crate::dto::{IpcError, MainPreferencesDto, MainPreferencesPatch, ReaderPositionDto};
+use crate::dto::{
+    IpcError, MainPreferencesDto, MainPreferencesPatch, MainViewDto, ReaderPositionDto,
+};
 
 pub const VALID_THEME_IDS: &[&str] = &[
     "system", "default", "midnight", "tidal", "rose", "earth", "forest",
@@ -51,6 +56,141 @@ pub fn resolve_preview_data_dir_with(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(PREVIEW_DATA_DIR_NAME)
+}
+
+/// Resolve the isolated Live-mode data directory:
+/// `KITEMAIL_DATA_DIR` > `KITEMAIL_PREVIEW_DATA_DIR` > portable `<exe_dir>\data-preview` > `%LOCALAPPDATA%\KiteMailPreview`.
+pub fn resolve_live_data_dir_with(
+    mail_env: Option<&str>,
+    preview_env: Option<&str>,
+    is_portable: bool,
+    exe_dir: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> PathBuf {
+    if let Some(raw) = mail_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(raw);
+    }
+    if let Some(raw) = preview_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(raw);
+    }
+    if is_portable {
+        if let Some(dir) = exe_dir {
+            return dir.join("data-preview");
+        }
+    }
+    local_app_data
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(PREVIEW_DATA_DIR_NAME)
+}
+
+pub fn production_default_data_dir_with(
+    is_portable: bool,
+    exe_dir: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> PathBuf {
+    resolve_data_dir(None, is_portable, exe_dir, local_app_data)
+}
+
+fn normalized_path_key(path: &Path) -> String {
+    let resolved = if path.exists() {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        let mut cursor = Some(path);
+        let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+        let mut base = None;
+        while let Some(cur) = cursor {
+            if cur.exists() {
+                if let Ok(canon) = std::fs::canonicalize(cur) {
+                    base = Some(canon);
+                    break;
+                }
+            }
+            if let Some(name) = cur.file_name() {
+                suffix.push(name.to_os_string());
+                cursor = cur.parent();
+            } else {
+                break;
+            }
+        }
+        if let Some(mut rebuilt) = base {
+            for comp in suffix.into_iter().rev() {
+                rebuilt.push(comp);
+            }
+            rebuilt
+        } else {
+            path.to_path_buf()
+        }
+    };
+    let s = resolved.to_string_lossy();
+    let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    stripped
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// Verify that neither `data_dir` nor its resolved `mail_data_dir` points to any production default path.
+pub fn verify_isolated_live_dirs(
+    data_dir: &Path,
+    prod_data_dirs: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let data_key = normalized_path_key(data_dir);
+    let mail_dir = resolve_mail_data_dir_in(data_dir);
+    let mail_key = normalized_path_key(&mail_dir);
+
+    for prod in prod_data_dirs {
+        let prod_key = normalized_path_key(prod);
+        let prod_mail_key = normalized_path_key(&default_mail_data_dir_in(prod));
+        if data_key == prod_key || data_key == prod_mail_key {
+            return Err(format!(
+                "Live 预览模式禁止直接使用正式默认资料目录: {}",
+                data_dir.display()
+            ));
+        }
+        if mail_key == prod_key || mail_key == prod_mail_key {
+            return Err(format!(
+                "Live 预览模式禁止将实际邮件目录指向正式默认目录: {}",
+                mail_dir.display()
+            ));
+        }
+    }
+    Ok(mail_dir)
+}
+
+/// Resolve and verify the active Live-mode data directory.
+pub fn resolve_and_verify_live_data_dir() -> Result<(PathBuf, PathBuf), String> {
+    let mail_env = std::env::var("KITEMAIL_DATA_DIR").ok();
+    let preview_env = std::env::var("KITEMAIL_PREVIEW_DATA_DIR").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let local_app_data = dirs::data_local_dir();
+    let is_portable = kitemail_mail_core::update::is_portable();
+
+    let data_dir = resolve_live_data_dir_with(
+        mail_env.as_deref(),
+        preview_env.as_deref(),
+        is_portable,
+        exe_dir.as_deref(),
+        local_app_data.as_deref(),
+    );
+
+    let mut prod_dirs = vec![production_default_data_dir_with(
+        false,
+        exe_dir.as_deref(),
+        local_app_data.as_deref(),
+    )];
+    if is_portable {
+        prod_dirs.push(production_default_data_dir_with(
+            true,
+            exe_dir.as_deref(),
+            local_app_data.as_deref(),
+        ));
+    }
+
+    let mail_dir = verify_isolated_live_dirs(&data_dir, &prod_dirs)?;
+    Ok((data_dir, mail_dir))
 }
 
 /// Active preview data directory for `preferences.toml` and isolated WebView2 profiles.
@@ -290,6 +430,47 @@ impl PreferencesStore {
         *guard = candidate;
         Ok(true)
     }
+
+    pub fn update_last_location(&self, view: MainViewDto) {
+        let (next_last_view, next_last_folder) = match view {
+            MainViewDto::UnifiedInbox => (Some("unified".to_string()), None),
+            MainViewDto::Unread => (Some("unread".to_string()), None),
+            MainViewDto::Starred => (Some("starred".to_string()), None),
+            MainViewDto::Sent => (Some("sent".to_string()), None),
+            MainViewDto::Drafts => (Some("drafts".to_string()), None),
+            MainViewDto::Archive => (Some("archive".to_string()), None),
+            MainViewDto::Junk => (Some("junk".to_string()), None),
+            MainViewDto::Trash => (Some("trash".to_string()), None),
+            MainViewDto::Snoozed => (Some("snoozed".to_string()), None),
+            MainViewDto::AccountFolder {
+                account_id,
+                folder_id,
+            } => (None, Some((account_id, folder_id))),
+        };
+        let _ = self.mutate_and_save(|prefs| {
+            if prefs.last_view == next_last_view && prefs.last_folder == next_last_folder {
+                return false;
+            }
+            prefs.last_view = next_last_view;
+            prefs.last_folder = next_last_folder;
+            true
+        });
+    }
+}
+
+pub fn view_from_last_str(last: Option<&str>) -> Option<MainViewDto> {
+    match last? {
+        "unified" => Some(MainViewDto::UnifiedInbox),
+        "unread" => Some(MainViewDto::Unread),
+        "starred" => Some(MainViewDto::Starred),
+        "sent" => Some(MainViewDto::Sent),
+        "drafts" => Some(MainViewDto::Drafts),
+        "archive" => Some(MainViewDto::Archive),
+        "junk" => Some(MainViewDto::Junk),
+        "trash" => Some(MainViewDto::Trash),
+        "snoozed" => Some(MainViewDto::Snoozed),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -420,5 +601,48 @@ mod tests {
         assert_eq!(reopened, follow_sys);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_data_dir_prefers_env_falls_back_to_preview_and_rejects_production_dirs() {
+        let local = temp_dir("prod-root");
+        let prod_dir = production_default_data_dir_with(false, None, Some(&local));
+        assert_eq!(prod_dir, local.join("KiteMail"));
+
+        let fallback = resolve_live_data_dir_with(None, None, false, None, Some(&local));
+        assert_eq!(fallback, local.join("KiteMailPreview"));
+        assert!(verify_isolated_live_dirs(&fallback, std::slice::from_ref(&prod_dir)).is_ok());
+
+        let env_custom = temp_dir("live-env");
+        let resolved_env = resolve_live_data_dir_with(
+            Some(env_custom.to_str().unwrap()),
+            Some(r"D:\OtherPreview"),
+            false,
+            None,
+            Some(&local),
+        );
+        assert_eq!(resolved_env, env_custom);
+        assert!(verify_isolated_live_dirs(&resolved_env, std::slice::from_ref(&prod_dir)).is_ok());
+
+        // Reject data_dir pointing directly to production default directory.
+        let direct_prod = verify_isolated_live_dirs(&prod_dir, std::slice::from_ref(&prod_dir));
+        assert!(direct_prod.is_err());
+
+        // Reject isolated data_dir whose storage.toml points mail_data_dir to production mail dir!
+        let sneaky_dir = temp_dir("sneaky-storage");
+        let prod_mail_dir = default_mail_data_dir_in(&prod_dir);
+        kitemail_mail_core::config::save_storage_config_in(
+            &sneaky_dir,
+            &kitemail_mail_core::config::StorageConfig {
+                mail_data_dir: Some(prod_mail_dir.to_string_lossy().into_owned()),
+            },
+        )
+        .expect("write storage.toml");
+        let sneaky_check = verify_isolated_live_dirs(&sneaky_dir, std::slice::from_ref(&prod_dir));
+        assert!(sneaky_check.is_err());
+
+        let _ = std::fs::remove_dir_all(&local);
+        let _ = std::fs::remove_dir_all(&env_custom);
+        let _ = std::fs::remove_dir_all(&sneaky_dir);
     }
 }
