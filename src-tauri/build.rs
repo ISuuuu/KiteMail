@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=capabilities/main.json");
+    println!("cargo:rerun-if-changed=capabilities/settings.json");
     println!("cargo:rerun-if-changed=tauri.conf.json");
     println!("cargo:rerun-if-env-changed=KITEMAIL_VERSION");
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
@@ -53,6 +54,7 @@ fn main() {
             "manage_trusted_senders",
             "clear_body_caches",
             "check_app_update",
+            "open_settings_window",
         ]),
     ))
     .expect("failed to run tauri build");

@@ -22,6 +22,11 @@ export default defineConfig({
     host: "127.0.0.1",
     port: devPort,
     strictPort: true,
+    watch: {
+      // Rust 构建产物在 cargo 重链接时被 Windows 文件锁占用，
+      // chokidar 监听会触发 EBUSY 使 dev server 崩溃，故排除。
+      ignored: ["**/src-tauri/target/**"],
+    },
     hmr: {
       protocol: "ws",
       host: "127.0.0.1",

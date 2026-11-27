@@ -12,6 +12,7 @@ mod mail_session;
 mod preferences;
 mod reader;
 mod settings;
+mod settings_window;
 mod single_instance;
 mod tray;
 mod win_idle;
@@ -354,6 +355,7 @@ fn main() {
             contacts::delete_contact,
             contacts::import_contacts,
             contacts::export_contacts,
+            settings_window::open_settings_window,
             settings::get_full_preferences,
             settings::update_full_preferences,
             settings::set_app_lock_passcode,

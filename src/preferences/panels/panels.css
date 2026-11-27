@@ -1,0 +1,378 @@
+/*
+ * 偏好设置页面板共享样式（从 PreferencesModal.vue 抽出，供弹窗与独立设置窗复用）。
+ * 所有规则以 `.km-pref-panels` 为作用域前缀，避免影响主窗口其他组件的同名类。
+ */
+
+.km-pref-panels .km-tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+}
+
+.km-pref-panels .km-tab-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.km-pref-panels .km-tab-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--km-text);
+}
+
+.km-pref-panels .km-card {
+  padding: 14px;
+  border-radius: var(--km-radius-md);
+  border: 1px solid var(--km-border);
+  background: var(--km-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.km-pref-panels .km-card-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.km-pref-panels .km-card-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--km-text-muted);
+}
+
+.km-pref-panels .km-theme-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.km-pref-panels .km-theme-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border-radius: var(--km-radius-sm);
+  border: 1px solid var(--km-border);
+  background: var(--km-canvas);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.km-pref-panels .km-theme-chip.active {
+  border-color: var(--km-accent);
+  background: var(--km-accent-soft);
+  font-weight: 600;
+}
+
+.km-pref-panels .km-theme-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.km-pref-panels .km-field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.km-pref-panels .km-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.km-pref-panels .km-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.km-pref-panels .km-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--km-text);
+}
+
+.km-pref-panels .km-input,
+.km-pref-panels .km-select {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: var(--km-radius-sm);
+  border: 1px solid var(--km-border);
+  background: var(--km-canvas);
+  color: var(--km-text);
+  user-select: text;
+}
+
+.km-pref-panels .km-select {
+  min-width: 190px;
+}
+
+.km-pref-panels .km-num-input {
+  width: 110px;
+}
+
+.km-pref-panels .km-toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--km-text);
+  cursor: pointer;
+}
+
+.km-pref-panels .km-toggle-row input:disabled + span {
+  color: var(--km-text-muted);
+}
+
+.km-pref-panels .km-inline-add,
+.km-pref-panels .km-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.km-pref-panels .km-inline-add .km-input {
+  flex: 1;
+}
+
+.km-pref-panels .km-sender-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.km-pref-panels .km-sender-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-radius: var(--km-radius-sm);
+  border: 1px solid var(--km-border);
+  background: var(--km-canvas);
+  font-size: 12px;
+}
+
+.km-pref-panels .km-mono {
+  font-family: var(--km-font-mono);
+}
+
+.km-pref-panels .km-muted-hint {
+  font-size: 12px;
+  color: var(--km-text-muted);
+}
+
+.km-pref-panels .km-status-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--km-hover-bg);
+  color: var(--km-text-muted);
+}
+
+.km-pref-panels .km-status-pill.active {
+  background: var(--km-accent-soft);
+  color: var(--km-accent);
+}
+
+.km-pref-panels .km-field-err {
+  font-size: 11px;
+  color: var(--km-danger);
+}
+
+.km-pref-panels .km-path-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.km-pref-panels .km-path-label {
+  font-size: 11px;
+  color: var(--km-text-muted);
+}
+
+.km-pref-panels .km-path-code {
+  padding: 6px 8px;
+  border-radius: var(--km-radius-sm);
+  background: var(--km-canvas);
+  border: 1px solid var(--km-border);
+  font-family: var(--km-font-mono);
+  font-size: 11px;
+  word-break: break-all;
+  user-select: text;
+}
+
+.km-pref-panels .km-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.km-pref-panels .km-stat-box {
+  padding: 10px;
+  border-radius: var(--km-radius-sm);
+  border: 1px solid var(--km-border);
+  background: var(--km-canvas);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.km-pref-panels .km-stat-label {
+  font-size: 11px;
+  color: var(--km-text-muted);
+}
+
+.km-pref-panels .km-stat-value {
+  font-size: 14px;
+  color: var(--km-text);
+}
+
+.km-pref-panels .km-about-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.km-pref-panels .km-about-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--km-text);
+}
+
+.km-pref-panels .km-about-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--km-text-muted);
+}
+
+.km-pref-panels .km-update-box {
+  padding: 10px 12px;
+  border-radius: var(--km-radius-sm);
+  border: 1px solid var(--km-border);
+  background: var(--km-canvas);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.km-pref-panels .km-update-msg {
+  font-weight: 600;
+}
+
+.km-pref-panels .km-update-meta,
+.km-pref-panels .km-update-notes {
+  margin: 0;
+  color: var(--km-text-muted);
+  white-space: pre-wrap;
+}
+
+.km-pref-panels .km-update-link {
+  color: var(--km-accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.km-pref-panels .km-banner {
+  padding: 9px 12px;
+  border-radius: var(--km-radius-sm);
+  font-size: 12px;
+  border: 1px solid var(--km-border);
+  background: var(--km-canvas);
+}
+
+.km-pref-panels .km-banner.is-success {
+  border-color: color-mix(in srgb, #26a269 45%, var(--km-border));
+  background: color-mix(in srgb, #26a269 12%, transparent);
+}
+
+.km-pref-panels .km-banner.is-error {
+  border-color: color-mix(in srgb, var(--km-danger) 50%, var(--km-border));
+  background: var(--km-danger-soft);
+  color: var(--km-danger);
+}
+
+.km-pref-panels .km-banner.is-info {
+  border-color: color-mix(in srgb, var(--km-accent) 45%, var(--km-border));
+  background: var(--km-accent-soft);
+}
+
+.km-pref-panels .km-btn {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--km-radius-sm);
+  border: 1px solid var(--km-border);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.km-pref-panels .km-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.km-pref-panels .km-btn-primary {
+  border-color: var(--km-accent);
+  background: var(--km-accent);
+  color: var(--km-accent-fg);
+}
+
+.km-pref-panels .km-btn-secondary {
+  background: var(--km-surface);
+  color: var(--km-text);
+}
+
+.km-pref-panels .km-btn-secondary:hover:not(:disabled) {
+  background: var(--km-hover-bg);
+}
+
+.km-pref-panels .km-btn-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--km-accent);
+}
+
+.km-pref-panels .km-btn-ghost:hover:not(:disabled) {
+  background: var(--km-hover-bg);
+}
+
+.km-pref-panels .km-btn-danger-outline {
+  border-color: color-mix(in srgb, var(--km-danger) 50%, var(--km-border));
+  background: transparent;
+  color: var(--km-danger);
+}
+
+.km-pref-panels .km-btn-danger-outline:hover:not(:disabled) {
+  background: var(--km-danger-soft);
+}
+
+.km-pref-panels .km-danger-text {
+  color: var(--km-danger);
+}
+
+@media (max-width: 760px) {
+  .km-pref-panels .km-grid-2,
+  .km-pref-panels .km-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

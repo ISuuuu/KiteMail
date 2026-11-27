@@ -1,24 +1,26 @@
 <template>
-  <div class="km-app" :class="{ locked: state.locked.value }">
-    <MainWindow v-if="!state.loading.value && !state.error.value && !state.locked.value" />
-    <div v-else-if="state.loading.value" class="km-splash">
+  <!-- 独立设置窗：同一前端仅渲染设置窗内容（WP-01），不跑主窗口 bootstrap / 锁屏流程 -->
+  <SettingsWindow v-if="isSettings" />
+  <div v-else class="km-app" :class="{ locked: state!.locked.value }">
+    <MainWindow v-if="!state!.loading.value && !state!.error.value && !state!.locked.value" />
+    <div v-else-if="state!.loading.value" class="km-splash">
       <span class="km-splash-text">正在加载 KiteMail…</span>
     </div>
-    <div v-else-if="state.error.value" class="km-error-page" role="alert">
+    <div v-else-if="state!.error.value" class="km-error-page" role="alert">
       <p class="km-error-title">主窗口初始化失败</p>
-      <p class="km-error-msg">{{ state.error.value }}</p>
-      <button type="button" class="km-retry-btn" @click="state.init()">重试</button>
+      <p class="km-error-msg">{{ state!.error.value }}</p>
+      <button type="button" class="km-retry-btn" @click="state!.init()">重试</button>
     </div>
     <LockScreen
-      v-else-if="state.locked.value"
-      :hasPasscode="state.hasPasscode.value"
-      :lockedReason="state.lockedReason.value"
-      :submitting="state.unlockSubmitting.value"
-      :error="state.unlockError.value"
-      :retryAfterSecs="state.unlockRetryAfterSecs.value"
-      :mode="state.mode.value"
-      @unlock="state.unlock"
-      @quit="state.quit"
+      v-else-if="state!.locked.value"
+      :hasPasscode="state!.hasPasscode.value"
+      :lockedReason="state!.lockedReason.value"
+      :submitting="state!.unlockSubmitting.value"
+      :error="state!.unlockError.value"
+      :retryAfterSecs="state!.unlockRetryAfterSecs.value"
+      :mode="state!.mode.value"
+      @unlock="state!.unlock"
+      @quit="state!.quit"
     />
   </div>
 </template>
@@ -26,9 +28,13 @@
 <script setup lang="ts">
 import MainWindow from "./main-window/MainWindow.vue";
 import LockScreen from "./main-window/LockScreen.vue";
+import SettingsWindow from "./settings/SettingsWindow.vue";
 import { provideMainWindow } from "./main-window/useMainWindow";
+import { isSettingsWindow } from "./settings/windowEnv";
 
-const state = provideMainWindow();
+// 入口分流一次性判定：设置窗不初始化主窗口状态。
+const isSettings = isSettingsWindow();
+const state = isSettings ? null : provideMainWindow();
 </script>
 
 <style scoped>

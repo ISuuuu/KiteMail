@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings-capability",
+  "description": "Capabilities for the KiteMail standalone settings window",
+  "windows": [
+    "settings"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "allow-get-full-preferences",
+    "allow-update-full-preferences",
+    "allow-set-app-lock-passcode",
+    "allow-manage-trusted-senders",
+    "allow-clear-body-caches",
+    "allow-check-app-update"
+  ]
+}
