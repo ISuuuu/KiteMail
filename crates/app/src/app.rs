@@ -1397,20 +1397,23 @@ impl HylkiApp {
                 .masked(true)
                 .placeholder("输入锁屏密码…")
         });
-        cx.subscribe(&lock_passcode_input, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::PressEnter { .. } => {
-                this.submit_unlock_passcode(cx);
-            }
-            InputEvent::Change => {
-                if this
-                    .lock_cooldown_until
-                    .is_none_or(|until| until <= Instant::now())
-                {
-                    this.lock_error = None;
+        cx.subscribe(
+            &lock_passcode_input,
+            |this, _, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } => {
+                    this.submit_unlock_passcode(cx);
                 }
-            }
-            _ => {}
-        })
+                InputEvent::Change => {
+                    if this
+                        .lock_cooldown_until
+                        .is_none_or(|until| until <= Instant::now())
+                    {
+                        this.lock_error = None;
+                    }
+                }
+                _ => {}
+            },
+        )
         .detach();
 
         let initial_rem_scale = config::clamp_ui_text_scale(prefs.ui_text_scale_percent);

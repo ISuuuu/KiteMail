@@ -2823,7 +2823,8 @@ fn render_privacy(
         (app.prefs.clone(), app.has_app_lock_passcode())
     };
     let idle_mins = config::normalize_app_lock_idle_minutes(prefs.app_lock_idle_minutes);
-    let bg_timeout = config::normalize_app_lock_background_timeout(&prefs.app_lock_background_timeout);
+    let bg_timeout =
+        config::normalize_app_lock_background_timeout(&prefs.app_lock_background_timeout);
 
     let app_lock_now = app_entity.clone();
     let app_lock_idle = app_entity.clone();

@@ -37,17 +37,20 @@ pub(crate) fn render(
     let cooldown_remaining = app
         .lock_cooldown_until
         .and_then(|until| until.checked_duration_since(Instant::now()))
-        .map(|d| d.as_secs().saturating_add(if d.subsec_nanos() > 0 { 1 } else { 0 }));
+        .map(|d| {
+            d.as_secs()
+                .saturating_add(if d.subsec_nanos() > 0 { 1 } else { 0 })
+        });
     let in_cooldown = cooldown_remaining.is_some_and(|s| s > 0);
 
-    let feedback_text: Option<SharedString> = if let Some(secs) = cooldown_remaining.filter(|&s| s > 0)
-    {
-        Some(SharedString::from(format!(
-            "密码错误次数过多，请 {secs} 秒后再试"
-        )))
-    } else {
-        app.lock_error.clone()
-    };
+    let feedback_text: Option<SharedString> =
+        if let Some(secs) = cooldown_remaining.filter(|&s| s > 0) {
+            Some(SharedString::from(format!(
+                "密码错误次数过多，请 {secs} 秒后再试"
+            )))
+        } else {
+            app.lock_error.clone()
+        };
 
     let unlock_label: &'static str = if app.lock_verifying {
         "正在验证..."

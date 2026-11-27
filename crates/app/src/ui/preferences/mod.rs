@@ -476,24 +476,30 @@ impl SettingsWindow {
                 .masked(true)
                 .placeholder("再次输入新密码以确认")
         });
-        cx.subscribe(&app_lock_current_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. })
-                && this.app_lock_form_mode == AppLockFormMode::Disable
-            {
-                this.submit_app_lock_form(cx);
-            }
-        })
+        cx.subscribe(
+            &app_lock_current_input,
+            |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && this.app_lock_form_mode == AppLockFormMode::Disable
+                {
+                    this.submit_app_lock_form(cx);
+                }
+            },
+        )
         .detach();
-        cx.subscribe(&app_lock_confirm_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. })
-                && matches!(
-                    this.app_lock_form_mode,
-                    AppLockFormMode::Setup | AppLockFormMode::Change
-                )
-            {
-                this.submit_app_lock_form(cx);
-            }
-        })
+        cx.subscribe(
+            &app_lock_confirm_input,
+            |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && matches!(
+                        this.app_lock_form_mode,
+                        AppLockFormMode::Setup | AppLockFormMode::Change
+                    )
+                {
+                    this.submit_app_lock_form(cx);
+                }
+            },
+        )
         .detach();
 
         let mut account_form = AccountFormState::new(edit_account.as_ref(), window, cx);
@@ -682,7 +688,8 @@ impl SettingsWindow {
             }
             AppLockFormMode::Change => {
                 if current_val.is_empty() {
-                    self.app_lock_feedback = Some((false, SharedString::from("请输入当前锁屏密码")));
+                    self.app_lock_feedback =
+                        Some((false, SharedString::from("请输入当前锁屏密码")));
                     cx.notify();
                     return;
                 }
@@ -700,7 +707,8 @@ impl SettingsWindow {
             }
             AppLockFormMode::Disable => {
                 if current_val.is_empty() {
-                    self.app_lock_feedback = Some((false, SharedString::from("请输入当前锁屏密码")));
+                    self.app_lock_feedback =
+                        Some((false, SharedString::from("请输入当前锁屏密码")));
                     cx.notify();
                     return;
                 }
@@ -2677,7 +2685,8 @@ impl Render for SettingsWindow {
                 } else if this.pending_leave_action.is_some() {
                     this.pending_leave_action = None;
                     cx.notify();
-                } else if this.app_lock_form_mode != AppLockFormMode::Closed && !this.app_lock_busy {
+                } else if this.app_lock_form_mode != AppLockFormMode::Closed && !this.app_lock_busy
+                {
                     this.close_app_lock_form(Some(window), cx);
                 } else if this.active_tab == PrefTab::MailAccounts && this.account_editor_open {
                     this.request_leave_editor(EditorLeaveAction::BackToAccountList, window, cx);

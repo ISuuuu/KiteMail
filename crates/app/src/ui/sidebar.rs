@@ -2659,127 +2659,128 @@ fn main_menu_button(app: &HylkiApp, cx: &mut Context<HylkiApp>) -> impl IntoElem
             let entity_for_quit = entity_for_quit.clone();
             let entity_for_reader_pos = entity_for_reader_pos.clone();
             let entity_for_focus = entity_for_focus.clone();
-            let menu = menu.item(
-                // 演示模式下账号管理不可用（无 worker 账号可编辑）。
-                PopupMenuItem::new("账号管理")
-                    .icon(Icon::new(IconName::Settings))
-                    .disabled(demo_mode)
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |app, cx| {
-                            app.open_account_manager(cx);
-                        });
-                    }),
-            )
-            .item(
-                // 对齐原版「Show Accounts」（Ctrl+Shift+A）：隐藏 / 恢复侧栏账号区段。
-                PopupMenuItem::new(if show_accounts {
-                    "隐藏账号列表  Ctrl+Shift+A"
-                } else {
-                    "显示账号列表  Ctrl+Shift+A"
-                })
-                .icon(Icon::new(IconName::PanelLeft))
-                .on_click(move |_, _, cx| {
-                    entity_for_accounts.update(cx, |app, cx| {
-                        app.toggle_accounts_list(cx);
-                    });
-                }),
-            )
-            .separator()
-            // L-6：阅读器位置子菜单（右上 / 下方 / 关闭，当前项打勾，Ctrl+Alt+1/2/3），
-            // 对齐原版主菜单「Reading Pane」单选组（#475）。
-            .submenu("阅读器位置", window, cx, move |mut sub, _, _| {
-                for (label, position) in [
-                    ("右侧  Ctrl+Alt+1", ReaderPosition::Right),
-                    ("下方  Ctrl+Alt+2", ReaderPosition::Below),
-                    ("关闭  Ctrl+Alt+3", ReaderPosition::Hidden),
-                ] {
-                    let e_pos = entity_for_reader_pos.clone();
-                    let is_current = reader_position == position;
-                    sub = sub.item(PopupMenuItem::new(label).checked(is_current).on_click(
-                        move |_, _, cx| {
-                            e_pos.update(cx, |app, cx| {
-                                app.set_reader_position(position, cx);
+            let menu = menu
+                .item(
+                    // 演示模式下账号管理不可用（无 worker 账号可编辑）。
+                    PopupMenuItem::new("账号管理")
+                        .icon(Icon::new(IconName::Settings))
+                        .disabled(demo_mode)
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |app, cx| {
+                                app.open_account_manager(cx);
                             });
-                        },
-                    ));
-                }
-                sub
-            })
-            .item(
-                // L-6：专注模式开关（会话级，Ctrl+Shift+F，对齐原版 focus-mode）。
-                PopupMenuItem::new(if focus_mode {
-                    "关闭专注模式  Ctrl+Shift+F"
-                } else {
-                    "专注模式  Ctrl+Shift+F"
-                })
-                .checked(focus_mode)
-                .icon(Icon::new(IconName::Eye))
-                .on_click(move |_, _, cx| {
-                    entity_for_focus.update(cx, |app, cx| {
-                        app.toggle_focus_mode(cx);
-                    });
-                }),
-            )
-            .item(
-                PopupMenuItem::new("全屏切换  F11")
-                    .icon(Icon::new(IconName::Maximize))
-                    .on_click(move |_, window, cx| {
-                        entity_for_fullscreen.update(cx, |app, cx| {
-                            app.toggle_fullscreen(window, cx);
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new(if dark {
-                    "切换亮色主题"
-                } else {
-                    "切换暗色主题"
-                })
-                .icon(Icon::new(if dark { IconName::Sun } else { IconName::Moon }))
-                .on_click(move |_, _, cx| {
-                    entity_for_theme.update(cx, |app, cx| {
-                        app.toggle_theme(cx);
-                    });
-                }),
-            )
-            .item(
-                PopupMenuItem::new("设置  Ctrl+,")
-                    .icon(Icon::new(IconName::Settings2))
-                    .on_click(move |_, window, cx| {
-                        entity_for_prefs.update(cx, |app, cx| {
-                            app.open_preferences(window, cx);
-                        });
-                    }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new("命令面板  Ctrl+K")
-                    .icon(Icon::new(IconName::Command))
-                    .on_click(move |_, window, cx| {
-                        entity_for_palette.update(cx, |app, cx| {
-                            app.open_command_palette(window, cx, false);
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new("键盘快捷键  F1")
-                    .icon(Icon::new(IconName::Keyboard))
+                        }),
+                )
+                .item(
+                    // 对齐原版「Show Accounts」（Ctrl+Shift+A）：隐藏 / 恢复侧栏账号区段。
+                    PopupMenuItem::new(if show_accounts {
+                        "隐藏账号列表  Ctrl+Shift+A"
+                    } else {
+                        "显示账号列表  Ctrl+Shift+A"
+                    })
+                    .icon(Icon::new(IconName::PanelLeft))
                     .on_click(move |_, _, cx| {
-                        entity_for_shortcuts.update(cx, |app, cx| {
-                            app.open_shortcuts(cx);
+                        entity_for_accounts.update(cx, |app, cx| {
+                            app.toggle_accounts_list(cx);
                         });
                     }),
-            )
-            .item(
-                PopupMenuItem::new("关于 KiteMail")
-                    .icon(Icon::new(IconName::Info))
+                )
+                .separator()
+                // L-6：阅读器位置子菜单（右上 / 下方 / 关闭，当前项打勾，Ctrl+Alt+1/2/3），
+                // 对齐原版主菜单「Reading Pane」单选组（#475）。
+                .submenu("阅读器位置", window, cx, move |mut sub, _, _| {
+                    for (label, position) in [
+                        ("右侧  Ctrl+Alt+1", ReaderPosition::Right),
+                        ("下方  Ctrl+Alt+2", ReaderPosition::Below),
+                        ("关闭  Ctrl+Alt+3", ReaderPosition::Hidden),
+                    ] {
+                        let e_pos = entity_for_reader_pos.clone();
+                        let is_current = reader_position == position;
+                        sub = sub.item(PopupMenuItem::new(label).checked(is_current).on_click(
+                            move |_, _, cx| {
+                                e_pos.update(cx, |app, cx| {
+                                    app.set_reader_position(position, cx);
+                                });
+                            },
+                        ));
+                    }
+                    sub
+                })
+                .item(
+                    // L-6：专注模式开关（会话级，Ctrl+Shift+F，对齐原版 focus-mode）。
+                    PopupMenuItem::new(if focus_mode {
+                        "关闭专注模式  Ctrl+Shift+F"
+                    } else {
+                        "专注模式  Ctrl+Shift+F"
+                    })
+                    .checked(focus_mode)
+                    .icon(Icon::new(IconName::Eye))
                     .on_click(move |_, _, cx| {
-                        entity_for_about.update(cx, |app, cx| {
-                            app.open_about(cx);
+                        entity_for_focus.update(cx, |app, cx| {
+                            app.toggle_focus_mode(cx);
                         });
                     }),
-            )
-            .separator();
+                )
+                .item(
+                    PopupMenuItem::new("全屏切换  F11")
+                        .icon(Icon::new(IconName::Maximize))
+                        .on_click(move |_, window, cx| {
+                            entity_for_fullscreen.update(cx, |app, cx| {
+                                app.toggle_fullscreen(window, cx);
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(if dark {
+                        "切换亮色主题"
+                    } else {
+                        "切换暗色主题"
+                    })
+                    .icon(Icon::new(if dark { IconName::Sun } else { IconName::Moon }))
+                    .on_click(move |_, _, cx| {
+                        entity_for_theme.update(cx, |app, cx| {
+                            app.toggle_theme(cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("设置  Ctrl+,")
+                        .icon(Icon::new(IconName::Settings2))
+                        .on_click(move |_, window, cx| {
+                            entity_for_prefs.update(cx, |app, cx| {
+                                app.open_preferences(window, cx);
+                            });
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("命令面板  Ctrl+K")
+                        .icon(Icon::new(IconName::Command))
+                        .on_click(move |_, window, cx| {
+                            entity_for_palette.update(cx, |app, cx| {
+                                app.open_command_palette(window, cx, false);
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("键盘快捷键  F1")
+                        .icon(Icon::new(IconName::Keyboard))
+                        .on_click(move |_, _, cx| {
+                            entity_for_shortcuts.update(cx, |app, cx| {
+                                app.open_shortcuts(cx);
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("关于 KiteMail")
+                        .icon(Icon::new(IconName::Info))
+                        .on_click(move |_, _, cx| {
+                            entity_for_about.update(cx, |app, cx| {
+                                app.open_about(cx);
+                            });
+                        }),
+                )
+                .separator();
             let menu = if lock_enabled {
                 menu.item(
                     PopupMenuItem::new("立即锁定  Ctrl+Shift+L")

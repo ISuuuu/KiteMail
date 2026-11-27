@@ -4178,10 +4178,8 @@ smtp_separate_credentials = false
 
     #[test]
     fn app_lock_preferences_backward_compat_and_backup_excludes_passcode() {
-        let base = std::env::temp_dir().join(format!(
-            "hylki-app-lock-prefs-test-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("hylki-app-lock-prefs-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
 
@@ -4194,7 +4192,10 @@ smtp_separate_credentials = false
         assert_eq!(normalize_app_lock_idle_minutes(0), 0);
         assert_eq!(normalize_app_lock_idle_minutes(30), 30);
         assert_eq!(normalize_app_lock_idle_minutes(999), 15);
-        assert_eq!(normalize_app_lock_background_timeout("immediate"), "immediate");
+        assert_eq!(
+            normalize_app_lock_background_timeout("immediate"),
+            "immediate"
+        );
         assert_eq!(normalize_app_lock_background_timeout("never"), "never");
         assert_eq!(normalize_app_lock_background_timeout("bogus"), "5");
 

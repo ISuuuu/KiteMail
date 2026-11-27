@@ -278,8 +278,7 @@ impl AutoLockTracker {
                     if let Some(sys_idle) = input.system_idle {
                         let since_unlock = input.now.saturating_duration_since(self.unlocked_at);
                         let effective_idle = sys_idle.min(since_unlock);
-                        if effective_idle
-                            >= Duration::from_secs(u64::from(input.idle_minutes) * 60)
+                        if effective_idle >= Duration::from_secs(u64::from(input.idle_minutes) * 60)
                         {
                             return Some(AutoLockTrigger::Idle);
                         }
@@ -356,7 +355,10 @@ mod tests {
 
         // 畸形串与迭代次数降级应被拒绝。
         assert!(!verify_passcode("secret-1234", "invalid"));
-        assert!(!verify_passcode("secret-1234", "pbkdf2_sha256$100$c2FsdHNhbHQ=$AAAA"));
+        assert!(!verify_passcode(
+            "secret-1234",
+            "pbkdf2_sha256$100$c2FsdHNhbHQ=$AAAA"
+        ));
         assert!(!verify_passcode(
             "secret-1234",
             "argon2id$200000$c2FsdHNhbHQ=$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
