@@ -8,6 +8,11 @@
  *   set_reader_layout({ input })       包在 input 字段
  *   update_main_preferences({ patch }) 包在 patch 字段
  *   refresh_mail({ input })            包在 input 字段
+ *   unlock_app({ input })              包在 input 字段
+ *   lock_app()                         无参
+ *   set_message_seen({ input })        包在 input 字段
+ *   set_message_flagged({ input })     包在 input 字段
+ *   quit_app()                         无参
  *
  * 在非 Tauri 环境（无 window.__TAURI_INTERNALS__）下使用内置 Mock 传输层，
  * 以便独立浏览器预览和单元测试。
@@ -23,15 +28,25 @@ import type {
   SetReaderLayoutOutput,
   RefreshMailInput,
   RefreshMailOutput,
+  UnlockAppInput,
+  UnlockAppOutput,
+  LockAppOutput,
+  SetMessageSeenInput,
+  SetMessageSeenOutput,
+  SetMessageFlaggedInput,
+  SetMessageFlaggedOutput,
   MainPreferencesPatch,
   MainPreferencesDto,
   MailChangedEvent,
   SyncStatusEvent,
+  SyncStatusDto,
   ReaderStatusEvent,
   LockStateEvent,
   MessageSummaryDto,
+  FolderSummaryDto,
   ViewDto,
   MessageSort,
+  IpcError,
 } from "./types";
 
 // ---------- 传输层检测 ----------
@@ -59,6 +74,49 @@ export function extractErrorMessage(err: unknown): string {
     }
   }
   return String(err ?? "未知错误");
+}
+
+/** 判断异常是否为后端返回的 LOCKED 结构化错误 */
+export function isLockedError(err: unknown): boolean {
+  return Boolean(
+    err &&
+      typeof err === "object" &&
+      (err as Partial<IpcError>).code === "LOCKED"
+  );
+}
+
+/** 标准化 main://sync-status 事件载荷（兼容嵌套 syncStatus 与扁平字段） */
+export function normalizeSyncStatusEvent(e: SyncStatusEvent): {
+  syncStatus: SyncStatusDto;
+  stateVersion?: number;
+} {
+  if ("syncStatus" in e && e.syncStatus) {
+    return {
+      syncStatus: {
+        syncing: Boolean(e.syncStatus.syncing),
+        message: e.syncStatus.message ?? null,
+        lastSyncAt: e.syncStatus.lastSyncAt ?? null,
+      },
+      stateVersion: e.stateVersion,
+    };
+  }
+  const flat = e as SyncStatusDto & { stateVersion?: number };
+  return {
+    syncStatus: {
+      syncing: Boolean(flat.syncing),
+      message: flat.message ?? null,
+      lastSyncAt: flat.lastSyncAt ?? null,
+    },
+    stateVersion: flat.stateVersion,
+  };
+}
+
+let globalReaderLayoutRevision = 0;
+
+/** 生成严格递增的阅读器布局修订号（供组件与锁屏隐藏共享） */
+export function nextReaderLayoutRevision(): number {
+  globalReaderLayoutRevision += 1;
+  return globalReaderLayoutRevision;
 }
 
 // ---------- Tauri invoke / listen ----------
@@ -237,7 +295,15 @@ function getMockMessages(): MessageSummaryDto[] {
 }
 
 let mockStateVersion = 1;
-const mockPrefs: MainPreferencesDto = {
+let mockLocked = false;
+let mockHasPasscode = true;
+let mockCacheReady = true;
+let mockPasscode = "1234";
+let mockFailedAttempts = 0;
+let mockUnlockCooldownUntilMs = 0;
+const mockRecordedReaderLayouts: SetReaderLayoutInput[] = [];
+
+const DEFAULT_MOCK_PREFS: MainPreferencesDto = {
   themeId: "system",
   darkMode: false,
   readerPosition: "right",
@@ -251,21 +317,59 @@ const mockPrefs: MainPreferencesDto = {
   readerZoomPercent: 100,
 };
 
+let mockPrefs: MainPreferencesDto = { ...DEFAULT_MOCK_PREFS };
+
+const BASE_MOCK_FOLDERS: ReadonlyArray<Omit<FolderSummaryDto, "unreadCount" | "totalCount">> = [
+  { id: 1, accountId: 1, name: "收件箱", path: "INBOX", hasMoreRemote: false },
+  { id: 2, accountId: 1, name: "已发送", path: "Sent", hasMoreRemote: false },
+  { id: 3, accountId: 1, name: "草稿箱", path: "Drafts", hasMoreRemote: false },
+  { id: 4, accountId: 1, name: "归档", path: "Archive", hasMoreRemote: false },
+  { id: 5, accountId: 1, name: "垃圾邮件", path: "Junk", hasMoreRemote: false },
+  { id: 6, accountId: 1, name: "已删除", path: "Trash", hasMoreRemote: false },
+];
+
+function computeMockFolders(): FolderSummaryDto[] {
+  const all = getMockMessages();
+  return BASE_MOCK_FOLDERS.map((base) => {
+    let unreadCount = 0;
+    let totalCount = 0;
+    for (const m of all) {
+      if (m.accountId === base.accountId && m.folderId === base.id) {
+        totalCount += 1;
+        if (m.unread) unreadCount += 1;
+      }
+    }
+    return { ...base, unreadCount, totalCount };
+  });
+}
+
+function makeLockedIpcError(requestId?: string | null): IpcError {
+  return {
+    code: "LOCKED",
+    message: "应用已锁定，请先解锁后再访问邮件内容",
+    retryable: false,
+    ...(requestId ? { requestId } : {}),
+  };
+}
+
+function mockCooldownSecs(failedAttempts: number): number {
+  if (failedAttempts < 5) return 0;
+  if (failedAttempts === 5) return 5;
+  if (failedAttempts === 6) return 10;
+  if (failedAttempts === 7) return 30;
+  return 60;
+}
+
 const MOCK_BOOTSTRAP: MainBootstrapDto = {
   mode: "demo",
   locked: false,
+  hasPasscode: true,
+  cacheReady: true,
   stateVersion: 1,
   accounts: [{ id: 1, displayName: "测试工作邮箱", email: "demo@kitemail.example" }],
-  folders: [
-    { id: 1, accountId: 1, name: "收件箱", path: "INBOX", unreadCount: 64, totalCount: MOCK_INBOX_TOTAL, hasMoreRemote: false },
-    { id: 2, accountId: 1, name: "已发送", path: "Sent", unreadCount: 0, totalCount: 4, hasMoreRemote: false },
-    { id: 3, accountId: 1, name: "草稿箱", path: "Drafts", unreadCount: 0, totalCount: 2, hasMoreRemote: false },
-    { id: 4, accountId: 1, name: "归档", path: "Archive", unreadCount: 0, totalCount: 2, hasMoreRemote: false },
-    { id: 5, accountId: 1, name: "垃圾邮件", path: "Junk", unreadCount: 0, totalCount: 1, hasMoreRemote: false },
-    { id: 6, accountId: 1, name: "已删除", path: "Trash", unreadCount: 0, totalCount: 1, hasMoreRemote: false },
-  ],
+  folders: [],
   currentView: { kind: "unifiedInbox" },
-  preferences: { ...mockPrefs },
+  preferences: { ...DEFAULT_MOCK_PREFS },
   syncStatus: { syncing: false, message: null, lastSyncAt: null },
 };
 
@@ -357,8 +461,24 @@ function compareMessages(a: MessageSummaryDto, b: MessageSummaryDto, sort: Messa
 
 export async function mainBootstrap(): Promise<MainBootstrapDto> {
   if (isTauri()) return tauriInvoke<MainBootstrapDto>("main_bootstrap");
+  if (mockLocked) {
+    return Promise.resolve({
+      ...MOCK_BOOTSTRAP,
+      locked: true,
+      hasPasscode: mockHasPasscode,
+      cacheReady: mockCacheReady,
+      stateVersion: mockStateVersion,
+      accounts: [],
+      folders: [],
+      preferences: { ...mockPrefs },
+    });
+  }
   return Promise.resolve({
     ...MOCK_BOOTSTRAP,
+    locked: false,
+    hasPasscode: mockHasPasscode,
+    cacheReady: mockCacheReady,
+    folders: computeMockFolders(),
     stateVersion: mockStateVersion,
     preferences: { ...mockPrefs },
   });
@@ -366,6 +486,7 @@ export async function mainBootstrap(): Promise<MainBootstrapDto> {
 
 export async function listMessages(input: ListMessagesInput): Promise<ListMessagesOutput> {
   if (isTauri()) return tauriInvoke<ListMessagesOutput>("list_messages", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError(input.requestId));
 
   const all = getMockMessages();
   const q = input.query.trim().toLowerCase();
@@ -403,12 +524,13 @@ export async function listMessages(input: ListMessagesInput): Promise<ListMessag
     offset: input.offset,
     total: filtered.length,
     hasMore: input.offset + page.length < filtered.length,
-    items: page,
+    items: page.map((m) => ({ ...m, tags: [...m.tags] })),
   };
 }
 
 export async function openMessage(input: OpenMessageInput): Promise<OpenMessageOutput> {
   if (isTauri()) return tauriInvoke<OpenMessageOutput>("open_message", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError(input.requestId));
 
   const msg = getMockMessages().find(
     (m) => m.id === input.messageId && m.accountId === input.accountId
@@ -474,6 +596,7 @@ export async function openMessage(input: OpenMessageInput): Promise<OpenMessageO
 
 export async function setReaderLayout(input: SetReaderLayoutInput): Promise<SetReaderLayoutOutput> {
   if (isTauri()) return tauriInvoke<SetReaderLayoutOutput>("set_reader_layout", { input });
+  mockRecordedReaderLayouts.push({ ...input });
   return {
     applied: true,
     readerSessionId: input.readerSessionId,
@@ -489,20 +612,26 @@ export async function updateMainPreferences(patch: MainPreferencesPatch): Promis
 
 export async function refreshMail(input: RefreshMailInput): Promise<RefreshMailOutput> {
   if (isTauri()) return tauriInvoke<RefreshMailOutput>("refresh_mail", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
   mockStateVersion += 1;
   emitMock("main://sync-status", {
-    syncing: true,
-    message: "正在刷新演示邮件…",
-    lastSyncAt: null,
     stateVersion: mockStateVersion,
+    syncStatus: {
+      syncing: true,
+      message: "正在刷新演示邮件…",
+      lastSyncAt: null,
+    },
   });
   setTimeout(() => {
+    if (mockLocked) return;
     const nowSec = Math.floor(Date.now() / 1000);
     emitMock("main://sync-status", {
-      syncing: false,
-      message: null,
-      lastSyncAt: nowSec,
       stateVersion: mockStateVersion,
+      syncStatus: {
+        syncing: false,
+        message: null,
+        lastSyncAt: nowSec,
+      },
     });
     emitMock("main://mail-changed", {
       stateVersion: mockStateVersion,
@@ -511,6 +640,162 @@ export async function refreshMail(input: RefreshMailInput): Promise<RefreshMailO
     });
   }, 150);
   return { accepted: true, stateVersion: mockStateVersion };
+}
+
+export async function unlockApp(input: UnlockAppInput): Promise<UnlockAppOutput> {
+  if (isTauri()) return tauriInvoke<UnlockAppOutput>("unlock_app", { input });
+
+  const nowMs = Date.now();
+  if (mockUnlockCooldownUntilMs > nowMs) {
+    const retryAfterSecs = Math.max(1, Math.ceil((mockUnlockCooldownUntilMs - nowMs) / 1000));
+    return {
+      unlocked: false,
+      locked: mockLocked,
+      error: `尝试次数过多，请 ${retryAfterSecs} 秒后再试`,
+      retryAfterSecs,
+    };
+  }
+
+  if (input.passcode === mockPasscode) {
+    mockFailedAttempts = 0;
+    mockUnlockCooldownUntilMs = 0;
+    mockLocked = false;
+    emitMock("main://lock-state", {
+      locked: false,
+      hasPasscode: mockHasPasscode,
+      lockedReason: null,
+    });
+    return {
+      unlocked: true,
+      locked: false,
+      error: null,
+      retryAfterSecs: null,
+    };
+  }
+
+  mockFailedAttempts += 1;
+  const cooldown = mockCooldownSecs(mockFailedAttempts);
+  if (cooldown > 0) {
+    mockUnlockCooldownUntilMs = nowMs + cooldown * 1000;
+  }
+  return {
+    unlocked: false,
+    locked: true,
+    error: cooldown > 0 ? `锁屏密码错误，请 ${cooldown} 秒后再试` : "锁屏密码错误",
+    retryAfterSecs: cooldown > 0 ? cooldown : null,
+  };
+}
+
+export async function lockApp(): Promise<LockAppOutput> {
+  if (isTauri()) return tauriInvoke<LockAppOutput>("lock_app");
+  mockLocked = true;
+  emitMock("main://lock-state", {
+    locked: true,
+    hasPasscode: mockHasPasscode,
+    lockedReason: "manual",
+  });
+  return { locked: true };
+}
+
+export async function setMessageSeen(input: SetMessageSeenInput): Promise<SetMessageSeenOutput> {
+  if (isTauri()) return tauriInvoke<SetMessageSeenOutput>("set_message_seen", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+
+  const msg = getMockMessages().find(
+    (m) => m.id === input.messageId && m.accountId === input.accountId
+  );
+  if (!msg) {
+    return Promise.reject({
+      code: "MESSAGE_NOT_FOUND",
+      message: `未找到邮件 #${input.messageId}`,
+      retryable: false,
+    } satisfies IpcError);
+  }
+  msg.unread = !input.seen;
+  mockStateVersion += 1;
+  emitMock("main://mail-changed", {
+    stateVersion: mockStateVersion,
+    reason: "seenChanged",
+    accountId: msg.accountId,
+    folderId: msg.folderId,
+    messageId: msg.id,
+  });
+  return {
+    accountId: msg.accountId,
+    messageId: msg.id,
+    unread: msg.unread,
+    stateVersion: mockStateVersion,
+  };
+}
+
+export async function setMessageFlagged(
+  input: SetMessageFlaggedInput
+): Promise<SetMessageFlaggedOutput> {
+  if (isTauri()) return tauriInvoke<SetMessageFlaggedOutput>("set_message_flagged", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+
+  const msg = getMockMessages().find(
+    (m) => m.id === input.messageId && m.accountId === input.accountId
+  );
+  if (!msg) {
+    return Promise.reject({
+      code: "MESSAGE_NOT_FOUND",
+      message: `未找到邮件 #${input.messageId}`,
+      retryable: false,
+    } satisfies IpcError);
+  }
+  msg.flagged = input.flagged;
+  mockStateVersion += 1;
+  emitMock("main://mail-changed", {
+    stateVersion: mockStateVersion,
+    reason: "flaggedChanged",
+    accountId: msg.accountId,
+    folderId: msg.folderId,
+    messageId: msg.id,
+  });
+  return {
+    accountId: msg.accountId,
+    messageId: msg.id,
+    flagged: msg.flagged,
+    stateVersion: mockStateVersion,
+  };
+}
+
+export async function quitApp(): Promise<void> {
+  if (isTauri()) return tauriInvoke<void>("quit_app");
+}
+
+// ---------- 测试辅助（仅作用于 Mock 传输层） ----------
+
+export function resetMockSession(options?: {
+  locked?: boolean;
+  hasPasscode?: boolean;
+  cacheReady?: boolean;
+  passcode?: string;
+  failedAttempts?: number;
+  cooldownMs?: number;
+}): void {
+  cachedMockAll = null;
+  mockStateVersion = 1;
+  mockLocked = options?.locked ?? false;
+  mockHasPasscode = options?.hasPasscode ?? true;
+  mockCacheReady = options?.cacheReady ?? true;
+  mockPasscode = options?.passcode ?? "1234";
+  mockFailedAttempts = options?.failedAttempts ?? 0;
+  mockUnlockCooldownUntilMs = options?.cooldownMs ? Date.now() + options.cooldownMs : 0;
+  mockPrefs = { ...DEFAULT_MOCK_PREFS };
+  mockRecordedReaderLayouts.length = 0;
+}
+
+export function getMockRecordedReaderLayouts(): readonly SetReaderLayoutInput[] {
+  return mockRecordedReaderLayouts;
+}
+
+export function emitMockEvent<K extends keyof MockBus>(
+  event: K,
+  payload: Parameters<MockBus[K][number]>[0]
+): void {
+  emitMock(event, payload);
 }
 
 // ---------- 事件订阅 ----------

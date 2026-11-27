@@ -1,4 +1,4 @@
-import { ref, computed, onUnmounted } from "vue";
+import { ref, computed, onUnmounted, getCurrentInstance } from "vue";
 import type { MainPreferencesDto, MainPreferencesPatch, ReaderPosition } from "../ipc/types";
 import { updateMainPreferences } from "../ipc/main-window";
 
@@ -188,13 +188,15 @@ export function usePaneLayout() {
     }
   }
 
-  onUnmounted(() => {
-    flushSave();
-    if (typeof window !== "undefined") {
-      window.removeEventListener("beforeunload", flushSave);
-    }
-    mediaQuery?.removeEventListener("change", onSystemSchemeChange);
-  });
+  if (getCurrentInstance()) {
+    onUnmounted(() => {
+      flushSave();
+      if (typeof window !== "undefined") {
+        window.removeEventListener("beforeunload", flushSave);
+      }
+      mediaQuery?.removeEventListener("change", onSystemSchemeChange);
+    });
+  }
 
   // --- 操作方法 ---
 

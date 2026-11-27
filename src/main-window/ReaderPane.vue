@@ -32,10 +32,30 @@
       </div>
 
       <div class="km-reader-actions">
+        <template v-if="message">
+          <button
+            type="button"
+            class="km-action-btn"
+            :title="selectedUnread ? '标为已读' : '标为未读'"
+            @click="emit('toggleSeen', Boolean(selectedUnread))"
+          >
+            {{ selectedUnread ? "标为已读" : "标为未读" }}
+          </button>
+          <button
+            type="button"
+            class="km-action-btn"
+            :class="{ flagged: message.flagged }"
+            :title="message.flagged ? '取消星标' : '加上星标'"
+            @click="emit('toggleFlagged', !message.flagged)"
+          >
+            {{ message.flagged ? "★ 已星标" : "☆ 星标" }}
+          </button>
+        </template>
+
         <button
-          v-if="error && message"
+          v-if="(error || message?.bodyStatus === 'unavailable') && message"
           type="button"
-          class="km-action-btn"
+          class="km-action-btn km-action-retry"
           @click="emit('retry')"
         >
           重试正文
@@ -101,9 +121,16 @@
       <p>选择一封邮件查看正文</p>
     </div>
 
-    <!-- 仅加载中 -->
-    <div v-else-if="loading && !message" class="km-reader-empty">
-      <p>正在打开邮件…</p>
+    <!-- 仅加载中骨架 -->
+    <div v-else-if="loading && !message" class="km-reader-skeleton" aria-busy="true" aria-label="正在加载邮件">
+      <div class="km-sk-line km-sk-title" />
+      <div class="km-sk-line km-sk-meta" />
+      <div class="km-sk-line km-sk-meta short" />
+      <div class="km-sk-card">
+        <div class="km-sk-line" />
+        <div class="km-sk-line" />
+        <div class="km-sk-line short" />
+      </div>
     </div>
 
     <!-- 仅错误 -->
@@ -117,7 +144,16 @@
       <div class="km-mail-meta">
         <div class="km-subject-row">
           <h1 class="km-subject-title">{{ message.subject || "(无主题)" }}</h1>
-          <span v-if="message.flagged" class="km-star-badge" title="已加星标">★</span>
+          <button
+            type="button"
+            class="km-star-badge-btn"
+            :class="{ flagged: message.flagged }"
+            :title="message.flagged ? '取消星标' : '加上星标'"
+            :aria-label="message.flagged ? '取消星标' : '加上星标'"
+            @click="emit('toggleFlagged', !message.flagged)"
+          >
+            {{ message.flagged ? "★" : "☆" }}
+          </button>
         </div>
 
         <div class="km-meta-grid">
@@ -180,6 +216,7 @@ const props = defineProps<{
   message: OpenMessageOutput | null;
   loading: boolean;
   error: string | null;
+  selectedUnread?: boolean;
   readerPosition: ReaderPosition;
   themeId: string;
   effectiveDark?: boolean;
@@ -191,6 +228,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   retry: [];
+  toggleSeen: [seen: boolean];
+  toggleFlagged: [flagged: boolean];
   setReaderPosition: [pos: ReaderPosition];
   setTheme: [themeId: string, darkMode?: boolean];
   toggleDarkMode: [];
@@ -334,6 +373,65 @@ onUnmounted(() => {
   background: var(--km-hover-bg);
 }
 
+.km-action-btn.flagged {
+  color: var(--km-star-gold);
+  border-color: color-mix(in srgb, var(--km-star-gold) 45%, var(--km-border));
+}
+
+.km-action-retry {
+  color: var(--km-danger);
+  border-color: color-mix(in srgb, var(--km-danger) 45%, var(--km-border));
+}
+
+.km-reader-skeleton {
+  flex: 1 1 auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.km-sk-card {
+  margin-top: 10px;
+  padding: 18px;
+  border-radius: var(--km-radius-lg);
+  border: 1px solid var(--km-border);
+  background: var(--km-surface-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.km-sk-line {
+  height: 12px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--km-text-muted) 16%, transparent);
+  animation: km-sk-pulse 1.3s ease-in-out infinite;
+}
+
+.km-sk-title {
+  width: 62%;
+  height: 20px;
+}
+
+.km-sk-meta {
+  width: 44%;
+}
+
+.km-sk-line.short {
+  width: 30%;
+}
+
+@keyframes km-sk-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
 .km-popover-wrap {
   position: relative;
 }
@@ -462,10 +560,23 @@ onUnmounted(() => {
   user-select: text;
 }
 
-.km-star-badge {
-  color: var(--km-star-gold);
+.km-star-badge-btn {
+  border: none;
+  background: transparent;
+  padding: 2px 4px;
+  color: var(--km-text-muted);
   font-size: 16px;
   flex-shrink: 0;
+  cursor: pointer;
+  border-radius: var(--km-radius-sm);
+}
+
+.km-star-badge-btn.flagged {
+  color: var(--km-star-gold);
+}
+
+.km-star-badge-btn:hover {
+  background: var(--km-hover-bg);
 }
 
 .km-meta-grid {

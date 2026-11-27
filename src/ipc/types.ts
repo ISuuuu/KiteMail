@@ -86,12 +86,55 @@ export interface SyncStatusDto {
 export interface MainBootstrapDto {
   mode: "demo" | "live";
   locked: boolean;
+  hasPasscode?: boolean;
+  cacheReady?: boolean;
   stateVersion: number;
   accounts: AccountSummaryDto[];
   folders: FolderSummaryDto[];
   currentView: ViewDto;
   preferences: MainPreferencesDto;
   syncStatus: SyncStatusDto;
+}
+
+export interface UnlockAppInput {
+  passcode: string;
+}
+
+export interface UnlockAppOutput {
+  unlocked: boolean;
+  locked: boolean;
+  error?: string | null;
+  retryAfterSecs?: number | null;
+}
+
+export interface LockAppOutput {
+  locked: boolean;
+}
+
+export interface SetMessageSeenInput {
+  accountId: number;
+  messageId: number;
+  seen: boolean;
+}
+
+export interface SetMessageSeenOutput {
+  accountId: number;
+  messageId: number;
+  unread: boolean;
+  stateVersion: number;
+}
+
+export interface SetMessageFlaggedInput {
+  accountId: number;
+  messageId: number;
+  flagged: boolean;
+}
+
+export interface SetMessageFlaggedOutput {
+  accountId: number;
+  messageId: number;
+  flagged: boolean;
+  stateVersion: number;
 }
 
 export type SearchScope = "thisFolder" | "allFolders";
@@ -249,17 +292,19 @@ export interface MailChangedEvent {
   reason?: string | null;
   accountId?: number | null;
   folderId?: number | null;
+  messageId?: number | null;
 }
 
-export interface SyncStatusEvent extends SyncStatusDto {
-  stateVersion?: number;
-}
+export type SyncStatusEvent =
+  | (SyncStatusDto & { stateVersion?: number })
+  | { stateVersion?: number; syncStatus: SyncStatusDto };
 
 export interface ReaderStatusEvent {
   readerSessionId: string;
   accountId?: number;
   messageId?: number;
   bodyStatus: BodyStatus;
+  detail?: string | null;
   message?: string | null;
   retryable?: boolean;
   plainText?: string | null;
@@ -269,7 +314,10 @@ export interface ReaderStatusEvent {
 
 export interface LockStateEvent {
   locked: boolean;
+  hasPasscode: boolean;
+  lockedReason?: string | null;
   reason?: string | null;
+  stateVersion?: number;
 }
 
 export interface MessageRef {

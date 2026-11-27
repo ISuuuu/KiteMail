@@ -6,6 +6,7 @@ import {
   inject,
   onMounted,
   onUnmounted,
+  getCurrentInstance,
   type InjectionKey,
 } from "vue";
 import type {
@@ -28,13 +29,22 @@ import {
   mainBootstrap,
   listMessages,
   openMessage,
+  setReaderLayout,
   updateMainPreferences,
   refreshMail,
+  unlockApp,
+  lockApp,
+  setMessageSeen,
+  setMessageFlagged,
+  quitApp,
   onMailChanged,
   onSyncStatus,
   onReaderStatus,
   onLockState,
   extractErrorMessage,
+  isLockedError,
+  normalizeSyncStatusEvent,
+  nextReaderLayoutRevision,
 } from "../ipc/main-window";
 import { usePaneLayout } from "./usePaneLayout";
 
@@ -54,10 +64,68 @@ export function dateGroupLabel(dateTs: number, nowTs: number): string {
 }
 
 export const PAGE_SIZE = 50;
+export const READER_BODY_TIMEOUT_MS = 15_000;
 
 export interface MessageGroup {
   label: string;
   items: MessageSummaryDto[];
+}
+
+export interface AnchorLayoutItem {
+  type?: string;
+  key: string;
+  top: number;
+  height: number;
+}
+
+/** 按 accountId + messageId 在列表中定位邮件 */
+export function findMessageByRef(
+  items: readonly MessageSummaryDto[],
+  target: MessageRef | null
+): MessageSummaryDto | null {
+  if (!target) return null;
+  return (
+    items.find((m) => m.accountId === target.accountId && m.id === target.messageId) ?? null
+  );
+}
+
+/** 根据前后虚拟列表布局与当前 scrollTop 计算增量刷新后的锚点 scrollTop */
+export function computeAnchorScrollTop(
+  prevItems: readonly AnchorLayoutItem[],
+  nextItems: readonly AnchorLayoutItem[],
+  currentScrollTop: number,
+  selectedKey?: string | null
+): number {
+  if (currentScrollTop <= 0 || nextItems.length === 0) return 0;
+
+  const nextByKey = new Map<string, AnchorLayoutItem>();
+  for (const item of nextItems) {
+    nextByKey.set(item.key, item);
+  }
+
+  for (const prev of prevItems) {
+    if (prev.type === "header") continue;
+    if (prev.top + prev.height <= currentScrollTop) continue;
+    if (prev.top > currentScrollTop + 600) break;
+    const matched = nextByKey.get(prev.key);
+    if (matched) {
+      return Math.max(0, Math.round(matched.top + (currentScrollTop - prev.top)));
+    }
+  }
+
+  if (selectedKey) {
+    const selectedNext = nextByKey.get(selectedKey);
+    const selectedPrev = prevItems.find((it) => it.key === selectedKey);
+    if (selectedNext && selectedPrev) {
+      return Math.max(0, Math.round(selectedNext.top + (currentScrollTop - selectedPrev.top)));
+    }
+  }
+
+  const maxTop = Math.max(
+    0,
+    nextItems[nextItems.length - 1].top + nextItems[nextItems.length - 1].height
+  );
+  return Math.min(currentScrollTop, maxTop);
 }
 
 /** 分批合并纯函数（供组件与单元测试直接复用） */
@@ -119,6 +187,12 @@ export function useMainWindow() {
   const error = ref<string | null>(null);
   const mode = ref<"demo" | "live">("demo");
   const locked = ref(false);
+  const hasPasscode = ref(false);
+  const cacheReady = ref(true);
+  const lockedReason = ref<string | null>(null);
+  const unlockSubmitting = ref(false);
+  const unlockError = ref<string | null>(null);
+  const unlockRetryAfterSecs = ref(0);
   const stateVersion = ref(0);
   const accounts = ref<AccountSummaryDto[]>([]);
   const folders = ref<FolderSummaryDto[]>([]);
@@ -151,6 +225,9 @@ export function useMainWindow() {
   let inFlightOffset = -1;
   let openEpoch = 0;
   let activeOpenRequestId = "";
+  let lastReaderSessionId = "";
+  let readerBodyTimer: ReturnType<typeof setTimeout> | null = null;
+  let unlockCountdownTimer: ReturnType<typeof setInterval> | null = null;
 
   // 选中状态
   const selectedId = ref<MessageRef | null>(null);
@@ -162,6 +239,9 @@ export function useMainWindow() {
   const unlisteners: Array<() => void> = [];
 
   // --- 派生 ---
+  const selectedMessage = computed(() => findMessageByRef(messages.value, selectedId.value));
+  const selectedUnread = computed(() => selectedMessage.value?.unread ?? false);
+
   const groupedMessages = computed<MessageGroup[]>(() => {
     if (!layout.prefs.value.listGroupByDate) {
       return [{ label: "", items: messages.value }];
@@ -183,21 +263,115 @@ export function useMainWindow() {
       .map((l) => ({ label: l, items: groups.get(l)! }));
   });
 
+  function clearReaderBodyTimer() {
+    if (readerBodyTimer !== null) {
+      clearTimeout(readerBodyTimer);
+      readerBodyTimer = null;
+    }
+  }
+
+  function clearUnlockCountdown() {
+    if (unlockCountdownTimer !== null) {
+      clearInterval(unlockCountdownTimer);
+      unlockCountdownTimer = null;
+    }
+  }
+
+  function startUnlockCooldown(seconds: number) {
+    clearUnlockCountdown();
+    const initial = Math.max(0, Math.ceil(seconds));
+    unlockRetryAfterSecs.value = initial;
+    if (initial <= 0) return;
+    unlockCountdownTimer = setInterval(() => {
+      if (unlockRetryAfterSecs.value <= 1) {
+        unlockRetryAfterSecs.value = 0;
+        clearUnlockCountdown();
+      } else {
+        unlockRetryAfterSecs.value -= 1;
+      }
+    }, 1000);
+  }
+
+  function hideNativeReaderOnLock() {
+    const sessionId = openedMessage.value?.readerSessionId || lastReaderSessionId;
+    lastReaderSessionId = "";
+    if (!sessionId) return;
+    void setReaderLayout({
+      readerSessionId: sessionId,
+      layoutRevision: nextReaderLayoutRevision(),
+      contentRect: { x: 0, y: 0, width: 0, height: 0 },
+      clipRect: { x: 0, y: 0, width: 0, height: 0 },
+      visible: false,
+      devicePixelRatio: typeof window !== "undefined" ? window.devicePixelRatio : 1,
+    }).catch(() => {
+      /* 忽略非 Tauri 或过期会话拒绝 */
+    });
+  }
+
+  function clearSensitiveMailState() {
+    clearReaderBodyTimer();
+    queryEpoch += 1;
+    inFlightOffset = -1;
+    openEpoch += 1;
+    activeOpenRequestId = "";
+    accounts.value = [];
+    folders.value = [];
+    messages.value = [];
+    listTotal.value = 0;
+    hasMore.value = false;
+    listLoading.value = false;
+    listError.value = null;
+    selectedId.value = null;
+    openedMessage.value = null;
+    readerLoading.value = false;
+    readerError.value = null;
+    searchQuery.value = "";
+    filterSet.value = {};
+    layout.clearOverlays();
+  }
+
+  function enterLockedState(reason?: string | null, nextHasPasscode?: boolean) {
+    hideNativeReaderOnLock();
+    locked.value = true;
+    if (nextHasPasscode !== undefined) {
+      hasPasscode.value = nextHasPasscode;
+    }
+    if (reason !== undefined) {
+      lockedReason.value = reason ?? null;
+    }
+    clearSensitiveMailState();
+  }
+
+  function handleIpcError(err: unknown): boolean {
+    if (isLockedError(err)) {
+      enterLockedState("locked");
+      return true;
+    }
+    return false;
+  }
+
   // --- 加载列表 ---
-  async function loadMessages(resetList = true) {
+  async function loadMessages(resetList = true, options?: { preserveAnchor?: boolean }) {
     if (locked.value) return;
+
+    const preserveAnchor = Boolean(resetList && options?.preserveAnchor);
 
     if (resetList) {
       queryEpoch += 1;
       inFlightOffset = -1;
-      messages.value = [];
-      listTotal.value = 0;
-      hasMore.value = false;
-      scrollResetToken.value += 1;
+      if (!preserveAnchor) {
+        messages.value = [];
+        listTotal.value = 0;
+        hasMore.value = false;
+        scrollResetToken.value += 1;
+      }
     }
 
     const epoch = queryEpoch;
     const offset = resetList ? 0 : messages.value.length;
+    const limit = preserveAnchor
+      ? Math.min(500, Math.max(PAGE_SIZE, messages.value.length))
+      : PAGE_SIZE;
 
     if (!resetList && inFlightOffset === offset) return;
     inFlightOffset = offset;
@@ -214,17 +388,33 @@ export function useMainWindow() {
         sort: sortMode.value,
         filter: filterSet.value,
         offset,
-        limit: PAGE_SIZE,
+        limit,
       });
 
       // 严格按代次与偏移校验，丢弃过期或乱序响应
-      if (shouldApplyListResponse(epoch, queryEpoch, requestId, offset, result)) {
+      if (!locked.value && shouldApplyListResponse(epoch, queryEpoch, requestId, offset, result)) {
         messages.value = mergePagedMessages(messages.value, result.items, resetList);
         listTotal.value = result.total;
         hasMore.value = result.hasMore;
         stateVersion.value = Math.max(stateVersion.value, result.stateVersion);
+        if (result.total > 0 || result.items.length > 0) {
+          cacheReady.value = true;
+        }
+        if (preserveAnchor && openedMessage.value) {
+          const updatedSelected = findMessageByRef(result.items, {
+            accountId: openedMessage.value.accountId,
+            messageId: openedMessage.value.messageId,
+          });
+          if (updatedSelected && updatedSelected.flagged !== openedMessage.value.flagged) {
+            openedMessage.value = {
+              ...openedMessage.value,
+              flagged: updatedSelected.flagged,
+            };
+          }
+        }
       }
     } catch (e) {
+      if (handleIpcError(e)) return;
       if (epoch === queryEpoch) {
         listError.value = extractErrorMessage(e);
       }
@@ -287,10 +477,31 @@ export function useMainWindow() {
     if (locked.value) return;
     try {
       await refreshMail({ view: currentView.value });
-      await loadMessages(true);
+      await loadMessages(true, { preserveAnchor: true });
     } catch (e) {
+      if (handleIpcError(e)) return;
       listError.value = extractErrorMessage(e);
     }
+  }
+
+  function scheduleReaderBodyTimeout(epoch: number, sessionId: string) {
+    clearReaderBodyTimer();
+    readerBodyTimer = setTimeout(() => {
+      readerBodyTimer = null;
+      if (
+        !locked.value &&
+        epoch === openEpoch &&
+        openedMessage.value?.readerSessionId === sessionId &&
+        openedMessage.value.bodyStatus === "loading"
+      ) {
+        openedMessage.value = {
+          ...openedMessage.value,
+          bodyStatus: "unavailable",
+        };
+        readerLoading.value = false;
+        readerError.value = "正文加载超时，请点击重试";
+      }
+    }, READER_BODY_TIMEOUT_MS);
   }
 
   // --- 打开邮件正文 ---
@@ -299,6 +510,7 @@ export function useMainWindow() {
       return;
     }
 
+    clearReaderBodyTimer();
     const epoch = ++openEpoch;
     const requestId = `open-${epoch}-${target.accountId}-${target.messageId}`;
     activeOpenRequestId = requestId;
@@ -314,6 +526,7 @@ export function useMainWindow() {
       });
 
       if (
+        !locked.value &&
         shouldApplyOpenResponse(
           epoch,
           openEpoch,
@@ -323,13 +536,17 @@ export function useMainWindow() {
           layout.prefs.value.readerPosition
         )
       ) {
+        lastReaderSessionId = result.readerSessionId;
         openedMessage.value = result;
         readerLoading.value = result.bodyStatus === "loading";
-        if (result.bodyStatus === "unavailable") {
-          readerError.value = "正文暂不可用";
+        if (result.bodyStatus === "loading") {
+          scheduleReaderBodyTimeout(epoch, result.readerSessionId);
+        } else if (result.bodyStatus === "unavailable") {
+          readerError.value = "正文暂不可用，请点击重试";
         }
       }
     } catch (e) {
+      if (handleIpcError(e)) return;
       if (epoch === openEpoch) {
         readerError.value = extractErrorMessage(e);
         readerLoading.value = false;
@@ -340,6 +557,7 @@ export function useMainWindow() {
   // --- 选邮件（点击行与键盘共用） ---
   function selectMessage(target: MessageRef | null, forceReload = false) {
     if (!target) {
+      clearReaderBodyTimer();
       openEpoch += 1;
       activeOpenRequestId = "";
       selectedId.value = null;
@@ -357,6 +575,7 @@ export function useMainWindow() {
     selectedId.value = { accountId: target.accountId, messageId: target.messageId };
 
     if (layout.prefs.value.readerPosition === "off") {
+      clearReaderBodyTimer();
       openedMessage.value = null;
       readerLoading.value = false;
       readerError.value = null;
@@ -369,6 +588,140 @@ export function useMainWindow() {
   function retryOpen() {
     if (selectedId.value) {
       selectMessage(selectedId.value, true);
+    }
+  }
+
+  // --- 已读 / 星标切换 ---
+  function applyFolderUnreadDelta(accountId: number, folderId: number, delta: number) {
+    if (delta === 0) return;
+    folders.value = folders.value.map((f) => {
+      if (f.accountId === accountId && f.id === folderId) {
+        return { ...f, unreadCount: Math.max(0, f.unreadCount + delta) };
+      }
+      return f;
+    });
+  }
+
+  async function toggleMessageSeen(target: MessageRef, explicitSeen?: boolean) {
+    if (locked.value) return;
+    const current = findMessageByRef(messages.value, target);
+    const prevUnread = current?.unread;
+    const folderIdForDelta = current?.folderId;
+    const seen = explicitSeen ?? Boolean(prevUnread ?? true);
+    try {
+      const res = await setMessageSeen({
+        accountId: target.accountId,
+        messageId: target.messageId,
+        seen,
+      });
+      if (locked.value) return;
+      stateVersion.value = Math.max(stateVersion.value, res.stateVersion);
+      messages.value = messages.value.map((m) =>
+        m.accountId === res.accountId && m.id === res.messageId
+          ? { ...m, unread: res.unread }
+          : m
+      );
+      if (
+        prevUnread !== undefined &&
+        prevUnread !== res.unread &&
+        folderIdForDelta !== undefined
+      ) {
+        applyFolderUnreadDelta(res.accountId, folderIdForDelta, res.unread ? 1 : -1);
+      }
+    } catch (e) {
+      if (handleIpcError(e)) return;
+      listError.value = extractErrorMessage(e);
+    }
+  }
+
+  async function toggleMessageFlagged(target: MessageRef, explicitFlagged?: boolean) {
+    if (locked.value) return;
+    const current = findMessageByRef(messages.value, target);
+    const currentFlagged =
+      current?.flagged ??
+      (openedMessage.value?.accountId === target.accountId &&
+      openedMessage.value?.messageId === target.messageId
+        ? openedMessage.value.flagged
+        : false);
+    const flagged = explicitFlagged ?? !currentFlagged;
+    try {
+      const res = await setMessageFlagged({
+        accountId: target.accountId,
+        messageId: target.messageId,
+        flagged,
+      });
+      if (locked.value) return;
+      stateVersion.value = Math.max(stateVersion.value, res.stateVersion);
+      messages.value = messages.value.map((m) =>
+        m.accountId === res.accountId && m.id === res.messageId
+          ? { ...m, flagged: res.flagged }
+          : m
+      );
+      if (
+        openedMessage.value &&
+        openedMessage.value.accountId === res.accountId &&
+        openedMessage.value.messageId === res.messageId
+      ) {
+        openedMessage.value = {
+          ...openedMessage.value,
+          flagged: res.flagged,
+        };
+      }
+    } catch (e) {
+      if (handleIpcError(e)) return;
+      listError.value = extractErrorMessage(e);
+    }
+  }
+
+  // --- 锁屏 / 解锁 / 退出 ---
+  async function lock() {
+    try {
+      const res = await lockApp();
+      if (res.locked) {
+        enterLockedState("manual");
+      }
+    } catch (e) {
+      error.value = extractErrorMessage(e);
+    }
+  }
+
+  async function unlock(passcode: string): Promise<boolean> {
+    if (unlockSubmitting.value || unlockRetryAfterSecs.value > 0) return false;
+    if (!passcode) {
+      unlockError.value = "请输入锁屏密码";
+      return false;
+    }
+    unlockSubmitting.value = true;
+    unlockError.value = null;
+    try {
+      const res = await unlockApp({ passcode });
+      if (res.unlocked && !res.locked) {
+        clearUnlockCountdown();
+        unlockRetryAfterSecs.value = 0;
+        unlockError.value = null;
+        locked.value = false;
+        lockedReason.value = null;
+        await init();
+        return true;
+      }
+      unlockError.value = res.error ?? "锁屏密码错误";
+      if (res.retryAfterSecs && res.retryAfterSecs > 0) {
+        startUnlockCooldown(res.retryAfterSecs);
+      }
+      return false;
+    } catch (e) {
+      unlockError.value = extractErrorMessage(e);
+      return false;
+    } finally {
+      unlockSubmitting.value = false;
+    }
+  }
+
+  async function quit() {
+    try {
+      await quitApp();
+    } catch (e) {
+      error.value = extractErrorMessage(e);
     }
   }
 
@@ -422,15 +775,37 @@ export function useMainWindow() {
   }
 
   // --- 事件处理 ---
+  async function syncFoldersMetadata() {
+    if (locked.value) return;
+    try {
+      const bootstrap = await mainBootstrap();
+      if (bootstrap.locked) {
+        enterLockedState("locked", bootstrap.hasPasscode ?? hasPasscode.value);
+        return;
+      }
+      accounts.value = bootstrap.accounts;
+      folders.value = bootstrap.folders;
+      hasPasscode.value = Boolean(bootstrap.hasPasscode);
+      cacheReady.value = bootstrap.cacheReady ?? true;
+    } catch (e) {
+      handleIpcError(e);
+    }
+  }
+
   function handleMailChanged(e: MailChangedEvent) {
     if (locked.value) return;
     if (e.stateVersion > stateVersion.value) {
       stateVersion.value = e.stateVersion;
-      void loadMessages(true);
+      cacheReady.value = true;
+      void loadMessages(true, { preserveAnchor: true });
+      if (e.reason !== "seenChanged" && e.reason !== "flaggedChanged") {
+        void syncFoldersMetadata();
+      }
     }
   }
 
   function handleReaderStatus(e: ReaderStatusEvent) {
+    if (locked.value) return;
     if (openedMessage.value && openedMessage.value.readerSessionId === e.readerSessionId) {
       openedMessage.value = {
         ...openedMessage.value,
@@ -439,27 +814,16 @@ export function useMainWindow() {
         hasHtml: e.hasHtml ?? openedMessage.value.hasHtml,
         htmlBody: e.htmlBody ?? openedMessage.value.htmlBody,
       };
-      if (e.bodyStatus !== "loading") readerLoading.value = false;
+      if (e.bodyStatus !== "loading") {
+        clearReaderBodyTimer();
+        readerLoading.value = false;
+      }
       if (e.bodyStatus === "unavailable") {
-        readerError.value = e.message ?? "正文加载失败";
+        readerError.value = e.detail ?? e.message ?? "正文加载失败，请点击重试";
       } else if (e.bodyStatus === "ready") {
         readerError.value = null;
       }
     }
-  }
-
-  function clearLoadedMailState() {
-    queryEpoch += 1;
-    openEpoch += 1;
-    activeOpenRequestId = "";
-    messages.value = [];
-    listTotal.value = 0;
-    hasMore.value = false;
-    selectedId.value = null;
-    openedMessage.value = null;
-    readerLoading.value = false;
-    readerError.value = null;
-    layout.clearOverlays();
   }
 
   // --- 初始化 ---
@@ -471,23 +835,33 @@ export function useMainWindow() {
       if (unlisteners.length === 0) {
         unlisteners.push(await onMailChanged(handleMailChanged));
         unlisteners.push(
-          await onSyncStatus((e) => {
-            syncStatus.value = {
-              syncing: e.syncing,
-              message: e.message,
-              lastSyncAt: e.lastSyncAt,
-            };
+          await onSyncStatus((rawEvent) => {
+            const normalized = normalizeSyncStatusEvent(rawEvent);
+            syncStatus.value = normalized.syncStatus;
+            if (normalized.stateVersion !== undefined) {
+              stateVersion.value = Math.max(stateVersion.value, normalized.stateVersion);
+            }
+            if (!normalized.syncStatus.syncing && !locked.value) {
+              cacheReady.value = true;
+            }
           })
         );
         unlisteners.push(await onReaderStatus(handleReaderStatus));
         unlisteners.push(
           await onLockState((e) => {
             const wasLocked = locked.value;
-            locked.value = e.locked;
             if (e.locked) {
-              clearLoadedMailState();
-            } else if (wasLocked && !e.locked) {
-              void loadMessages(true);
+              enterLockedState(e.lockedReason ?? e.reason ?? null, e.hasPasscode);
+            } else {
+              hasPasscode.value = e.hasPasscode;
+              lockedReason.value = null;
+              locked.value = false;
+              clearUnlockCountdown();
+              unlockRetryAfterSecs.value = 0;
+              unlockError.value = null;
+              if (wasLocked && !unlockSubmitting.value) {
+                void init();
+              }
             }
           })
         );
@@ -495,37 +869,54 @@ export function useMainWindow() {
 
       const bootstrap = await mainBootstrap();
       mode.value = bootstrap.mode;
-      locked.value = bootstrap.locked;
+      hasPasscode.value = Boolean(bootstrap.hasPasscode);
+      cacheReady.value = bootstrap.cacheReady ?? true;
       stateVersion.value = bootstrap.stateVersion;
-      accounts.value = bootstrap.accounts;
-      folders.value = bootstrap.folders;
-      currentView.value = bootstrap.currentView;
       syncStatus.value = bootstrap.syncStatus;
       layout.applyPrefs(bootstrap.preferences);
 
-      if (!bootstrap.locked) {
+      if (bootstrap.locked) {
+        enterLockedState(lockedReason.value ?? "startup", bootstrap.hasPasscode ?? true);
+      } else {
+        locked.value = false;
+        lockedReason.value = null;
+        accounts.value = bootstrap.accounts;
+        folders.value = bootstrap.folders;
+        currentView.value = bootstrap.currentView;
         await loadMessages(true);
       }
     } catch (e) {
-      error.value = extractErrorMessage(e);
+      if (!handleIpcError(e)) {
+        error.value = extractErrorMessage(e);
+      }
     } finally {
       loading.value = false;
     }
   }
 
   function dispose() {
+    clearReaderBodyTimer();
+    clearUnlockCountdown();
     for (const unlisten of unlisteners) unlisten();
     unlisteners.length = 0;
   }
 
-  onMounted(init);
-  onUnmounted(dispose);
+  if (getCurrentInstance()) {
+    onMounted(init);
+    onUnmounted(dispose);
+  }
 
   return {
     loading,
     error,
     mode,
     locked,
+    hasPasscode,
+    cacheReady,
+    lockedReason,
+    unlockSubmitting,
+    unlockError,
+    unlockRetryAfterSecs,
     stateVersion,
     accounts,
     folders,
@@ -544,10 +935,13 @@ export function useMainWindow() {
     sortMode,
     filterSet,
     selectedId,
+    selectedMessage,
+    selectedUnread,
     openedMessage,
     readerLoading,
     readerError,
     init,
+    dispose,
     selectView,
     setSearch,
     setFilter,
@@ -556,6 +950,11 @@ export function useMainWindow() {
     refresh,
     selectMessage,
     retryOpen,
+    toggleMessageSeen,
+    toggleMessageFlagged,
+    lock,
+    unlock,
+    quit,
     selectPrev,
     selectNext,
     loadMore,
