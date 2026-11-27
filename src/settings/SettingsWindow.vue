@@ -69,9 +69,12 @@
         <template v-else>
           <GeneralPage v-if="activeTab.id === 'general'" :state="state" />
           <AppearancePage v-else-if="activeTab.id === 'appearance'" :state="state" />
-          <template v-else-if="activeTab.id === 'composing'">
-            <ComposePanel :state="state" />
-          </template>
+          <FocusPage v-else-if="activeTab.id === 'focusMode'" :state="state" />
+          <SidebarPage v-else-if="activeTab.id === 'sidebar'" :state="state" />
+          <MessageListPage v-else-if="activeTab.id === 'messageList'" :state="state" />
+          <ConversationsPage v-else-if="activeTab.id === 'conversations'" :state="state" />
+          <ReadingPage v-else-if="activeTab.id === 'reading'" :state="state" />
+          <ComposingPage v-else-if="activeTab.id === 'composing'" :state="state" />
           <template v-else-if="activeTab.id === 'privacy'">
             <PrivacyPanel :state="state" />
           </template>
@@ -103,13 +106,18 @@ import { KNOWN_THEMES, resolveDarkMode } from "../main-window/usePaneLayout";
 import type { FullPreferencesDto } from "../preferences/types";
 import {
   AboutPanel,
-  ComposePanel,
   PrivacyPanel,
   StoragePanel,
 } from "../preferences/panels";
 import { usePreferences } from "../preferences/usePreferences";
 import AppearancePage from "./AppearancePage.vue";
+import ComposingPage from "./ComposingPage.vue";
+import ConversationsPage from "./ConversationsPage.vue";
+import FocusPage from "./FocusPage.vue";
 import GeneralPage from "./GeneralPage.vue";
+import MessageListPage from "./MessageListPage.vue";
+import ReadingPage from "./ReadingPage.vue";
+import SidebarPage from "./SidebarPage.vue";
 import PlaceholderPage from "./PlaceholderPage.vue";
 import SettingsIcon from "./SettingsIcon.vue";
 import WindowControls from "./WindowControls.vue";
