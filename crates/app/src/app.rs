@@ -436,6 +436,16 @@ impl ComposeAddressField {
 /// Windows 版正文是一个多行文本框，没有原版 GTK 富文本编辑器的选区命令，
 /// 所以这些按钮做的是「往正文里插入对应语法」——写的是 Markdown 标记，
 /// 切换格式 / 发信时按语法转换成 HTML。
+/// 回复 / 转发时保留的原邮件完整 HTML（纯文本编辑器仅编辑附言与纯文本引用；
+/// 发送/预览非纯文本格式时，将分隔线后的纯文本替换为此处保留的原邮件 HTML）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ComposeQuotedHtml {
+    pub(crate) separator: String,
+    pub(crate) html: String,
+    pub(crate) is_forward: bool,
+    pub(crate) trailing_signature: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposeMarkup {
     Bold,
@@ -885,6 +895,8 @@ pub(crate) struct HylkiApp {
     /// 落盘（`body_format`），重新打开草稿时按原格式恢复。
     pub(crate) compose_format: ComposeFormat,
     pub(crate) compose_preview: bool,
+    /// 回复 / 转发时保留的原邮件 HTML（纯文本编辑区保留纯文本引用，发信/预览时还原原邮件 HTML）。
+    pub(crate) compose_quoted_html: Option<ComposeQuotedHtml>,
     /// WP-10-4 写信是否以「阅读器在上、写信器在下」的内联分屏呈现
     /// （对齐原版 `compose_inline` / `.reader-split`）。仅回复 / 转发且
     /// 阅读器里有可对照的邮件时成立。
@@ -1066,6 +1078,14 @@ pub(crate) struct HylkiApp {
     pub(crate) reader_thread_synced_meta: Option<u64>,
     #[cfg(windows)]
     pub(crate) reader_thread_scroll_anchor: Option<(u32, u32, i32)>,
+    #[cfg(windows)]
+    pub(crate) compose_preview_webview: Option<(
+        AnyWindowHandle,
+        std::rc::Rc<crate::webview_host::WebViewHost>,
+    )>,
+    #[cfg(windows)]
+    pub(crate) compose_preview_webview_key:
+        Option<(String, crate::webview_host::DocumentAppearance)>,
     pub(crate) reader_popup_open: bool,
     /// WP-09：打印预览浮层状态。
     pub(crate) print_preview: Option<PrintPreviewState>,
@@ -1532,6 +1552,7 @@ impl HylkiApp {
                 compose_body,
                 compose_format: ComposeFormat::default(),
                 compose_preview: false,
+                compose_quoted_html: None,
                 compose_split: false,
                 compose_split_height: COMPOSE_SPLIT_DEFAULT_HEIGHT,
                 compose_detached: false,
@@ -1632,6 +1653,10 @@ impl HylkiApp {
                 reader_body_cache: HashMap::new(),
                 #[cfg(windows)]
                 reader_webview: None,
+                #[cfg(windows)]
+                compose_preview_webview: None,
+                #[cfg(windows)]
+                compose_preview_webview_key: None,
                 #[cfg(windows)]
                 reader_webview_key: None,
                 #[cfg(windows)]
@@ -1840,6 +1865,7 @@ impl HylkiApp {
             compose_body,
             compose_format: ComposeFormat::default(),
             compose_preview: false,
+            compose_quoted_html: None,
             compose_split: false,
             compose_split_height: COMPOSE_SPLIT_DEFAULT_HEIGHT,
             compose_detached: false,
@@ -1940,6 +1966,10 @@ impl HylkiApp {
             reader_body_cache: HashMap::new(),
             #[cfg(windows)]
             reader_webview: None,
+            #[cfg(windows)]
+            compose_preview_webview: None,
+            #[cfg(windows)]
+            compose_preview_webview_key: None,
             #[cfg(windows)]
             reader_webview_key: None,
             #[cfg(windows)]
@@ -6539,6 +6569,16 @@ impl HylkiApp {
         if body.trim().is_empty() {
             return None;
         }
+        if let Some(ref quoted) = self.compose_quoted_html {
+            return Some(kitemail_mail_core::markup::compose_with_quoted_html(
+                &body,
+                self.compose_format,
+                &quoted.separator,
+                &quoted.html,
+                quoted.is_forward,
+                quoted.trailing_signature.as_deref(),
+            ));
+        }
         Some(kitemail_mail_core::markup::convert(
             &body,
             self.compose_format,
@@ -6563,6 +6603,12 @@ impl HylkiApp {
         let from = self.compose_format;
         let body = self.compose_body.read(cx).value().to_string();
         let converted = kitemail_mail_core::markup::convert(&body, from, to);
+        if let Some(ref mut quoted) = self.compose_quoted_html {
+            if let Some(ref sig) = quoted.trailing_signature {
+                quoted.trailing_signature =
+                    Some(kitemail_mail_core::markup::convert(sig, from, to));
+            }
+        }
         self.compose_format = to;
         self.compose_preview = false;
         self.compose_body
@@ -6576,6 +6622,13 @@ impl HylkiApp {
     pub(crate) fn toggle_compose_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.compose_preview = !self.compose_preview;
         if !self.compose_preview {
+            #[cfg(windows)]
+            {
+                if let Some((_, ref host)) = self.compose_preview_webview {
+                    host.set_visible(false);
+                }
+                crate::webview_host::WebViewHost::focus_host_window(window);
+            }
             self.compose_body.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
@@ -6998,6 +7051,7 @@ impl HylkiApp {
         });
         // 正文按模板记录里的格式打开，避免把 Markdown 源当成纯文本发出去。
         self.compose_format = ComposeFormat::from_str_lossy(&template.body_format);
+        self.compose_quoted_html = None;
         self.compose_preview = false;
         self.compose_body.update(cx, |s, cx| {
             s.set_value(template.body_text.clone(), window, cx)
@@ -7302,6 +7356,15 @@ impl HylkiApp {
     fn finish_compose_session(&mut self, cx: &mut Context<Self>) {
         self.compose_session_generation += 1;
         self.compose_split = false;
+        self.compose_preview = false;
+        #[cfg(windows)]
+        {
+            if let Some((_, ref host)) = self.compose_preview_webview {
+                host.set_visible(false);
+            }
+            self.compose_preview_webview = None;
+            self.compose_preview_webview_key = None;
+        }
         self.right_mode = RightPaneMode::Reader;
         if self.compose_detached || self.compose_window.is_some() {
             self.close_compose_window(cx);
@@ -7349,6 +7412,7 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
         self.compose_format = ComposeFormat::default();
+        self.compose_quoted_html = None;
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
@@ -7566,6 +7630,27 @@ impl HylkiApp {
         self.compose_subject
             .update(cx, |s, cx| s.set_value(forward_subject, window, cx));
         let (signature_body, signature_is_html) = self.account_reply_signature(detail.account_id);
+        let trailing_signature = if self.prefs.signature_above_quote {
+            None
+        } else {
+            let block = signature::signature_for(
+                self.compose_format,
+                &signature_body,
+                signature_is_html,
+                self.prefs.signature_dashes,
+            );
+            (!block.is_empty()).then_some(block)
+        };
+        self.compose_quoted_html = detail
+            .body_html
+            .as_deref()
+            .filter(|h| !h.trim().is_empty())
+            .map(|h| ComposeQuotedHtml {
+                separator: "------------------ 转发邮件 ------------------".to_string(),
+                html: h.to_string(),
+                is_forward: true,
+                trailing_signature,
+            });
         let body_with_sig = insert_signature_with_quote(
             &quoted,
             &signature_body,
@@ -7603,6 +7688,11 @@ impl HylkiApp {
         }
         if !self.prefs.reply_inline {
             self.pop_out_compose(cx);
+        } else {
+            window.activate_window();
+            #[cfg(windows)]
+            crate::webview_host::WebViewHost::focus_host_window(window);
+            self.compose_to.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
         true
@@ -7622,6 +7712,7 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
         self.compose_format = ComposeFormat::default();
+        self.compose_quoted_html = None;
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
@@ -7703,6 +7794,33 @@ impl HylkiApp {
         self.compose_subject
             .update(cx, |s, cx| s.set_value(reply_subject, window, cx));
         let (signature_body, signature_is_html) = self.account_reply_signature(detail.account_id);
+        let trailing_signature = if self.prefs.signature_above_quote {
+            None
+        } else {
+            let block = signature::signature_for(
+                self.compose_format,
+                &signature_body,
+                signature_is_html,
+                self.prefs.signature_dashes,
+            );
+            (!block.is_empty()).then_some(block)
+        };
+        let reply_separator = header
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        self.compose_quoted_html = detail
+            .body_html
+            .as_deref()
+            .filter(|h| !h.trim().is_empty() && !reply_separator.is_empty())
+            .map(|h| ComposeQuotedHtml {
+                separator: reply_separator,
+                html: h.to_string(),
+                is_forward: false,
+                trailing_signature,
+            });
         let body_with_sig = insert_signature_with_quote(
             &quoted,
             &signature_body,
@@ -7719,6 +7837,11 @@ impl HylkiApp {
         self.ensure_contacts_loaded();
         if !self.prefs.reply_inline {
             self.pop_out_compose(cx);
+        } else {
+            window.activate_window();
+            #[cfg(windows)]
+            crate::webview_host::WebViewHost::focus_host_window(window);
+            self.compose_body.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
         true
@@ -7768,6 +7891,7 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
         self.compose_format = ComposeFormat::default();
+        self.compose_quoted_html = None;
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
@@ -7783,6 +7907,7 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         // WP-10-3：正文格式属于会话状态，离开或新开写信一律回到默认格式。
         self.compose_format = ComposeFormat::default();
+        self.compose_quoted_html = None;
         self.compose_attachment_reminder = None;
         self.pending_forward_msg_id = None;
         self.compose_autocomplete_field = None;
@@ -7836,6 +7961,7 @@ impl HylkiApp {
             .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
         // WP-10-3：草稿里记着正文格式，按原格式打开，避免把 Markdown 源当成纯文本。
         self.compose_format = ComposeFormat::from_str_lossy(&draft.body_format);
+        self.compose_quoted_html = None;
         self.compose_body
             .update(cx, |s, cx| s.set_value(draft.body_text.clone(), window, cx));
         // WP-10-4：草稿自带头与正文，整栏呈现。
@@ -8843,6 +8969,7 @@ impl HylkiApp {
         self.compose_confirm_discard = false;
         self.compose_autocomplete_field = None;
         self.pending_forward_msg_id = None;
+        self.compose_quoted_html = None;
         // F-4：发送即清除挂起的自动保存（草稿由发送流程交接删除，不再落库）。
         self.cancel_draft_autosave();
         self.compose_autosaved_new = false;
@@ -9312,6 +9439,7 @@ impl HylkiApp {
         self.compose_subject
             .update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
         self.compose_format = ComposeFormat::from_str_lossy(&draft.body_format);
+        self.compose_quoted_html = None;
         self.compose_body
             .update(cx, |s, cx| s.set_value(draft.body.clone(), window, cx));
         self.compose_confirm_discard = false;
@@ -12608,6 +12736,8 @@ impl HylkiApp {
         pane_top: bool,
         detached: bool,
     ) -> gpui_kit::AnyElement {
+        #[cfg(windows)]
+        self.sync_compose_preview_webview(window, cx);
         let p = theme::current(cx);
         // 写信页唯一标题栏（B-8：合并进 48px 顶栏，compose.rs 不再画第二层标题）：
         // 左侧「取消 / 存草稿」，中间拖拽区，右侧「附件 / 发送」，复用现有动作。
@@ -12816,6 +12946,85 @@ impl HylkiApp {
             )
             .child(compose::render(self, cx))
             .into_any_element()
+    }
+
+    #[cfg(windows)]
+    fn sync_compose_preview_webview(&mut self, window: &Window, cx: &mut Context<Self>) {
+        use crate::webview_host::{build_body_document, DocumentAppearance, WebViewHost};
+        let show = self.compose_preview && self.compose_format != ComposeFormat::Plain;
+        if !show {
+            if let Some((_, ref host)) = self.compose_preview_webview {
+                host.set_visible(false);
+            }
+            return;
+        }
+        let target_handle = window.window_handle();
+        if self
+            .compose_preview_webview
+            .as_ref()
+            .is_some_and(|(h, _)| *h != target_handle)
+        {
+            if let Some((_, old)) = self.compose_preview_webview.take() {
+                old.set_visible(false);
+            }
+            self.compose_preview_webview_key = None;
+        }
+        let rendered = self.compose_body_html(cx).unwrap_or_default();
+        let (background, foreground) = theme::reader_body_colors(self.dark_mode);
+        let appearance = DocumentAppearance {
+            dark: self.dark_mode,
+            zoom_percent: self.prefs.reader_zoom_percent,
+            background,
+            foreground,
+        };
+        let next_key = (rendered.clone(), appearance);
+        if self.compose_preview_webview_key.as_ref() == Some(&next_key)
+            && self.compose_preview_webview.is_some()
+        {
+            return;
+        }
+        self.compose_preview_webview_key = Some(next_key.clone());
+        let document = build_body_document(&rendered, appearance);
+        if let Some((_, ref host)) = self.compose_preview_webview {
+            let _ = host.load_with_remote(document, true);
+        } else {
+            cx.defer_in(window, move |this, window, cx| {
+                if !this.compose_preview
+                    || this.compose_format == ComposeFormat::Plain
+                    || window.window_handle() != target_handle
+                    || this.compose_preview_webview_key.as_ref() != Some(&next_key)
+                {
+                    return;
+                }
+                if let Some(host) = WebViewHost::for_window(window, None) {
+                    let (tx, mut rx) = futures::channel::mpsc::channel::<()>(16);
+                    host.set_notifier(tx);
+                    let _ = host.load_with_remote(document, true);
+                    let host = std::rc::Rc::new(host);
+                    this.compose_preview_webview = Some((target_handle, host));
+                    cx.spawn(async move |weak_app, cx| {
+                        use futures::StreamExt as _;
+                        while rx.next().await.is_some() {
+                            if weak_app
+                                .update(cx, |app, cx| {
+                                    if let Some((_, ref h)) = app.compose_preview_webview {
+                                        for link in h.take_links() {
+                                            app.open_mail_link(&link, cx);
+                                        }
+                                    }
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
+                    cx.notify();
+                }
+            });
+        }
     }
 
     fn render_status_bar(

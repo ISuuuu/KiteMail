@@ -523,6 +523,18 @@ fn compose_format_bar(
                 .flex_shrink_0()
                 .items_center()
                 .gap_1()
+                .when(
+                    app.compose_quoted_html.is_some() && current != ComposeFormat::Plain,
+                    |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.text_muted)
+                                .px_1p5()
+                                .child("已保留原邮件 HTML 格式"),
+                        )
+                    },
+                )
                 .when(current != ComposeFormat::Plain, |el| {
                     el.child(
                         Button::new("compose-preview")
@@ -548,6 +560,7 @@ fn compose_format_bar(
 struct CachedComposePreview {
     format: ComposeFormat,
     raw_body: String,
+    quoted_html: Option<String>,
     sanitized_html: String,
 }
 
@@ -559,16 +572,56 @@ fn compose_preview_cache() -> &'static std::sync::Mutex<Option<CachedComposePrev
 
 fn compose_editor(app: &HylkiApp, cx: &Context<HylkiApp>) -> gpui_kit::AnyElement {
     if app.compose_preview {
+        #[cfg(windows)]
+        if app.compose_format != ComposeFormat::Plain {
+            if let Some((_, ref host)) = app.compose_preview_webview {
+                let host = host.clone();
+                let (version, view_state) = host.load_status();
+                if view_state == crate::webview_host::BodyView::Html {
+                    let visible = !app.compose_confirm_discard
+                        && (app.compose_detached || !app.reader_webview_yields_to_popup());
+                    return gpui_kit::canvas(
+                        move |bounds, window, cx| {
+                            let scale = window.scale_factor();
+                            let rect = windows::Win32::Foundation::RECT {
+                                left: (bounds.origin.x.as_f32() * scale).round() as i32,
+                                top: (bounds.origin.y.as_f32() * scale).round() as i32,
+                                right: ((bounds.origin.x + bounds.size.width).as_f32() * scale)
+                                    .round() as i32,
+                                bottom: ((bounds.origin.y + bounds.size.height).as_f32() * scale)
+                                    .round() as i32,
+                            };
+                            cx.defer(move |_| {
+                                if host.load_status()
+                                    == (version, crate::webview_host::BodyView::Html)
+                                {
+                                    host.set_bounds(rect);
+                                    host.set_visible(visible);
+                                }
+                            });
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .size_full()
+                    .into_any_element();
+                }
+            }
+        }
         let format = app.compose_format;
         let raw_body = if format == ComposeFormat::Plain {
             String::new()
         } else {
             app.compose_body.read(cx).value().to_string()
         };
+        let current_quoted_html = app.compose_quoted_html.as_ref().map(|q| q.html.clone());
         let cached = compose_preview_cache().lock().ok().and_then(|guard| {
             guard
                 .as_ref()
-                .filter(|c| c.format == format && c.raw_body == raw_body)
+                .filter(|c| {
+                    c.format == format
+                        && c.raw_body == raw_body
+                        && c.quoted_html == current_quoted_html
+                })
                 .map(|c| c.sanitized_html.clone())
         });
         let html = if let Some(hit) = cached {
@@ -580,6 +633,7 @@ fn compose_editor(app: &HylkiApp, cx: &Context<HylkiApp>) -> gpui_kit::AnyElemen
                 *guard = Some(CachedComposePreview {
                     format,
                     raw_body,
+                    quoted_html: current_quoted_html,
                     sanitized_html: clean.clone(),
                 });
             }

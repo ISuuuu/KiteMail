@@ -60,6 +60,21 @@ impl ComposeWindow {
         cx.observe_global::<theme::HylkiThemeState>(|_, cx| cx.notify())
             .detach();
 
+        // 窗口打开后显式激活并聚焦输入区，避免焦点仍停留在主窗口或 WebView2 子窗口上导致无法输入。
+        let app_for_focus = app.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            window.activate_window();
+            app_for_focus.update(cx, |app, cx| {
+                if app.compose_to_pills.is_empty()
+                    && app.compose_to.read(cx).value().trim().is_empty()
+                {
+                    app.compose_to.focus_handle(cx).focus(window, cx);
+                } else {
+                    app.compose_body.focus_handle(cx).focus(window, cx);
+                }
+            });
+        });
+
         Self {
             app,
             focused_once: false,

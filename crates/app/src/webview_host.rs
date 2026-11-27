@@ -28,11 +28,13 @@ use windows::{
         },
         System::Com::{IStream, STREAM_SEEK_SET},
         UI::{
+            Input::KeyboardAndMouse::{GetFocus, SetFocus},
             Shell::SHCreateMemStream,
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetAncestor, GetForegroundWindow, GetWindowRect,
-                SetWindowPos, ShowWindow, GA_ROOT, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
-                SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
+                CreateWindowExW, DestroyWindow, GetAncestor, GetForegroundWindow, GetParent,
+                GetWindowRect, IsChild, SetWindowPos, ShowWindow, GA_ROOT, SWP_NOACTIVATE,
+                SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_CHILD,
+                WS_CLIPCHILDREN,
             },
         },
     },
@@ -671,6 +673,18 @@ impl WebViewHost {
         }
         true
     }
+    pub(crate) fn focus_host_window(window: &Window) {
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return;
+        };
+        if let RawWindowHandle::Win32(raw) = handle.as_raw() {
+            let hwnd = HWND(raw.hwnd.get() as *mut _);
+            unsafe {
+                let _ = SetFocus(Some(hwnd));
+            }
+        }
+    }
+
     pub(crate) fn for_window(
         window: &Window,
         scroll_window: Option<AsyncWindowContext>,
@@ -929,6 +943,20 @@ impl WebViewHost {
         if visible {
             if let Some(controller) = &controller {
                 self.resume_if_needed(controller);
+            }
+        }
+        if !visible {
+            unsafe {
+                let focused = GetFocus();
+                if !focused.is_invalid()
+                    && (focused == clip_window || IsChild(clip_window, focused).as_bool())
+                {
+                    if let Ok(parent) = GetParent(clip_window) {
+                        if !parent.is_invalid() {
+                            let _ = SetFocus(Some(parent));
+                        }
+                    }
+                }
             }
         }
         unsafe {

@@ -1062,6 +1062,262 @@ fn escape_html(text: &str) -> String {
     out
 }
 
+/// 从完整邮件 HTML 中提取可安全嵌入到另一封邮件正文中的片段：
+/// 保留 `<style>...</style>`（常见于 `<head>` 内），并提取 `<body>...</body>`
+/// 内容（保留 `<body>` 上的内联 `style` 属性），避免出现嵌套 `<html>/<body>`。
+pub fn extract_embeddable_html(raw_html: &str) -> String {
+    let trimmed = raw_html.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 仅使用 ASCII 小写转换，保证字节偏移与原字符串严格对齐。
+    let lower = trimmed.to_ascii_lowercase();
+
+    // 收集所有 <style ...>...</style>（通常在 <head> 中，转发 HTML 邮件依赖它们还原样式）。
+    let mut styles = String::new();
+    let mut search_from = 0usize;
+    while let Some(rel_start) = lower[search_from..].find("<style") {
+        let start = search_from + rel_start;
+        let after_tag = start + 6;
+        let valid_boundary = lower[after_tag..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c.is_ascii_whitespace());
+        if !valid_boundary {
+            search_from = after_tag;
+            continue;
+        }
+        let Some(rel_end) = lower[after_tag..].find("</style>") else {
+            break;
+        };
+        let end = after_tag + rel_end + "</style>".len();
+        styles.push_str(&trimmed[start..end]);
+        styles.push('\n');
+        search_from = end;
+    }
+
+    // 查找 <body>...</body>。
+    let body_fragment = if let Some(body_open_start) = find_tag_start(&lower, "<body") {
+        if let Some(rel_gt) = lower[body_open_start..].find('>') {
+            let open_tag = &trimmed[body_open_start..body_open_start + rel_gt + 1];
+            let content_start = body_open_start + rel_gt + 1;
+            let content_end = lower[content_start..]
+                .rfind("</body>")
+                .map(|rel| content_start + rel)
+                .unwrap_or(trimmed.len());
+            let inner = trimmed[content_start..content_end].trim();
+            if let Some(style_attr) = extract_style_attr(open_tag) {
+                format!("<div style=\"{}\">{inner}</div>", escape_html(&style_attr))
+            } else {
+                format!("<div>{inner}</div>")
+            }
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        // 没有 <body> 时去掉外层 <!DOCTYPE> / <html> / <head>...</head> 壳。
+        strip_document_shell(trimmed, &lower)
+    };
+
+    if styles.is_empty() {
+        body_fragment
+    } else if body_fragment.contains("<style") {
+        // <body> 内部已经自带的 <style> 无需重复前置，仅保留 <head> 中的 <style>。
+        let head_styles = extract_head_styles(trimmed, &lower);
+        if head_styles.is_empty() {
+            body_fragment
+        } else {
+            format!("{head_styles}{body_fragment}")
+        }
+    } else {
+        format!("{styles}{body_fragment}")
+    }
+}
+
+fn find_tag_start(lower: &str, prefix: &str) -> Option<usize> {
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(prefix) {
+        let pos = from + rel;
+        let after = pos + prefix.len();
+        if lower[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c.is_ascii_whitespace())
+        {
+            return Some(pos);
+        }
+        from = after;
+    }
+    None
+}
+
+fn extract_head_styles(trimmed: &str, lower: &str) -> String {
+    let Some(head_start) = find_tag_start(lower, "<head") else {
+        return String::new();
+    };
+    let Some(rel_end) = lower[head_start..].find("</head>") else {
+        return String::new();
+    };
+    let head_slice = &trimmed[head_start..head_start + rel_end];
+    let head_lower = &lower[head_start..head_start + rel_end];
+    let mut out = String::new();
+    let mut pos = 0usize;
+    while let Some(rel_s) = head_lower[pos..].find("<style") {
+        let s = pos + rel_s;
+        let after = s + 6;
+        if !head_lower[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c.is_ascii_whitespace())
+        {
+            pos = after;
+            continue;
+        }
+        let Some(rel_e) = head_lower[after..].find("</style>") else {
+            break;
+        };
+        let e = after + rel_e + "</style>".len();
+        out.push_str(&head_slice[s..e]);
+        out.push('\n');
+        pos = e;
+    }
+    out
+}
+
+fn extract_style_attr(open_tag: &str) -> Option<String> {
+    let lower = open_tag.to_ascii_lowercase();
+    let idx = lower.find("style=")?;
+    let rest = &open_tag[idx + "style=".len()..];
+    let mut chars = rest.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let after_quote = &rest[quote.len_utf8()..];
+    let end = after_quote.find(quote)?;
+    let val = after_quote[..end].trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+fn strip_document_shell(trimmed: &str, lower: &str) -> String {
+    let mut s = trimmed.to_string();
+    let mut l = lower.to_string();
+    if let Some(head_start) = find_tag_start(&l, "<head") {
+        if let Some(rel_end) = l[head_start..].find("</head>") {
+            let head_end = head_start + rel_end + "</head>".len();
+            s.replace_range(head_start..head_end, "");
+            l = s.to_ascii_lowercase();
+        }
+    }
+    if let Some(dt_start) = l.find("<!doctype") {
+        if let Some(rel_gt) = l[dt_start..].find('>') {
+            s.replace_range(dt_start..dt_start + rel_gt + 1, "");
+            l = s.to_ascii_lowercase();
+        }
+    }
+    if let Some(html_start) = find_tag_start(&l, "<html") {
+        if let Some(rel_gt) = l[html_start..].find('>') {
+            s.replace_range(html_start..html_start + rel_gt + 1, "");
+            l = s.to_ascii_lowercase();
+        }
+    }
+    if let Some(html_end) = l.rfind("</html>") {
+        s.replace_range(html_end..html_end + "</html>".len(), "");
+    }
+    s.trim().to_string()
+}
+
+/// 将写信编辑区的正文（附言 + 纯文本引用）与原邮件完整 HTML 合并：
+/// - 在 `body` 中按行定位 `separator`（如 `------------------ 转发邮件 ------------------`）；
+/// - `separator` 之前的用户附言（含上方签名）按当前 `format` 转成 HTML；
+/// - `separator` 及紧随的信头行渲染为结构化引用头，后接原邮件 `quoted_html`；
+/// - 若用户已在编辑区删除 `separator`，则退化为普通的 `convert(body, format, ComposeFormat::Html)`。
+pub fn compose_with_quoted_html(
+    body: &str,
+    format: ComposeFormat,
+    separator: &str,
+    quoted_html: &str,
+    is_forward: bool,
+    trailing_signature: Option<&str>,
+) -> String {
+    let sep_trimmed = separator.trim();
+    if format == ComposeFormat::Plain || sep_trimmed.is_empty() || quoted_html.trim().is_empty() {
+        return convert(body, format, ComposeFormat::Html);
+    }
+
+    // 按行查找分隔行在 body 中的字节起止位置。
+    let mut offset = 0usize;
+    let mut sep_byte_start = None;
+    for raw_line in body.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        if line.trim() == sep_trimmed {
+            sep_byte_start = Some(offset);
+            break;
+        }
+        offset += raw_line.len();
+    }
+    if sep_byte_start.is_none() && body.trim() == sep_trimmed {
+        sep_byte_start = Some(0);
+    }
+
+    let Some(sep_start) = sep_byte_start else {
+        return convert(body, format, ComposeFormat::Html);
+    };
+
+    let before = body[..sep_start].trim_end_matches(['\r', '\n']);
+    let after = &body[sep_start..];
+
+    let before_html = if before.trim().is_empty() {
+        String::new()
+    } else {
+        convert(before, format, ComposeFormat::Html)
+    };
+
+    // 收集分隔行及其紧随的非空信头行（发件人 / 时间 / 主题），遇到空行即止。
+    let mut header_lines: Vec<&str> = Vec::new();
+    for raw_line in after.lines().take(12) {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        header_lines.push(trimmed);
+    }
+    let header_inner = header_lines
+        .iter()
+        .map(|l| escape_html(l))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let header_html = format!(
+        "<div class=\"kitemail-quote-header\" style=\"margin:16px 0 12px 0;padding-top:12px;border-top:1px solid #d0d7de;color:#57606a;font-size:12px;line-height:1.5;\">{header_inner}</div>"
+    );
+
+    let embedded_html = extract_embeddable_html(quoted_html);
+    let quoted_block = if is_forward {
+        format!("<div class=\"kitemail-forward-body\">{embedded_html}</div>")
+    } else {
+        format!(
+            "<blockquote type=\"cite\" style=\"margin:8px 0 0 0;padding-left:12px;border-left:2px solid #d0d7de;\">{embedded_html}</blockquote>"
+        )
+    };
+
+    let trailing_sig_html = trailing_signature
+        .map(str::trim)
+        .filter(|sig| !sig.is_empty() && after.trim_end().ends_with(sig))
+        .map(|sig| {
+            format!(
+                "<div class=\"kitemail-signature\" style=\"margin-top:16px;\">{}</div>",
+                convert(sig, format, ComposeFormat::Html)
+            )
+        })
+        .unwrap_or_default();
+
+    format!("{before_html}{header_html}{quoted_block}{trailing_sig_html}")
+}
+
 /// HTML 实体还原（命名实体 + 十进制 / 十六进制数字实体）。
 fn decode_entities(text: &str) -> String {
     if !text.contains('&') {
@@ -1251,5 +1507,85 @@ mod tests {
             "a & b A B  c"
         );
         assert_eq!(decode_entities("100% & 完成"), "100% & 完成");
+    }
+
+    #[test]
+    fn extract_embeddable_html_keeps_head_styles_and_body_content() {
+        let raw = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>.btn{color:green;}</style></head><body style=\"margin:0\"><table class=\"btn\"><tr><td>View</td></tr></table></body></html>";
+        let out = extract_embeddable_html(raw);
+        assert!(out.contains("<style>.btn{color:green;}</style>"), "{out}");
+        assert!(
+            out.contains("<div style=\"margin:0\"><table class=\"btn\">"),
+            "{out}"
+        );
+        assert!(!out.contains("<!DOCTYPE"), "{out}");
+        assert!(!out.contains("<html"), "{out}");
+        assert!(!out.contains("<body"), "{out}");
+    }
+
+    #[test]
+    fn compose_with_quoted_html_preserves_original_html_for_forward_and_reply() {
+        let sep = "------------------ 转发邮件 ------------------";
+        let body = format!(
+            "请查收以下通知\n\n{sep}\n发件人：GitHub <notifications@github.com>\n时间：11-26 20:02\n主题：Run failed\n\n纯文本兜底"
+        );
+        let orig_html = "<html><head><style>.card{border:1px solid #ccc;}</style></head><body><div class=\"card\"><a href=\"https://github.com\">View workflow run</a></div></body></html>";
+
+        let fwd_html =
+            compose_with_quoted_html(&body, ComposeFormat::Rich, sep, orig_html, true, None);
+        assert!(fwd_html.contains("请查收以下通知"), "{fwd_html}");
+        assert!(fwd_html.contains("kitemail-quote-header"), "{fwd_html}");
+        assert!(
+            fwd_html.contains("发件人：GitHub &lt;notifications@github.com&gt;"),
+            "{fwd_html}"
+        );
+        assert!(
+            fwd_html.contains("<style>.card{border:1px solid #ccc;}</style>"),
+            "{fwd_html}"
+        );
+        assert!(
+            fwd_html.contains(
+                "<div class=\"card\"><a href=\"https://github.com\">View workflow run</a></div>"
+            ),
+            "{fwd_html}"
+        );
+        assert!(!fwd_html.contains("纯文本兜底"), "{fwd_html}");
+
+        let reply_html =
+            compose_with_quoted_html(&body, ComposeFormat::Rich, sep, orig_html, false, None);
+        assert!(
+            reply_html.contains("<blockquote type=\"cite\""),
+            "{reply_html}"
+        );
+
+        // 若用户删除了分隔线，则退化为普通正文转换。
+        let no_sep = compose_with_quoted_html(
+            "仅保留自己的话",
+            ComposeFormat::Rich,
+            sep,
+            orig_html,
+            true,
+            None,
+        );
+        assert!(no_sep.contains("仅保留自己的话"), "{no_sep}");
+        assert!(!no_sep.contains("View workflow run"), "{no_sep}");
+    }
+
+    #[test]
+    fn compose_with_quoted_html_keeps_trailing_signature() {
+        let sep = "------------------ 转发邮件 ------------------";
+        let sig = "-- \nAlice";
+        let body = format!("请查收\n\n{sep}\n发件人：Bob\n\n原正文\n\n{sig}");
+        let out = compose_with_quoted_html(
+            &body,
+            ComposeFormat::Rich,
+            sep,
+            "<p>原HTML</p>",
+            true,
+            Some(sig),
+        );
+        assert!(out.contains("<p>原HTML</p>"), "{out}");
+        assert!(out.contains("kitemail-signature"), "{out}");
+        assert!(out.contains("Alice"), "{out}");
     }
 }
