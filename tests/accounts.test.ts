@@ -23,6 +23,24 @@ import {
   useAccounts,
   validateAccountForm,
 } from "../src/accounts/useAccounts.ts";
+import {
+  addToBlocklist,
+  buildFilterRuleSummary,
+  filterBlocklist,
+  filterFieldLabel,
+  generateLocalFingerprint,
+  normalizeBlockedSender,
+  normalizeTagColor,
+  normalizeTagShortcut,
+  pgpKeySubtitle,
+  pgpKeyTitle,
+  registerPgpKey,
+  removeFromBlocklist,
+  saveTag,
+  smartFolderSubtitle,
+  tagShortcutLabel,
+  type FilterRuleItem,
+} from "../src/settings/extraTabsLogic.ts";
 
 test("extractEmailDomain 与 matchPresetByEmail 正确识别主流邮箱服务商", () => {
   assert.equal(extractEmailDomain("Alice <Alice@QQ.COM>"), "qq.com");
@@ -395,4 +413,132 @@ test("useAccountLayers 两级层级：脏检查、未保存守卫与离开动作
 
   state.dispose();
   resetMockAccounts();
+});
+
+test("saveTag 名称必填、颜色规整、快捷键 1..9 且跨标签唯一", () => {
+  const base = [{ id: 1, name: "工作", color: "#337FDC", shortcut: 3 }];
+
+  const empty = saveTag(base, { id: null, name: "  ", color: "#29ae74", shortcut: null });
+  assert.equal(empty.error, "标签名称不能为空");
+
+  const added = saveTag(base, { id: null, name: " 紧急 ", color: "nope", shortcut: 2 });
+  assert.equal(added.error, null);
+  assert.equal(added.tags.length, 2);
+  assert.equal(added.tags[1].name, "紧急");
+  assert.equal(added.tags[1].color, "#3584e4");
+  assert.equal(added.tags[1].shortcut, 2);
+  assert.equal(added.tags[0].shortcut, 3);
+
+  // 同一快捷键移到新标签时，旧标签快捷键被清空
+  const moved = saveTag(added.tags, { id: null, name: "稍后", color: "#29AE74", shortcut: 3 });
+  assert.equal(moved.tags[0].shortcut, null);
+  assert.equal(moved.tags[2].shortcut, 3);
+  assert.equal(moved.tags[2].color, "#29ae74");
+
+  const clamped = saveTag([], { id: null, name: "x", color: "#29ae74", shortcut: 12 });
+  assert.equal(clamped.tags[0].shortcut, null);
+
+  assert.equal(normalizeTagShortcut(0), null);
+  assert.equal(normalizeTagShortcut(9), 9);
+  assert.equal(tagShortcutLabel(3), "快捷键 3");
+  assert.equal(tagShortcutLabel(null), "无快捷键");
+  assert.equal(normalizeTagColor("#337FDC"), "#337fdc");
+});
+
+test("buildFilterRuleSummary 按字段/匹配/动作生成条件摘要", () => {
+  const rule = (overrides: Partial<FilterRuleItem>): FilterRuleItem => ({
+    id: 1,
+    name: "r",
+    accountEmail: "",
+    enabled: true,
+    field: "from",
+    matcher: "contains",
+    value: "boss",
+    moveToFolder: "",
+    archive: false,
+    star: false,
+    markRead: false,
+    applyTag: "",
+    forwardTo: "",
+    ...overrides,
+  });
+
+  assert.equal(
+    buildFilterRuleSummary(rule({})),
+    "发件人 包含 “boss” → 无动作"
+  );
+  assert.equal(
+    buildFilterRuleSummary(
+      rule({
+        field: "subject",
+        matcher: "startsWith",
+        moveToFolder: " 工作 ",
+        archive: true,
+        markRead: true,
+        applyTag: " 紧急 ",
+      })
+    ),
+    "主题 开头为 “boss” → 移动到 工作、归档、标为已读、打标签 紧急"
+  );
+  assert.equal(filterFieldLabel("body"), "正文");
+});
+
+test("smartFolderSubtitle 显示账号范围与查询", () => {
+  assert.equal(smartFolderSubtitle("", "from:alice"), "全部账号 · 查询: from:alice");
+  assert.equal(smartFolderSubtitle("a@b.com", "is:unread"), "a@b.com · 查询: is:unread");
+});
+
+test("normalizeBlockedSender 校验邮箱/域名并规整小写", () => {
+  assert.equal(normalizeBlockedSender("  User@Example.COM  "), "user@example.com");
+  assert.equal(normalizeBlockedSender("张三 <Boss@Corp.com>"), "boss@corp.com");
+  assert.equal(normalizeBlockedSender("example.com"), "example.com");
+  assert.equal(normalizeBlockedSender("user@"), null);
+  assert.equal(normalizeBlockedSender("bad/path"), null);
+  assert.equal(normalizeBlockedSender("   "), null);
+});
+
+test("黑名单增删筛选：去重、排序与实时过滤", () => {
+  const added = addToBlocklist(["zz@x.com"], "A@B.com");
+  assert.deepEqual(added.blocked, ["a@b.com", "zz@x.com"]);
+  assert.equal(added.added, "a@b.com");
+
+  // 重复添加不产生新条目，但仍返回规整结果（对照 block_sender 返回 Some）
+  const dup = addToBlocklist(added.blocked, "A@B.COM");
+  assert.equal(dup.blocked.length, 2);
+  assert.equal(dup.added, "a@b.com");
+
+  const illegal = addToBlocklist(added.blocked, "bad/path");
+  assert.equal(illegal.added, null);
+  assert.equal(illegal.blocked.length, 2);
+
+  assert.deepEqual(filterBlocklist(added.blocked, "ZZ"), ["zz@x.com"]);
+  assert.deepEqual(filterBlocklist(added.blocked, "nomatch"), []);
+  assert.deepEqual(removeFromBlocklist(added.blocked, "A@b.com"), ["zz@x.com"]);
+});
+
+test("registerPgpKey 邮箱必填、指纹自动生成与标题说明", () => {
+  const bad = registerPgpKey([], { name: "a", email: "no-at", fingerprint: "" });
+  assert.equal(bad.error, "请输入有效的绑定邮箱地址");
+
+  const ok = registerPgpKey([], {
+    name: " 张三 ",
+    email: " zhang@corp.com ",
+    fingerprint: " ABCDEF ",
+    nowMs: Date.UTC(2026, 0, 15),
+  });
+  assert.equal(ok.error, null);
+  assert.equal(ok.keys[0].name, "张三");
+  assert.equal(ok.keys[0].email, "zhang@corp.com");
+  assert.equal(ok.keys[0].fingerprint, "ABCDEF");
+  assert.equal(ok.keys[0].hasSecret, true);
+  assert.equal(ok.keys[0].trusted, true);
+  assert.equal(ok.keys[0].createdAt, "2026-01-15");
+
+  const auto = registerPgpKey([], { name: "", email: "a@b.com", fingerprint: "", nowMs: 0 });
+  assert.equal(auto.keys[0].fingerprint, generateLocalFingerprint(0));
+  assert.match(auto.keys[0].fingerprint, /^LOCAL-[0-9A-F]{8}$/);
+
+  assert.equal(pgpKeyTitle(ok.keys[0]), "张三 <zhang@corp.com>");
+  assert.equal(pgpKeyTitle({ name: "", email: "a@b.com" }), "a@b.com");
+  assert.equal(pgpKeySubtitle({ fingerprint: "ABC", hasSecret: false }), "指纹: ABC · 仅公钥");
 });

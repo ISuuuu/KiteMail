@@ -69,6 +69,15 @@
         <template v-else>
           <GeneralPage v-if="activeTab.id === 'general'" :state="state" />
           <AccountsPage v-else-if="activeTab.id === 'mailAccounts'" />
+          <TagPage v-else-if="activeTab.id === 'tags'" />
+          <FilterPage v-else-if="activeTab.id === 'filters'" />
+          <SmartFolderPage v-else-if="activeTab.id === 'smartFolders'" />
+          <SendersPage
+            v-else-if="activeTab.id === 'senders'"
+            :state="state"
+            @goto-privacy="selectTab('privacy')"
+          />
+          <PgpKeysPage v-else-if="activeTab.id === 'openPgp'" />
           <AppearancePage v-else-if="activeTab.id === 'appearance'" :state="state" />
           <template v-else-if="activeTab.id === 'composing'">
             <ComposePanel :state="state" />
@@ -111,8 +120,13 @@ import {
 import { usePreferences } from "../preferences/usePreferences";
 import AccountsPage from "./AccountsPage.vue";
 import AppearancePage from "./AppearancePage.vue";
+import FilterPage from "./FilterPage.vue";
 import GeneralPage from "./GeneralPage.vue";
+import PgpKeysPage from "./PgpKeysPage.vue";
 import PlaceholderPage from "./PlaceholderPage.vue";
+import SendersPage from "./SendersPage.vue";
+import SmartFolderPage from "./SmartFolderPage.vue";
+import TagPage from "./TagPage.vue";
 import SettingsIcon from "./SettingsIcon.vue";
 import WindowControls from "./WindowControls.vue";
 import {
