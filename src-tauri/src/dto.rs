@@ -1448,6 +1448,432 @@ pub struct AccountEvent {
     pub message: String,
 }
 
+// ---- Wave 3: Attachments, Contacts, and Full Settings DTOs ----
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ListCachedAttachmentsInput {
+    pub query: Option<String>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedAttachmentDto {
+    pub id: u32,
+    pub message_id: u32,
+    pub account_id: u32,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: usize,
+    pub sender: String,
+    pub subject: String,
+    pub date_ts: i64,
+    pub date_display: String,
+    pub downloaded: bool,
+    pub is_image: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListCachedAttachmentsOutput {
+    pub items: Vec<CachedAttachmentDto>,
+    pub total: usize,
+    pub has_more: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchAttachmentPreviewInput {
+    pub attachment_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchAttachmentPreviewOutput {
+    pub attachment_id: u32,
+    pub filename: String,
+    pub mime_type: String,
+    pub data_url: String,
+    pub size_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAttachmentInput {
+    pub attachment_id: u32,
+    #[serde(default)]
+    pub dest_path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAttachmentOutput {
+    pub saved: bool,
+    pub saved_path: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAllAttachmentsInput {
+    pub attachment_ids: Vec<u32>,
+    #[serde(default)]
+    pub dest_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAllAttachmentsOutput {
+    pub saved_count: usize,
+    pub dest_dir: String,
+    pub saved_paths: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMessagePrintHtmlInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    #[serde(default)]
+    pub include_header: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMessagePrintHtmlOutput {
+    pub subject: String,
+    pub html_document: String,
+    pub plain_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenMessageWindowInput {
+    pub account_id: u32,
+    pub message_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenMessageWindowOutput {
+    pub window_label: String,
+    pub opened: bool,
+    pub message: OpenMessageOutput,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ListContactsInput {
+    pub query: Option<String>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactDto {
+    pub id: Option<u32>,
+    pub name: String,
+    pub email: String,
+    pub notes: String,
+    pub phone: String,
+    pub organization: String,
+    pub job_title: String,
+    pub groups: Vec<String>,
+    pub is_user_contact: bool,
+    pub message_count: usize,
+    pub last_contact_ts: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListContactsOutput {
+    pub items: Vec<ContactDto>,
+    pub total: usize,
+    pub has_more: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveContactInput {
+    #[serde(default)]
+    pub id: Option<u32>,
+    pub name: String,
+    pub email: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub phone: Option<String>,
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub job_title: Option<String>,
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveContactOutput {
+    pub contact: ContactDto,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteContactInput {
+    pub contact_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteContactOutput {
+    pub deleted: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportContactsFormatDto {
+    #[default]
+    Auto,
+    Vcard,
+    Csv,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportContactsInput {
+    #[serde(default)]
+    pub format: ImportContactsFormatDto,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportContactsOutput {
+    pub added: usize,
+    pub skipped: usize,
+    pub total_parsed: usize,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportContactsFormatDto {
+    Vcard,
+    Csv,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportContactsInput {
+    pub format: ExportContactsFormatDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportContactsOutput {
+    pub format: ExportContactsFormatDto,
+    pub filename: String,
+    pub content: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatsDto {
+    pub total_bytes: u64,
+    pub mail_bytes: u64,
+    pub config_bytes: u64,
+    pub file_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullPreferencesDto {
+    pub theme_id: String,
+    pub dark_mode: Option<bool>,
+    pub reader_position: ReaderPositionDto,
+    pub compact_list: bool,
+    pub show_avatars: bool,
+    pub list_group_by_date: bool,
+    pub reader_zoom_percent: u32,
+    pub ui_text_scale_percent: u32,
+    pub auto_sync_minutes: u32,
+    pub push_enabled: bool,
+    pub desktop_notifications: bool,
+    pub notification_show_content: bool,
+    pub close_to_minimize: bool,
+    pub minimize_to_tray: bool,
+    pub check_updates: bool,
+    pub block_remote_images: bool,
+    pub show_remote_banner: bool,
+    pub clean_links: bool,
+    pub read_mark_mode: String,
+    pub thread_newest_first: bool,
+    pub undo_send_secs: u32,
+    pub signature_above_quote: bool,
+    pub signature_dashes: bool,
+    pub attachment_reminder_keywords: String,
+    pub reply_header_template: String,
+    pub single_key_shortcuts: bool,
+    pub default_view: String,
+    pub app_lock_enabled: bool,
+    pub app_lock_idle_minutes: u32,
+    pub app_lock_on_startup: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct FullPreferencesPatchDto {
+    pub theme_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub dark_mode: Option<Option<bool>>,
+    pub reader_position: Option<ReaderPositionDto>,
+    pub compact_list: Option<bool>,
+    pub show_avatars: Option<bool>,
+    pub list_group_by_date: Option<bool>,
+    pub reader_zoom_percent: Option<u32>,
+    pub ui_text_scale_percent: Option<u32>,
+    pub auto_sync_minutes: Option<u32>,
+    pub push_enabled: Option<bool>,
+    pub desktop_notifications: Option<bool>,
+    pub notification_show_content: Option<bool>,
+    pub close_to_minimize: Option<bool>,
+    pub minimize_to_tray: Option<bool>,
+    pub check_updates: Option<bool>,
+    pub block_remote_images: Option<bool>,
+    pub show_remote_banner: Option<bool>,
+    pub clean_links: Option<bool>,
+    pub read_mark_mode: Option<String>,
+    pub thread_newest_first: Option<bool>,
+    pub undo_send_secs: Option<u32>,
+    pub signature_above_quote: Option<bool>,
+    pub signature_dashes: Option<bool>,
+    pub attachment_reminder_keywords: Option<String>,
+    pub reply_header_template: Option<String>,
+    pub single_key_shortcuts: Option<bool>,
+    pub default_view: Option<String>,
+    pub app_lock_enabled: Option<bool>,
+    pub app_lock_idle_minutes: Option<u32>,
+    pub app_lock_on_startup: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFullPreferencesOutput {
+    pub preferences: FullPreferencesDto,
+    pub has_passcode: bool,
+    pub allowed_remote_senders: Vec<String>,
+    pub data_dir: String,
+    pub mail_data_dir: String,
+    pub storage_stats: StorageStatsDto,
+    pub app_version: String,
+    pub is_portable: bool,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateFullPreferencesOutput {
+    pub preferences: FullPreferencesDto,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SetAppLockPasscodeInput {
+    pub current_passcode: Option<String>,
+    pub new_passcode: Option<String>,
+    pub enable_on_startup: Option<bool>,
+    pub idle_minutes: Option<u32>,
+}
+
+impl std::fmt::Debug for SetAppLockPasscodeInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetAppLockPasscodeInput")
+            .field(
+                "current_passcode",
+                &self.current_passcode.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "new_passcode",
+                &self.new_passcode.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("enable_on_startup", &self.enable_on_startup)
+            .field("idle_minutes", &self.idle_minutes)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAppLockPasscodeOutput {
+    pub has_passcode: bool,
+    pub app_lock_enabled: bool,
+    pub message: String,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrustedSenderActionDto {
+    List,
+    Add,
+    Remove,
+    Clear,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManageTrustedSendersInput {
+    pub action: TrustedSenderActionDto,
+    #[serde(default)]
+    pub sender: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManageTrustedSendersOutput {
+    pub senders: Vec<String>,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ClearBodyCachesInput {
+    pub keep_days: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearBodyCachesOutput {
+    pub accepted: bool,
+    pub message: String,
+    pub storage_stats: StorageStatsDto,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckAppUpdateOutput {
+    pub checked: bool,
+    pub update_available: bool,
+    pub current_version: String,
+    pub target: String,
+    pub latest_version: Option<String>,
+    pub notes: Option<String>,
+    pub pub_date: Option<String>,
+    pub download_url: Option<String>,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,5 +2272,70 @@ mod tests {
         .expect("AccountEvent");
         assert_eq!(acc_ev["kind"], "oauthReauthorized");
         assert_eq!(acc_ev["accountId"], "2");
+    }
+
+    #[test]
+    fn wave3_attachments_contacts_and_settings_dtos_match_frozen_contract() {
+        let att_in: ListCachedAttachmentsInput =
+            serde_json::from_value(json!({ "query": "pdf", "offset": 10, "limit": 20 }))
+                .expect("ListCachedAttachmentsInput");
+        assert_eq!(att_in.offset, Some(10));
+        assert_eq!(att_in.limit, Some(20));
+
+        let att_dto = serde_json::to_value(CachedAttachmentDto {
+            id: 12,
+            message_id: 1,
+            account_id: 1,
+            filename: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            size_bytes: 1024,
+            sender: "a@b.com".to_string(),
+            subject: "Sub".to_string(),
+            date_ts: 1_700_000_000,
+            date_display: "10:00".to_string(),
+            downloaded: true,
+            is_image: true,
+        })
+        .expect("CachedAttachmentDto");
+        assert_eq!(att_dto["isImage"], true);
+        assert_eq!(att_dto["sizeBytes"], 1024);
+
+        let contact_null_id = serde_json::to_value(ContactDto {
+            id: None,
+            name: "Aggregated".to_string(),
+            email: "agg@example.com".to_string(),
+            notes: String::new(),
+            phone: String::new(),
+            organization: String::new(),
+            job_title: String::new(),
+            groups: vec![],
+            is_user_contact: false,
+            message_count: 3,
+            last_contact_ts: 0,
+        })
+        .expect("ContactDto");
+        assert_eq!(contact_null_id["id"], serde_json::Value::Null);
+        assert_eq!(contact_null_id["isUserContact"], false);
+        assert_eq!(contact_null_id["lastContactTs"], 0);
+
+        let patch_null_dark: FullPreferencesPatchDto =
+            serde_json::from_value(json!({ "darkMode": null, "uiTextScalePercent": 110 }))
+                .expect("FullPreferencesPatchDto");
+        assert_eq!(patch_null_dark.dark_mode, Some(None));
+        assert_eq!(patch_null_dark.ui_text_scale_percent, Some(110));
+
+        let unknown_patch =
+            serde_json::from_value::<FullPreferencesPatchDto>(json!({ "unexpectedField": true }));
+        assert!(unknown_patch.is_err());
+
+        let passcode_in: SetAppLockPasscodeInput = serde_json::from_value(json!({
+            "currentPasscode": "1234",
+            "newPasscode": null,
+            "enableOnStartup": false,
+            "idleMinutes": 5
+        }))
+        .expect("SetAppLockPasscodeInput");
+        assert_eq!(passcode_in.new_passcode, None);
+        assert_eq!(passcode_in.idle_minutes, Some(5));
     }
 }

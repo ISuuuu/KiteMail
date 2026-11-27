@@ -38,6 +38,23 @@
     "allow-save-account",
     "allow-delete-account",
     "allow-set-account-enabled",
-    "allow-start-microsoft-oauth"
+    "allow-start-microsoft-oauth",
+    "allow-list-cached-attachments",
+    "allow-fetch-attachment-preview",
+    "allow-save-attachment",
+    "allow-save-all-attachments",
+    "allow-get-message-print-html",
+    "allow-open-message-window",
+    "allow-list-contacts",
+    "allow-save-contact",
+    "allow-delete-contact",
+    "allow-import-contacts",
+    "allow-export-contacts",
+    "allow-get-full-preferences",
+    "allow-update-full-preferences",
+    "allow-set-app-lock-passcode",
+    "allow-manage-trusted-senders",
+    "allow-clear-body-caches",
+    "allow-check-app-update"
   ]
 }

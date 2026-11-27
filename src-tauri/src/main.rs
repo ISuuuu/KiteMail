@@ -3,12 +3,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod accounts;
+mod attachments;
 mod commands;
 mod compose;
+mod contacts;
 mod dto;
 mod mail_session;
 mod preferences;
 mod reader;
+mod settings;
 mod single_instance;
 mod tray;
 mod win_idle;
@@ -340,6 +343,23 @@ fn main() {
             accounts::delete_account,
             accounts::set_account_enabled,
             accounts::start_microsoft_oauth,
+            attachments::list_cached_attachments,
+            attachments::fetch_attachment_preview,
+            attachments::save_attachment,
+            attachments::save_all_attachments,
+            attachments::get_message_print_html,
+            attachments::open_message_window,
+            contacts::list_contacts,
+            contacts::save_contact,
+            contacts::delete_contact,
+            contacts::import_contacts,
+            contacts::export_contacts,
+            settings::get_full_preferences,
+            settings::update_full_preferences,
+            settings::set_app_lock_passcode,
+            settings::manage_trusted_senders,
+            settings::clear_body_caches,
+            settings::check_app_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running KiteMail Tauri preview");
