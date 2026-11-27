@@ -15,6 +15,9 @@ const devPort = resolveDevPort();
 export default defineConfig({
   plugins: [vue()],
   clearScreen: false,
+  build: {
+    outDir: "dist-web",
+  },
   server: {
     host: "127.0.0.1",
     port: devPort,
