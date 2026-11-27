@@ -4,7 +4,7 @@
     <section class="km-app-group">
       <h4 class="km-app-group-title">明暗外观</h4>
       <div class="km-app-card">
-        <div class="km-app-row">
+        <div class="km-app-row" id="sp-dark-mode">
           <div class="km-app-row-text">
             <span class="km-app-row-title">外观模式</span>
             <span class="km-app-row-desc">
@@ -30,7 +30,7 @@
     </section>
 
     <!-- 分组二：主题配色（3 列双态迷你窗主题卡） -->
-    <section class="km-app-group km-app-group-wide">
+    <section id="sp-theme-gallery" class="km-app-group km-app-group-wide">
       <h4 class="km-app-group-title">主题配色</h4>
       <p class="km-app-group-desc">
         点击卡片即时切换主窗口与设置窗口的界面与按钮强调色
@@ -73,7 +73,7 @@
     </section>
 
     <!-- 分组三：应用图标（当前仅内置默认图标，对齐 GPUI WP-05 icon_picker） -->
-    <section class="km-app-group">
+    <section class="km-app-group" id="sp-app-icon">
       <h4 class="km-app-group-title">应用图标</h4>
       <p class="km-app-group-desc">
         窗口与任务栏使用的应用图标。当前资源库仅内置默认图标，后续图标包发布后可在此选择
@@ -97,7 +97,7 @@
     <section class="km-app-group">
       <h4 class="km-app-group-title">字体缩放与窗口 chrome</h4>
       <div class="km-app-card">
-        <div class="km-app-row">
+        <div class="km-app-row" id="sp-ui-text-scale">
           <div class="km-app-row-text">
             <span class="km-app-row-title">界面字体缩放</span>
             <span class="km-app-row-desc">调整全应用控件字号比例（不影响操作系统 DPI）</span>
@@ -114,7 +114,7 @@
 
         <div class="km-app-sep" />
 
-        <div class="km-app-row">
+        <div class="km-app-row" id="sp-settings-open-accounts">
           <div class="km-app-row-text">
             <span class="km-app-row-title">打开偏好设置时优先显示「邮箱账号」</span>
           </div>
@@ -133,7 +133,7 @@
         每个按钮可选择左组（固定显示）/ 右组（窄时折叠进 ⋯）/ 不显示，并可用箭头在组内排序（完整渲染接线随后续工具栏工作落地）
       </p>
       <div class="km-app-card">
-        <div class="km-app-row">
+        <div class="km-app-row" id="sp-tb-fold">
           <div class="km-app-row-text">
             <span class="km-app-row-title">始终折叠右侧工具栏辅助按钮</span>
             <span class="km-app-row-desc">
@@ -148,7 +148,7 @@
 
         <template v-for="item in TOOLBAR_ITEMS" :key="item.key">
           <div class="km-app-sep" />
-          <div class="km-app-row">
+          <div :id="`sp-tb-${item.key}`" class="km-app-row">
             <div class="km-app-row-text">
               <span class="km-app-row-title">{{ item.label }}</span>
             </div>
@@ -185,7 +185,7 @@
         </template>
 
         <div class="km-app-sep" />
-        <div class="km-app-toolbar-footer">
+        <div id="sp-toolbar-restore" class="km-app-toolbar-footer">
           <button type="button" class="km-outline-btn" @click="restoreToolbar">
             恢复默认布局
           </button>

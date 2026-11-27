@@ -5,7 +5,7 @@
       <h4 class="km-sp-title">日期与时间格式</h4>
       <p class="km-sp-desc">实时影响邮件列表时间列与阅读器邮件头日期展示</p>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-datetime-preview">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">当前格式实时预览</span>
           </div>
@@ -14,7 +14,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-date-style">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">日期排列顺序</span>
           </div>
@@ -28,7 +28,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-clock-style">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">时间制式</span>
           </div>

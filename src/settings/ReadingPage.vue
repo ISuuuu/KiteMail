@@ -4,7 +4,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">已读行为</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-readMarkMode">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">自动标记为已读时机</span>
             <span class="km-sp-row-desc">控制点击选中未读邮件后何时提交已读状态</span>
@@ -25,7 +25,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">布局与正文字体主题</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-readerPosition">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">阅读器窗格位置</span>
             <span class="km-sp-row-desc">可用 Ctrl+Alt+1 / 2 / 3 快捷键实时切换</span>
@@ -40,7 +40,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-singleMessageCard">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">单封邮件显示卡片框线</span>
             <span class="km-sp-row-desc">关闭后单封邮件将边缘贴合铺满阅读区（仅单封会话生效）</span>
@@ -50,7 +50,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-messageTheme">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">默认信纸主题</span>
             <span class="km-sp-row-desc">控制 HTML/文本正文底色（可被单封邮件顶部切换临时覆盖）</span>
@@ -65,7 +65,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-reader-zoom">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">阅读器正文字号</span>
             <span class="km-sp-row-desc">同时也可在阅读邮件时使用 Ctrl+= / Ctrl+- / Ctrl+0 快速调节</span>
@@ -80,7 +80,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-alwaysShowRecipients">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">始终显示收件人行</span>
           </div>
@@ -97,7 +97,7 @@
       <div class="km-sp-card">
         <template v-for="(row, idx) in TOPBAR_ROWS" :key="row.key">
           <div v-if="idx > 0" class="km-sp-sep" />
-          <div class="km-sp-row">
+          <div :id="`sp-${row.key}`" class="km-sp-row">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
             </div>
@@ -107,7 +107,7 @@
           </div>
         </template>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-readerDefaultMode">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">打开邮件时默认视图</span>
           </div>

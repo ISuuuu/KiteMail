@@ -1,7 +1,9 @@
 <template>
-  <!-- 账号列表层（GPUI accounts.rs#L1438） -->
+  <!-- 账号列表层（GPUI accounts.rs#L1438）；ref 供搜索命中时做卡片级高亮（WP-09） -->
   <AccountSettingsList
     v-if="layer === 'list'"
+    ref="listRef"
+    :id="'sp-account-list'"
     class="km-accounts-layer"
     :state="accountState"
     @add="startCreateFlow"
@@ -30,7 +32,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onBeforeUnmount, ref, watch } from "vue";
 import AccountSettingsEdit from "../accounts/AccountSettingsEdit.vue";
 import AccountSettingsList from "../accounts/AccountSettingsList.vue";
 import { useAccountLayers } from "../accounts/useAccountLayers";
@@ -47,8 +49,10 @@ const props = withDefaults(
   defineProps<{
     /** 壳层承载编辑顶栏（返回/移除/保存上提），隐藏编辑组件内置顶栏 */
     hostChrome?: boolean;
+    /** 搜索命中信号（递增 token）；变化时对账号列表卡做 1.6s 卡片级高亮 */
+    highlightToken?: number;
   }>(),
-  { hostChrome: false }
+  { hostChrome: false, highlightToken: 0 }
 );
 
 const emit = defineEmits<{
@@ -58,6 +62,33 @@ const emit = defineEmits<{
 
 const accountState = useAccounts();
 const editorRef = ref<InstanceType<typeof AccountSettingsEdit> | null>(null);
+const listRef = ref<InstanceType<typeof AccountSettingsList> | null>(null);
+
+// ---- 搜索命中：账号列表卡片级高亮 1.6s（WP-09，不改 AccountSettingsList） ----
+const HIGHLIGHT_MS = 1600;
+const ACCOUNT_CARD_CLASS = "km-account-card-hit";
+let highlightTimer: ReturnType<typeof setTimeout> | null = null;
+
+watch(
+  () => props.highlightToken,
+  (token) => {
+    if (token <= 0) return;
+    const el = listRef.value?.$el as HTMLElement | undefined;
+    if (!el) return;
+    el.scrollIntoView({ block: "nearest" });
+    el.classList.add(ACCOUNT_CARD_CLASS);
+    if (highlightTimer) clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(() => {
+      el.classList.remove(ACCOUNT_CARD_CLASS);
+      highlightTimer = null;
+    }, HIGHLIGHT_MS);
+  }
+);
+
+onBeforeUnmount(() => {
+  if (highlightTimer) clearTimeout(highlightTimer);
+  highlightTimer = null;
+});
 
 const {
   layer,

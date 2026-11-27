@@ -12,7 +12,7 @@
         允许外部 AI 助手通过 MCP (Model Context Protocol) 按权限访问本地邮件（Windows 命名管道监听待后台服务端接入）
       </p>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-mcp-enabled">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">启用本地 MCP Server</span>
             <span class="km-sp-row-desc">开启后将按下方工具权限暴露只读/草稿能力</span>
@@ -22,7 +22,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-edit-row">
+        <div class="km-sp-edit-row" id="sp-mcp-socket">
           <div class="km-sp-edit-inputs">
             <input
               v-model="socketPathInput"
@@ -45,7 +45,7 @@
       <div class="km-sp-card">
         <template v-for="(row, idx) in PERM_ROWS" :key="row.key">
           <div v-if="idx > 0" class="km-sp-sep" />
-          <div class="km-sp-row">
+          <div :id="`sp-${row.key}`" class="km-sp-row">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
               <span class="km-sp-row-desc">{{ row.desc }}</span>

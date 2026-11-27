@@ -17,7 +17,7 @@
         设置本地密码后，无操作或切到后台超过设定时间将自动锁定界面；锁定状态下重启软件仍需输入密码解锁
       </p>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-app-lock-status">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">锁屏密码</span>
             <span class="km-sp-row-desc">
@@ -135,7 +135,7 @@
         </template>
 
         <div class="km-sp-sep" />
-        <div class="km-sp-row" :class="{ disabled: !state.hasPasscode.value }">
+        <div class="km-sp-row" :class="{ disabled: !state.hasPasscode.value }" id="sp-app-lock-idle">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">无操作自动锁定</span>
             <span class="km-sp-row-desc">连续未操作鼠标或键盘达到设定时长后自动锁定界面</span>
@@ -151,7 +151,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row" :class="{ disabled: !state.hasPasscode.value }">
+        <div class="km-sp-row" :class="{ disabled: !state.hasPasscode.value }" id="sp-app-lock-background">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">切到后台或最小化后自动锁定</span>
             <span class="km-sp-row-desc">窗口切到后台、最小化或隐藏到托盘超过设定时长后自动锁定</span>
@@ -167,7 +167,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row" :class="{ disabled: !state.hasPasscode.value }">
+        <div class="km-sp-row" :class="{ disabled: !state.hasPasscode.value }" id="sp-app-lock-system">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">系统锁屏或休眠时立即锁定</span>
             <span class="km-sp-row-desc">触发 Windows 锁屏（Win+L）、切换用户或电脑睡眠时立刻锁定应用</span>
@@ -186,7 +186,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">远程图像与跟踪保护</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-blockRemoteImages">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">默认屏蔽远程图像</span>
             <span class="km-sp-row-desc">阻止外部图片链接追踪您的阅读时间与 IP</span>
@@ -199,7 +199,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-showRemoteBanner">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">显示已屏蔽远程图像提示横幅</span>
             <span class="km-sp-row-desc">关闭后静默屏蔽外链图片，不再显示提示横幅</span>
@@ -212,7 +212,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-cleanLinks">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">自动剥离链接中的追踪参数</span>
             <span class="km-sp-row-desc">渲染邮件链接时移除 utm_* / fbclid / gclid / msclkid / spm 等参数</span>
@@ -225,7 +225,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-showSpoofBanner">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">警告仿冒域名发件人</span>
             <span class="km-sp-row-desc">检测到显示名称或域名疑似钓鱼仿冒时在阅读器顶部显示警告横幅</span>
@@ -244,7 +244,7 @@
         从第三方服务拉取发件人头像或品牌徽标（可能向对应服务发送邮箱哈希或域名请求）
       </p>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-useGravatar">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">加载 Gravatar 头像</span>
             <span class="km-sp-row-desc">根据发件人邮箱哈希请求 Gravatar 公开头像</span>
@@ -254,7 +254,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-senderLogos">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">加载公司徽标</span>
             <span class="km-sp-row-desc">按发件人域名展示对应的品牌或企业图标</span>
@@ -270,7 +270,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">已读回执</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-read-receipt">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">发送已读回执</span>
             <span class="km-sp-row-desc">当发件人请求阅读回执（Disposition-Notification-To）时的处理策略</span>

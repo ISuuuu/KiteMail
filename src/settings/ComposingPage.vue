@@ -9,7 +9,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">发件身份与签名</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-compose-default-from">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">新邮件默认发件账号</span>
           </div>
@@ -23,7 +23,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-compose-inline">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">在主窗口中新建邮件</span>
             <span class="km-sp-row-desc">关闭时点击写信将在独立窗口中打开新邮件</span>
@@ -33,7 +33,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-reply-inline">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">在主窗口中回复与转发</span>
             <span class="km-sp-row-desc">关闭时回复与转发将在独立窗口中打开；开启时在主窗口分屏对照原邮件</span>
@@ -43,7 +43,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-signature-position">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">回复与转发时的签名位置</span>
             <span class="km-sp-row-desc">默认在引用内容上方，使新写正文与签名紧靠在一起</span>
@@ -58,7 +58,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-signatureDashes">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">签名前插入 "-- " 分隔符</span>
           </div>
@@ -76,7 +76,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">发送与引用头格式</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-undo-send">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">撤销发送缓冲时间</span>
             <span class="km-sp-row-desc">点击发送后在指定秒数内可通过底部提示条「撤销发送」中止发出</span>
@@ -91,7 +91,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-edit-row">
+        <div class="km-sp-edit-row" id="sp-reply-header">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">自定义回复引用头模板</span>
             <span class="km-sp-row-desc">
@@ -121,7 +121,7 @@
         多个关键词用逗号分隔；若发件主题或输入正文中出现关键词但附件列表为空，将在发送前提醒
       </p>
       <div class="km-sp-card">
-        <div class="km-sp-edit-row">
+        <div class="km-sp-edit-row" id="sp-attach-keywords">
           <div class="km-sp-edit-inputs">
             <input
               v-model="attachmentKeywordsInput"

@@ -10,10 +10,54 @@
         <div class="km-set-drag" data-tauri-drag-region>
           <span class="km-set-title">偏好设置</span>
         </div>
+        <!-- 搜索开关（GPUI render_sidebar：标题右侧搜索图标） -->
+        <button
+          type="button"
+          class="km-set-search-toggle"
+          :title="searchOpen ? '收起搜索 (Esc)' : '搜索设置 (Ctrl+F)'"
+          :aria-label="searchOpen ? '收起设置搜索' : '搜索设置'"
+          @click="toggleSearch"
+        >
+          <SettingsIcon :name="searchOpen ? 'close' : 'search'" :size="14" />
+        </button>
         <WindowControls v-if="narrowOnlySidebar" />
       </header>
 
-      <nav class="km-set-nav" aria-label="设置分类">
+      <!-- 搜索输入框（展开时自动聚焦，Esc 收起） -->
+      <div v-if="searchOpen" class="km-set-search-box">
+        <input
+          ref="searchInputRef"
+          v-model="searchQuery"
+          type="text"
+          class="km-set-search-input"
+          placeholder="搜索设置…"
+          aria-label="搜索设置"
+          @keydown.escape.stop.prevent="closeSearch"
+        />
+      </div>
+
+      <!-- 有查询时：两行结果替换导航；空结果：原提示样式（GPUI render_search_results） -->
+      <div v-if="searchOpen && searchQuery.trim()" class="km-set-search-results" role="listbox">
+        <template v-if="searchResults.length > 0">
+          <button
+            v-for="result in searchResults"
+            :key="result.id"
+            type="button"
+            class="km-set-search-item"
+            role="option"
+            @click="activateSearchHit(result)"
+          >
+            <span class="km-set-search-item-title">{{ result.title }}</span>
+            <span class="km-set-search-item-tab">{{ searchTabLabel(result.tabId) }}</span>
+          </button>
+        </template>
+        <div v-else class="km-set-search-empty">
+          <SettingsIcon name="search" :size="16" />
+          <span>未找到匹配的设置项</span>
+        </div>
+      </div>
+
+      <nav v-else class="km-set-nav" aria-label="设置分类">
         <div v-for="group in SETTINGS_TAB_GROUPS" :key="group.id" class="km-set-nav-group">
           <div class="km-set-nav-group-label">{{ group.label }}</div>
           <button
@@ -92,6 +136,7 @@
             v-else-if="activeTab.id === 'mailAccounts'"
             ref="accountsPageRef"
             hostChrome
+            :highlightToken="accountHighlightToken"
             @chrome="onAccountChrome"
           />
           <TagPage v-else-if="activeTab.id === 'tags'" />
@@ -135,10 +180,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { KNOWN_THEMES, resolveDarkMode } from "../main-window/usePaneLayout";
 import type { FullPreferencesDto } from "../preferences/types";
 import { usePreferences } from "../preferences/usePreferences";
+import {
+  filterSearchEntries,
+  HIGHLIGHT_CLASS,
+  HIGHLIGHT_MS,
+  type PrefSearchEntry,
+} from "./settingsSearch";
 import AccountsPage from "./AccountsPage.vue";
 import AppearancePage from "./AppearancePage.vue";
 import BackupPage from "./BackupPage.vue";
@@ -230,8 +281,86 @@ function onNarrowBack() {
 function selectTab(id: SettingsTabId) {
   activeTabId.value = id;
   // 窄窗：点击页签进入内容（对齐 GPUI select_tab → narrow_show_content = true）。
-  if (narrow.value) {
+  // 用实时 innerWidth 兜底（ResizeObserver 在个别环境下有延迟）。
+  if (narrow.value || isNarrowViewport(window.innerWidth)) {
     narrowShowContent.value = true;
+    windowWidth.value = Math.min(windowWidth.value, window.innerWidth);
+  }
+}
+
+// ---- 设置搜索（WP-09，对齐 GPUI mod.rs render_sidebar / search.rs） ----
+const searchOpen = ref(false);
+const searchQuery = ref("");
+const searchInputRef = ref<HTMLInputElement | null>(null);
+const searchResults = computed(() => filterSearchEntries(searchQuery.value));
+/** 账号卡高亮 token（递增触发 AccountsPage 卡片级高亮） */
+const accountHighlightToken = ref(0);
+/** 命中行高亮的清理定时器（重复命中时先清旧的） */
+let highlightTimer: ReturnType<typeof setTimeout> | null = null;
+
+function searchTabLabel(tabId: SettingsTabId): string {
+  return findSettingsTab(tabId).label;
+}
+
+function toggleSearch() {
+  if (searchOpen.value) {
+    closeSearch();
+  } else {
+    searchOpen.value = true;
+    nextTick(() => searchInputRef.value?.focus());
+  }
+}
+
+function closeSearch() {
+  // 对齐 GPUI close_search：清空查询与输入。
+  searchOpen.value = false;
+  searchQuery.value = "";
+}
+
+/** 命中激活：切页 → 滚动至设置行 → 1.6s 行高亮（窄窗收起搜索面板）。 */
+function activateSearchHit(entry: PrefSearchEntry) {
+  selectTab(entry.tabId);
+  if (narrow.value || isNarrowViewport(window.innerWidth)) {
+    // 窄窗：进入内容并收起搜索面板（GPUI apply_search_hit_immediate）。
+    searchOpen.value = false;
+  }
+  if (highlightTimer) {
+    clearTimeout(highlightTimer);
+    document.querySelectorAll(`.${HIGHLIGHT_CLASS}`).forEach((el) => el.classList.remove(HIGHLIGHT_CLASS));
+    highlightTimer = null;
+  }
+  void nextTick(() => {
+    // 等页面渲染完成后再定位（切页 + 异步数据均有缓冲）。
+    window.setTimeout(() => {
+      // 邮箱账号页：账号列表卡片级高亮（AccountsPage token 触发，含滚动）
+      if (entry.tabId === "mailAccounts") {
+        accountHighlightToken.value += 1;
+        return;
+      }
+      if (entry.anchorId) {
+        const el = document.getElementById(entry.anchorId);
+        if (el) {
+          el.scrollIntoView({ block: "center" });
+          el.classList.add(HIGHLIGHT_CLASS);
+          highlightTimer = setTimeout(() => {
+            el.classList.remove(HIGHLIGHT_CLASS);
+            highlightTimer = null;
+          }, HIGHLIGHT_MS);
+          return;
+        }
+      }
+      // 无锚点条目（并行开发中的三页）：仅切页不滚动
+    }, 60);
+  });
+}
+
+function onSettingsKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.key === "Process" || e.keyCode === 229) return;
+  // Ctrl+F：打开并聚焦设置搜索
+  if (e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    searchOpen.value = true;
+    nextTick(() => searchInputRef.value?.focus());
   }
 }
 
@@ -271,6 +400,7 @@ function onSystemSchemeChange() {
 onMounted(() => {
   // 加载偏好数据；页签路由由设置窗本地 activeTabId 管理，不写入旧弹窗的 6 页签状态。
   void state.init();
+  window.addEventListener("keydown", onSettingsKeydown);
   if (rootRef.value) {
     const rect = rootRef.value.getBoundingClientRect();
     if (rect.width > 0) {
@@ -291,6 +421,11 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onSettingsKeydown);
+  if (highlightTimer) {
+    clearTimeout(highlightTimer);
+    highlightTimer = null;
+  }
   resizeObserver?.disconnect();
   resizeObserver = null;
   schemeQuery?.removeEventListener("change", onSystemSchemeChange);
@@ -332,6 +467,109 @@ onBeforeUnmount(() => {
 
 .km-set-titlebar {
   justify-content: space-between;
+}
+
+/* 搜索开关按钮 */
+.km-set-search-toggle {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--km-radius-sm);
+  background: transparent;
+  color: var(--km-text-muted);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.km-set-search-toggle:hover {
+  background: var(--km-hover-bg);
+  color: var(--km-text);
+}
+
+/* 搜索输入框行（GPUI：px_2p5 py_2 border_b） */
+.km-set-search-box {
+  flex-shrink: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--km-border);
+}
+
+.km-set-search-input {
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--km-radius-md);
+  border: 1px solid var(--km-border);
+  background: var(--km-surface-raised);
+  color: var(--km-text);
+  font-size: 12px;
+  user-select: text;
+}
+
+.km-set-search-input:focus {
+  outline: 2px solid var(--km-accent);
+  outline-offset: -2px;
+}
+
+/* 搜索结果列表（替换导航；两行：设置名 + 所属页） */
+.km-set-search-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.km-set-search-item {
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--km-radius-sm);
+  background: transparent;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.km-set-search-item:hover {
+  background: var(--km-surface);
+}
+
+.km-set-search-item-title {
+  font-size: 13px;
+  color: var(--km-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.km-set-search-item-tab {
+  font-size: 12px;
+  color: var(--km-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 空结果提示（GPUI 居中图标 + 文案） */
+.km-set-search-empty {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 16px;
+  color: var(--km-text-muted);
+  font-size: 12px;
 }
 
 .km-set-drag {

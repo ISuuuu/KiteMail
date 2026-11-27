@@ -11,7 +11,7 @@
     </div>
 
     <!-- 密钥查询策略（偏好字段 openpgp_wkd_lookup / openpgp_keyserver_lookup） -->
-    <section class="km-xp-group">
+    <section class="km-xp-group" id="sp-openpgp-page">
       <h4 class="km-xp-group-title">密钥查询策略</h4>
       <p class="km-xp-group-desc">
         发信时自动查找收件人公钥（本地元信息与策略持久化；Windows 端尚未内置 GnuPG/Sequoia

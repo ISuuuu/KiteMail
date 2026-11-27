@@ -12,6 +12,12 @@ import {
 } from "../src/settings/nav.ts";
 import { isSettingsWindow, isTauriRuntime } from "../src/settings/windowEnv.ts";
 import {
+  HIGHLIGHT_MS,
+  SEARCH_ENTRIES,
+  SEARCH_RESULT_CAP,
+  filterSearchEntries,
+} from "../src/settings/settingsSearch.ts";
+import {
   TOOLBAR_ITEMS,
   TOOLBAR_LEFT_MAX,
   defaultToolbarLayout,
@@ -120,4 +126,47 @@ test("工具栏 place：隐藏/放置与左组 7 上限钳制", () => {
   const afterHide = place(hidden, "reply", "left");
   assert.equal(afterHide.left.length, 7);
   assert.equal(indexInZone(afterHide, "reply"), 7 - 1);
+});
+
+
+test("设置搜索：排序镜像 GPUI（标题前缀>包含>页签>关键词，上限 60）", () => {
+  assert.equal(filterSearchEntries("   ").length, 0);
+
+  // 标题前缀命中排最前
+  const prefix = filterSearchEntries("默认屏蔽");
+  assert.ok(prefix.length > 0);
+  assert.equal(prefix[0].tabId, "privacy");
+
+  // 关键词命中（英文别名）
+  const idle = filterSearchEntries("idle");
+  assert.ok(idle.some((entry) => entry.id === "general-push"));
+
+  // 页签名命中
+  const byTab = filterSearchEntries("备份");
+  assert.ok(byTab.some((entry) => entry.tabId === "backup"));
+
+  // 单字符宽泛命中不超过上限
+  const broad = filterSearchEntries("a");
+  assert.ok(broad.length > 0 && broad.length <= SEARCH_RESULT_CAP);
+  assert.equal(SEARCH_RESULT_CAP, 60);
+});
+
+test("设置搜索：索引覆盖与锚点约定", () => {
+  // id 唯一
+  assert.equal(new Set(SEARCH_ENTRIES.map((entry) => entry.id)).size, SEARCH_ENTRIES.length);
+  // 全部 tabId 合法（能解析出中文页签名）
+  for (const entry of SEARCH_ENTRIES) {
+    assert.ok(entry.title.length > 0);
+  }
+  // 三个并行开发中页允许无锚点（切页不滚动），其余必须有锚点
+  const deferred = new Set(["cloudStorage", "translation", "contactsSources"]);
+  for (const entry of SEARCH_ENTRIES) {
+    if (deferred.has(entry.tabId)) {
+      assert.equal(entry.anchorId, null, entry.id);
+    } else {
+      assert.ok(entry.anchorId && entry.anchorId.startsWith("sp-"), entry.id);
+    }
+  }
+  // 高亮时长 1.6s
+  assert.equal(HIGHLIGHT_MS, 1600);
 });

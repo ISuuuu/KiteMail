@@ -14,7 +14,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">窗口、托盘与快捷键</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-startAtLogin">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">登录 Windows 时自动启动</span>
             <span class="km-sp-row-desc">读写 HKCU\Software\Microsoft\Windows\CurrentVersion\Run 注册表项</span>
@@ -24,7 +24,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-linkOpenMode">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">邮件内链接打开方式</span>
             <span class="km-sp-row-desc">选择点击外部链接或退订页面时使用的浏览器</span>
@@ -39,7 +39,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-closeToMinimize">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">关闭主窗口时最小化到托盘</span>
             <span class="km-sp-row-desc">点击关闭按钮时不退出程序，保持系统托盘后台收取新邮件</span>
@@ -52,7 +52,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-minimizeToTray">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">最小化主窗口时隐藏到托盘</span>
             <span class="km-sp-row-desc">最小化主窗口后从任务栏隐藏，可通过托盘图标单/双击恢复</span>
@@ -65,7 +65,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-startFullscreen">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">启动时进入全屏模式</span>
             <span class="km-sp-row-desc">冷启动创建主窗口后自动切换全屏（可随时按 F11 还原）</span>
@@ -75,7 +75,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-singleKeyShortcuts">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">启用单键快捷键</span>
             <span class="km-sp-row-desc">在非输入焦点下响应 j/k/r/a/d/s/m（按 ? 查看速查）</span>
@@ -88,7 +88,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-statusBarTop">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">将状态栏置于窗口顶部</span>
             <span class="km-sp-row-desc">仅将连接与同步状态栏从窗口底部移至顶栏下方（操作提示条仍在底部显示）</span>
@@ -104,7 +104,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">本地数据与缓存维护</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-app-dir">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">程序配置目录</span>
             <span class="km-sp-row-desc km-sp-path">{{ state.dataDir.value || "-" }}</span>
@@ -120,7 +120,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-mail-dir">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">邮件存储目录</span>
             <span class="km-sp-row-desc km-sp-path">
@@ -145,7 +145,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-storage-stats">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">本地缓存与附件占用</span>
           </div>
@@ -154,7 +154,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-keepDownloadsDays">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">已下载邮件保留时长</span>
             <span class="km-sp-row-desc">控制本地 SQLite 缓存的邮件正文保留期限</span>
@@ -169,7 +169,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-run-mode">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">运行模式</span>
           </div>
@@ -178,7 +178,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-clear-cache">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">清除本地邮件正文缓存</span>
             <span class="km-sp-row-desc">仅移除已缓存的 HTML / 纯文本正文，保留账号配置与邮件列表索引</span>
@@ -201,7 +201,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">软件更新</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-checkUpdates">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">启动时检查更新</span>
             <span class="km-sp-row-desc">
@@ -222,7 +222,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">关于 KiteMail</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-version">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">版本号</span>
           </div>
@@ -231,7 +231,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-engine">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">界面与通信内核</span>
           </div>
