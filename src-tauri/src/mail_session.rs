@@ -26,7 +26,7 @@ use kitemail_mail_core::worker::{MailWorkerHandle, MailWorkerSender, PageQueryRe
 use kitemail_mail_core::{
     secrets, start_of_today_ts, LocalDraft, MailPage, MailRequest, MessageDetail, MessageFilter,
     MessageSort, MessageSummary, OutboxItem, QuickFilterSet, UndoOutboxOutcome, UnifiedView,
-    WorkerEvent,
+    UserContact, WorkerEvent,
 };
 use kitemail_windows_mail_reader::WebViewAction;
 use tauri::Emitter;
@@ -188,6 +188,8 @@ pub(crate) struct DemoSessionState {
     pub(crate) next_outbox_id: u32,
     pub(crate) next_undo_token: u64,
     pub(crate) next_sent_msg_id: u32,
+    pub(crate) user_contacts: Vec<UserContact>,
+    pub(crate) next_user_contact_id: u32,
 }
 
 impl DemoSessionState {
@@ -264,6 +266,14 @@ impl DemoSessionState {
             next_outbox_id: 1,
             next_undo_token: 1,
             next_sent_msg_id: 100_000,
+            user_contacts: vec![UserContact {
+                id: 1,
+                email: "design@hylki.example".to_string(),
+                display_name: "产品设计组".to_string(),
+                notes: "产品设计组通讯录（演示）".to_string(),
+                ..UserContact::default()
+            }],
+            next_user_contact_id: 2,
         }
     }
 
@@ -662,6 +672,9 @@ pub(crate) struct LiveWaiters {
     pub(crate) save_account: HashMap<u32, mpsc::Sender<Result<AccountConfig, String>>>,
     pub(crate) delete_account: HashMap<u32, mpsc::Sender<()>>,
     pub(crate) set_account_enabled: VecDeque<mpsc::Sender<()>>,
+    pub(crate) attachment_bytes:
+        HashMap<u32, mpsc::Sender<Result<(String, String, Vec<u8>), String>>>,
+    pub(crate) attachment_saved: VecDeque<mpsc::Sender<Result<PathBuf, String>>>,
 }
 
 pub(crate) struct LiveSessionState {
@@ -679,7 +692,7 @@ pub(crate) struct LiveSessionState {
     pub(crate) syncing_accounts: HashSet<u32>,
     in_flight_bodies: HashMap<(u32, u32), InFlightBodyEntry>,
     in_flight_gen: u64,
-    body_cache: HashMap<(u32, u32), MessageDetail>,
+    pub(crate) body_cache: HashMap<(u32, u32), MessageDetail>,
     body_cache_order: VecDeque<(u32, u32)>,
     active_reader_target: Option<(String, u32, u32)>,
     pending_mark_thread_seen: Option<u32>,
@@ -812,23 +825,31 @@ impl LiveSessionState {
     }
 }
 
-struct AppLockState {
-    passcode_hash: Option<String>,
-    locked: bool,
-    locked_reason: Option<String>,
-    persist_dir: Option<PathBuf>,
-    failed_attempts: u32,
-    cooldown_until: Option<Instant>,
-    tracker: AutoLockTracker,
+pub(crate) struct AppLockState {
+    pub(crate) passcode_hash: Option<String>,
+    pub(crate) locked: bool,
+    pub(crate) locked_reason: Option<String>,
+    pub(crate) persist_dir: Option<PathBuf>,
+    pub(crate) lock_on_startup: bool,
+    pub(crate) persist_keyring: bool,
+    pub(crate) failed_attempts: u32,
+    pub(crate) cooldown_until: Option<Instant>,
+    pub(crate) tracker: AutoLockTracker,
 }
 
 impl AppLockState {
     fn new(passcode_hash: Option<String>, locked: bool, persist_dir: Option<PathBuf>) -> Self {
+        let lock_on_startup = persist_dir
+            .as_deref()
+            .is_some_and(crate::preferences::is_startup_lock_enabled_in)
+            && passcode_hash.is_some();
         Self {
             passcode_hash,
             locked,
             locked_reason: locked.then(|| "startup".to_string()),
             persist_dir,
+            lock_on_startup,
+            persist_keyring: false,
             failed_attempts: 0,
             cooldown_until: None,
             tracker: AutoLockTracker::new(Instant::now()),
@@ -1007,7 +1028,7 @@ fn html_has_remote_images(html: &str) -> bool {
     strip_remote_images_for_webview(html).1 > 0
 }
 
-fn is_message_remote_images_blocked(
+pub(crate) fn is_message_remote_images_blocked(
     detail: &MessageDetail,
     raw_prefs: &AppPreferences,
     allowed_msgs: &HashSet<(u32, u32)>,
@@ -1063,7 +1084,7 @@ fn compute_default_collapsed_cards(
         .collect()
 }
 
-fn build_open_message_output(
+pub(crate) fn build_open_message_output(
     request_id: String,
     reader_session_id: String,
     detail: &MessageDetail,
@@ -1118,17 +1139,17 @@ fn build_open_message_output(
 
 pub struct MailSession {
     pub(crate) mode: AppMode,
-    locked: AtomicBool,
+    pub(crate) locked: AtomicBool,
     pub(crate) quitting: AtomicBool,
     state_version: AtomicU64,
     read_mark_gen: AtomicU64,
-    active_selected_msg: Mutex<Option<(u32, u32)>>,
-    allowed_remote_messages: Mutex<HashSet<(u32, u32)>>,
+    pub(crate) active_selected_msg: Mutex<Option<(u32, u32)>>,
+    pub(crate) allowed_remote_messages: Mutex<HashSet<(u32, u32)>>,
     thread_collapsed_cards: Mutex<(Option<(u32, u32)>, HashSet<u32>)>,
     thread_raw_cards: Mutex<(Option<(u32, u32)>, HashSet<u32>)>,
     current_view: Mutex<MainViewDto>,
     sync_status: Mutex<SyncStatusDto>,
-    lock_state: Mutex<AppLockState>,
+    pub(crate) lock_state: Mutex<AppLockState>,
     pub(crate) demo: Mutex<DemoSessionState>,
     pub(crate) live: Mutex<LiveSessionState>,
     pub(crate) prefs: Arc<PreferencesStore>,
@@ -1201,11 +1222,13 @@ impl MailSession {
 
         let (passcode_hash, initial_locked) = match secrets::load_app_lock_hash() {
             Ok(Some(hash)) => {
-                let persisted = app_lock::is_lock_persisted_in(&data_dir);
+                let persisted = app_lock::is_lock_persisted_in(&data_dir)
+                    || crate::preferences::is_startup_lock_enabled_in(&data_dir);
                 (Some(hash), persisted)
             }
             Ok(None) => {
                 let _ = app_lock::set_lock_persisted_in(&data_dir, false);
+                let _ = crate::preferences::set_startup_lock_enabled_in(&data_dir, false);
                 (None, false)
             }
             Err(_) => (None, false),
@@ -1284,11 +1307,12 @@ impl MailSession {
             thread_raw_cards: Mutex::new((None, HashSet::new())),
             current_view: Mutex::new(initial_view),
             sync_status: Mutex::new(sync_status),
-            lock_state: Mutex::new(AppLockState::new(
-                passcode_hash,
-                initial_locked,
-                Some(data_dir.clone()),
-            )),
+            lock_state: Mutex::new({
+                let mut ls =
+                    AppLockState::new(passcode_hash, initial_locked, Some(data_dir.clone()));
+                ls.persist_keyring = true;
+                ls
+            }),
             demo: Mutex::new(DemoSessionState::new()),
             live: Mutex::new(live_state),
             prefs,
@@ -1449,6 +1473,42 @@ impl MailSession {
             .lock()
             .expect("lock_state mutex poisoned")
             .has_passcode()
+    }
+
+    pub(crate) fn is_lock_on_startup(&self) -> bool {
+        let guard = self.lock_state.lock().expect("lock_state mutex poisoned");
+        guard.has_passcode() && guard.lock_on_startup
+    }
+
+    pub(crate) fn set_lock_on_startup(&self, enabled: bool) -> Result<bool, IpcError> {
+        let mut guard = self.lock_state.lock().expect("lock_state mutex poisoned");
+        if enabled && !guard.has_passcode() {
+            return Err(IpcError::invalid_input(
+                "请先设置锁屏口令后再开启启动锁定",
+                None,
+            ));
+        }
+        let next = guard.has_passcode() && enabled;
+        if let Some(ref dir) = guard.persist_dir {
+            crate::preferences::set_startup_lock_enabled_in(dir, next)
+                .map_err(|e| IpcError::internal(format!("保存启动锁配置失败: {e}"), None))?;
+        }
+        guard.lock_on_startup = next;
+        Ok(next)
+    }
+
+    pub(crate) fn clear_live_body_cache(&self) {
+        if self.mode == AppMode::Live {
+            let mut live = self.live.lock().expect("live mutex poisoned");
+            live.body_cache.clear();
+            live.body_cache_order.clear();
+        }
+    }
+
+    pub(crate) fn refresh_tray_lock_enabled(&self) {
+        if let Some(ref tray) = *self.tray.lock().expect("tray mutex poisoned") {
+            tray.set_lock_enabled(self.has_passcode());
+        }
     }
 
     pub fn current_view(&self) -> MainViewDto {
@@ -2996,6 +3056,23 @@ impl MailSession {
                         "messageMarkedSpam",
                     );
                 }
+                WorkerEvent::AttachmentBytesFetched {
+                    attachment_id,
+                    filename,
+                    mime_type,
+                    bytes,
+                } => {
+                    let mut live = self.live.lock().expect("live mutex poisoned");
+                    if let Some(tx) = live.waiters.attachment_bytes.remove(&attachment_id) {
+                        let _ = tx.send(Ok((filename, mime_type, bytes)));
+                    }
+                }
+                WorkerEvent::AttachmentSaved { path } => {
+                    let mut live = self.live.lock().expect("live mutex poisoned");
+                    if let Some(tx) = live.waiters.attachment_saved.pop_front() {
+                        let _ = tx.send(Ok(path));
+                    }
+                }
                 WorkerEvent::Error {
                     account_id,
                     message,
@@ -3010,6 +3087,9 @@ impl MailSession {
                                 false
                             }
                         } else {
+                            if let Some(tx) = live.waiters.attachment_saved.pop_front() {
+                                let _ = tx.send(Err(message.clone()));
+                            }
                             false
                         }
                     };
@@ -3713,7 +3793,7 @@ impl MailSession {
         }
     }
 
-    fn load_detail_for_action(
+    pub(crate) fn load_detail_for_action(
         &self,
         account_id: u32,
         message_id: u32,
