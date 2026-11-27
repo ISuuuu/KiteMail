@@ -23,10 +23,10 @@ use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     actions, black, div, img, point, px, size, AnyWindowHandle, AppContext, Axis, Bounds,
-    ClipboardItem, Context, DragMoveEvent, Entity, Focusable, Hsla, Image, InteractiveElement,
-    IntoElement, MouseButton, ObjectFit, ParentElement, Render, ScrollHandle, SharedString, Styled,
-    StyledImage, Subscription, TitlebarOptions, Window, WindowAppearance, WindowBounds,
-    WindowOptions,
+    ClipboardItem, Context, DragMoveEvent, Entity, FocusHandle, Focusable, Hsla, Image,
+    InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Render, ScrollHandle,
+    SharedString, Styled, StyledImage, Subscription, TitlebarOptions, Window, WindowAppearance,
+    WindowBounds, WindowOptions,
 };
 use kitemail_mail_core::app_lock::{
     self, AutoLockTickInput, AutoLockTracker, BackgroundLockPolicy,
@@ -819,6 +819,7 @@ pub(crate) enum PendingRowAction {
 }
 
 pub(crate) struct HylkiApp {
+    pub(crate) focus_handle: FocusHandle,
     pub(crate) demo_mode: bool,
     pub(crate) demo_store: Arc<DemoStore>,
     pub(crate) worker: Option<Arc<MailWorkerHandle>>,
@@ -1178,6 +1179,8 @@ impl HylkiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
         let demo_store = Arc::new(DemoStore::new());
         let window_handle = window.window_handle();
         let tray = TrayHandle::start(crate::APP_ICON_PNG).map(Arc::new);
@@ -1488,6 +1491,7 @@ impl HylkiApp {
                 ..Default::default()
             };
             return Self {
+                focus_handle,
                 demo_mode: true,
                 demo_store,
                 worker: None,
@@ -1785,6 +1789,7 @@ impl HylkiApp {
         };
 
         let mut app = Self {
+            focus_handle,
             welcome_step: 0,
             demo_mode: false,
             demo_store,
@@ -13045,7 +13050,11 @@ impl Render for HylkiApp {
         } else {
             14.0
         };
+        if window.focused(cx).is_none() {
+            self.focus_handle.focus(window, cx);
+        }
         let mut root = v_flex()
+            .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .bg(p.canvas)

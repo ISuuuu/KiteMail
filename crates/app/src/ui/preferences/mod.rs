@@ -14,8 +14,8 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    black, div, px, AnyElement, AnyWindowHandle, AppContext, Context, Entity, FontWeight,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollHandle,
+    black, div, px, AnyElement, AnyWindowHandle, AppContext, Context, Entity, FocusHandle,
+    FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, ScrollHandle,
     SharedString, StatefulInteractiveElement, Styled, Window, WindowControlArea,
 };
 use kitemail_mail_core::app_lock;
@@ -230,6 +230,7 @@ pub(crate) enum AppLockFormMode {
 
 /// 独立偏好设置窗口主视图（单实例、非模态，持有子窗口级输入控件并双向订阅 `HylkiApp`）。
 pub(crate) struct SettingsWindow {
+    pub(crate) focus_handle: FocusHandle,
     pub(crate) app: Entity<HylkiApp>,
     pub(crate) window_handle: AnyWindowHandle,
     pub(crate) active_tab: PrefTab,
@@ -339,6 +340,8 @@ impl SettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
         let initial_scale = config::clamp_ui_text_scale(initial_prefs.ui_text_scale_percent);
         window.set_rem_size(px(16.0 * initial_scale as f32 / 100.0));
         let window_handle = window.window_handle();
@@ -511,6 +514,7 @@ impl SettingsWindow {
         let narrow_show_content = editor_open || edit_account.is_some() || preset_idx.is_some();
 
         Self {
+            focus_handle,
             app,
             window_handle,
             active_tab: initial_tab,
@@ -2661,7 +2665,11 @@ impl Render for SettingsWindow {
             .app
             .update(cx, |app, cx| app.render_settings_window_toasts(window, cx));
 
+        if window.focused(cx).is_none() {
+            self.focus_handle.focus(window, cx);
+        }
         h_flex()
+            .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .bg(p.canvas)
