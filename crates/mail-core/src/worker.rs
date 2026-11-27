@@ -389,6 +389,13 @@ impl MailWorkerSender {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+
+    /// 同步准备退出：保留所有已排队邮件的 `send_at`，仅刷盘检查点后立即返回。
+    pub fn prepare_quit_now(&self) -> Result<(), String> {
+        let mut cache = open_existing_or_create_cache(&self.data_dir)?;
+        cache.checkpoint_and_close_all();
+        Ok(())
+    }
 }
 
 /// Exclusive receiver for broadcast [`WorkerEvent`]s emitted by the background mail worker.
@@ -524,9 +531,7 @@ impl MailWorkerHandle {
     /// 同步准备退出：保留所有已排队邮件的 `send_at`（缓冲件与定时件均不提前清空到期时间），
     /// 仅刷盘检查点后立即返回，避免阻塞主线程关窗。
     pub fn prepare_quit_now(&self) -> Result<(), String> {
-        let mut cache = open_existing_or_create_cache(&self.data_dir)?;
-        cache.checkpoint_and_close_all();
-        Ok(())
+        self.sender.prepare_quit_now()
     }
 
     /// Send a request to the background mail worker.

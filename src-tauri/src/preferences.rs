@@ -190,6 +190,7 @@ pub fn resolve_and_verify_live_data_dir() -> Result<(PathBuf, PathBuf), String> 
     }
 
     let mail_dir = verify_isolated_live_dirs(&data_dir, &prod_dirs)?;
+    kitemail_mail_core::config::validate_isolated_data_dir(&data_dir, None)?;
     Ok((data_dir, mail_dir))
 }
 

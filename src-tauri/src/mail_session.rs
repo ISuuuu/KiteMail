@@ -21,9 +21,10 @@ use kitemail_mail_core::demo::{
     DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_INBOX_TOTAL, DEMO_SENT_ID,
 };
 use kitemail_mail_core::search_query::SearchQuery;
+use kitemail_mail_core::worker::{MailWorkerHandle, MailWorkerSender, PageQueryRequest};
 use kitemail_mail_core::{
-    secrets, start_of_today_ts, MailPage, MailRequest, MessageDetail, MessageSort, MessageSummary,
-    QuickFilterSet, WorkerEvent,
+    secrets, start_of_today_ts, MailPage, MailRequest, MessageDetail, MessageFilter, MessageSort,
+    MessageSummary, QuickFilterSet, UnifiedView, WorkerEvent,
 };
 use tauri::Emitter;
 
@@ -86,23 +87,26 @@ impl MainEventEmitter for TauriMainEventEmitter {
 pub trait LiveWorkerSink: Send + Sync {
     fn send(&self, req: MailRequest);
     fn prepare_quit(&self);
+    fn query_page(&self, _req: PageQueryRequest) -> Option<Result<MailPage, String>> {
+        None
+    }
 }
 
 struct RealMailWorkerSink {
-    handle: Mutex<kitemail_mail_core::worker::MailWorkerHandle>,
+    sender: MailWorkerSender,
 }
 
 impl LiveWorkerSink for RealMailWorkerSink {
     fn send(&self, req: MailRequest) {
-        if let Ok(guard) = self.handle.lock() {
-            guard.send(req);
-        }
+        self.sender.send(req);
     }
 
     fn prepare_quit(&self) {
-        if let Ok(guard) = self.handle.lock() {
-            let _ = guard.prepare_quit_now();
-        }
+        let _ = self.sender.prepare_quit_now();
+    }
+
+    fn query_page(&self, req: PageQueryRequest) -> Option<Result<MailPage, String>> {
+        Some(self.sender.query_page(req))
     }
 }
 
@@ -871,15 +875,13 @@ impl MailSession {
 
     fn spawn_live_worker(&self, data_dir: PathBuf) {
         let (notify_tx, notify_rx) = mpsc::channel::<()>();
-        let worker = match kitemail_mail_core::worker::MailWorkerHandle::spawn_with_notifier(
+        let worker_handle = match MailWorkerHandle::spawn_with_notifier(
             data_dir,
             Some(Arc::new(move || {
                 let _ = notify_tx.send(());
             })),
         ) {
-            Ok(w) => Arc::new(RealMailWorkerSink {
-                handle: Mutex::new(w),
-            }),
+            Ok(w) => w,
             Err(err) => {
                 let mut status = self.sync_status.lock().expect("sync_status mutex poisoned");
                 status.syncing = false;
@@ -887,6 +889,9 @@ impl MailSession {
                 return;
             }
         };
+
+        let (sender, events_rx) = worker_handle.split();
+        let worker = Arc::new(RealMailWorkerSink { sender });
 
         let has_accounts = {
             let mut live = self.live.lock().expect("live mutex poisoned");
@@ -906,15 +911,10 @@ impl MailSession {
             .lock()
             .expect("self_weak mutex poisoned")
             .clone();
-        let worker_for_events = Arc::clone(&worker);
         let _ = std::thread::Builder::new()
             .name("kitemail-tauri-worker-events".to_string())
             .spawn(move || loop {
-                let events = worker_for_events
-                    .handle
-                    .lock()
-                    .map(|w| w.drain_events())
-                    .unwrap_or_default();
+                let events = events_rx.drain_events();
                 if !events.is_empty() {
                     if let Some(session) = weak_session.upgrade() {
                         session.process_worker_events(events);
@@ -1086,12 +1086,9 @@ impl MailSession {
         }
     }
 
-    // [MERGE-POINT: core-worker-query-page]
-    // 待 c-core-worker 的 `MailRequest::QueryPage` / `WorkerEvent::PageQueried` 合并后，
-    // 可将此处直接只读 CacheStore 查询切换为单次 worker 查询接口，保留相同的视图校验与 DTO 映射。
     fn query_live_messages_page(&self, input: &ListMessagesInput) -> Result<MailPage, IpcError> {
         let req_id = Some(input.request_id.clone());
-        let (data_dir, cache_ready, enabled_ids, unified_ids, folders) = {
+        let (data_dir, cache_ready, enabled_ids, unified_ids, folders, worker) = {
             let live = self.live.lock().expect("live mutex poisoned");
             (
                 live.data_dir.clone(),
@@ -1099,6 +1096,7 @@ impl MailSession {
                 live.enabled_account_ids(),
                 live.unified_account_ids(),
                 live.all_folders(),
+                live.worker.clone(),
             )
         };
 
@@ -1120,6 +1118,115 @@ impl MailSession {
             }
         }
 
+        let quick = to_quick_filters(input.filter);
+        let sort: MessageSort = input.sort.into();
+        let limit = input.limit.min(MAX_PAGE_LIMIT);
+        let cross_folder =
+            !input.query.trim().is_empty() && input.scope == SearchScopeDto::AllFolders;
+
+        let worker_query = if cross_folder {
+            Some(PageQueryRequest::SearchAllFolders {
+                query: input.query.clone(),
+                quick_filters: quick,
+                sort,
+                offset: input.offset,
+                limit,
+            })
+        } else {
+            match input.view {
+                MainViewDto::UnifiedInbox => Some(PageQueryRequest::UnifiedInbox {
+                    query: input.query.clone(),
+                    filter: MessageFilter::All,
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::Unread => Some(PageQueryRequest::UnifiedView {
+                    view: UnifiedView::Unread,
+                    query: input.query.clone(),
+                    filter: MessageFilter::All,
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::Starred => Some(PageQueryRequest::UnifiedView {
+                    view: UnifiedView::Starred,
+                    query: input.query.clone(),
+                    filter: MessageFilter::All,
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::Sent => Some(PageQueryRequest::UnifiedView {
+                    view: UnifiedView::Sent,
+                    query: input.query.clone(),
+                    filter: MessageFilter::All,
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::Archive => Some(PageQueryRequest::UnifiedView {
+                    view: UnifiedView::Archive,
+                    query: input.query.clone(),
+                    filter: MessageFilter::All,
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::Junk => Some(PageQueryRequest::UnifiedView {
+                    view: UnifiedView::Junk,
+                    query: input.query.clone(),
+                    filter: MessageFilter::All,
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::Trash => Some(PageQueryRequest::UnifiedView {
+                    view: UnifiedView::Trash,
+                    query: input.query.clone(),
+                    filter: MessageFilter::All,
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::Snoozed => Some(PageQueryRequest::UnifiedView {
+                    view: UnifiedView::Snoozed,
+                    query: input.query.clone(),
+                    filter: MessageFilter::All,
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::AccountFolder { folder_id, .. } => {
+                    Some(PageQueryRequest::MessagesPage {
+                        folder_id,
+                        query: input.query.clone(),
+                        filter: MessageFilter::All,
+                        quick_filters: quick,
+                        sort,
+                        offset: input.offset,
+                        limit,
+                    })
+                }
+                MainViewDto::Drafts => None,
+            }
+        };
+
+        if let (Some(w), Some(page_req)) = (worker.as_ref(), worker_query) {
+            if let Some(res) = w.query_page(page_req) {
+                return res
+                    .map_err(|e| IpcError::internal(format!("查询邮件列表失败: {e}"), req_id));
+            }
+        }
+
         if !config::global_db_in(&data_dir).exists() {
             return Ok(MailPage {
                 folder_id: 0,
@@ -1132,12 +1239,6 @@ impl MailSession {
         let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
             IpcError::internal(format!("打开本地只读缓存失败: {e}"), req_id.clone())
         })?;
-
-        let quick = to_quick_filters(input.filter);
-        let sort: MessageSort = input.sort.into();
-        let limit = input.limit.min(MAX_PAGE_LIMIT);
-        let cross_folder =
-            !input.query.trim().is_empty() && input.scope == SearchScopeDto::AllFolders;
 
         let res = if cross_folder {
             cache.search_all_folders(&enabled_ids, &input.query, quick, sort, input.offset, limit)
