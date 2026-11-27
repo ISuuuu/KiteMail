@@ -345,12 +345,21 @@ pub(crate) const ACCOUNT_PROVIDERS: &[AccountProvider] = &[
 
 /// 按账号配置与邮箱域名推断品牌图标 ID（对应 `brands/<id>.png`）。
 pub(crate) fn brand_for_account(acc: &AccountConfig) -> Option<&'static str> {
-    if acc.auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
+    brand_for_account_fields(acc.auth_backend, &acc.imap_host, acc.imap_port, &acc.email)
+}
+
+/// 按认证方式、IMAP 主机/端口与邮箱域名推断品牌图标 ID（对应 `brands/<id>.png`）。
+pub(crate) fn brand_for_account_fields(
+    auth_backend: AuthBackend,
+    imap_host: &str,
+    imap_port: u16,
+    email: &str,
+) -> Option<&'static str> {
+    if auth_backend == AuthBackend::MicrosoftGraphOAuth2 {
         return Some("outlook");
     }
-    let host = acc.imap_host.trim().to_ascii_lowercase();
-    let domain = acc
-        .email
+    let host = imap_host.trim().to_ascii_lowercase();
+    let domain = email
         .trim()
         .rsplit_once('@')
         .map(|(_, d)| d.to_ascii_lowercase())
@@ -393,7 +402,7 @@ pub(crate) fn brand_for_account(acc: &AccountConfig) -> Option<&'static str> {
         Some("icloud")
     } else if host.contains("yahoo.") || domain.starts_with("yahoo.") {
         Some("yahoo")
-    } else if (host == "127.0.0.1" && acc.imap_port == 1143)
+    } else if (host == "127.0.0.1" && imap_port == 1143)
         || host.contains("proton")
         || domain.starts_with("proton.")
         || domain == "protonmail.com"
@@ -502,6 +511,17 @@ impl Render for AccountRowDrag {
     }
 }
 
+/// 账号头像显示模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AvatarDisplayMode {
+    /// 默认：优先使用品牌图标，未匹配品牌时回退首字母。
+    BrandDefault,
+    /// 原有方式：自定义 Emoji（留空则显示首字母，不使用品牌图标）。
+    InitialsOrEmoji,
+    /// 自定义上传图片。
+    Picture,
+}
+
 /// 账号表单输入与编辑器状态（在设置窗口自己的 Window 上创建，避免跨窗口持有 InputState）。
 pub(crate) struct AccountFormState {
     pub(crate) editing_account_id: Option<u32>,
@@ -529,7 +549,7 @@ pub(crate) struct AccountFormState {
     pub(crate) in_unified: bool,
     pub(crate) push_override: Option<bool>,
     pub(crate) color: Option<String>,
-    pub(crate) picture_mode: bool,
+    pub(crate) avatar_mode: AvatarDisplayMode,
     pub(crate) emoji: Option<String>,
     pub(crate) emoji_input: Entity<InputState>,
     pub(crate) avatar: Option<String>,
@@ -888,7 +908,13 @@ impl AccountFormState {
         } else {
             cfg.special_folders.clone()
         };
-        let picture_mode = cfg.avatar.is_some();
+        let avatar_mode = if cfg.avatar.is_some() {
+            AvatarDisplayMode::Picture
+        } else if normalized_emoji.is_some() || !cfg.use_brand_avatar {
+            AvatarDisplayMode::InitialsOrEmoji
+        } else {
+            AvatarDisplayMode::BrandDefault
+        };
         let mut form = Self {
             editing_account_id,
             session_generation: 0,
@@ -915,7 +941,7 @@ impl AccountFormState {
             in_unified: cfg.in_unified,
             push_override: cfg.push_override,
             color: cfg.color,
-            picture_mode,
+            avatar_mode,
             emoji: normalized_emoji,
             emoji_input,
             avatar: cfg.avatar,
@@ -992,7 +1018,13 @@ impl AccountFormState {
         self.in_unified = c.in_unified;
         self.push_override = c.push_override;
         self.color = c.color;
-        self.picture_mode = c.avatar.is_some();
+        self.avatar_mode = if c.avatar.is_some() {
+            AvatarDisplayMode::Picture
+        } else if normalized_emoji.is_some() || !c.use_brand_avatar {
+            AvatarDisplayMode::InitialsOrEmoji
+        } else {
+            AvatarDisplayMode::BrandDefault
+        };
         self.emoji = normalized_emoji.clone();
         self.emoji_input.update(cx, |s, cx| {
             s.set_value(normalized_emoji.unwrap_or_default(), window, cx)
@@ -1140,7 +1172,11 @@ impl AccountFormState {
             self.in_unified,
             self.push_override.map(|v| if v { "1" } else { "0" }).unwrap_or("n"),
             self.color,
-            self.picture_mode,
+            match self.avatar_mode {
+                AvatarDisplayMode::BrandDefault => 0u8,
+                AvatarDisplayMode::InitialsOrEmoji => 1,
+                AvatarDisplayMode::Picture => 2,
+            },
             self.emoji.as_deref().unwrap_or(""),
             self.avatar,
             self.signature.read(cx).value(),
@@ -1229,7 +1265,7 @@ impl AccountFormState {
             .as_deref()
             .filter(|c| avatar::parse_hex_color(c).is_some())
             .map(|c| c.trim().to_ascii_lowercase());
-        let emoji = if !self.picture_mode {
+        let emoji = if self.avatar_mode == AvatarDisplayMode::InitialsOrEmoji {
             self.emoji
                 .as_deref()
                 .map(str::trim)
@@ -1238,7 +1274,7 @@ impl AccountFormState {
         } else {
             None
         };
-        let avatar_file = if self.picture_mode {
+        let avatar_file = if self.avatar_mode == AvatarDisplayMode::Picture {
             self.avatar
                 .as_deref()
                 .map(str::trim)
@@ -1247,6 +1283,7 @@ impl AccountFormState {
         } else {
             None
         };
+        let use_brand_avatar = self.avatar_mode == AvatarDisplayMode::BrandDefault;
 
         let existing_acc = self
             .editing_account_id
@@ -1295,6 +1332,7 @@ impl AccountFormState {
                 color,
                 emoji,
                 avatar: avatar_file,
+                use_brand_avatar,
                 in_unified: self.in_unified,
                 push_override: self.push_override,
                 quota_used_bytes: self.quota_used_bytes,
@@ -1364,6 +1402,7 @@ impl AccountFormState {
             color,
             emoji,
             avatar: avatar_file,
+            use_brand_avatar,
             in_unified: self.in_unified,
             push_override: self.push_override,
             quota_used_bytes: self.quota_used_bytes,
@@ -1494,6 +1533,7 @@ pub(crate) fn render_list_page(
                 acc.color.as_deref(),
                 acc.emoji.as_deref(),
                 acc.avatar.as_deref(),
+                if acc.use_brand_avatar { brand } else { None },
                 &data_dir,
                 30.0,
                 2.0,
@@ -2199,17 +2239,46 @@ pub(crate) fn render_editor_page(
             }
         }
     };
+    let preview_imap_host = form.imap_host.read(cx).value().trim().to_string();
+    let preview_imap_port = form
+        .imap_port
+        .read(cx)
+        .value()
+        .trim()
+        .parse::<u16>()
+        .unwrap_or(993);
+    let preview_auth_backend = if oauth_locked || provider.kind == ProviderKind::Microsoft {
+        AuthBackend::MicrosoftGraphOAuth2
+    } else {
+        AuthBackend::Password
+    };
+    let preview_brand = provider
+        .brand
+        .or_else(|| {
+            brand_for_account_fields(
+                preview_auth_backend,
+                &preview_imap_host,
+                preview_imap_port,
+                &preview_email,
+            )
+        })
+        .or(existing_brand);
     let preview_disc = avatar::account_circle_visual(
         &preview_label,
         &preview_email,
         form.color.as_deref(),
-        if form.picture_mode {
-            None
-        } else {
+        if form.avatar_mode == AvatarDisplayMode::InitialsOrEmoji {
             form.emoji.as_deref()
+        } else {
+            None
         },
-        if form.picture_mode {
+        if form.avatar_mode == AvatarDisplayMode::Picture {
             form.avatar.as_deref()
+        } else {
+            None
+        },
+        if form.avatar_mode == AvatarDisplayMode::BrandDefault {
+            preview_brand
         } else {
             None
         },
@@ -2324,13 +2393,24 @@ pub(crate) fn render_editor_page(
                     .border_1()
                     .border_color(border)
                     .child(
+                        Button::new("acct-mode-brand")
+                            .ghost()
+                            .compact()
+                            .selected(form.avatar_mode == AvatarDisplayMode::BrandDefault)
+                            .label("默认")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.account_form.avatar_mode = AvatarDisplayMode::BrandDefault;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         Button::new("acct-mode-text")
                             .ghost()
                             .compact()
-                            .selected(!form.picture_mode)
+                            .selected(form.avatar_mode == AvatarDisplayMode::InitialsOrEmoji)
                             .label("首字母或 Emoji")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.account_form.picture_mode = false;
+                                this.account_form.avatar_mode = AvatarDisplayMode::InitialsOrEmoji;
                                 cx.notify();
                             })),
                     )
@@ -2338,10 +2418,10 @@ pub(crate) fn render_editor_page(
                         Button::new("acct-mode-picture")
                             .ghost()
                             .compact()
-                            .selected(form.picture_mode)
+                            .selected(form.avatar_mode == AvatarDisplayMode::Picture)
                             .label("图片")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.account_form.picture_mode = true;
+                                this.account_form.avatar_mode = AvatarDisplayMode::Picture;
                                 cx.notify();
                             })),
                     ),
@@ -2349,204 +2429,228 @@ pub(crate) fn render_editor_page(
             .into_any_element(),
     ];
 
-    if !form.picture_mode {
-        let win_for_emoji = cx.entity();
-        appearance_rows.push(
-            h_flex()
-                .w_full()
-                .min_h(px(54.0))
-                .px_4()
-                .py_2()
-                .gap_3()
-                .items_center()
-                .justify_between()
-                .child(
-                    v_flex()
-                        .w(px(140.0))
-                        .flex_shrink_0()
-                        .gap_0p5()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(text)
-                                .child("Emoji（可选）"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child("留空自动使用首字母"),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(Input::new(&form.emoji_input)),
-                        )
-                        .child(
-                            Button::new("acct-emoji-picker")
-                                .outline()
-                                .compact()
-                                .label("预设")
-                                .icon(IconName::ChevronDown)
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    for emoji_choice in QUICK_EMOJIS {
-                                        let win_ref = win_for_emoji.clone();
-                                        let glyph = *emoji_choice;
-                                        menu = menu.item(PopupMenuItem::new(glyph).on_click(
-                                            move |_, window, cx| {
-                                                let _ = win_ref.update(cx, |win, cx| {
-                                                    win.account_form.emoji =
-                                                        Some(glyph.to_string());
-                                                    win.account_form
-                                                        .emoji_input
-                                                        .update(cx, |s, cx| {
-                                                            s.set_value(glyph, window, cx)
-                                                        });
-                                                    cx.notify();
-                                                });
-                                            },
-                                        ));
-                                    }
-                                    let win_clear = win_for_emoji.clone();
-                                    menu.separator().item(
-                                        PopupMenuItem::new("清除 Emoji").on_click(
-                                            move |_, window, cx| {
-                                                let _ = win_clear.update(cx, |win, cx| {
-                                                    win.account_form.emoji = None;
-                                                    win.account_form
-                                                        .emoji_input
-                                                        .update(cx, |s, cx| {
-                                                            s.set_value("", window, cx)
-                                                        });
-                                                    cx.notify();
-                                                });
-                                            },
-                                        ),
-                                    )
-                                }),
-                        ),
-                )
-                .into_any_element(),
-        );
-    } else {
-        let has_avatar = form.avatar.is_some();
-        let file_label = form
-            .avatar
-            .as_deref()
-            .unwrap_or("尚未选择图片（支持 PNG / JPG / WebP / GIF）");
-        appearance_rows.push(
-            h_flex()
-                .w_full()
-                .min_h(px(56.0))
-                .px_4()
-                .py_2()
-                .gap_3()
-                .items_center()
-                .justify_between()
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_0p5()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(text)
-                                .child("自定义头像图片"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .truncate()
-                                .child(SharedString::from(file_label.to_string())),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .flex_shrink_0()
-                        .child(
-                            Button::new("acct-pick-avatar")
-                                .outline()
-                                .compact()
-                                .icon(IconName::Image)
-                                .label("选择图片…")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.file_dialog_open {
-                                        return;
-                                    }
-                                    this.file_dialog_open = true;
-                                    let generation = this.account_form.session_generation;
-                                    cx.spawn(async move |this, cx| {
-                                        let src = cx
-                                            .background_executor()
-                                            .spawn(async move {
-                                                rfd::FileDialog::new()
-                                                    .set_title("选择账号头像图片")
-                                                    .add_filter(
-                                                        "图片文件",
-                                                        &["png", "jpg", "jpeg", "webp", "gif"],
-                                                    )
-                                                    .pick_file()
-                                            })
-                                            .await;
-                                        let _ = this
-                                            .update(cx, |this, _| this.file_dialog_open = false);
-                                        if let Some(src) = src {
-                                            let _ = this.update(cx, |this, cx| {
-                                                if !this.account_editor_open
-                                                    || this.account_form.session_generation
-                                                        != generation
-                                                {
-                                                    return;
-                                                }
-                                                match config::import_avatar_file_in(
-                                                    &config::data_dir(),
-                                                    &src,
-                                                ) {
-                                                    Ok(filename) => {
-                                                        this.account_form.avatar = Some(filename);
-                                                        this.account_form.picture_mode = true;
-                                                        this.account_form.validation_error = None;
-                                                    }
-                                                    Err(err) => {
-                                                        this.account_form.validation_error =
-                                                            Some(SharedString::from(err));
-                                                    }
-                                                }
-                                                cx.notify();
-                                            });
-                                        }
-                                    })
-                                    .detach();
-                                })),
-                        )
-                        .when(has_avatar, |el| {
-                            el.child(
-                                Button::new("acct-clear-avatar")
-                                    .ghost()
+    match form.avatar_mode {
+        AvatarDisplayMode::BrandDefault => {
+            let brand_hint = if preview_brand.is_some() {
+                "默认使用服务商品牌图标；如需文字或自定义图片，可切换上方选项"
+            } else {
+                "当前邮箱未匹配到品牌图标，将自动使用首字母头像"
+            };
+            appearance_rows.push(
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_2p5()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(brand_hint)
+                    .into_any_element(),
+            );
+        }
+        AvatarDisplayMode::InitialsOrEmoji => {
+            let win_for_emoji = cx.entity();
+            appearance_rows.push(
+                h_flex()
+                    .w_full()
+                    .min_h(px(54.0))
+                    .px_4()
+                    .py_2()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .w(px(140.0))
+                            .flex_shrink_0()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(text)
+                                    .child("Emoji（可选）"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child("留空自动使用首字母"),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&form.emoji_input)),
+                            )
+                            .child(
+                                Button::new("acct-emoji-picker")
+                                    .outline()
                                     .compact()
-                                    .label("移除图片")
+                                    .label("预设")
+                                    .icon(IconName::ChevronDown)
+                                    .dropdown_menu(move |mut menu, _, _| {
+                                        for emoji_choice in QUICK_EMOJIS {
+                                            let win_ref = win_for_emoji.clone();
+                                            let glyph = *emoji_choice;
+                                            menu = menu.item(PopupMenuItem::new(glyph).on_click(
+                                                move |_, window, cx| {
+                                                    let _ = win_ref.update(cx, |win, cx| {
+                                                        win.account_form.emoji =
+                                                            Some(glyph.to_string());
+                                                        win.account_form
+                                                            .emoji_input
+                                                            .update(cx, |s, cx| {
+                                                                s.set_value(glyph, window, cx)
+                                                            });
+                                                        cx.notify();
+                                                    });
+                                                },
+                                            ));
+                                        }
+                                        let win_clear = win_for_emoji.clone();
+                                        menu.separator().item(
+                                            PopupMenuItem::new("清除 Emoji").on_click(
+                                                move |_, window, cx| {
+                                                    let _ = win_clear.update(cx, |win, cx| {
+                                                        win.account_form.emoji = None;
+                                                        win.account_form
+                                                            .emoji_input
+                                                            .update(cx, |s, cx| {
+                                                                s.set_value("", window, cx)
+                                                            });
+                                                        cx.notify();
+                                                    });
+                                                },
+                                            ),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        AvatarDisplayMode::Picture => {
+            let has_avatar = form.avatar.is_some();
+            let file_label = form
+                .avatar
+                .as_deref()
+                .unwrap_or("尚未选择图片（支持 PNG / JPG / WebP / GIF）");
+            appearance_rows.push(
+                h_flex()
+                    .w_full()
+                    .min_h(px(56.0))
+                    .px_4()
+                    .py_2()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(text)
+                                    .child("自定义头像图片"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .truncate()
+                                    .child(SharedString::from(file_label.to_string())),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("acct-pick-avatar")
+                                    .outline()
+                                    .compact()
+                                    .icon(IconName::Image)
+                                    .label("选择图片…")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.account_form.avatar = None;
-                                        cx.notify();
+                                        if this.file_dialog_open {
+                                            return;
+                                        }
+                                        this.file_dialog_open = true;
+                                        let generation = this.account_form.session_generation;
+                                        cx.spawn(async move |this, cx| {
+                                            let src = cx
+                                                .background_executor()
+                                                .spawn(async move {
+                                                    rfd::FileDialog::new()
+                                                        .set_title("选择账号头像图片")
+                                                        .add_filter(
+                                                            "图片文件",
+                                                            &["png", "jpg", "jpeg", "webp", "gif"],
+                                                        )
+                                                        .pick_file()
+                                                })
+                                                .await;
+                                            let _ = this.update(cx, |this, _| {
+                                                this.file_dialog_open = false
+                                            });
+                                            if let Some(src) = src {
+                                                let _ = this.update(cx, |this, cx| {
+                                                    if !this.account_editor_open
+                                                        || this.account_form.session_generation
+                                                            != generation
+                                                    {
+                                                        return;
+                                                    }
+                                                    match config::import_avatar_file_in(
+                                                        &config::data_dir(),
+                                                        &src,
+                                                    ) {
+                                                        Ok(filename) => {
+                                                            this.account_form.avatar =
+                                                                Some(filename);
+                                                            this.account_form.avatar_mode =
+                                                                AvatarDisplayMode::Picture;
+                                                            this.account_form.validation_error =
+                                                                None;
+                                                        }
+                                                        Err(err) => {
+                                                            this.account_form.validation_error =
+                                                                Some(SharedString::from(err));
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }
+                                        })
+                                        .detach();
                                     })),
                             )
-                        }),
-                )
-                .into_any_element(),
-        );
+                            .when(has_avatar, |el| {
+                                el.child(
+                                    Button::new("acct-clear-avatar")
+                                        .ghost()
+                                        .compact()
+                                        .label("移除图片")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.account_form.avatar = None;
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
     }
 
     // ---- WP-06 分组 0：存储配额（Storage） ----

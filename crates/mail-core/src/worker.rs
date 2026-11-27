@@ -1734,6 +1734,7 @@ async fn handle_request(
                 color: prev.and_then(|p| p.color.clone()),
                 emoji: prev.and_then(|p| p.emoji.clone()),
                 avatar: prev.and_then(|p| p.avatar.clone()),
+                use_brand_avatar: prev.map(|p| p.use_brand_avatar).unwrap_or(true),
                 in_unified: prev.map(|p| p.in_unified).unwrap_or(true),
                 push_override: prev.and_then(|p| p.push_override),
                 imap_host: "outlook.office365.com".to_string(),

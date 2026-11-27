@@ -100,6 +100,9 @@ pub struct AccountConfig {
     /// Optional avatar picture file name stored under `avatars/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<String>,
+    /// Whether to use the provider brand icon as the default avatar when no custom avatar or emoji is set.
+    #[serde(default = "default_true")]
+    pub use_brand_avatar: bool,
     /// Whether this account's mail is included in unified views (All Inboxes, Starred, Sent, Archive).
     #[serde(default = "default_true")]
     pub in_unified: bool,
@@ -214,6 +217,7 @@ impl Default for AccountConfig {
             color: None,
             emoji: None,
             avatar: None,
+            use_brand_avatar: true,
             in_unified: true,
             push_override: None,
             imap_host: String::new(),

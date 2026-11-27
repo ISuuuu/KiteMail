@@ -359,7 +359,12 @@ pub fn avatar(name: &str, email: &str, size: f32) -> Div {
                 .rounded_full()
                 .overflow_hidden()
                 .size(px(size))
-                .child(img(image).size_full().object_fit(ObjectFit::Cover));
+                .child(
+                    img(image)
+                        .size_full()
+                        .rounded_full()
+                        .object_fit(ObjectFit::Cover),
+                );
         }
         if let Some(brand) = kitemail_mail_core::avatar::lookup_builtin_brand(trimmed_email) {
             let bg = parse_hex_color(brand.color).unwrap_or_else(|| avatar_bg_color(trimmed_email));
@@ -400,7 +405,7 @@ pub fn avatar(name: &str, email: &str, size: f32) -> Div {
         .child(SharedString::from(initials))
 }
 
-/// 账号外观圆盘：外层强调色圆环 + `ring_gap_px` 留白 + 内层圆盘（图片 → Emoji → 首字母）。
+/// 账号外观圆盘：外层强调色圆环 + `ring_gap_px` 留白 + 内层圆盘（自定义图片 → Emoji → 品牌图标 → 首字母）。
 #[allow(clippy::too_many_arguments)]
 pub fn account_circle_visual(
     display_label: &str,
@@ -408,6 +413,7 @@ pub fn account_circle_visual(
     color_hex: Option<&str>,
     emoji: Option<&str>,
     avatar_file: Option<&str>,
+    brand: Option<&str>,
     data_dir: &Path,
     size: f32,
     ring_px: f32,
@@ -424,13 +430,44 @@ pub fn account_circle_visual(
         .justify_center();
 
     if let Some(image) = avatar_file.and_then(|f| load_local_avatar_image(data_dir, f)) {
-        inner = inner.child(img(image).size_full().object_fit(ObjectFit::Cover));
+        inner = inner.child(
+            img(image)
+                .size_full()
+                .rounded_full()
+                .object_fit(ObjectFit::Cover),
+        );
     } else if let Some(em) = emoji.map(str::trim).filter(|s| !s.is_empty()) {
         let glyph: String = em.chars().take(4).collect();
         inner = inner
             .text_color(white())
             .text_size(px(size * 0.52))
             .child(SharedString::from(glyph));
+    } else if let Some(brand_id) = brand.map(str::trim).filter(|s| !s.is_empty()) {
+        let is_tile_brand = matches!(
+            brand_id,
+            "qq" | "netease163"
+                | "netease126"
+                | "exmail"
+                | "aliyun_qiye"
+                | "yahoo"
+                | "aol"
+                | "mailcom"
+        );
+        if is_tile_brand {
+            inner = inner.child(
+                img(SharedString::from(format!("brands/{brand_id}.png")))
+                    .size_full()
+                    .rounded_full()
+                    .object_fit(ObjectFit::Cover),
+            );
+        } else {
+            let pad = (size * 0.14).max(2.0);
+            inner = inner.bg(white()).p(px(pad)).child(
+                img(SharedString::from(format!("brands/{brand_id}.png")))
+                    .size_full()
+                    .object_fit(ObjectFit::Contain),
+            );
+        }
     } else {
         let label = if display_label.trim().is_empty() {
             email
@@ -498,12 +535,18 @@ pub fn account_circle_with_badge(
     badge_accent: Hsla,
     badge_border: Hsla,
 ) -> Div {
+    let brand = if acc.use_brand_avatar {
+        crate::ui::accounts::brand_for_account(acc)
+    } else {
+        None
+    };
     let base = account_circle_visual(
         &acc.display_label(),
         &acc.email,
         acc.color.as_deref(),
         acc.emoji.as_deref(),
         acc.avatar.as_deref(),
+        brand,
         data_dir,
         size,
         2.0,
