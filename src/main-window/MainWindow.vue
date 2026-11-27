@@ -354,6 +354,7 @@ import ShortcutsHelpModal from "../command-palette/ShortcutsHelpModal.vue";
 import type { CommandPaletteItem } from "../command-palette/types";
 import { matchSingleKeyShortcut } from "../command-palette/useCommandPalette";
 import type { OpenMessageOutput } from "../ipc/types";
+import { openSettingsWindow } from "../ipc/windows";
 import { injectMainWindow } from "./useMainWindow";
 import {
   BELOW_LIST_MIN_HEIGHT,
@@ -623,8 +624,12 @@ const commandPaletteItems = computed<CommandPaletteItem[]>(() => {
 });
 
 function openPreferencesModal(tab: PreferenceTabId = "appearance") {
-  preferencesInitialTab.value = tab;
-  preferencesModalOpen.value = true;
+  // WP-01：偏好设置入口改为打开独立设置窗；IPC 不可用（浏览器预览）时回落旧弹窗。
+  void openSettingsWindow().then((opened) => {
+    if (opened) return;
+    preferencesInitialTab.value = tab;
+    preferencesModalOpen.value = true;
+  });
 }
 
 function openAccountsFromPreferences() {
@@ -885,6 +890,13 @@ function onKeyDown(e: KeyboardEvent) {
   if (e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
     e.preventDefault();
     window.dispatchEvent(new CustomEvent("km-focus-search"));
+    return;
+  }
+
+  // Ctrl+, 打开偏好设置（独立设置窗）
+  if (e.ctrlKey && !e.altKey && !e.shiftKey && e.key === ",") {
+    e.preventDefault();
+    openPreferencesModal("appearance");
     return;
   }
 
