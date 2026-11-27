@@ -2416,6 +2416,8 @@ impl HylkiApp {
 
     fn apply_worker_events(&mut self, events: Vec<WorkerEvent>, cx: &mut Context<Self>) {
         let mut folders_updated = false;
+        let mut reload_view_after_folder_sync = false;
+        let mut refresh_thread_accounts: HashSet<u32> = HashSet::new();
         let mut total_new_unread: u32 = 0;
         let mut notify_account_id: Option<u32> = None;
         let mut latest_unread_preview: Option<(String, String)> = None;
@@ -3223,6 +3225,42 @@ impl HylkiApp {
                         }
                     }
                 }
+                WorkerEvent::FolderSynced {
+                    account_id,
+                    folder_id,
+                    folder_path,
+                    folder_name,
+                } => {
+                    if !self.demo_mode {
+                        let special = self
+                            .accounts
+                            .iter()
+                            .find(|a| a.id == account_id)
+                            .map(|a| &a.special_folders);
+                        if folder_matches_current_view(
+                            self.current_view,
+                            self.selected_folder_id,
+                            folder_id,
+                            &folder_name,
+                            &folder_path,
+                            special,
+                        ) {
+                            let account_folder_needs_reapply = self.current_view
+                                == CurrentView::AccountFolder
+                                && (!self.search_query.trim().is_empty()
+                                    || self.quick_filters != QuickFilterSet::default()
+                                    || self.list_sort != MessageSort::DateNewest);
+                            if self.current_view != CurrentView::AccountFolder
+                                || account_folder_needs_reapply
+                            {
+                                reload_view_after_folder_sync = true;
+                            }
+                        }
+                        if is_account_sent_folder(&folder_name, &folder_path, special) {
+                            refresh_thread_accounts.insert(account_id);
+                        }
+                    }
+                }
                 WorkerEvent::AccountSyncFinished {
                     account_id,
                     user_initiated,
@@ -3865,6 +3903,34 @@ impl HylkiApp {
                         self.prefs.notification_show_content && !self.app_locked,
                     );
                     tray.show_notification(&title, &body);
+                }
+            }
+        }
+        if reload_view_after_folder_sync {
+            self.reload_current_page(cx);
+        }
+        if !refresh_thread_accounts.is_empty()
+            && !self.selected_message_is_placeholder
+            && self.pending_body_message_id.is_none()
+        {
+            if let Some(selected_id) = self
+                .selected_message
+                .as_ref()
+                .filter(|m| refresh_thread_accounts.contains(&m.account_id))
+                .map(|m| m.id)
+            {
+                if let Some((fresh_detail, _)) = self.try_load_cached_detail(selected_id) {
+                    let changed = self.selected_message.as_ref().is_some_and(|prev| {
+                        prev.thread_messages.len() != fresh_detail.thread_messages.len()
+                            || prev
+                                .thread_messages
+                                .iter()
+                                .map(|m| m.id)
+                                .ne(fresh_detail.thread_messages.iter().map(|m| m.id))
+                    });
+                    if changed {
+                        self.set_selected_message(fresh_detail);
+                    }
                 }
             }
         }
@@ -4579,6 +4645,30 @@ impl HylkiApp {
         }
         self.remember_last_location(None);
         self.reload_current_page(cx);
+        if !self.demo_mode && !self.mail_dir_switching {
+            if let Some(ref w) = self.worker {
+                match view {
+                    CurrentView::UnifiedInbox => {
+                        w.send(MailRequest::SyncUnifiedView { view: None });
+                    }
+                    CurrentView::Sent
+                    | CurrentView::Trash
+                    | CurrentView::Junk
+                    | CurrentView::Archive
+                    | CurrentView::Unread => {
+                        if let Some(unified) = view.unified() {
+                            w.send(MailRequest::SyncUnifiedView {
+                                view: Some(unified),
+                            });
+                        }
+                    }
+                    CurrentView::Drafts
+                    | CurrentView::Starred
+                    | CurrentView::Snoozed
+                    | CurrentView::AccountFolder => {}
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -15143,16 +15233,27 @@ pub(crate) fn next_index_after_removal(removed: usize, len: usize) -> Option<usi
     }
 }
 
+/// 判定文件夹是否为已删除 / 废纸篓（对齐 cache.rs 的 TRASH_FOLDER_MATCH）。
+pub(crate) fn is_trash_folder(name: &str, path: &str) -> bool {
+    let upper = path.to_ascii_uppercase();
+    name == "已删除" || upper.contains("TRASH") || upper.contains("DELETED")
+}
+
+/// 判定文件夹是否为垃圾邮件（对齐 cache.rs 的 JUNK_FOLDER_MATCH）。
+pub(crate) fn is_junk_folder(name: &str, path: &str) -> bool {
+    let upper = path.to_ascii_uppercase();
+    name == "垃圾邮件" || upper.contains("JUNK") || upper.contains("SPAM")
+}
+
+/// 判定文件夹是否为归档（对齐 cache.rs 的 ARCHIVE_FOLDER_MATCH）。
+pub(crate) fn is_archive_folder(name: &str, path: &str) -> bool {
+    name == "归档" || path.to_ascii_uppercase().contains("ARCHIVE")
+}
+
 /// B-2：判定文件夹是否为回收站 / 垃圾邮件（语义对齐 cache.rs 的
 /// TRASH_FOLDER_MATCH / JUNK_FOLDER_MATCH 与原版 FolderKind::Trash / Junk）。
 pub(crate) fn is_trash_or_junk_folder(name: &str, path: &str) -> bool {
-    let upper = path.to_ascii_uppercase();
-    name == "已删除"
-        || name == "垃圾邮件"
-        || upper.contains("TRASH")
-        || upper.contains("DELETED")
-        || upper.contains("JUNK")
-        || upper.contains("SPAM")
+    is_trash_folder(name, path) || is_junk_folder(name, path)
 }
 
 /// B-6：判定文件夹是否为已发送（语义对齐 cache.rs 的 SENT_FOLDER_MATCH）。
@@ -15163,6 +15264,64 @@ pub(crate) fn is_sent_folder(name: &str, path: &str) -> bool {
 /// 判定文件夹是否为收件箱（兼容 IMAP `INBOX` 与 Graph 显示名「收件箱」）。
 pub(crate) fn is_inbox_folder(name: &str, path: &str) -> bool {
     path.eq_ignore_ascii_case("INBOX") || name.eq_ignore_ascii_case("INBOX") || name == "收件箱"
+}
+
+fn matches_configured_or_fallback(
+    configured_path: Option<&str>,
+    folder_name: &str,
+    folder_path: &str,
+    fallback: impl FnOnce(&str, &str) -> bool,
+) -> bool {
+    if let Some(custom) = configured_path.map(str::trim).filter(|s| !s.is_empty()) {
+        if folder_path.eq_ignore_ascii_case(custom) {
+            return true;
+        }
+    }
+    fallback(folder_name, folder_path)
+}
+
+fn is_account_sent_folder(
+    name: &str,
+    path: &str,
+    special: Option<&config::SpecialFoldersConfig>,
+) -> bool {
+    matches_configured_or_fallback(special.map(|s| s.sent.as_str()), name, path, is_sent_folder)
+}
+
+fn folder_matches_current_view(
+    current_view: CurrentView,
+    selected_folder_id: u32,
+    synced_folder_id: u32,
+    folder_name: &str,
+    folder_path: &str,
+    special: Option<&config::SpecialFoldersConfig>,
+) -> bool {
+    match current_view {
+        CurrentView::AccountFolder => selected_folder_id == synced_folder_id,
+        CurrentView::UnifiedInbox | CurrentView::Unread => {
+            is_inbox_folder(folder_name, folder_path)
+        }
+        CurrentView::Sent => is_account_sent_folder(folder_name, folder_path, special),
+        CurrentView::Trash => matches_configured_or_fallback(
+            special.map(|s| s.trash.as_str()),
+            folder_name,
+            folder_path,
+            is_trash_folder,
+        ),
+        CurrentView::Junk => matches_configured_or_fallback(
+            special.map(|s| s.junk.as_str()),
+            folder_name,
+            folder_path,
+            is_junk_folder,
+        ),
+        CurrentView::Archive => matches_configured_or_fallback(
+            special.map(|s| s.archive.as_str()),
+            folder_name,
+            folder_path,
+            is_archive_folder,
+        ),
+        CurrentView::Starred | CurrentView::Snoozed | CurrentView::Drafts => false,
+    }
 }
 
 /// 收集折叠会话中同文件夹内的其它未读成员 `(id, uid, folder_path)`，
@@ -16547,5 +16706,135 @@ mod tests {
     fn parse_update_notes_returns_none_for_blank_input() {
         assert!(parse_update_notes("").is_none());
         assert!(parse_update_notes("  \r\n\t  ").is_none());
+    }
+
+    #[test]
+    fn folder_matches_current_view_covers_unified_and_custom_special_folders() {
+        let special = config::SpecialFoldersConfig {
+            sent: "Custom/Outbox".to_string(),
+            trash: "Custom/Bin".to_string(),
+            junk: "Custom/Spam".to_string(),
+            archive: "Custom/Vault".to_string(),
+            ..Default::default()
+        };
+
+        // 统一视图精确按角色匹配（含自定义特殊文件夹）。
+        assert!(folder_matches_current_view(
+            CurrentView::Sent,
+            0,
+            10,
+            "Outbox",
+            "custom/outbox",
+            Some(&special),
+        ));
+        assert!(folder_matches_current_view(
+            CurrentView::Sent,
+            0,
+            11,
+            "已发送",
+            "Sent",
+            None,
+        ));
+        assert!(folder_matches_current_view(
+            CurrentView::Trash,
+            0,
+            12,
+            "Bin",
+            "Custom/Bin",
+            Some(&special),
+        ));
+        // Trash 与 Junk 互不串台。
+        assert!(!folder_matches_current_view(
+            CurrentView::Trash,
+            0,
+            13,
+            "垃圾邮件",
+            "Junk",
+            Some(&special),
+        ));
+        assert!(folder_matches_current_view(
+            CurrentView::Junk,
+            0,
+            13,
+            "Spam",
+            "Custom/Spam",
+            Some(&special),
+        ));
+        assert!(!folder_matches_current_view(
+            CurrentView::Junk,
+            0,
+            12,
+            "已删除",
+            "Trash",
+            Some(&special),
+        ));
+        assert!(folder_matches_current_view(
+            CurrentView::Archive,
+            0,
+            14,
+            "Vault",
+            "Custom/Vault",
+            Some(&special),
+        ));
+        assert!(folder_matches_current_view(
+            CurrentView::UnifiedInbox,
+            0,
+            15,
+            "收件箱",
+            "INBOX",
+            None,
+        ));
+        assert!(folder_matches_current_view(
+            CurrentView::Unread,
+            0,
+            15,
+            "INBOX",
+            "INBOX",
+            None,
+        ));
+
+        // Drafts / Starred / Snoozed 不由文件夹同步事件刷新。
+        assert!(!folder_matches_current_view(
+            CurrentView::Drafts,
+            0,
+            16,
+            "草稿箱",
+            "Drafts",
+            None,
+        ));
+        assert!(!folder_matches_current_view(
+            CurrentView::Starred,
+            0,
+            15,
+            "INBOX",
+            "INBOX",
+            None,
+        ));
+        assert!(!folder_matches_current_view(
+            CurrentView::Snoozed,
+            0,
+            15,
+            "INBOX",
+            "INBOX",
+            None,
+        ));
+
+        // AccountFolder 按 folder_id 精确匹配。
+        assert!(folder_matches_current_view(
+            CurrentView::AccountFolder,
+            42,
+            42,
+            "Work",
+            "Work",
+            None,
+        ));
+        assert!(!folder_matches_current_view(
+            CurrentView::AccountFolder,
+            42,
+            43,
+            "Work",
+            "Work",
+            None,
+        ));
     }
 }

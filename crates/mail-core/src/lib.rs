@@ -654,6 +654,12 @@ pub enum MailRequest {
         folder_path: String,
         user_initiated: bool,
     },
+    /// 静默刷新统一视图对应的各账号远端文件夹（由后端按统一视图账号范围、
+    /// 去重与冷却/脏标记策略执行，不弹成功或失败 Toast）。
+    SyncUnifiedView {
+        /// `None` 表示统一收件箱（`UnifiedInbox`）；`Some(view)` 表示对应角色统一视图。
+        view: Option<UnifiedView>,
+    },
     LoadUnifiedInbox {
         query: String,
         filter: MessageFilter,
@@ -1046,6 +1052,13 @@ pub enum WorkerEvent {
         user_initiated: bool,
         removed_from_server: bool,
         message: String,
+    },
+    /// 单文件夹远端同步完成并写入本地缓存（供统一视图与会话线程增量刷新）。
+    FolderSynced {
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+        folder_name: String,
     },
     /// 单账号同步结束，携带未成功同步的文件夹详情，避免笼统报「同步完成」。
     AccountSyncFinished {

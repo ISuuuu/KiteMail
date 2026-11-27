@@ -12,9 +12,9 @@ use crate::search_query::SearchQuery;
 use crate::secrets::{self, AccountSecrets};
 use crate::smtp_client::SendOutcome;
 use crate::{
-    graph_client, imap_client, oauth, smtp_client, FetchedMessageBody, MailRequest, MessageDetail,
-    MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus, QuickFilterSet,
-    UnifiedView, WorkerEvent,
+    graph_client, imap_client, oauth, smtp_client, FetchedMessageBody, FolderSummary, MailRequest,
+    MessageDetail, MessageFilter, MessageSort, MessageSummary, OutboxItem, OutboxStatus,
+    QuickFilterSet, UnifiedView, WorkerEvent,
 };
 
 type TokenCache = HashMap<u32, (String, Instant, AccountConfig)>;
@@ -472,7 +472,15 @@ async fn worker_loop(
             for acc in &accounts {
                 refresh_account_watcher(&mut watchers, &data_dir, acc, &req_tx);
             }
-            deliver_due_outbox(&data_dir, cache, &tokens, &accounts, &evt_tx).await;
+            deliver_due_outbox(
+                &data_dir,
+                cache,
+                &tokens,
+                &accounts,
+                Some(&background),
+                &evt_tx,
+            )
+            .await;
         }
     }
     if let Some(cache) = cache_opt.as_mut() {
@@ -514,7 +522,7 @@ async fn worker_loop(
         // 定时发送投递：内部先查有无到期记录，没有就立刻返回（不读盘），
         // 所以每次唤醒都调用也不影响交互请求的响应速度。
         if let Some(cache) = cache_opt.as_mut() {
-            deliver_due_outbox_tick(&data_dir, cache, &tokens, &evt_tx).await;
+            deliver_due_outbox_tick(&data_dir, cache, &tokens, Some(&background), &evt_tx).await;
         }
 
         let Some(req) = req else {
@@ -569,6 +577,7 @@ async fn worker_loop(
             &async_cache,
             &in_flight_bodies,
             &mut watchers,
+            &background,
             &req_tx,
             req,
             &evt_tx,
@@ -715,6 +724,7 @@ async fn handle_change_mail_data_dir(
     };
     *cache_opt = Some(reopened);
     *background.backfill.lock().await = BackfillIndexState::default();
+    background.clear_sync_coord();
     let _ = tokens;
     let Some(cache) = cache_opt.as_mut() else {
         return;
@@ -851,6 +861,209 @@ async fn handle_change_mail_data_dir(
     }
 }
 
+const FOLDER_SYNC_COOLDOWN: Duration = Duration::from_secs(15);
+const SERVER_SAVES_SENT_SYNC_DELAY: Duration = Duration::from_millis(1500);
+
+/// 协调单文件夹静默同步的去重、短冷却与脏标记绕过。
+#[derive(Default)]
+struct FolderSyncCoordinator {
+    in_flight: HashSet<u32>,
+    dirty: HashSet<u32>,
+    last_synced: HashMap<u32, Instant>,
+}
+
+impl FolderSyncCoordinator {
+    fn mark_dirty(&mut self, folder_id: u32) {
+        self.dirty.insert(folder_id);
+    }
+
+    fn try_begin_sync(&mut self, folder_id: u32, force: bool, now: Instant) -> bool {
+        if self.in_flight.contains(&folder_id) {
+            return false;
+        }
+        let is_dirty = self.dirty.contains(&folder_id);
+        if !force && !is_dirty {
+            if let Some(&last) = self.last_synced.get(&folder_id) {
+                if now.saturating_duration_since(last) < FOLDER_SYNC_COOLDOWN {
+                    return false;
+                }
+            }
+        }
+        // 提前消费脏标记，避免同步期间新产生的发信/删除脏标记在完成后被误删。
+        self.dirty.remove(&folder_id);
+        self.in_flight.insert(folder_id);
+        true
+    }
+
+    fn finish_sync(&mut self, folder_id: u32, succeeded: bool, now: Instant) {
+        self.in_flight.remove(&folder_id);
+        if succeeded {
+            self.last_synced.insert(folder_id, now);
+        }
+    }
+
+    fn record_external_sync(&mut self, folder_id: u32, now: Instant) {
+        self.dirty.remove(&folder_id);
+        self.last_synced.insert(folder_id, now);
+    }
+
+    fn clear(&mut self) {
+        self.in_flight.clear();
+        self.dirty.clear();
+        self.last_synced.clear();
+    }
+}
+
+/// 保证任意早退或 panic 路径都能释放 `in_flight` 槽位的 RAII 守卫。
+struct FolderSyncGuard {
+    coord: Arc<std::sync::Mutex<FolderSyncCoordinator>>,
+    folder_id: u32,
+    finished: bool,
+}
+
+impl FolderSyncGuard {
+    fn try_acquire(
+        coord: &Arc<std::sync::Mutex<FolderSyncCoordinator>>,
+        folder_id: u32,
+        force: bool,
+        now: Instant,
+    ) -> Option<Self> {
+        let acquired = coord
+            .lock()
+            .map(|mut c| c.try_begin_sync(folder_id, force, now))
+            .unwrap_or(false);
+        acquired.then(|| Self {
+            coord: Arc::clone(coord),
+            folder_id,
+            finished: false,
+        })
+    }
+
+    fn finish(mut self, succeeded: bool) {
+        self.finished = true;
+        if let Ok(mut c) = self.coord.lock() {
+            c.finish_sync(self.folder_id, succeeded, Instant::now());
+        }
+    }
+}
+
+impl Drop for FolderSyncGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Ok(mut c) = self.coord.lock() {
+                c.finish_sync(self.folder_id, false, Instant::now());
+            }
+        }
+    }
+}
+
+fn match_special_or_fallback(
+    folders: &[FolderSummary],
+    configured_path: &str,
+    fallback: impl Fn(&FolderSummary) -> bool,
+) -> Option<(u32, String)> {
+    let custom = configured_path.trim();
+    if !custom.is_empty() {
+        if let Some(found) = folders.iter().find(|f| f.path.eq_ignore_ascii_case(custom)) {
+            return Some((found.id, found.path.clone()));
+        }
+    }
+    folders
+        .iter()
+        .find(|f| fallback(f))
+        .map(|f| (f.id, f.path.clone()))
+}
+
+/// 按统一视图角色与账号自定义特殊文件夹配置解析对应的本地文件夹 `(folder_id, folder_path)`。
+fn resolve_account_role_folder(
+    account: &AccountConfig,
+    folders: &[FolderSummary],
+    view: Option<UnifiedView>,
+) -> Option<(u32, String)> {
+    match view {
+        None | Some(UnifiedView::Unread) => folders
+            .iter()
+            .find(|f| f.path.eq_ignore_ascii_case("INBOX"))
+            .or_else(|| {
+                folders
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case("INBOX") || f.name == "收件箱")
+            })
+            .map(|f| (f.id, f.path.clone())),
+        Some(UnifiedView::Sent) => {
+            match_special_or_fallback(folders, &account.special_folders.sent, |f| {
+                f.name == "已发送" || f.path.to_ascii_uppercase().contains("SENT")
+            })
+        }
+        Some(UnifiedView::Trash) => {
+            match_special_or_fallback(folders, &account.special_folders.trash, |f| {
+                let upper = f.path.to_ascii_uppercase();
+                f.name == "已删除" || upper.contains("TRASH") || upper.contains("DELETED")
+            })
+        }
+        Some(UnifiedView::Junk) => {
+            match_special_or_fallback(folders, &account.special_folders.junk, |f| {
+                let upper = f.path.to_ascii_uppercase();
+                f.name == "垃圾邮件" || upper.contains("JUNK") || upper.contains("SPAM")
+            })
+        }
+        Some(UnifiedView::Archive) => {
+            match_special_or_fallback(folders, &account.special_folders.archive, |f| {
+                f.name == "归档" || f.path.to_ascii_uppercase().contains("ARCHIVE")
+            })
+        }
+        Some(UnifiedView::Starred | UnifiedView::Snoozed) => None,
+    }
+}
+
+/// 收集统一视图需要按需同步的账号目标列表 `(account_id, folder_id, folder_path)`。
+fn resolve_unified_sync_targets(
+    accounts: &[AccountConfig],
+    folders_for_account: impl Fn(u32) -> Vec<FolderSummary>,
+    view: Option<UnifiedView>,
+) -> Vec<(u32, u32, String)> {
+    if matches!(view, Some(UnifiedView::Starred | UnifiedView::Snoozed)) {
+        return Vec::new();
+    }
+    accounts
+        .iter()
+        .filter(|acc| is_unified_scope_account(acc))
+        .filter_map(|acc| {
+            let folders = folders_for_account(acc.id);
+            resolve_account_role_folder(acc, &folders, view)
+                .map(|(folder_id, folder_path)| (acc.id, folder_id, folder_path))
+        })
+        .collect()
+}
+
+/// 解析移动/删除目标文件夹在本地缓存中的 `folder_id`（兼容 Graph well-known 名称）。
+fn resolve_move_dest_folder_id(
+    folders: &[FolderSummary],
+    account: &AccountConfig,
+    dest_path: &str,
+    target_hint: Option<UnifiedView>,
+) -> Option<u32> {
+    let trimmed = dest_path.trim();
+    if !trimmed.is_empty() {
+        if let Some(found) = folders
+            .iter()
+            .find(|f| f.path.eq_ignore_ascii_case(trimmed))
+        {
+            return Some(found.id);
+        }
+    }
+    let fallback_role = if trimmed.eq_ignore_ascii_case("deleteditems") {
+        Some(UnifiedView::Trash)
+    } else if trimmed.eq_ignore_ascii_case("junkemail") {
+        Some(UnifiedView::Junk)
+    } else {
+        target_hint
+    };
+    fallback_role
+        .and_then(|role| resolve_account_role_folder(account, folders, Some(role)))
+        .map(|(id, _)| id)
+}
+
 /// 可改派到后台执行的任务：历史索引与账号 / 文件夹同步。
 enum BackgroundJob {
     Backfill,
@@ -866,6 +1079,10 @@ enum BackgroundJob {
         folder_id: u32,
         folder_path: String,
         user_initiated: bool,
+        force: bool,
+    },
+    SyncUnifiedView {
+        view: Option<UnifiedView>,
     },
 }
 
@@ -893,7 +1110,9 @@ impl BackgroundJob {
                 folder_id: *folder_id,
                 folder_path: folder_path.clone(),
                 user_initiated: *user_initiated,
+                force: *user_initiated,
             }),
+            MailRequest::SyncUnifiedView { view } => Some(Self::SyncUnifiedView { view: *view }),
             _ => None,
         }
     }
@@ -904,6 +1123,7 @@ impl BackgroundJob {
         tokens: &SharedTokenCache,
         backfill: Arc<tokio::sync::Mutex<BackfillIndexState>>,
         bg_cache: &Arc<tokio::sync::Mutex<Option<CacheStore>>>,
+        sync_coord: &Arc<std::sync::Mutex<FolderSyncCoordinator>>,
         evt_tx: &EventSender,
     ) {
         let mut cache_guard = bg_cache.lock().await;
@@ -943,8 +1163,16 @@ impl BackgroundJob {
             }
             Self::SyncAllAccounts { user_initiated } => {
                 for acc in accounts.into_iter().filter(|a| a.enabled) {
-                    sync_account_inner(data_dir, cache, tokens, acc.id, user_initiated, evt_tx)
-                        .await;
+                    sync_account_inner(
+                        data_dir,
+                        cache,
+                        tokens,
+                        acc.id,
+                        user_initiated,
+                        Some(sync_coord),
+                        evt_tx,
+                    )
+                    .await;
                 }
                 let page_size = pref_page_size(data_dir);
                 let allowed = unified_account_ids(data_dir);
@@ -963,15 +1191,29 @@ impl BackgroundJob {
                 account_id,
                 user_initiated,
             } => {
-                sync_account_inner(data_dir, cache, tokens, account_id, user_initiated, evt_tx)
-                    .await;
+                sync_account_inner(
+                    data_dir,
+                    cache,
+                    tokens,
+                    account_id,
+                    user_initiated,
+                    Some(sync_coord),
+                    evt_tx,
+                )
+                .await;
             }
             Self::SyncFolder {
                 account_id,
                 folder_id,
                 folder_path,
                 user_initiated,
+                force,
             } => {
+                let Some(guard) =
+                    FolderSyncGuard::try_acquire(sync_coord, folder_id, force, Instant::now())
+                else {
+                    return;
+                };
                 let Ok(account) = load_account_config(data_dir, account_id) else {
                     let _ = evt_tx.send(WorkerEvent::Error {
                         account_id: Some(account_id),
@@ -992,12 +1234,49 @@ impl BackgroundJob {
                     evt_tx,
                 )
                 .await;
+                guard.finish(res.is_ok());
                 if res.is_ok() {
                     let _ = evt_tx.send(WorkerEvent::AccountSyncFinished {
                         account_id,
                         user_initiated,
                         failed_folders: Vec::new(),
                     });
+                }
+            }
+            Self::SyncUnifiedView { view } => {
+                let targets = resolve_unified_sync_targets(
+                    &accounts,
+                    |account_id| cache.list_folders(account_id).unwrap_or_default(),
+                    view,
+                );
+                if targets.is_empty() {
+                    return;
+                }
+                let page_size = pref_page_size(data_dir);
+                let account_map: HashMap<u32, AccountConfig> =
+                    accounts.into_iter().map(|a| (a.id, a)).collect();
+                for (account_id, folder_id, folder_path) in targets {
+                    let Some(account) = account_map.get(&account_id) else {
+                        continue;
+                    };
+                    let Some(guard) =
+                        FolderSyncGuard::try_acquire(sync_coord, folder_id, false, Instant::now())
+                    else {
+                        continue;
+                    };
+                    let res = sync_folder_inner(
+                        data_dir,
+                        cache,
+                        tokens,
+                        account,
+                        folder_id,
+                        &folder_path,
+                        page_size,
+                        false,
+                        evt_tx,
+                    )
+                    .await;
+                    guard.finish(res.is_ok());
                 }
             }
         }
@@ -1010,6 +1289,7 @@ struct BackgroundTasks {
     backfill: Arc<tokio::sync::Mutex<BackfillIndexState>>,
     tokens: SharedTokenCache,
     cache: Arc<tokio::sync::Mutex<Option<CacheStore>>>,
+    sync_coord: Arc<std::sync::Mutex<FolderSyncCoordinator>>,
     data_dir: PathBuf,
     evt_tx: EventSender,
 }
@@ -1021,9 +1301,69 @@ impl BackgroundTasks {
             backfill: Arc::new(tokio::sync::Mutex::new(BackfillIndexState::default())),
             tokens,
             cache: Arc::new(tokio::sync::Mutex::new(None)),
+            sync_coord: Arc::new(std::sync::Mutex::new(FolderSyncCoordinator::default())),
             data_dir,
             evt_tx,
         }
+    }
+
+    fn mark_folder_dirty(&self, folder_id: u32) {
+        if let Ok(mut coord) = self.sync_coord.lock() {
+            coord.mark_dirty(folder_id);
+        }
+    }
+
+    fn record_folder_synced(&self, folder_id: u32) {
+        if let Ok(mut coord) = self.sync_coord.lock() {
+            coord.record_external_sync(folder_id, Instant::now());
+        }
+    }
+
+    fn clear_sync_coord(&self) {
+        if let Ok(mut coord) = self.sync_coord.lock() {
+            coord.clear();
+        }
+    }
+
+    fn schedule_sent_sync(
+        &self,
+        account_id: u32,
+        folder_id: u32,
+        folder_path: String,
+        delay: Option<Duration>,
+    ) {
+        self.mark_folder_dirty(folder_id);
+        let gate = Arc::clone(&self.gate);
+        let backfill = Arc::clone(&self.backfill);
+        let tokens = self.tokens.clone();
+        let bg_cache = Arc::clone(&self.cache);
+        let sync_coord = Arc::clone(&self.sync_coord);
+        let data_dir = self.data_dir.clone();
+        let evt_tx = self.evt_tx.clone();
+        tokio::spawn(async move {
+            if let Some(d) = delay {
+                tokio::time::sleep(d).await;
+            }
+            let Ok(_permit) = gate.acquire_owned().await else {
+                return;
+            };
+            BackgroundJob::SyncFolder {
+                account_id,
+                folder_id,
+                folder_path,
+                user_initiated: false,
+                force: true,
+            }
+            .run(
+                &data_dir,
+                &tokens,
+                backfill,
+                &bg_cache,
+                &sync_coord,
+                &evt_tx,
+            )
+            .await;
+        });
     }
 
     async fn drain_and_close_cache(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
@@ -1033,6 +1373,7 @@ impl BackgroundTasks {
             c.checkpoint_and_close_all();
         }
         *guard = None;
+        self.clear_sync_coord();
         permit
     }
 
@@ -1045,14 +1386,22 @@ impl BackgroundTasks {
         let backfill = Arc::clone(&self.backfill);
         let tokens = self.tokens.clone();
         let bg_cache = Arc::clone(&self.cache);
+        let sync_coord = Arc::clone(&self.sync_coord);
         let data_dir = self.data_dir.clone();
         let evt_tx = self.evt_tx.clone();
         tokio::spawn(async move {
             let Ok(_permit) = gate.acquire_owned().await else {
                 return;
             };
-            job.run(&data_dir, &tokens, backfill, &bg_cache, &evt_tx)
-                .await;
+            job.run(
+                &data_dir,
+                &tokens,
+                backfill,
+                &bg_cache,
+                &sync_coord,
+                &evt_tx,
+            )
+            .await;
         });
         true
     }
@@ -1354,6 +1703,7 @@ async fn run_graph_fast_poll_fallback(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -1361,6 +1711,7 @@ async fn handle_request(
     async_cache: &SharedAsyncCache,
     in_flight_bodies: &Arc<std::sync::Mutex<HashSet<u32>>>,
     watchers: &mut IdleWatchers,
+    background: &BackgroundTasks,
     req_tx: &mpsc::Sender<MailRequest>,
     req: MailRequest,
     evt_tx: &EventSender,
@@ -1572,7 +1923,16 @@ async fn handle_request(
             refresh_account_watcher(watchers, data_dir, &config, req_tx);
             let _ = evt_tx.send(WorkerEvent::AccountSaved { account: config });
             if account_enabled {
-                sync_account_inner(data_dir, cache, tokens, account_id, true, evt_tx).await;
+                sync_account_inner(
+                    data_dir,
+                    cache,
+                    tokens,
+                    account_id,
+                    true,
+                    Some(&background.sync_coord),
+                    evt_tx,
+                )
+                .await;
             }
             let page_size = pref_page_size(data_dir);
             let allowed = unified_account_ids(data_dir);
@@ -1815,7 +2175,16 @@ async fn handle_request(
             refresh_account_watcher(watchers, data_dir, &account, req_tx);
             let _ = evt_tx.send(WorkerEvent::AccountSaved { account });
             if account_enabled {
-                sync_account_inner(data_dir, cache, tokens, account_id, true, evt_tx).await;
+                sync_account_inner(
+                    data_dir,
+                    cache,
+                    tokens,
+                    account_id,
+                    true,
+                    Some(&background.sync_coord),
+                    evt_tx,
+                )
+                .await;
             }
             let page_size = pref_page_size(data_dir);
             let allowed = unified_account_ids(data_dir);
@@ -1912,7 +2281,8 @@ async fn handle_request(
         MailRequest::BackfillHistoryBatch
         | MailRequest::SyncAllAccounts { .. }
         | MailRequest::SyncAccount { .. }
-        | MailRequest::SyncFolder { .. } => {}
+        | MailRequest::SyncFolder { .. }
+        | MailRequest::SyncUnifiedView { .. } => {}
 
         MailRequest::LoadUnifiedInbox {
             query,
@@ -2642,6 +3012,7 @@ async fn handle_request(
                 account_id,
                 message_id,
                 MoveTarget::Archive,
+                Some(background),
                 evt_tx,
             )
             .await;
@@ -2658,6 +3029,7 @@ async fn handle_request(
                 account_id,
                 message_id,
                 MoveTarget::Trash,
+                Some(background),
                 evt_tx,
             )
             .await;
@@ -2675,6 +3047,7 @@ async fn handle_request(
                 account_id,
                 message_id,
                 MoveTarget::Folder(target_folder_path),
+                Some(background),
                 evt_tx,
             )
             .await;
@@ -2691,6 +3064,7 @@ async fn handle_request(
                 account_id,
                 message_id,
                 MoveTarget::Spam,
+                Some(background),
                 evt_tx,
             )
             .await;
@@ -2757,7 +3131,7 @@ async fn handle_request(
                             folders.iter().find(|f| f.path == original_folder_path)
                         {
                             let page_size = pref_page_size(data_dir);
-                            let _ = sync_folder_inner(
+                            if sync_folder_inner(
                                 data_dir,
                                 cache,
                                 tokens,
@@ -2768,7 +3142,19 @@ async fn handle_request(
                                 false,
                                 evt_tx,
                             )
-                            .await;
+                            .await
+                            .is_ok()
+                            {
+                                background.record_folder_synced(folder.id);
+                            }
+                        }
+                        if let Some(cur_folder_id) = resolve_move_dest_folder_id(
+                            &folders,
+                            &account,
+                            &current_folder_path,
+                            None,
+                        ) {
+                            background.mark_folder_dirty(cur_folder_id);
                         }
                     }
                     let _ = evt_tx.send(WorkerEvent::Status {
@@ -3310,7 +3696,16 @@ async fn handle_request(
                 scheduled,
             });
             if due_ts.is_none() {
-                send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+                send_outbox_item(
+                    data_dir,
+                    cache,
+                    tokens,
+                    account_id,
+                    outbox_id,
+                    Some(background),
+                    evt_tx,
+                )
+                .await;
             }
             if let Ok(outbox) = cache.list_outbox(account_id) {
                 let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
@@ -3324,7 +3719,16 @@ async fn handle_request(
             account_id,
             outbox_id,
         } => {
-            retry_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+            retry_outbox_item(
+                data_dir,
+                cache,
+                tokens,
+                account_id,
+                outbox_id,
+                Some(background),
+                evt_tx,
+            )
+            .await;
         }
 
         MailRequest::DeleteOutboxItem {
@@ -3548,10 +3952,27 @@ async fn handle_request(
                         .list_due_queued_ids(Some(account_id), now)
                         .unwrap_or_default();
                     for (_, outbox_id) in due {
-                        send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx)
-                            .await;
+                        send_outbox_item(
+                            data_dir,
+                            cache,
+                            tokens,
+                            account_id,
+                            outbox_id,
+                            Some(background),
+                            evt_tx,
+                        )
+                        .await;
                     }
-                    sync_account_inner(data_dir, cache, tokens, account_id, true, evt_tx).await;
+                    sync_account_inner(
+                        data_dir,
+                        cache,
+                        tokens,
+                        account_id,
+                        true,
+                        Some(&background.sync_coord),
+                        evt_tx,
+                    )
+                    .await;
                     let allowed = unified_account_ids(data_dir);
                     if let Ok(page) = cache.list_unified_inbox_for_accounts(
                         &allowed,
@@ -3873,6 +4294,7 @@ enum MoveTarget {
 /// completion event. Failures (missing account config, missing remote ID,
 /// no target folder, remote error) are reported through the regular error
 /// event channel.
+#[allow(clippy::too_many_arguments)]
 async fn move_message_inner(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -3880,6 +4302,7 @@ async fn move_message_inner(
     account_id: u32,
     message_id: u32,
     target: MoveTarget,
+    background: Option<&BackgroundTasks>,
     evt_tx: &EventSender,
 ) {
     let Some((detail, uid, _)) = cache.get_message_detail(message_id).ok().flatten() else {
@@ -4020,6 +4443,19 @@ async fn move_message_inner(
             // its lists when it receives the completion event.
             let _ = cache.remove_message(message_id);
             if let Ok(folders) = cache.list_folders(account_id) {
+                if let (Some(bg), Some(ref dest)) = (background, dest_for_undo.as_ref()) {
+                    let target_hint = match &target {
+                        MoveTarget::Trash => Some(UnifiedView::Trash),
+                        MoveTarget::Spam => Some(UnifiedView::Junk),
+                        MoveTarget::Archive => Some(UnifiedView::Archive),
+                        MoveTarget::Folder(_) => None,
+                    };
+                    if let Some(dest_folder_id) =
+                        resolve_move_dest_folder_id(&folders, &account, dest, target_hint)
+                    {
+                        bg.mark_folder_dirty(dest_folder_id);
+                    }
+                }
                 let _ = evt_tx.send(WorkerEvent::FoldersLoaded {
                     account_id,
                     folders,
@@ -4156,6 +4592,7 @@ async fn sync_account_inner(
     tokens: &SharedTokenCache,
     account_id: u32,
     user_initiated: bool,
+    sync_coord: Option<&Arc<std::sync::Mutex<FolderSyncCoordinator>>>,
     evt_tx: &EventSender,
 ) {
     let Ok(account) = load_account_config(data_dir, account_id) else {
@@ -4248,7 +4685,7 @@ async fn sync_account_inner(
         .or_else(|| folders.first())
     {
         let page_size = pref_page_size(data_dir);
-        if let Err(err) = sync_folder_inner(
+        match sync_folder_inner(
             data_dir,
             cache,
             tokens,
@@ -4261,7 +4698,16 @@ async fn sync_account_inner(
         )
         .await
         {
-            failed_folders.push((inbox.name.clone(), err));
+            Ok(()) => {
+                if let Some(coord) = sync_coord {
+                    if let Ok(mut guard) = coord.lock() {
+                        guard.record_external_sync(inbox.id, Instant::now());
+                    }
+                }
+            }
+            Err(err) => {
+                failed_folders.push((inbox.name.clone(), err));
+            }
         }
     }
 
@@ -4490,6 +4936,12 @@ async fn sync_folder_inner(
                     folders,
                 });
             }
+            let _ = evt_tx.send(WorkerEvent::FolderSynced {
+                account_id: account.id,
+                folder_id,
+                folder_path: folder_path.to_string(),
+                folder_name,
+            });
             Ok(())
         }
         Err(e) => {
@@ -5134,6 +5586,7 @@ async fn deliver_due_outbox_tick(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
     tokens: &SharedTokenCache,
+    background: Option<&BackgroundTasks>,
     evt_tx: &EventSender,
 ) {
     let now = chrono::Utc::now().timestamp();
@@ -5145,7 +5598,7 @@ async fn deliver_due_outbox_tick(
         return;
     }
     let accounts = config::load_accounts_in(data_dir).unwrap_or_default();
-    deliver_due_outbox(data_dir, cache, tokens, &accounts, evt_tx).await;
+    deliver_due_outbox(data_dir, cache, tokens, &accounts, background, evt_tx).await;
     for acc in accounts.iter().filter(|a| a.enabled) {
         if let Ok(items) = cache.list_outbox(acc.id) {
             let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
@@ -5161,6 +5614,7 @@ async fn deliver_due_outbox(
     cache: &mut CacheStore,
     tokens: &SharedTokenCache,
     accounts: &[AccountConfig],
+    background: Option<&BackgroundTasks>,
     evt_tx: &EventSender,
 ) {
     let now = chrono::Utc::now().timestamp();
@@ -5174,7 +5628,10 @@ async fn deliver_due_outbox(
         if !enabled.contains(&account_id) {
             continue;
         }
-        send_outbox_item(data_dir, cache, tokens, account_id, outbox_id, evt_tx).await;
+        send_outbox_item(
+            data_dir, cache, tokens, account_id, outbox_id, background, evt_tx,
+        )
+        .await;
     }
 }
 
@@ -5186,6 +5643,7 @@ async fn send_outbox_item(
     tokens: &SharedTokenCache,
     account_id: u32,
     outbox_id: u32,
+    background: Option<&BackgroundTasks>,
     evt_tx: &EventSender,
 ) {
     let now = chrono::Utc::now().timestamp();
@@ -5200,7 +5658,10 @@ async fn send_outbox_item(
             return;
         }
     };
-    deliver_outbox_item(data_dir, cache, tokens, account_id, outbox_id, item, evt_tx).await;
+    deliver_outbox_item(
+        data_dir, cache, tokens, account_id, outbox_id, item, background, evt_tx,
+    )
+    .await;
 }
 
 /// 用户显式触发路径（手动重发 / 撤销倒计时到期的立即发送）：
@@ -5211,6 +5672,7 @@ async fn retry_outbox_item(
     tokens: &SharedTokenCache,
     account_id: u32,
     outbox_id: u32,
+    background: Option<&BackgroundTasks>,
     evt_tx: &EventSender,
 ) {
     match load_account_config(data_dir, account_id) {
@@ -5241,7 +5703,10 @@ async fn retry_outbox_item(
             return;
         }
     };
-    deliver_outbox_item(data_dir, cache, tokens, account_id, outbox_id, item, evt_tx).await;
+    deliver_outbox_item(
+        data_dir, cache, tokens, account_id, outbox_id, item, background, evt_tx,
+    )
+    .await;
 }
 
 fn resolve_send_due_ts(
@@ -5314,6 +5779,7 @@ fn resolve_imap_sent_append_target(
 }
 
 /// 投递一条已领取（Sending）的发件箱记录。
+#[allow(clippy::too_many_arguments)]
 async fn deliver_outbox_item(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -5321,6 +5787,7 @@ async fn deliver_outbox_item(
     account_id: u32,
     outbox_id: u32,
     item: OutboxItem,
+    background: Option<&BackgroundTasks>,
     evt_tx: &EventSender,
 ) {
     let Ok(account) = load_account_config(data_dir, account_id) else {
@@ -5423,6 +5890,8 @@ async fn deliver_outbox_item(
             // 移植方案阶段 2：服务器确认接收后，保存已发副本属于独立操作；
             // 若 `server_saves_sent` 为 true（Gmail/Outlook/iCloud 等）则跳过 APPEND 避免重复；
             // 若 APPEND 失败发独立的副本失败事件，绝不将已发邮件标记为失败或重发。
+            let mut appended_path: Option<String> = None;
+            let mut append_failed = false;
             if let (Some(raw), Some(imap_pwd)) = (sent_raw_rfc822, imap_password_for_sent) {
                 let discovered_sent = cache
                     .find_sent_folder(account_id)
@@ -5435,12 +5904,44 @@ async fn deliver_outbox_item(
                         imap_client::append_sent_message(&account, &imap_pwd, &sent_path, &raw)
                             .await
                     {
+                        append_failed = true;
                         let _ = evt_tx.send(WorkerEvent::SentCopySaveFailed {
                             account_id,
                             outbox_id,
                             subject: item.subject,
                             message: e,
                         });
+                    } else {
+                        appended_path = Some(sent_path);
+                    }
+                }
+            }
+            if !append_failed {
+                if let Some(bg) = background {
+                    if let Ok(folders) = cache.list_folders(account_id) {
+                        let sent_target = appended_path
+                            .as_deref()
+                            .and_then(|p| {
+                                folders
+                                    .iter()
+                                    .find(|f| f.path.eq_ignore_ascii_case(p))
+                                    .map(|f| (f.id, f.path.clone()))
+                            })
+                            .or_else(|| {
+                                resolve_account_role_folder(
+                                    &account,
+                                    &folders,
+                                    Some(UnifiedView::Sent),
+                                )
+                            });
+                        if let Some((sent_fid, sent_path)) = sent_target {
+                            let delay = if appended_path.is_some() {
+                                None
+                            } else {
+                                Some(SERVER_SAVES_SENT_SYNC_DELAY)
+                            };
+                            bg.schedule_sent_sync(account_id, sent_fid, sent_path, delay);
+                        }
                     }
                 }
             }
@@ -6551,5 +7052,180 @@ mod tests {
         assert!(!is_imap_nonexistent_mailbox_error(
             "IMAP 登录失败（请检查用户名或授权码）: Invalid credentials"
         ));
+    }
+
+    #[test]
+    fn folder_sync_coordinator_dedup_cooldown_and_dirty_bypass() {
+        let mut coord = FolderSyncCoordinator::default();
+        let t0 = Instant::now();
+
+        // 首次同步正常放行；在途期间同文件夹去重（即使 force=true 也不重叠同步）。
+        assert!(coord.try_begin_sync(10, false, t0));
+        assert!(!coord.try_begin_sync(10, false, t0));
+        assert!(!coord.try_begin_sync(10, true, t0));
+
+        // 同步期间新产生的脏标记不能丢失，但也不能突破 in_flight。
+        coord.mark_dirty(10);
+        assert!(!coord.try_begin_sync(10, false, t0));
+
+        // 成功后进入冷却，但因为同步中曾被标脏，下一次仍能绕过冷却。
+        coord.finish_sync(10, true, t0);
+        assert!(coord.try_begin_sync(10, false, t0 + Duration::from_secs(1)));
+        coord.finish_sync(10, true, t0 + Duration::from_secs(1));
+
+        // 冷却期（15s）内无脏标记且非 force 时跳过；force=true 可绕过冷却。
+        assert!(!coord.try_begin_sync(10, false, t0 + Duration::from_secs(10)));
+        assert!(coord.try_begin_sync(10, true, t0 + Duration::from_secs(10)));
+        coord.finish_sync(10, true, t0 + Duration::from_secs(10));
+
+        // 超过冷却期自动放行；若失败（succeeded=false）则不更新冷却，允许立即重试。
+        assert!(coord.try_begin_sync(10, false, t0 + Duration::from_secs(26)));
+        coord.finish_sync(10, false, t0 + Duration::from_secs(26));
+        assert!(coord.try_begin_sync(10, false, t0 + Duration::from_secs(26)));
+        coord.finish_sync(10, true, t0 + Duration::from_secs(26));
+
+        // FolderSyncGuard 提前 Drop 时自动按失败释放 in_flight，不卡死后续同步。
+        let shared = Arc::new(std::sync::Mutex::new(FolderSyncCoordinator::default()));
+        {
+            let guard = FolderSyncGuard::try_acquire(&shared, 99, false, t0);
+            assert!(guard.is_some());
+            assert!(FolderSyncGuard::try_acquire(&shared, 99, false, t0).is_none());
+        }
+        assert!(FolderSyncGuard::try_acquire(&shared, 99, false, t0).is_some());
+    }
+
+    #[test]
+    fn resolve_unified_sync_targets_respects_scope_and_special_folders() {
+        let mk_folder = |id: u32, account_id: u32, name: &str, path: &str| FolderSummary {
+            id,
+            account_id,
+            name: name.to_string(),
+            path: path.to_string(),
+            unread_count: 0,
+            total_count: 0,
+            has_more_remote: false,
+        };
+
+        let mut acc1 = AccountConfig {
+            id: 1,
+            enabled: true,
+            in_unified: true,
+            ..Default::default()
+        };
+        acc1.special_folders.sent = "Custom/OutboxCopy".to_string();
+
+        let acc2 = AccountConfig {
+            id: 2,
+            enabled: true,
+            in_unified: false,
+            ..Default::default()
+        };
+        let acc3 = AccountConfig {
+            id: 3,
+            enabled: false,
+            in_unified: true,
+            ..Default::default()
+        };
+        let acc4 = AccountConfig {
+            id: 4,
+            enabled: true,
+            in_unified: true,
+            ..Default::default()
+        };
+
+        let accounts = vec![acc1, acc2, acc3, acc4];
+        let folders = |acc_id: u32| match acc_id {
+            1 => vec![
+                mk_folder(101, 1, "收件箱", "INBOX"),
+                mk_folder(102, 1, "Custom/OutboxCopy", "Custom/OutboxCopy"),
+                mk_folder(103, 1, "已发送", "Sent"),
+                mk_folder(104, 1, "已删除", "Trash"),
+            ],
+            2 => vec![mk_folder(201, 2, "已发送", "Sent")],
+            3 => vec![mk_folder(301, 3, "已发送", "Sent")],
+            4 => vec![
+                mk_folder(401, 4, "Inbox", "INBOX"),
+                mk_folder(402, 4, "Sent Items", "Sent Items"),
+                mk_folder(403, 4, "垃圾邮件", "Junk"),
+            ],
+            _ => Vec::new(),
+        };
+
+        // 仅纳入 enabled && in_unified 的账号，且优先使用自定义 special_folders.sent。
+        assert_eq!(
+            resolve_unified_sync_targets(&accounts, folders, Some(UnifiedView::Sent)),
+            vec![
+                (1, 102, "Custom/OutboxCopy".to_string()),
+                (4, 402, "Sent Items".to_string()),
+            ]
+        );
+        // 统一 Trash 只命中拥有 Trash 的账号 1（账号 4 缺失则跳过）。
+        assert_eq!(
+            resolve_unified_sync_targets(&accounts, folders, Some(UnifiedView::Trash)),
+            vec![(1, 104, "Trash".to_string())]
+        );
+        // 统一收件箱与未读均指向收件箱。
+        assert_eq!(
+            resolve_unified_sync_targets(&accounts, folders, None),
+            vec![(1, 101, "INBOX".to_string()), (4, 401, "INBOX".to_string())]
+        );
+        assert_eq!(
+            resolve_unified_sync_targets(&accounts, folders, Some(UnifiedView::Unread)),
+            vec![(1, 101, "INBOX".to_string()), (4, 401, "INBOX".to_string())]
+        );
+        // Starred / Snoozed 不发起网络同步。
+        assert!(
+            resolve_unified_sync_targets(&accounts, folders, Some(UnifiedView::Starred)).is_empty()
+        );
+        assert!(
+            resolve_unified_sync_targets(&accounts, folders, Some(UnifiedView::Snoozed)).is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_move_dest_folder_id_handles_exact_and_graph_well_known() {
+        let mk_folder = |id: u32, name: &str, path: &str| FolderSummary {
+            id,
+            account_id: 1,
+            name: name.to_string(),
+            path: path.to_string(),
+            unread_count: 0,
+            total_count: 0,
+            has_more_remote: false,
+        };
+        let account = AccountConfig {
+            id: 1,
+            ..Default::default()
+        };
+        let folders = vec![
+            mk_folder(11, "已删除", "AAMkGraphTrashId=="),
+            mk_folder(12, "垃圾邮件", "AAMkGraphJunkId=="),
+            mk_folder(13, "Archive", "Archive"),
+        ];
+
+        // 精确路径（忽略大小写）优先命中。
+        assert_eq!(
+            resolve_move_dest_folder_id(&folders, &account, "archive", None),
+            Some(13)
+        );
+        // Graph well-known 名称回退到本地对应角色文件夹 ID。
+        assert_eq!(
+            resolve_move_dest_folder_id(
+                &folders,
+                &account,
+                "deleteditems",
+                Some(UnifiedView::Trash)
+            ),
+            Some(11)
+        );
+        assert_eq!(
+            resolve_move_dest_folder_id(&folders, &account, "junkemail", Some(UnifiedView::Junk)),
+            Some(12)
+        );
+        // 无匹配文件夹时返回 None。
+        assert_eq!(
+            resolve_move_dest_folder_id(&folders, &account, "NonExistent", None),
+            None
+        );
     }
 }
