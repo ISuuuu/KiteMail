@@ -69,6 +69,15 @@
         <template v-else>
           <GeneralPage v-if="activeTab.id === 'general'" :state="state" />
           <AccountsPage v-else-if="activeTab.id === 'mailAccounts'" />
+          <TagPage v-else-if="activeTab.id === 'tags'" />
+          <FilterPage v-else-if="activeTab.id === 'filters'" />
+          <SmartFolderPage v-else-if="activeTab.id === 'smartFolders'" />
+          <SendersPage
+            v-else-if="activeTab.id === 'senders'"
+            :state="state"
+            @goto-privacy="selectTab('privacy')"
+          />
+          <PgpKeysPage v-else-if="activeTab.id === 'openPgp'" />
           <AppearancePage v-else-if="activeTab.id === 'appearance'" :state="state" />
           <FocusPage v-else-if="activeTab.id === 'focusMode'" :state="state" />
           <SidebarPage v-else-if="activeTab.id === 'sidebar'" :state="state" />
@@ -115,12 +124,17 @@ import AccountsPage from "./AccountsPage.vue";
 import AppearancePage from "./AppearancePage.vue";
 import ComposingPage from "./ComposingPage.vue";
 import ConversationsPage from "./ConversationsPage.vue";
+import FilterPage from "./FilterPage.vue";
 import FocusPage from "./FocusPage.vue";
 import GeneralPage from "./GeneralPage.vue";
 import MessageListPage from "./MessageListPage.vue";
+import PgpKeysPage from "./PgpKeysPage.vue";
 import ReadingPage from "./ReadingPage.vue";
 import SidebarPage from "./SidebarPage.vue";
 import PlaceholderPage from "./PlaceholderPage.vue";
+import SendersPage from "./SendersPage.vue";
+import SmartFolderPage from "./SmartFolderPage.vue";
+import TagPage from "./TagPage.vue";
 import SettingsIcon from "./SettingsIcon.vue";
 import WindowControls from "./WindowControls.vue";
 import {
