@@ -1,7 +1,8 @@
 <template>
   <div class="as-edit-root">
-    <!-- 顶栏：返回 / 标题 / 移除 + 保存（preferences/mod.rs#L2465） -->
-    <header class="as-edit-header">
+    <!-- 顶栏：返回 / 标题 / 移除 + 保存（preferences/mod.rs#L2465）；
+         hostChrome=true 时由宿主壳层承载单条顶栏，此处隐藏避免双顶栏（WP-07） -->
+    <header v-if="!hostChrome" class="as-edit-header">
       <div class="as-edit-header-left">
         <button type="button" class="as-btn as-btn-ghost as-btn-compact" @click="emit('back')">
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -806,11 +807,14 @@ const props = withDefaults(
     pendingLeave?: boolean;
     /** 同步状态描述文本（如「已同步：N 封邮件 / M 未读」），为空则隐藏该行 */
     syncStatusText?: string;
+    /** 宿主壳层承载编辑顶栏（返回/移除/保存上提）；true 时隐藏本组件内置顶栏 */
+    hostChrome?: boolean;
   }>(),
   {
     demoMode: false,
     pendingLeave: false,
     syncStatusText: "",
+    hostChrome: false,
   }
 );
 
@@ -960,6 +964,24 @@ async function handleRemove() {
     emit("removed");
   }
 }
+
+// ---- 宿主壳层单顶栏（hostChrome）动作与状态（WP-07） ----
+
+const editorTitle = computed(() => (props.editingId ? "编辑账号" : "添加账号"));
+const canRemove = computed(() => props.editingId !== null && !props.demoMode);
+const editorBusy = computed(() => props.state.saving.value || props.state.verifying.value);
+
+defineExpose({
+  editorTitle,
+  canRemove,
+  editorBusy,
+  /** 壳层「保存」：与内置顶栏保存同一入口。 */
+  requestSave: handleSave,
+  /** 壳层「移除」：切换内联移除确认横幅。 */
+  toggleRemoveConfirm() {
+    confirmRemove.value = !confirmRemove.value;
+  },
+});
 
 /** 「导入 HTML…」：读取本地 HTML / 文本文件放入签名（accounts.rs#import_signature_file）。 */
 function pickSignatureFile() {
