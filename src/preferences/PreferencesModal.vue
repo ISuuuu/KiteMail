@@ -321,6 +321,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  background: var(--km-canvas);
 }
 
 .km-state-empty,

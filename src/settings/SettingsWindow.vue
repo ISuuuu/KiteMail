@@ -68,9 +68,7 @@
         </div>
         <template v-else>
           <GeneralPage v-if="activeTab.id === 'general'" :state="state" />
-          <template v-else-if="activeTab.id === 'appearance'">
-            <AppearancePanel :state="state" />
-          </template>
+          <AppearancePage v-else-if="activeTab.id === 'appearance'" :state="state" />
           <template v-else-if="activeTab.id === 'composing'">
             <ComposePanel :state="state" />
           </template>
@@ -78,8 +76,10 @@
             <PrivacyPanel :state="state" />
           </template>
           <template v-else-if="activeTab.id === 'system'">
-            <StoragePanel :state="state" />
-            <AboutPanel :state="state" />
+            <div class="km-panels-wide km-system-panels">
+              <StoragePanel :state="state" />
+              <AboutPanel :state="state" />
+            </div>
           </template>
           <PlaceholderPage v-else :label="activeTab.label" />
         </template>
@@ -103,12 +103,12 @@ import { KNOWN_THEMES, resolveDarkMode } from "../main-window/usePaneLayout";
 import type { FullPreferencesDto } from "../preferences/types";
 import {
   AboutPanel,
-  AppearancePanel,
   ComposePanel,
   PrivacyPanel,
   StoragePanel,
 } from "../preferences/panels";
 import { usePreferences } from "../preferences/usePreferences";
+import AppearancePage from "./AppearancePage.vue";
 import GeneralPage from "./GeneralPage.vue";
 import PlaceholderPage from "./PlaceholderPage.vue";
 import SettingsIcon from "./SettingsIcon.vue";
@@ -390,6 +390,13 @@ onBeforeUnmount(() => {
   flex-direction: column;
   align-items: center;
   gap: 16px;
+}
+
+.km-system-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
 }
 
 .km-set-state {

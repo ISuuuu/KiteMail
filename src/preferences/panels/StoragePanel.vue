@@ -44,17 +44,13 @@
       </div>
 
       <div class="km-field-row">
-        <label for="km-pref-keep-days" class="km-label">清理范围</label>
-        <select
-          id="km-pref-keep-days"
-          :value="state.cacheKeepDays.value === null ? 'all' : String(state.cacheKeepDays.value)"
-          class="km-select"
-          @change="onKeepDaysChange(state, $event)"
-        >
-          <option value="all">清理全部本地正文缓存</option>
-          <option value="30">保留最近 30 天正文缓存</option>
-          <option value="7">保留最近 7 天正文缓存</option>
-        </select>
+        <span class="km-label">清理范围</span>
+        <ComboSelect
+          :options="KEEP_DAYS_OPTIONS"
+          :modelValue="state.cacheKeepDays.value === null ? 'all' : String(state.cacheKeepDays.value)"
+          title="清理范围"
+          @update:modelValue="(v) => onKeepDaysValue(state, v)"
+        />
       </div>
 
       <div class="km-inline-actions">
@@ -72,9 +68,19 @@
 </template>
 
 <script setup lang="ts">
+import ComboSelect from "../../settings/ComboSelect.vue";
 import { formatBytes } from "../usePreferences";
-import { onKeepDaysChange } from "./fieldBinders";
 import type { PrefsPanelState } from "./state";
 
 defineProps<{ state: PrefsPanelState }>();
+
+const KEEP_DAYS_OPTIONS = [
+  { label: "清理全部本地正文缓存", value: "all" },
+  { label: "保留最近 30 天正文缓存", value: "30" },
+  { label: "保留最近 7 天正文缓存", value: "7" },
+] as const;
+
+function onKeepDaysValue(state: PrefsPanelState, value: string) {
+  state.cacheKeepDays.value = value === "all" ? null : Number(value);
+}
 </script>

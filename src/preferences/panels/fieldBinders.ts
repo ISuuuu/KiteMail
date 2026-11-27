@@ -26,6 +26,15 @@ export function onSelectString(
   void state.updatePreference({ [field]: val } as Partial<FullPreferencesDto>);
 }
 
+/** ComboSelect 字符串值版本。 */
+export function onSelectStringValue(
+  state: PrefsPanelState,
+  field: "readerPosition" | "readMarkMode" | "defaultView",
+  value: string
+) {
+  void state.updatePreference({ [field]: value } as Partial<FullPreferencesDto>);
+}
+
 export function onCheckbox(state: PrefsPanelState, field: keyof FullPreferencesDto, ev: Event) {
   const checked = (ev.target as HTMLInputElement).checked;
   void state.updatePreference({ [field]: checked } as Partial<FullPreferencesDto>);
@@ -53,9 +62,4 @@ export function onTextInput(
 ) {
   const val = (ev.target as HTMLInputElement).value;
   void state.updatePreference({ [field]: val });
-}
-
-export function onKeepDaysChange(state: PrefsPanelState, ev: Event) {
-  const val = (ev.target as HTMLSelectElement).value;
-  state.cacheKeepDays.value = val === "all" ? null : Number(val);
 }
