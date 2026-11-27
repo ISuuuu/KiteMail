@@ -14,6 +14,7 @@ import {
   senderInitials,
 } from "../src/accounts/brand.ts";
 import { buildSignaturePreviewHtml } from "../src/accounts/signature.ts";
+import { useAccountLayers } from "../src/accounts/useAccountLayers.ts";
 import {
   buildSaveAccountInput,
   createEmptyAccountForm,
@@ -336,4 +337,62 @@ test("签名预览：纯文本转义换行，HTML 清洗脚本与事件属性，
 
   assert.equal(buildSignaturePreviewHtml("<p>x</p>", false), "");
   assert.equal(buildSignaturePreviewHtml("  ", true), "");
+});
+
+test("useAccountLayers 两级层级：脏检查、未保存守卫与离开动作", async () => {
+  resetMockAccounts();
+  const state = useAccounts();
+  await state.init();
+  let closed = 0;
+  const layers = useAccountLayers({ state, onClose: () => { closed += 1; } });
+
+  assert.equal(layers.layer.value, "list");
+
+  // 未修改：行点击直接进编辑，返回直接回列表
+  layers.onRowSelect(state.accounts.value[0].id);
+  assert.equal(layers.layer.value, "editor");
+  assert.equal(layers.dirty.value, false);
+  layers.requestBack();
+  assert.equal(layers.layer.value, "list");
+
+  // 修改昵称后：返回挂起「回列表」动作，取消后停留在编辑层
+  layers.onRowSelect(state.accounts.value[0].id);
+  state.form.value.label = "脏昵称";
+  assert.equal(layers.dirty.value, true);
+  layers.requestBack();
+  assert.equal(layers.pendingLeave.value?.type, "list");
+  layers.pendingLeave.value = null;
+
+  // 行切换守卫：编辑中脏 → 挂起 select 动作
+  layers.onRowSelect(state.accounts.value[0].id);
+  assert.equal(layers.pendingLeave.value?.type, "select");
+  assert.equal(layers.layer.value, "editor");
+
+  // 关闭守卫：挂起 close，放弃更改后执行宿主 onClose
+  assert.equal(layers.requestClose(), true);
+  assert.equal(layers.pendingLeave.value?.type, "close");
+  assert.equal(closed, 0);
+  layers.discardPendingLeave();
+  assert.equal(closed, 1);
+
+  // 横幅「保存」：保存成功后执行挂起的离开动作（回列表）
+  layers.openEditor(state.accounts.value[0].id);
+  state.form.value.label = "保存后昵称";
+  layers.requestBack();
+  await layers.saveAndLeave();
+  assert.equal(layers.layer.value, "list");
+  assert.equal(layers.dirty.value, false);
+  assert.equal(state.accounts.value[0].label, "保存后昵称");
+
+  // 顶栏保存：编辑组件先调 IPC 保存，宿主收到 saved 事件后按 GPUI 行为回列表
+  layers.onRowSelect(state.accounts.value[0].id);
+  state.form.value.label = "顶栏保存昵称";
+  const saved = await state.saveCurrentAccount();
+  assert.ok(saved);
+  layers.onEditorSaved();
+  assert.equal(layers.layer.value, "list");
+  assert.equal(state.accounts.value[0].label, "顶栏保存昵称");
+
+  state.dispose();
+  resetMockAccounts();
 });

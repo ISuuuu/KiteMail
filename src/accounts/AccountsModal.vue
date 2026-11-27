@@ -56,9 +56,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { onMounted, onUnmounted, watch } from "vue";
 import AccountSettingsEdit from "./AccountSettingsEdit.vue";
 import AccountSettingsList from "./AccountSettingsList.vue";
+import { useAccountLayers } from "./useAccountLayers";
 import { useAccounts } from "./useAccounts";
 
 const props = withDefaults(
@@ -91,134 +92,29 @@ const state = useAccounts({
   },
 });
 
-/** 当前层级：账号列表 ↔ 编辑表单 */
-const viewLayer = ref<"list" | "editor">("list");
+// 两级层级编排（列表 ↔ 编辑、未保存守卫）与设置窗「邮箱账号」页共用同一 composable
+const {
+  layer: viewLayer,
+  pendingLeave,
+  snapshotBaseline,
+  startCreateFlow,
+  requestBack,
+  requestClose: guardRequestClose,
+  onRowSelect,
+  discardPendingLeave,
+  saveAndLeave,
+  onEditorSaved,
+  onEditorRemoved,
+} = useAccountLayers({ state, onClose: closeModal });
 
-type PendingLeave = { type: "close" } | { type: "list" } | { type: "select"; id: string };
-
-/** 未保存确认：待执行的离开动作（对照 GPUI pending_leave_action） */
-const pendingLeave = ref<PendingLeave | null>(null);
-
-// ---- 脏检查：表单签名与基线快照对比 ----
-
-function formSignature(): string {
-  return JSON.stringify(state.form.value);
-}
-
-const baselineJson = ref(formSignature());
-const dirty = computed(() => formSignature() !== baselineJson.value);
-
-function snapshotBaseline() {
-  baselineJson.value = formSignature();
-}
-
-// 选择 / 新建切换后重新取基线（覆盖 init、内部重载与宿主驱动的选择）
-watch(
-  () => [state.selectedAccountId.value, state.isCreating.value] as const,
-  () => {
-    snapshotBaseline();
-  }
-);
-
-// 非编辑态下收到后台事件（启停 / OAuth 重授权等）后同步基线，避免误报未保存
-watch(
-  () => state.stateVersion.value,
-  () => {
-    if (!dirty.value) {
-      snapshotBaseline();
-    }
-  }
-);
-
-// ---- 层级切换 ----
-
-function goList() {
-  pendingLeave.value = null;
-  viewLayer.value = "list";
-}
-
-function openEditor(accountId: string) {
-  state.selectAccount(accountId);
-  snapshotBaseline();
-  pendingLeave.value = null;
-  viewLayer.value = "editor";
-}
-
-function startCreateFlow() {
-  state.startCreate();
-  snapshotBaseline();
-  pendingLeave.value = null;
-  viewLayer.value = "editor";
-}
-
-// ---- 未保存确认 ----
-
-function requestBack() {
-  if (dirty.value) {
-    pendingLeave.value = { type: "list" };
-    return;
-  }
-  goList();
-}
+// ---- 弹窗生命周期 ----
 
 function requestClose() {
   if (!props.open) return;
-  if (viewLayer.value === "editor" && dirty.value) {
-    pendingLeave.value = { type: "close" };
-    return;
-  }
+  // 编辑中且有未保存更改：先显示「未保存提示」横幅，暂不关闭
+  if (guardRequestClose()) return;
   closeModal();
 }
-
-function onRowSelect(accountId: string) {
-  if (viewLayer.value === "editor" && dirty.value) {
-    pendingLeave.value = { type: "select", id: accountId };
-    return;
-  }
-  openEditor(accountId);
-}
-
-function executePendingLeave() {
-  const action = pendingLeave.value;
-  pendingLeave.value = null;
-  if (!action) return;
-  if (action.type === "close") {
-    closeModal();
-  } else if (action.type === "list") {
-    goList();
-  } else {
-    openEditor(action.id);
-  }
-}
-
-function discardPendingLeave() {
-  snapshotBaseline();
-  executePendingLeave();
-}
-
-async function saveAndLeave() {
-  const saved = await state.saveCurrentAccount();
-  if (saved) {
-    snapshotBaseline();
-    executePendingLeave();
-  } else {
-    // 保存失败：留在编辑页展示错误反馈
-    pendingLeave.value = null;
-  }
-}
-
-function onEditorSaved() {
-  snapshotBaseline();
-  // 对照 GPUI：顶栏保存成功后回到账号列表
-  goList();
-}
-
-function onEditorRemoved() {
-  snapshotBaseline();
-  goList();
-}
-
-// ---- 弹窗生命周期 ----
 
 function closeModal() {
   if (!props.open) return;
