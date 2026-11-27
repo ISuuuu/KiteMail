@@ -9,6 +9,11 @@ fn main() {
             "set_reader_layout",
             "update_main_preferences",
             "refresh_mail",
+            "unlock_app",
+            "lock_app",
+            "set_message_seen",
+            "set_message_flagged",
+            "quit_app",
         ]),
     ))
     .expect("failed to run tauri build");

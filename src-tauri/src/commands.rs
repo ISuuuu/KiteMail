@@ -1,22 +1,29 @@
 //! Tauri 2 IPC commands for the KiteMail main window (`snake_case` names, `camelCase` DTOs).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tauri::{State, WebviewWindow};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::dto::{
-    IpcError, ListMessagesInput, ListMessagesOutput, MainBootstrapDto, MainPreferencesDto,
-    MainPreferencesPatch, OpenMessageInput, OpenMessageOutput, RefreshMailInput, RefreshMailOutput,
-    SetReaderLayoutInput, SetReaderLayoutOutput, MAIN_WINDOW_LABEL,
+    IpcError, ListMessagesInput, ListMessagesOutput, LockAppOutput, MainBootstrapDto,
+    MainPreferencesDto, MainPreferencesPatch, OpenMessageInput, OpenMessageOutput,
+    RefreshMailInput, RefreshMailOutput, SetMessageFlaggedInput, SetMessageFlaggedOutput,
+    SetMessageSeenInput, SetMessageSeenOutput, SetReaderLayoutInput, SetReaderLayoutOutput,
+    UnlockAppInput, UnlockAppOutput, MAIN_WINDOW_LABEL,
 };
 use crate::mail_session::{MailSession, MAX_QUERY_LEN};
 use crate::preferences::PreferencesStore;
 use crate::reader::ReaderManager;
+use crate::tray::TrayHandle;
+use crate::window_lifecycle;
 
 pub struct AppState {
     pub session: Arc<MailSession>,
     pub prefs: Arc<PreferencesStore>,
     pub reader: Arc<ReaderManager>,
+    pub tray: Option<Arc<TrayHandle>>,
+    pub quitting: Arc<AtomicBool>,
 }
 
 fn validate_request_id(request_id: &str) -> Result<(), IpcError> {
@@ -99,6 +106,70 @@ pub fn refresh_mail(
     input: RefreshMailInput,
 ) -> Result<RefreshMailOutput, IpcError> {
     state.session.refresh_mail(&input)
+}
+
+#[tauri::command]
+pub fn unlock_app(
+    state: State<'_, AppState>,
+    input: UnlockAppInput,
+) -> Result<UnlockAppOutput, IpcError> {
+    Ok(state.session.unlock_app(&input))
+}
+
+#[tauri::command]
+pub fn lock_app(state: State<'_, AppState>) -> Result<LockAppOutput, IpcError> {
+    Ok(state.session.lock_app(Some("manual")))
+}
+
+#[tauri::command]
+pub fn set_message_seen(
+    state: State<'_, AppState>,
+    input: SetMessageSeenInput,
+) -> Result<SetMessageSeenOutput, IpcError> {
+    state.session.set_message_seen(&input)
+}
+
+#[tauri::command]
+pub fn set_message_flagged(
+    state: State<'_, AppState>,
+    input: SetMessageFlaggedInput,
+) -> Result<SetMessageFlaggedOutput, IpcError> {
+    state.session.set_message_flagged(&input)
+}
+
+#[tauri::command]
+pub fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), IpcError> {
+    perform_clean_quit(
+        &app,
+        &state.session,
+        &state.prefs,
+        &state.reader,
+        state.tray.as_deref(),
+        &state.quitting,
+    );
+    app.exit(0);
+    Ok(())
+}
+
+pub fn perform_clean_quit(
+    app: &AppHandle,
+    session: &MailSession,
+    prefs: &PreferencesStore,
+    reader: &ReaderManager,
+    tray: Option<&TrayHandle>,
+    quitting: &AtomicBool,
+) {
+    if quitting.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(main_win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        window_lifecycle::save_main_window_geometry(&main_win, prefs);
+    }
+    reader.close();
+    session.prepare_quit();
+    if let Some(t) = tray {
+        t.shutdown();
+    }
 }
 
 #[cfg(test)]
