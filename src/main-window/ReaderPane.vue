@@ -35,6 +35,30 @@
         <template v-if="message">
           <button
             type="button"
+            class="km-action-btn km-action-primary"
+            title="回复发件人"
+            @click="emit('reply')"
+          >
+            回复
+          </button>
+          <button
+            type="button"
+            class="km-action-btn"
+            title="回复所有收件人"
+            @click="emit('replyAll')"
+          >
+            全部回复
+          </button>
+          <button
+            type="button"
+            class="km-action-btn"
+            title="转发此邮件"
+            @click="emit('forward')"
+          >
+            转发
+          </button>
+          <button
+            type="button"
             class="km-action-btn"
             :title="selectedUnread ? '标为已读' : '标为未读'"
             @click="emit('toggleSeen', Boolean(selectedUnread))"
@@ -342,6 +366,9 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   retry: [];
+  reply: [];
+  replyAll: [];
+  forward: [];
   toggleSeen: [seen: boolean];
   toggleFlagged: [flagged: boolean];
   setReaderPosition: [pos: ReaderPosition];
@@ -551,6 +578,17 @@ onUnmounted(() => {
 
 .km-action-btn:hover:not(:disabled) {
   background: var(--km-hover-bg);
+}
+
+.km-action-primary {
+  background: var(--km-accent-soft);
+  color: var(--km-accent);
+  border-color: color-mix(in srgb, var(--km-accent) 40%, var(--km-border));
+  font-weight: 600;
+}
+
+.km-action-primary:hover:not(:disabled) {
+  background: var(--km-accent-soft-hover);
 }
 
 .km-action-btn:disabled {

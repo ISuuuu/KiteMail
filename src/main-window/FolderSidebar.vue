@@ -55,6 +55,21 @@
 
     <!-- 滚动导航区 -->
     <div class="km-sidebar-scroll">
+      <!-- 写邮件主操作入口 -->
+      <div class="km-compose-cta-wrap" :class="{ rail: isRail }">
+        <button
+          type="button"
+          class="km-compose-btn"
+          :class="{ 'rail-btn': isRail }"
+          title="写新邮件 (Ctrl+N)"
+          aria-label="写邮件"
+          @click="emit('compose')"
+        >
+          <span aria-hidden="true">✏</span>
+          <span v-if="!isRail">写邮件</span>
+        </button>
+      </div>
+
       <!-- 统一视图 -->
       <nav class="km-nav-section" aria-label="统一视图">
         <button
@@ -80,6 +95,20 @@
 
       <!-- 账号文件夹树 -->
       <div v-if="!isRail" class="km-accounts-section">
+        <div class="km-accounts-section-head">
+          <span class="km-accounts-section-title">邮箱账号</span>
+          <button
+            type="button"
+            class="km-accounts-manage-btn"
+            title="管理或添加邮箱账号"
+            @click="emit('openAccounts')"
+          >
+            ⚙ 账号管理
+          </button>
+        </div>
+        <div v-if="accounts.length === 0" class="km-accounts-empty">
+          尚未配置邮箱账号
+        </div>
         <div
           v-for="acc in accounts"
           :key="acc.id"
@@ -154,17 +183,27 @@
           {{ colorModeShortLabel }}
         </button>
       </template>
-      <button
-        v-else-if="hasPasscode"
-        type="button"
-        class="km-icon-btn"
-        title="锁定应用"
-        aria-label="锁定应用"
-        @click="emit('lock')"
-      >
-        🔒
-      </button>
-      <span v-else class="km-mode-dot" :title="mode === 'demo' ? '演示模式' : '本地工作区'" />
+      <template v-else>
+        <button
+          type="button"
+          class="km-icon-btn"
+          title="账号管理"
+          aria-label="账号管理"
+          @click="emit('openAccounts')"
+        >
+          ⚙
+        </button>
+        <button
+          v-if="hasPasscode"
+          type="button"
+          class="km-icon-btn"
+          title="锁定应用"
+          aria-label="锁定应用"
+          @click="emit('lock')"
+        >
+          🔒
+        </button>
+      </template>
     </footer>
   </aside>
 </template>
@@ -197,6 +236,8 @@ const emit = defineEmits<{
   refresh: [];
   lock: [];
   toggleDarkMode: [];
+  compose: [];
+  openAccounts: [];
 }>();
 
 const colorModeShortLabel = computed(() => {
@@ -359,6 +400,79 @@ function avatarInitial(name: string): string {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.km-compose-cta-wrap {
+  display: flex;
+}
+
+.km-compose-cta-wrap.rail {
+  justify-content: center;
+}
+
+.km-compose-btn {
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--km-radius-md);
+  background: var(--km-accent);
+  color: var(--km-accent-fg);
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  box-shadow: var(--km-shadow-card);
+  transition: filter 120ms ease;
+}
+
+.km-compose-btn:hover {
+  filter: brightness(1.06);
+}
+
+.km-compose-btn.rail-btn {
+  width: 40px;
+  height: 36px;
+  padding: 0;
+}
+
+.km-accounts-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px 2px;
+  gap: 6px;
+}
+
+.km-accounts-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--km-text-muted);
+}
+
+.km-accounts-manage-btn {
+  border: 1px solid var(--km-border);
+  border-radius: var(--km-radius-sm);
+  background: transparent;
+  color: var(--km-text-muted);
+  font-size: 11px;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+
+.km-accounts-manage-btn:hover {
+  background: var(--km-hover-bg);
+  color: var(--km-text);
+  border-color: var(--km-accent);
+}
+
+.km-accounts-empty {
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--km-text-muted);
 }
 
 .km-sidebar.rail .km-sidebar-scroll {

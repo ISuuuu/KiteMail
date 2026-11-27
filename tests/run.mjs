@@ -1,23 +1,34 @@
 import { build } from "esbuild";
-import { spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-const root = path.resolve(import.meta.dirname, "..");
-const outDir = path.join(root, "node_modules", ".tmp-test");
+const TEST_FILES = [
+  "tests/main-window.test.ts",
+  "tests/compose.test.ts",
+  "tests/accounts.test.ts",
+];
+
+const outDir = path.resolve("node_modules/.tmp-test");
 fs.mkdirSync(outDir, { recursive: true });
-const outFile = path.join(outDir, "main-window.test.mjs");
 
-await build({
-  entryPoints: [path.join(root, "tests", "main-window.test.ts")],
-  outfile: outFile,
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  packages: "external",
-});
+const builtFiles = [];
+for (const entry of TEST_FILES) {
+  const outFile = path.join(
+    outDir,
+    `${path.basename(entry, path.extname(entry))}.mjs`
+  );
+  await build({
+    entryPoints: [entry],
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    outfile: outFile,
+    logLevel: "silent",
+  });
+  builtFiles.push(outFile);
+}
 
-const result = spawnSync(process.execPath, ["--test", outFile], {
+execFileSync(process.execPath, ["--test", ...builtFiles], {
   stdio: "inherit",
 });
-process.exit(result.status ?? 1);

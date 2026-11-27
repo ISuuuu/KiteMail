@@ -16,6 +16,8 @@
       @refresh="state.refresh"
       @lock="state.lock"
       @toggleDarkMode="state.layout.toggleDarkMode"
+      @compose="openNewCompose()"
+      @openAccounts="openAccountsModal()"
     />
 
     <!-- 侧栏分隔把手 -->
@@ -99,6 +101,9 @@
           :allowingRemoteImages="state.allowingRemoteImages.value"
           :movingMessage="state.movingMessage.value"
           @retry="state.retryOpen"
+          @reply="openReplyCompose('reply')"
+          @replyAll="openReplyCompose('replyAll')"
+          @forward="openReplyCompose('forward')"
           @toggleSeen="(seen) => state.selectedId.value && state.toggleMessageSeen(state.selectedId.value, seen)"
           @toggleFlagged="(flagged) => state.selectedId.value && state.toggleMessageFlagged(state.selectedId.value, flagged)"
           @setReaderPosition="state.layout.setReaderPosition"
@@ -145,6 +150,9 @@
         :allowingRemoteImages="state.allowingRemoteImages.value"
         :movingMessage="state.movingMessage.value"
         @retry="state.retryOpen"
+        @reply="openReplyCompose('reply')"
+        @replyAll="openReplyCompose('replyAll')"
+        @forward="openReplyCompose('forward')"
         @toggleSeen="(seen) => state.selectedId.value && state.toggleMessageSeen(state.selectedId.value, seen)"
         @toggleFlagged="(flagged) => state.selectedId.value && state.toggleMessageFlagged(state.selectedId.value, flagged)"
         @setReaderPosition="state.layout.setReaderPosition"
@@ -199,15 +207,58 @@
         显示阅读窗格
       </button>
     </div>
+
+    <!-- 写邮件弹窗 / 撤销发送浮层 / 账号管理与首次欢迎引导 -->
+    <ComposePane
+      :open="compose.open.value"
+      :accounts="composeAccounts"
+      :composeState="compose"
+      @update:open="(v) => (compose.open.value = v)"
+      @overlayChange="(open) => state.layout.setOverlayOpen('compose', open)"
+    />
+
+    <OutboxUndoToast
+      :undoBanner="compose.undoBanner.value"
+      :outboxItems="compose.outboxItems.value"
+      :undoing="compose.undoing.value"
+      :busyOutboxId="compose.busyOutboxId.value"
+      @undo="compose.undoSend()"
+      @dismissUndo="compose.dismissUndoBanner()"
+      @retryItem="(accountId, outboxId) => compose.retryOutbox(accountId, outboxId)"
+      @deleteItem="(accountId, outboxId) => compose.deleteOutbox(accountId, outboxId)"
+      @overlayChange="(open) => state.layout.setOverlayOpen('outbox-panel', open)"
+    />
+
+    <AccountsModal
+      :open="accountsModalOpen"
+      @update:open="(v) => (accountsModalOpen = v)"
+      @close="accountsModalOpen = false"
+      @changed="onAccountsChanged"
+      @overlayChange="state.layout.setOverlayOpen"
+    />
+
+    <WelcomeOverlay
+      :open="showWelcome"
+      :allowSkip="true"
+      @completed="onWelcomeCompleted"
+      @skip="welcomeSkipped = true"
+      @overlayChange="state.layout.setOverlayOpen"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import FolderSidebar from "./FolderSidebar.vue";
 import MessageListPane from "./MessageListPane.vue";
 import ReaderPane from "./ReaderPane.vue";
 import PaneSplitter from "./PaneSplitter.vue";
+import ComposePane from "../compose/ComposePane.vue";
+import OutboxUndoToast from "../compose/OutboxUndoToast.vue";
+import { useCompose } from "../compose/useCompose";
+import type { ComposeAccountOption, ComposeMode } from "../compose/types";
+import AccountsModal from "../accounts/AccountsModal.vue";
+import WelcomeOverlay from "../accounts/WelcomeOverlay.vue";
 import { injectMainWindow } from "./useMainWindow";
 import {
   BELOW_LIST_MIN_HEIGHT,
@@ -218,6 +269,82 @@ import {
 
 const state = injectMainWindow();
 const rootRef = ref<HTMLElement | null>(null);
+
+const composeAccounts = computed<ComposeAccountOption[]>(() =>
+  state.accounts.value.map((acc) => ({
+    id: String(acc.id),
+    displayName: acc.displayName,
+    email: acc.email,
+  }))
+);
+
+const compose = useCompose({ accounts: composeAccounts.value });
+watch(
+  composeAccounts,
+  (next) => {
+    compose.setAccounts(next);
+  },
+  { deep: true, immediate: true }
+);
+
+const accountsModalOpen = ref(false);
+const welcomeSkipped = ref(false);
+const showWelcome = computed(
+  () =>
+    !state.loading.value &&
+    !state.locked.value &&
+    state.mode.value === "live" &&
+    state.accounts.value.length === 0 &&
+    !welcomeSkipped.value
+);
+
+function openNewCompose() {
+  const defaultAccountId =
+    state.currentView.value.kind === "accountFolder"
+      ? String(state.currentView.value.accountId)
+      : composeAccounts.value[0]?.id ?? null;
+  compose.openCompose({
+    mode: "new",
+    accountId: defaultAccountId,
+  });
+}
+
+function openReplyCompose(mode: ComposeMode) {
+  const msg = state.openedMessage.value;
+  if (!msg) return;
+  const rfcMessageId =
+    msg.rfcMessageId ??
+    msg.threadMessages?.[msg.threadMessages.length - 1]?.rfcMessageId ??
+    null;
+  compose.openCompose({
+    mode,
+    accountId: String(msg.accountId),
+    originalMessage: {
+      accountId: String(msg.accountId),
+      sender: msg.sender,
+      recipients: msg.recipients,
+      cc: msg.cc,
+      subject: msg.subject,
+      dateDisplay: msg.dateDisplay,
+      plainText: msg.plainText,
+      htmlBody: msg.htmlBody,
+      rfcMessageId,
+    },
+  });
+}
+
+function openAccountsModal() {
+  accountsModalOpen.value = true;
+}
+
+async function onAccountsChanged() {
+  await state.init();
+}
+
+async function onWelcomeCompleted() {
+  welcomeSkipped.value = false;
+  await state.init();
+}
 
 const dragBaseSidebar = ref(state.layout.prefs.value.sidebarWidth);
 const dragBaseList = ref(state.layout.prefs.value.listWidth);
@@ -304,6 +431,22 @@ function onKeyDown(e: KeyboardEvent) {
   if (e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
     e.preventDefault();
     window.dispatchEvent(new CustomEvent("km-focus-search"));
+    return;
+  }
+
+  // Ctrl+N: 写新邮件（输入聚焦或模态框已打开时不拦截）
+  if (
+    (e.ctrlKey || e.metaKey) &&
+    !e.altKey &&
+    !e.shiftKey &&
+    e.key.toLowerCase() === "n" &&
+    !isEditableFocused() &&
+    !compose.open.value &&
+    !accountsModalOpen.value &&
+    !showWelcome.value
+  ) {
+    e.preventDefault();
+    openNewCompose();
     return;
   }
 

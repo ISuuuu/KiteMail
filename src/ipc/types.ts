@@ -217,6 +217,7 @@ export interface AttachmentDto {
 export interface ThreadMessageDto {
   id: number;
   accountId: number;
+  rfcMessageId?: string;
   sender: string;
   recipients: string;
   cc: string;
