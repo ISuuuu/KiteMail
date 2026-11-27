@@ -1,0 +1,284 @@
+:root {
+  --km-star-gold: #e5a50a;
+  --km-font-sans: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, -apple-system, sans-serif;
+  --km-font-mono: "Cascadia Code", "Consolas", "Courier New", monospace;
+  --km-sidebar-width: 240px;
+  --km-list-width: 360px;
+  --km-list-below-height: 360px;
+  --km-radius-sm: 6px;
+  --km-radius-md: 8px;
+  --km-radius-lg: 12px;
+
+  /* 默认回落为 system light */
+  --km-canvas: #fafafa;
+  --km-sidebar: #ebebed;
+  --km-surface: #ffffff;
+  --km-surface-raised: #ffffff;
+  --km-accent: #3584e4;
+  --km-accent-fg: #ffffff;
+  --km-text: #2e2e32;
+  --km-text-muted: #707074;
+  --km-border: #d9d9d9;
+  --km-danger: #e01b24;
+  --km-accent-soft: color-mix(in srgb, var(--km-accent) 12%, transparent);
+  --km-accent-soft-hover: color-mix(in srgb, var(--km-accent) 18%, transparent);
+  --km-hover-bg: rgba(0, 0, 0, 0.045);
+  --km-danger-soft: color-mix(in srgb, var(--km-danger) 12%, transparent);
+  --km-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --km-shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.08);
+  color-scheme: light;
+}
+
+:root[data-color-mode="dark"] {
+  --km-hover-bg: rgba(255, 255, 255, 0.06);
+  --km-shadow-card: 0 1px 4px rgba(0, 0, 0, 0.28);
+  --km-shadow-popover: 0 10px 28px rgba(0, 0, 0, 0.45);
+  color-scheme: dark;
+}
+
+/* 1. system（系统） */
+:root[data-theme="system"][data-color-mode="light"] {
+  --km-canvas: #fafafa;
+  --km-sidebar: #ebebed;
+  --km-surface: #ffffff;
+  --km-surface-raised: #ffffff;
+  --km-accent: #3584e4;
+  --km-accent-fg: #ffffff;
+  --km-text: #2e2e32;
+  --km-text-muted: #707074;
+  --km-border: #d9d9d9;
+  --km-danger: #e01b24;
+}
+
+:root[data-theme="system"][data-color-mode="dark"] {
+  --km-canvas: #242424;
+  --km-sidebar: #303030;
+  --km-surface: #303030;
+  --km-surface-raised: #363636;
+  --km-accent: #3584e4;
+  --km-accent-fg: #ffffff;
+  --km-text: #ffffff;
+  --km-text-muted: #a7a7a9;
+  --km-border: #454545;
+  --km-danger: #f66151;
+}
+
+/* 2. default（经典蓝） */
+:root[data-theme="default"][data-color-mode="light"] {
+  --km-canvas: #f5f6f8;
+  --km-sidebar: #eef0f4;
+  --km-surface: #ffffff;
+  --km-surface-raised: #ffffff;
+  --km-accent: #3584e4;
+  --km-accent-fg: #ffffff;
+  --km-text: #1e232d;
+  --km-text-muted: #667085;
+  --km-border: #e2e5ec;
+  --km-danger: #e01b24;
+}
+
+:root[data-theme="default"][data-color-mode="dark"] {
+  --km-canvas: #1c1e24;
+  --km-sidebar: #23262e;
+  --km-surface: #282b34;
+  --km-surface-raised: #2e323c;
+  --km-accent: #3584e4;
+  --km-accent-fg: #ffffff;
+  --km-text: #eef2f8;
+  --km-text-muted: #9aa4b8;
+  --km-border: #363b47;
+  --km-danger: #f66151;
+}
+
+/* 3. midnight（子夜） */
+:root[data-theme="midnight"][data-color-mode="light"] {
+  --km-canvas: #f8f7f9;
+  --km-sidebar: #edeaf4;
+  --km-surface: #f8f7f9;
+  --km-surface-raised: #f0eff2;
+  --km-accent: #7253b9;
+  --km-accent-fg: #fffaff;
+  --km-text: #241523;
+  --km-text-muted: #766c76;
+  --km-border: #d6d1de;
+  --km-danger: #fb2c36;
+}
+
+:root[data-theme="midnight"][data-color-mode="dark"] {
+  --km-canvas: #1d1929;
+  --km-sidebar: #272139;
+  --km-surface: #1d1929;
+  --km-surface-raised: #383443;
+  --km-accent: #5d41a6;
+  --km-accent-fg: #ffffff;
+  --km-text: #fffaff;
+  --km-text-muted: #8e8a95;
+  --km-border: #4d4366;
+  --km-danger: #fb414a;
+}
+
+/* 4. tidal（海潮） */
+:root[data-theme="tidal"][data-color-mode="light"] {
+  --km-canvas: #f5f7f8;
+  --km-sidebar: #e4ecf2;
+  --km-surface: #f5f7f8;
+  --km-surface-raised: #edeff1;
+  --km-accent: #2672af;
+  --km-accent-fg: #fffaff;
+  --km-text: #241523;
+  --km-text-muted: #746c75;
+  --km-border: #cdd4dc;
+  --km-danger: #fb2c36;
+}
+
+:root[data-theme="tidal"][data-color-mode="dark"] {
+  --km-canvas: #17212b;
+  --km-sidebar: #1e2d3b;
+  --km-surface: #17212b;
+  --km-surface-raised: #333b45;
+  --km-accent: #509ed8;
+  --km-accent-fg: #241523;
+  --km-text: #fffaff;
+  --km-text-muted: #8d8f97;
+  --km-border: #405567;
+  --km-danger: #fb414a;
+}
+
+/* 5. rose（玫瑰） */
+:root[data-theme="rose"][data-color-mode="light"] {
+  --km-canvas: #fdf7fd;
+  --km-sidebar: #f2e1f4;
+  --km-surface: #faf3fb;
+  --km-surface-raised: #fdfafd;
+  --km-accent: #b75077;
+  --km-accent-fg: #ffffff;
+  --km-text: #501854;
+  --km-text-muted: #ac1668;
+  --km-border: #eee1ed;
+  --km-danger: #f7086c;
+}
+
+:root[data-theme="rose"][data-color-mode="dark"] {
+  --km-canvas: #291921;
+  --km-sidebar: #39202c;
+  --km-surface: #291921;
+  --km-surface-raised: #43343c;
+  --km-accent: #a63962;
+  --km-accent-fg: #fbd0e8;
+  --km-text: #f9f8fb;
+  --km-text-muted: #e7d0dd;
+  --km-border: #654153;
+  --km-danger: #9d174d;
+}
+
+/* 6. earth（大地） */
+:root[data-theme="earth"][data-color-mode="light"] {
+  --km-canvas: #f9f7f5;
+  --km-sidebar: #f3eae5;
+  --km-surface: #f9f7f5;
+  --km-surface-raised: #f1efee;
+  --km-accent: #ae552a;
+  --km-accent-fg: #fffaff;
+  --km-text: #241523;
+  --km-text-muted: #766c74;
+  --km-border: #ddd2ce;
+  --km-danger: #fb2c36;
+}
+
+:root[data-theme="earth"][data-color-mode="dark"] {
+  --km-canvas: #291e1a;
+  --km-sidebar: #39281f;
+  --km-surface: #291e1a;
+  --km-surface-raised: #433835;
+  --km-accent: #ea8946;
+  --km-accent-fg: #241523;
+  --km-text: #fffaff;
+  --km-text-muted: #968e8f;
+  --km-border: #664c3f;
+  --km-danger: #fb414a;
+}
+
+/* 7. forest（森林） */
+:root[data-theme="forest"][data-color-mode="light"] {
+  --km-canvas: #f3f7f4;
+  --km-sidebar: #e2ede7;
+  --km-surface: #f3f7f4;
+  --km-surface-raised: #ecefed;
+  --km-accent: #1b7d50;
+  --km-accent-fg: #fffaff;
+  --km-text: #241523;
+  --km-text-muted: #746c73;
+  --km-border: #cbd5d1;
+  --km-danger: #fb2c36;
+}
+
+:root[data-theme="forest"][data-color-mode="dark"] {
+  --km-canvas: #1b2821;
+  --km-sidebar: #21362b;
+  --km-surface: #1b2821;
+  --km-surface-raised: #36413c;
+  --km-accent: #3eb272;
+  --km-accent-fg: #241523;
+  --km-text: #fffaff;
+  --km-text-muted: #919595;
+  --km-border: #415f4f;
+  --km-danger: #fb414a;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--km-canvas);
+  color: var(--km-text);
+  font-family: var(--km-font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--km-accent);
+  outline-offset: -2px;
+}
+
+/* 细滚动条样式 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--km-text-muted) 32%, transparent);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--km-text-muted) 52%, transparent);
+}
