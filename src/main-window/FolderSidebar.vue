@@ -140,9 +140,20 @@
 
     <!-- 底部状态 -->
     <footer class="km-sidebar-footer">
-      <span v-if="!isRail" class="km-mode-badge">
-        {{ mode === "demo" ? "演示模式 (--demo)" : "本地工作区" }}
-      </span>
+      <template v-if="!isRail">
+        <span class="km-mode-badge">
+          {{ mode === "demo" ? "演示模式 (--demo)" : "本地工作区" }}
+        </span>
+        <button
+          type="button"
+          class="km-footer-mode-btn"
+          :title="colorModeTitle"
+          :aria-label="colorModeTitle"
+          @click="emit('toggleDarkMode')"
+        >
+          {{ colorModeShortLabel }}
+        </button>
+      </template>
       <button
         v-else-if="hasPasscode"
         type="button"
@@ -176,6 +187,8 @@ const props = defineProps<{
   syncing?: boolean;
   mode?: "demo" | "live";
   hasPasscode?: boolean;
+  darkMode?: boolean | null;
+  effectiveDark?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -183,7 +196,24 @@ const emit = defineEmits<{
   toggleCollapse: [];
   refresh: [];
   lock: [];
+  toggleDarkMode: [];
 }>();
+
+const colorModeShortLabel = computed(() => {
+  if (props.darkMode === null || props.darkMode === undefined) {
+    return props.effectiveDark ? "🌓 系统·暗" : "🌓 系统·亮";
+  }
+  return props.darkMode ? "🌙 深色" : "☀ 浅色";
+});
+
+const colorModeTitle = computed(() => {
+  if (props.darkMode === null || props.darkMode === undefined) {
+    return "当前：跟随系统深浅色（点击切换为浅色）";
+  }
+  return props.darkMode
+    ? "当前：深色模式（点击切换为跟随系统）"
+    : "当前：浅色模式（点击切换为深色）";
+});
 
 const collapsedAccounts = ref<Set<number>>(new Set());
 
@@ -491,13 +521,34 @@ function avatarInitial(name: string): string {
 
 .km-sidebar-footer {
   height: 32px;
-  padding: 0 12px;
+  padding: 0 10px;
   border-top: 1px solid var(--km-border);
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: space-between;
+  gap: 6px;
   font-size: 11px;
   color: var(--km-text-muted);
+}
+
+.km-sidebar.rail .km-sidebar-footer {
+  justify-content: center;
+}
+
+.km-footer-mode-btn {
+  border: 1px solid var(--km-border);
+  border-radius: var(--km-radius-sm);
+  background: transparent;
+  color: var(--km-text-muted);
+  font-size: 11px;
+  padding: 2px 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.km-footer-mode-btn:hover {
+  background: var(--km-hover-bg);
+  color: var(--km-text);
 }
 
 .km-mode-badge {

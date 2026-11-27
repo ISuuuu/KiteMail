@@ -12,6 +12,13 @@
  *   lock_app()                         无参
  *   set_message_seen({ input })        包在 input 字段
  *   set_message_flagged({ input })     包在 input 字段
+ *   allow_remote_images({ input })     包在 input 字段
+ *   load_older_messages({ input })     包在 input 字段
+ *   archive_message({ input })         包在 input 字段
+ *   delete_message({ input })          包在 input 字段
+ *   mark_message_spam({ input })       包在 input 字段
+ *   move_message({ input })            包在 input 字段
+ *   undo_message_move({ input })       包在 input 字段
  *   quit_app()                         无参
  *
  * 在非 Tauri 环境（无 window.__TAURI_INTERNALS__）下使用内置 Mock 传输层，
@@ -35,6 +42,15 @@ import type {
   SetMessageSeenOutput,
   SetMessageFlaggedInput,
   SetMessageFlaggedOutput,
+  AllowRemoteImagesInput,
+  AllowRemoteImagesOutput,
+  LoadOlderMessagesInput,
+  LoadOlderMessagesOutput,
+  MessageActionInput,
+  MoveMessageInput,
+  MessageMoveOutput,
+  UndoMessageMoveInput,
+  UndoMessageMoveOutput,
   MainPreferencesPatch,
   MainPreferencesDto,
   MailChangedEvent,
@@ -301,11 +317,15 @@ let mockCacheReady = true;
 let mockPasscode = "1234";
 let mockFailedAttempts = 0;
 let mockUnlockCooldownUntilMs = 0;
+let mockNextMessageId = MOCK_INBOX_TOTAL + 11;
 const mockRecordedReaderLayouts: SetReaderLayoutInput[] = [];
+const mockAllowedRemoteMessages = new Set<string>();
+const mockAllowedRemoteSenders = new Set<string>();
+const mockFolderHasMoreRemote = new Map<number, boolean>([[1, true]]);
 
 const DEFAULT_MOCK_PREFS: MainPreferencesDto = {
   themeId: "system",
-  darkMode: false,
+  darkMode: null,
   readerPosition: "right",
   sidebarWidth: 240,
   listWidth: 360,
@@ -319,13 +339,13 @@ const DEFAULT_MOCK_PREFS: MainPreferencesDto = {
 
 let mockPrefs: MainPreferencesDto = { ...DEFAULT_MOCK_PREFS };
 
-const BASE_MOCK_FOLDERS: ReadonlyArray<Omit<FolderSummaryDto, "unreadCount" | "totalCount">> = [
-  { id: 1, accountId: 1, name: "收件箱", path: "INBOX", hasMoreRemote: false },
-  { id: 2, accountId: 1, name: "已发送", path: "Sent", hasMoreRemote: false },
-  { id: 3, accountId: 1, name: "草稿箱", path: "Drafts", hasMoreRemote: false },
-  { id: 4, accountId: 1, name: "归档", path: "Archive", hasMoreRemote: false },
-  { id: 5, accountId: 1, name: "垃圾邮件", path: "Junk", hasMoreRemote: false },
-  { id: 6, accountId: 1, name: "已删除", path: "Trash", hasMoreRemote: false },
+const BASE_MOCK_FOLDERS: ReadonlyArray<Omit<FolderSummaryDto, "unreadCount" | "totalCount" | "hasMoreRemote">> = [
+  { id: 1, accountId: 1, name: "收件箱", path: "INBOX" },
+  { id: 2, accountId: 1, name: "已发送", path: "Sent" },
+  { id: 3, accountId: 1, name: "草稿箱", path: "Drafts" },
+  { id: 4, accountId: 1, name: "归档", path: "Archive" },
+  { id: 5, accountId: 1, name: "垃圾邮件", path: "Junk" },
+  { id: 6, accountId: 1, name: "已删除", path: "Trash" },
 ];
 
 function computeMockFolders(): FolderSummaryDto[] {
@@ -339,8 +359,65 @@ function computeMockFolders(): FolderSummaryDto[] {
         if (m.unread) unreadCount += 1;
       }
     }
-    return { ...base, unreadCount, totalCount };
+    return {
+      ...base,
+      unreadCount,
+      totalCount,
+      hasMoreRemote: mockFolderHasMoreRemote.get(base.id) ?? false,
+    };
   });
+}
+
+function extractMockSenderEmail(sender: string): string {
+  const match = sender.match(/<([^>]+)>/);
+  const raw = match ? match[1] : sender;
+  return raw.trim().toLowerCase();
+}
+
+function hasMockRemoteImages(msg: MessageSummaryDto): boolean {
+  return msg.id === 2 || (msg.id > 4 && msg.id % 5 === 2);
+}
+
+function isMockRemoteImagesBlocked(msg: MessageSummaryDto | undefined): boolean {
+  if (!msg || !hasMockRemoteImages(msg)) return false;
+  const key = `${msg.accountId}:${msg.id}`;
+  if (mockAllowedRemoteMessages.has(key)) return false;
+  const senderEmail = extractMockSenderEmail(msg.sender);
+  if (senderEmail && mockAllowedRemoteSenders.has(senderEmail)) return false;
+  return true;
+}
+
+function makeMockRfcMessageId(accountId: number, messageId: number): string {
+  return `<mock-${accountId}-${messageId}@kitemail.example>`;
+}
+
+function findMockFolderByPathOrName(
+  targetFolderPath: string
+): (typeof BASE_MOCK_FOLDERS)[number] | undefined {
+  const normalized = targetFolderPath.trim().toLowerCase();
+  return BASE_MOCK_FOLDERS.find(
+    (f) => f.path.toLowerCase() === normalized || f.name.toLowerCase() === normalized
+  );
+}
+
+function resolveMockFolderIdForView(view: ViewDto): number | null {
+  if (view.kind === "accountFolder") return view.folderId;
+  switch (view.kind) {
+    case "unifiedInbox":
+      return 1;
+    case "sent":
+      return 2;
+    case "drafts":
+      return 3;
+    case "archive":
+      return 4;
+    case "junk":
+      return 5;
+    case "trash":
+      return 6;
+    default:
+      return null;
+  }
 }
 
 function makeLockedIpcError(requestId?: string | null): IpcError {
@@ -537,6 +614,7 @@ export async function openMessage(input: OpenMessageInput): Promise<OpenMessageO
   );
   const sessionId = `mock-session-${input.accountId}-${input.messageId}-${Date.now()}`;
   const isThread = (msg?.threadCount ?? 1) > 1;
+  const remoteImagesBlocked = isMockRemoteImagesBlocked(msg);
   return {
     requestId: input.requestId,
     readerSessionId: sessionId,
@@ -556,6 +634,9 @@ export async function openMessage(input: OpenMessageInput): Promise<OpenMessageO
     hasHtml: false,
     htmlBody: null,
     flagged: msg?.flagged ?? false,
+    remoteImagesBlocked,
+    rfcMessageId: makeMockRfcMessageId(input.accountId, input.messageId),
+    folderPath: msg?.folderPath ?? "INBOX",
     attachments: msg?.hasAttachment
       ? [{ id: 1, filename: "KiteMail-三栏布局规范.pdf", mimeType: "application/pdf", sizeBytes: 184320 }]
       : [],
@@ -607,6 +688,9 @@ export async function setReaderLayout(input: SetReaderLayoutInput): Promise<SetR
 export async function updateMainPreferences(patch: MainPreferencesPatch): Promise<MainPreferencesDto> {
   if (isTauri()) return tauriInvoke<MainPreferencesDto>("update_main_preferences", { patch });
   Object.assign(mockPrefs, patch);
+  if ("darkMode" in patch) {
+    mockPrefs.darkMode = patch.darkMode === true ? true : patch.darkMode === false ? false : null;
+  }
   return { ...mockPrefs };
 }
 
@@ -761,6 +845,219 @@ export async function setMessageFlagged(
   };
 }
 
+function moveMockMessageToFolder(
+  accountId: number,
+  messageId: number,
+  targetFolderPath: string
+): MessageMoveOutput {
+  const msg = getMockMessages().find(
+    (m) => m.id === messageId && m.accountId === accountId
+  );
+  if (!msg) {
+    throw {
+      code: "MESSAGE_NOT_FOUND",
+      message: `未找到邮件 #${messageId}`,
+      retryable: false,
+    } satisfies IpcError;
+  }
+  const targetFolder = findMockFolderByPathOrName(targetFolderPath);
+  if (!targetFolder) {
+    throw {
+      code: "INVALID_INPUT",
+      message: `目标文件夹不存在: ${targetFolderPath}`,
+      retryable: false,
+    } satisfies IpcError;
+  }
+
+  const originalFolderPath = msg.folderPath;
+  msg.folderId = targetFolder.id;
+  msg.folderPath = targetFolder.path;
+  mockStateVersion += 1;
+
+  emitMock("main://mail-changed", {
+    stateVersion: mockStateVersion,
+    reason: "messageMoved",
+    accountId: msg.accountId,
+    folderId: msg.folderId,
+    messageId: msg.id,
+  });
+
+  return {
+    accountId: msg.accountId,
+    messageId: msg.id,
+    rfcMessageId: makeMockRfcMessageId(msg.accountId, msg.id),
+    originalFolderPath,
+    targetFolderPath: targetFolder.path,
+    stateVersion: mockStateVersion,
+  };
+}
+
+export async function allowRemoteImages(
+  input: AllowRemoteImagesInput
+): Promise<AllowRemoteImagesOutput> {
+  if (isTauri()) return tauriInvoke<AllowRemoteImagesOutput>("allow_remote_images", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+
+  const msg = getMockMessages().find(
+    (m) => m.id === input.messageId && m.accountId === input.accountId
+  );
+  if (!msg) {
+    return Promise.reject({
+      code: "MESSAGE_NOT_FOUND",
+      message: `未找到邮件 #${input.messageId}`,
+      retryable: false,
+    } satisfies IpcError);
+  }
+
+  mockAllowedRemoteMessages.add(`${input.accountId}:${input.messageId}`);
+  let senderTrusted = false;
+  if (input.trustSender) {
+    const email = extractMockSenderEmail(msg.sender);
+    if (email) {
+      mockAllowedRemoteSenders.add(email);
+      senderTrusted = true;
+    }
+  }
+  mockStateVersion += 1;
+  return {
+    allowed: true,
+    senderTrusted,
+    stateVersion: mockStateVersion,
+  };
+}
+
+export async function loadOlderMessages(
+  input: LoadOlderMessagesInput
+): Promise<LoadOlderMessagesOutput> {
+  if (isTauri()) return tauriInvoke<LoadOlderMessagesOutput>("load_older_messages", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+
+  const folderId = resolveMockFolderIdForView(input.view);
+  if (folderId === null || !(mockFolderHasMoreRemote.get(folderId) ?? false)) {
+    return {
+      accepted: false,
+      hasMoreRemote: false,
+      stateVersion: mockStateVersion,
+    };
+  }
+
+  const all = getMockMessages();
+  const folderMeta = BASE_MOCK_FOLDERS.find((f) => f.id === folderId) ?? BASE_MOCK_FOLDERS[0];
+  let minTs = MOCK_NOW - 86400 * 30;
+  for (const m of all) {
+    if (m.folderId === folderId && m.dateTs < minTs) {
+      minTs = m.dateTs;
+    }
+  }
+  const batchCount = Math.max(1, Math.min(input.limit || 20, 50));
+  for (let i = 0; i < batchCount; i++) {
+    const id = mockNextMessageId++;
+    all.push({
+      id,
+      accountId: folderMeta.accountId,
+      folderId: folderMeta.id,
+      folderPath: folderMeta.path,
+      sender: `历史发件人 ${i + 1} <archive${i + 1}@example.com>`,
+      recipients: "demo@kitemail.example",
+      subject: `历史拉取邮件 #${id}（远端同步）`,
+      preview: `通过 load_older_messages 从远端拉取的历史邮件 #${id}。`,
+      dateTs: minTs - (i + 1) * 3600,
+      dateDisplay: "更早",
+      unread: false,
+      flagged: false,
+      hasAttachment: false,
+      threadCount: 1,
+      importance: 0,
+      tags: [],
+      answered: false,
+      forwarded: false,
+    });
+  }
+
+  mockFolderHasMoreRemote.set(folderId, false);
+  mockStateVersion += 1;
+  emitMock("main://mail-changed", {
+    stateVersion: mockStateVersion,
+    view: input.view,
+    reason: "olderMessagesLoaded",
+    accountId: folderMeta.accountId,
+    folderId: folderMeta.id,
+  });
+
+  return {
+    accepted: true,
+    hasMoreRemote: false,
+    stateVersion: mockStateVersion,
+  };
+}
+
+export async function archiveMessage(input: MessageActionInput): Promise<MessageMoveOutput> {
+  if (isTauri()) return tauriInvoke<MessageMoveOutput>("archive_message", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  return moveMockMessageToFolder(input.accountId, input.messageId, "Archive");
+}
+
+export async function deleteMessage(input: MessageActionInput): Promise<MessageMoveOutput> {
+  if (isTauri()) return tauriInvoke<MessageMoveOutput>("delete_message", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  return moveMockMessageToFolder(input.accountId, input.messageId, "Trash");
+}
+
+export async function markMessageSpam(input: MessageActionInput): Promise<MessageMoveOutput> {
+  if (isTauri()) return tauriInvoke<MessageMoveOutput>("mark_message_spam", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  return moveMockMessageToFolder(input.accountId, input.messageId, "Junk");
+}
+
+export async function moveMessage(input: MoveMessageInput): Promise<MessageMoveOutput> {
+  if (isTauri()) return tauriInvoke<MessageMoveOutput>("move_message", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  return moveMockMessageToFolder(input.accountId, input.messageId, input.targetFolderPath);
+}
+
+export async function undoMessageMove(
+  input: UndoMessageMoveInput
+): Promise<UndoMessageMoveOutput> {
+  if (isTauri()) return tauriInvoke<UndoMessageMoveOutput>("undo_message_move", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+
+  const msg = getMockMessages().find(
+    (m) => m.id === input.messageId && m.accountId === input.accountId
+  );
+  if (!msg) {
+    return Promise.reject({
+      code: "MESSAGE_NOT_FOUND",
+      message: `未找到邮件 #${input.messageId}`,
+      retryable: false,
+    } satisfies IpcError);
+  }
+  const origFolder = findMockFolderByPathOrName(input.originalFolderPath);
+  if (!origFolder) {
+    return Promise.reject({
+      code: "INVALID_INPUT",
+      message: `原文件夹不存在: ${input.originalFolderPath}`,
+      retryable: false,
+    } satisfies IpcError);
+  }
+
+  msg.folderId = origFolder.id;
+  msg.folderPath = origFolder.path;
+  mockStateVersion += 1;
+
+  emitMock("main://mail-changed", {
+    stateVersion: mockStateVersion,
+    reason: "messageMoveUndone",
+    accountId: msg.accountId,
+    folderId: msg.folderId,
+    messageId: msg.id,
+  });
+
+  return {
+    accepted: true,
+    stateVersion: mockStateVersion,
+  };
+}
+
 export async function quitApp(): Promise<void> {
   if (isTauri()) return tauriInvoke<void>("quit_app");
 }
@@ -774,6 +1071,8 @@ export function resetMockSession(options?: {
   passcode?: string;
   failedAttempts?: number;
   cooldownMs?: number;
+  darkMode?: boolean | null;
+  inboxHasMoreRemote?: boolean;
 }): void {
   cachedMockAll = null;
   mockStateVersion = 1;
@@ -783,8 +1082,16 @@ export function resetMockSession(options?: {
   mockPasscode = options?.passcode ?? "1234";
   mockFailedAttempts = options?.failedAttempts ?? 0;
   mockUnlockCooldownUntilMs = options?.cooldownMs ? Date.now() + options.cooldownMs : 0;
-  mockPrefs = { ...DEFAULT_MOCK_PREFS };
+  mockNextMessageId = MOCK_INBOX_TOTAL + 11;
+  mockPrefs = {
+    ...DEFAULT_MOCK_PREFS,
+    ...(options && "darkMode" in options ? { darkMode: options.darkMode ?? null } : {}),
+  };
   mockRecordedReaderLayouts.length = 0;
+  mockAllowedRemoteMessages.clear();
+  mockAllowedRemoteSenders.clear();
+  mockFolderHasMoreRemote.clear();
+  mockFolderHasMoreRemote.set(1, options?.inboxHasMoreRemote ?? true);
 }
 
 export function getMockRecordedReaderLayouts(): readonly SetReaderLayoutInput[] {

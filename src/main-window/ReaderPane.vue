@@ -50,6 +50,64 @@
           >
             {{ message.flagged ? "★ 已星标" : "☆ 星标" }}
           </button>
+          <button
+            type="button"
+            class="km-action-btn"
+            title="归档邮件"
+            :disabled="movingMessage"
+            @click="emit('archive')"
+          >
+            归档
+          </button>
+          <button
+            type="button"
+            class="km-action-btn"
+            title="标记为垃圾邮件"
+            :disabled="movingMessage"
+            @click="emit('markSpam')"
+          >
+            垃圾邮件
+          </button>
+          <button
+            type="button"
+            class="km-action-btn km-action-danger"
+            title="删除邮件 (Delete)"
+            :disabled="movingMessage"
+            @click="emit('delete')"
+          >
+            删除
+          </button>
+
+          <!-- 移动到文件夹弹出菜单 -->
+          <div ref="moveWrapRef" class="km-popover-wrap">
+            <button
+              type="button"
+              class="km-action-btn"
+              aria-haspopup="menu"
+              :aria-expanded="moveMenuOpen"
+              :disabled="movingMessage || accountFolders.length === 0"
+              @click="toggleMoveMenu"
+            >
+              <span>移动到</span>
+              <span aria-hidden="true">▾</span>
+            </button>
+
+            <div v-if="moveMenuOpen" class="km-theme-popover km-move-popover" role="menu">
+              <div class="km-menu-title">移动到文件夹</div>
+              <button
+                v-for="folder in accountFolders"
+                :key="`${folder.accountId}:${folder.id}`"
+                type="button"
+                class="km-theme-item"
+                :class="{ active: isCurrentFolder(folder.path) }"
+                :disabled="isCurrentFolder(folder.path)"
+                @click="pickMoveFolder(folder.path)"
+              >
+                <span>{{ folder.name }}</span>
+                <span v-if="isCurrentFolder(folder.path)" class="km-current-tag">当前</span>
+              </button>
+            </div>
+          </div>
         </template>
 
         <button
@@ -61,14 +119,14 @@
           重试正文
         </button>
 
-        <!-- 亮暗快速切换 -->
+        <!-- 三态亮暗快速循环切换 -->
         <button
           type="button"
           class="km-action-btn"
-          :title="effectiveDark ? '切换为浅色模式' : '切换为深色模式'"
+          :title="colorModeBtnTitle"
           @click="emit('toggleDarkMode')"
         >
-          {{ effectiveDark ? "🌙 深色" : "☀ 浅色" }}
+          {{ colorModeBtnLabel }}
         </button>
 
         <!-- 7 套内置主题选择器 -->
@@ -101,14 +159,33 @@
               <span v-if="themeId === theme.id">✓</span>
             </button>
             <div class="km-menu-divider" />
+            <div class="km-menu-title">亮暗模式</div>
             <button
               type="button"
               class="km-theme-item"
-              :class="{ active: themeId === 'system' && followSystem }"
-              @click="pickFollowSystem"
+              :class="{ active: darkMode === null || darkMode === undefined }"
+              @click="pickDarkMode(null)"
             >
-              <span>跟随系统深浅色</span>
-              <span v-if="themeId === 'system' && followSystem">✓</span>
+              <span>跟随系统</span>
+              <span v-if="darkMode === null || darkMode === undefined">✓</span>
+            </button>
+            <button
+              type="button"
+              class="km-theme-item"
+              :class="{ active: darkMode === false }"
+              @click="pickDarkMode(false)"
+            >
+              <span>浅色</span>
+              <span v-if="darkMode === false">✓</span>
+            </button>
+            <button
+              type="button"
+              class="km-theme-item"
+              :class="{ active: darkMode === true }"
+              @click="pickDarkMode(true)"
+            >
+              <span>深色</span>
+              <span v-if="darkMode === true">✓</span>
             </button>
           </div>
         </div>
@@ -191,6 +268,34 @@
         </div>
       </div>
 
+      <!-- 远程图片隐私拦截提示条 -->
+      <div
+        v-if="message.remoteImagesBlocked === true"
+        class="km-remote-img-banner"
+        role="region"
+        aria-label="远程图片隐私保护"
+      >
+        <span class="km-remote-img-text">已拦截远程图片以保护隐私</span>
+        <div class="km-remote-img-actions">
+          <button
+            type="button"
+            class="km-remote-img-btn"
+            :disabled="allowingRemoteImages"
+            @click="emit('allowRemoteImages', false)"
+          >
+            仅本次显示
+          </button>
+          <button
+            type="button"
+            class="km-remote-img-btn primary"
+            :disabled="allowingRemoteImages"
+            @click="emit('allowRemoteImages', true)"
+          >
+            始终信任此发件人
+          </button>
+        </div>
+      </div>
+
       <ReaderViewport
         :readerSessionId="message.readerSessionId"
         :bodyStatus="message.bodyStatus"
@@ -209,7 +314,12 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { BUILTIN_THEMES, type OpenMessageOutput, type ReaderPosition } from "../ipc/types";
+import {
+  BUILTIN_THEMES,
+  type FolderSummaryDto,
+  type OpenMessageOutput,
+  type ReaderPosition,
+} from "../ipc/types";
 import ReaderViewport from "./ReaderViewport.vue";
 
 const props = defineProps<{
@@ -219,11 +329,15 @@ const props = defineProps<{
   selectedUnread?: boolean;
   readerPosition: ReaderPosition;
   themeId: string;
+  darkMode?: boolean | null;
   effectiveDark?: boolean;
   followSystem?: boolean;
   overlayOccluded?: boolean;
   zoomPercent?: number;
   isBelow?: boolean;
+  folders?: FolderSummaryDto[];
+  allowingRemoteImages?: boolean;
+  movingMessage?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -231,17 +345,26 @@ const emit = defineEmits<{
   toggleSeen: [seen: boolean];
   toggleFlagged: [flagged: boolean];
   setReaderPosition: [pos: ReaderPosition];
-  setTheme: [themeId: string, darkMode?: boolean];
+  setTheme: [themeId: string, darkMode?: boolean | null];
+  setDarkMode: [mode: boolean | null];
   toggleDarkMode: [];
   toggleFollowSystem: [];
+  allowRemoteImages: [trustSender: boolean];
+  archive: [];
+  markSpam: [];
+  delete: [];
+  moveToFolder: [targetFolderPath: string];
   overlayChange: [id: string, open: boolean];
 }>();
 
 const themeWrapRef = ref<HTMLElement | null>(null);
 const themeMenuOpen = ref(false);
+const moveWrapRef = ref<HTMLElement | null>(null);
+const moveMenuOpen = ref(false);
 
 function setThemeMenu(open: boolean) {
   if (themeMenuOpen.value === open) return;
+  if (open) setMoveMenu(false);
   themeMenuOpen.value = open;
   emit("overlayChange", "reader-theme-menu", open);
 }
@@ -250,15 +373,58 @@ function toggleThemeMenu() {
   setThemeMenu(!themeMenuOpen.value);
 }
 
+function setMoveMenu(open: boolean) {
+  if (moveMenuOpen.value === open) return;
+  if (open) setThemeMenu(false);
+  moveMenuOpen.value = open;
+  emit("overlayChange", "reader-move-menu", open);
+}
+
+function toggleMoveMenu() {
+  setMoveMenu(!moveMenuOpen.value);
+}
+
 function pickTheme(id: string) {
   emit("setTheme", id);
   setThemeMenu(false);
 }
 
-function pickFollowSystem() {
-  emit("toggleFollowSystem");
+function pickDarkMode(mode: boolean | null) {
+  emit("setDarkMode", mode);
   setThemeMenu(false);
 }
+
+function pickMoveFolder(targetFolderPath: string) {
+  emit("moveToFolder", targetFolderPath);
+  setMoveMenu(false);
+}
+
+const accountFolders = computed(() => {
+  if (!props.message || !props.folders) return [];
+  return props.folders.filter((f) => f.accountId === props.message!.accountId);
+});
+
+function isCurrentFolder(folderPath: string): boolean {
+  const current = props.message?.folderPath;
+  if (!current) return false;
+  return current.toLowerCase() === folderPath.toLowerCase();
+}
+
+const colorModeBtnLabel = computed(() => {
+  if (props.darkMode === null || props.darkMode === undefined) {
+    return props.effectiveDark ? "🌓 跟随系统·暗" : "🌓 跟随系统·亮";
+  }
+  return props.darkMode ? "🌙 深色" : "☀ 浅色";
+});
+
+const colorModeBtnTitle = computed(() => {
+  if (props.darkMode === null || props.darkMode === undefined) {
+    return "当前：跟随系统深浅色（点击切换为浅色）";
+  }
+  return props.darkMode
+    ? "当前：深色模式（点击切换为跟随系统）"
+    : "当前：浅色模式（点击切换为深色）";
+});
 
 const currentThemeMeta = computed(
   () => BUILTIN_THEMES.find((t) => t.id === props.themeId) ?? BUILTIN_THEMES[0]
@@ -273,19 +439,31 @@ function formatBytes(bytes: number): string {
 }
 
 function onDocumentPointerDown(e: PointerEvent) {
-  if (!themeMenuOpen.value) return;
-  if (themeWrapRef.value && !themeWrapRef.value.contains(e.target as Node)) {
+  if (themeMenuOpen.value && themeWrapRef.value && !themeWrapRef.value.contains(e.target as Node)) {
     setThemeMenu(false);
+  }
+  if (moveMenuOpen.value && moveWrapRef.value && !moveWrapRef.value.contains(e.target as Node)) {
+    setMoveMenu(false);
+  }
+}
+
+function onDocumentKeyDown(e: KeyboardEvent) {
+  if (e.key === "Escape") {
+    setThemeMenu(false);
+    setMoveMenu(false);
   }
 }
 
 onMounted(() => {
   document.addEventListener("pointerdown", onDocumentPointerDown);
+  document.addEventListener("keydown", onDocumentKeyDown);
 });
 
 onUnmounted(() => {
   document.removeEventListener("pointerdown", onDocumentPointerDown);
+  document.removeEventListener("keydown", onDocumentKeyDown);
   setThemeMenu(false);
+  setMoveMenu(false);
 });
 </script>
 
@@ -307,14 +485,14 @@ onUnmounted(() => {
 }
 
 .km-reader-header {
-  height: 48px;
   min-height: 48px;
-  padding: 0 16px;
+  padding: 6px 14px;
   border-bottom: 1px solid var(--km-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .km-layout-switch {
@@ -353,24 +531,31 @@ onUnmounted(() => {
 .km-reader-actions {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .km-action-btn {
   height: 28px;
-  padding: 0 10px;
+  padding: 0 9px;
   border: 1px solid var(--km-border);
   border-radius: var(--km-radius-sm);
   background: var(--km-surface-raised);
   font-size: 12px;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
-.km-action-btn:hover {
+.km-action-btn:hover:not(:disabled) {
   background: var(--km-hover-bg);
+}
+
+.km-action-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .km-action-btn.flagged {
@@ -378,9 +563,75 @@ onUnmounted(() => {
   border-color: color-mix(in srgb, var(--km-star-gold) 45%, var(--km-border));
 }
 
+.km-action-danger:hover:not(:disabled),
 .km-action-retry {
   color: var(--km-danger);
   border-color: color-mix(in srgb, var(--km-danger) 45%, var(--km-border));
+}
+
+.km-move-popover {
+  width: 176px;
+}
+
+.km-current-tag {
+  font-size: 11px;
+  color: var(--km-text-muted);
+}
+
+.km-theme-item:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.km-remote-img-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--km-accent) 35%, var(--km-border));
+  border-radius: var(--km-radius-md);
+  background: var(--km-accent-soft);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.km-remote-img-text {
+  color: var(--km-text);
+  font-weight: 500;
+}
+
+.km-remote-img-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.km-remote-img-btn {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--km-border);
+  border-radius: var(--km-radius-sm);
+  background: var(--km-surface-raised);
+  color: var(--km-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.km-remote-img-btn.primary {
+  background: var(--km-accent);
+  border-color: var(--km-accent);
+  color: var(--km-accent-fg);
+}
+
+.km-remote-img-btn:hover:not(:disabled) {
+  filter: brightness(0.96);
+}
+
+.km-remote-img-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .km-reader-skeleton {

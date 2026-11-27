@@ -24,8 +24,10 @@ import type {
   SyncStatusDto,
   MessageRef,
   ReaderPosition,
+  MessageMoveOutput,
 } from "../ipc/types";
 import {
+  isTauri,
   mainBootstrap,
   listMessages,
   openMessage,
@@ -36,6 +38,13 @@ import {
   lockApp,
   setMessageSeen,
   setMessageFlagged,
+  allowRemoteImages,
+  loadOlderMessages as loadOlderMessagesIpc,
+  archiveMessage,
+  deleteMessage,
+  markMessageSpam,
+  moveMessage,
+  undoMessageMove,
   quitApp,
   onMailChanged,
   onSyncStatus,
@@ -65,6 +74,17 @@ export function dateGroupLabel(dateTs: number, nowTs: number): string {
 
 export const PAGE_SIZE = 50;
 export const READER_BODY_TIMEOUT_MS = 15_000;
+export const UNDO_TOAST_DURATION_MS = 8_000;
+
+export interface UndoToastState {
+  id: number;
+  label: string;
+  accountId: number;
+  messageId: number;
+  rfcMessageId: string;
+  currentFolderPath: string;
+  originalFolderPath: string;
+}
 
 export interface MessageGroup {
   label: string;
@@ -228,12 +248,19 @@ export function useMainWindow() {
   let lastReaderSessionId = "";
   let readerBodyTimer: ReturnType<typeof setTimeout> | null = null;
   let unlockCountdownTimer: ReturnType<typeof setInterval> | null = null;
+  let undoToastTimer: ReturnType<typeof setTimeout> | null = null;
+  let undoToastSeq = 0;
 
   // 选中状态
   const selectedId = ref<MessageRef | null>(null);
   const openedMessage = ref<OpenMessageOutput | null>(null);
   const readerLoading = ref(false);
   const readerError = ref<string | null>(null);
+  const loadingOlder = ref(false);
+  const allowingRemoteImages = ref(false);
+  const movingMessage = ref(false);
+  const undoToast = ref<UndoToastState | null>(null);
+  const undoPending = ref(false);
 
   // 解订阅句柄
   const unlisteners: Array<() => void> = [];
@@ -241,6 +268,36 @@ export function useMainWindow() {
   // --- 派生 ---
   const selectedMessage = computed(() => findMessageByRef(messages.value, selectedId.value));
   const selectedUnread = computed(() => selectedMessage.value?.unread ?? false);
+
+  const currentFolderHasMoreRemote = computed(() => {
+    const view = currentView.value;
+    if (view.kind === "accountFolder") {
+      const folder = folders.value.find(
+        (f) => f.accountId === view.accountId && f.id === view.folderId
+      );
+      return Boolean(folder?.hasMoreRemote);
+    }
+    switch (view.kind) {
+      case "unifiedInbox":
+        return folders.value.some((f) => f.path.toUpperCase() === "INBOX" && f.hasMoreRemote);
+      case "sent":
+        return folders.value.some((f) => f.path.toUpperCase() === "SENT" && f.hasMoreRemote);
+      case "drafts":
+        return folders.value.some((f) => f.path.toUpperCase() === "DRAFTS" && f.hasMoreRemote);
+      case "archive":
+        return folders.value.some((f) => f.path.toUpperCase() === "ARCHIVE" && f.hasMoreRemote);
+      case "junk":
+        return folders.value.some(
+          (f) => (f.path.toUpperCase() === "JUNK" || f.path.toUpperCase() === "SPAM") && f.hasMoreRemote
+        );
+      case "trash":
+        return folders.value.some(
+          (f) => (f.path.toUpperCase() === "TRASH" || f.path.toUpperCase() === "DELETED") && f.hasMoreRemote
+        );
+      default:
+        return false;
+    }
+  });
 
   const groupedMessages = computed<MessageGroup[]>(() => {
     if (!layout.prefs.value.listGroupByDate) {
@@ -277,6 +334,18 @@ export function useMainWindow() {
     }
   }
 
+  function clearUndoToastTimer() {
+    if (undoToastTimer !== null) {
+      clearTimeout(undoToastTimer);
+      undoToastTimer = null;
+    }
+  }
+
+  function dismissUndoToast() {
+    clearUndoToastTimer();
+    undoToast.value = null;
+  }
+
   function startUnlockCooldown(seconds: number) {
     clearUnlockCountdown();
     const initial = Math.max(0, Math.ceil(seconds));
@@ -310,6 +379,12 @@ export function useMainWindow() {
 
   function clearSensitiveMailState() {
     clearReaderBodyTimer();
+    clearUndoToastTimer();
+    undoToast.value = null;
+    undoPending.value = false;
+    loadingOlder.value = false;
+    allowingRemoteImages.value = false;
+    movingMessage.value = false;
     queryEpoch += 1;
     inFlightOffset = -1;
     openEpoch += 1;
@@ -429,6 +504,38 @@ export function useMainWindow() {
   function loadMore() {
     if (!listLoading.value && hasMore.value && !locked.value) {
       loadMessages(false);
+    }
+  }
+
+  async function loadOlderMessages(limit = PAGE_SIZE) {
+    if (locked.value || loadingOlder.value || !currentFolderHasMoreRemote.value) return;
+    loadingOlder.value = true;
+    listError.value = null;
+    try {
+      const res = await loadOlderMessagesIpc({ view: currentView.value, limit });
+      if (locked.value) return;
+      stateVersion.value = Math.max(stateVersion.value, res.stateVersion);
+      if (!res.hasMoreRemote) {
+        const view = currentView.value;
+        folders.value = folders.value.map((f) => {
+          if (view.kind === "accountFolder") {
+            return f.accountId === view.accountId && f.id === view.folderId
+              ? { ...f, hasMoreRemote: false }
+              : f;
+          }
+          if (view.kind === "unifiedInbox" && f.path.toUpperCase() === "INBOX") {
+            return { ...f, hasMoreRemote: false };
+          }
+          return f;
+        });
+      }
+      await syncFoldersMetadata();
+      await loadMessages(true, { preserveAnchor: true });
+    } catch (e) {
+      if (handleIpcError(e)) return;
+      listError.value = extractErrorMessage(e);
+    } finally {
+      loadingOlder.value = false;
     }
   }
 
@@ -673,6 +780,224 @@ export function useMainWindow() {
     }
   }
 
+  // --- 远程图片放行 ---
+  async function allowOpenedRemoteImages(trustSender: boolean) {
+    const current = openedMessage.value;
+    if (locked.value || !current || allowingRemoteImages.value) return;
+    allowingRemoteImages.value = true;
+    try {
+      const res = await allowRemoteImages({
+        accountId: current.accountId,
+        messageId: current.messageId,
+        trustSender,
+      });
+      if (locked.value) return;
+      stateVersion.value = Math.max(stateVersion.value, res.stateVersion);
+
+      const stillSame =
+        openedMessage.value?.accountId === current.accountId &&
+        openedMessage.value?.messageId === current.messageId;
+      if (!stillSame || !openedMessage.value) return;
+
+      openedMessage.value = {
+        ...openedMessage.value,
+        remoteImagesBlocked: false,
+      };
+
+      if (!isTauri()) {
+        const refreshed = await openMessage({
+          requestId: `open-remote-${++openEpoch}-${current.accountId}-${current.messageId}`,
+          accountId: current.accountId,
+          messageId: current.messageId,
+        });
+        if (
+          !locked.value &&
+          openedMessage.value?.accountId === current.accountId &&
+          openedMessage.value?.messageId === current.messageId
+        ) {
+          openedMessage.value = {
+            ...refreshed,
+            remoteImagesBlocked: false,
+          };
+        }
+      }
+    } catch (e) {
+      if (handleIpcError(e)) return;
+      readerError.value = extractErrorMessage(e);
+    } finally {
+      allowingRemoteImages.value = false;
+    }
+  }
+
+  // --- 归档 / 删除 / 标垃圾 / 移动 / 撤销 ---
+  function computeAdjacentTarget(target: MessageRef): MessageRef | null {
+    const idx = messages.value.findIndex(
+      (m) => m.accountId === target.accountId && m.id === target.messageId
+    );
+    if (idx < 0) return null;
+    if (idx + 1 < messages.value.length) {
+      const next = messages.value[idx + 1];
+      return { accountId: next.accountId, messageId: next.id };
+    }
+    if (idx > 0) {
+      const prev = messages.value[idx - 1];
+      return { accountId: prev.accountId, messageId: prev.id };
+    }
+    return null;
+  }
+
+  function showUndoToast(label: string, res: MessageMoveOutput) {
+    clearUndoToastTimer();
+    undoToastSeq += 1;
+    undoToast.value = {
+      id: undoToastSeq,
+      label,
+      accountId: res.accountId,
+      messageId: res.messageId,
+      rfcMessageId: res.rfcMessageId,
+      currentFolderPath: res.targetFolderPath,
+      originalFolderPath: res.originalFolderPath,
+    };
+    undoToastTimer = setTimeout(() => {
+      undoToastTimer = null;
+      undoToast.value = null;
+    }, UNDO_TOAST_DURATION_MS);
+  }
+
+  function resolveFolderDisplayName(accountId: number, folderPath: string): string {
+    const matched = folders.value.find(
+      (f) => f.accountId === accountId && f.path.toLowerCase() === folderPath.toLowerCase()
+    );
+    return matched?.name ?? folderPath;
+  }
+
+  async function performMoveAction(
+    kind: "archive" | "delete" | "spam" | "move",
+    target: MessageRef,
+    targetFolderPath?: string
+  ): Promise<MessageMoveOutput | null> {
+    if (locked.value || movingMessage.value) return null;
+    movingMessage.value = true;
+    const nextTarget = computeAdjacentTarget(target);
+    const wasSelected =
+      selectedId.value?.accountId === target.accountId &&
+      selectedId.value?.messageId === target.messageId;
+
+    try {
+      let res: MessageMoveOutput;
+      if (kind === "archive") {
+        res = await archiveMessage(target);
+      } else if (kind === "delete") {
+        res = await deleteMessage(target);
+      } else if (kind === "spam") {
+        res = await markMessageSpam(target);
+      } else {
+        if (!targetFolderPath) return null;
+        res = await moveMessage({ ...target, targetFolderPath });
+      }
+      if (locked.value) return null;
+
+      stateVersion.value = Math.max(stateVersion.value, res.stateVersion);
+      const leavesCurrentView =
+        res.originalFolderPath !== res.targetFolderPath && currentView.value.kind !== "starred";
+
+      if (leavesCurrentView) {
+        messages.value = messages.value.filter(
+          (m) => !(m.accountId === res.accountId && m.id === res.messageId)
+        );
+        listTotal.value = Math.max(0, listTotal.value - 1);
+      }
+
+      if (wasSelected && leavesCurrentView) {
+        selectMessage(nextTarget);
+      }
+
+      const label =
+        kind === "archive"
+          ? "已归档邮件"
+          : kind === "delete"
+            ? "已移至已删除"
+            : kind === "spam"
+              ? "已标记为垃圾邮件"
+              : `已移动到 ${resolveFolderDisplayName(res.accountId, res.targetFolderPath)}`;
+      showUndoToast(label, res);
+
+      await syncFoldersMetadata();
+      await loadMessages(true, { preserveAnchor: true });
+      return res;
+    } catch (e) {
+      if (handleIpcError(e)) return null;
+      listError.value = extractErrorMessage(e);
+      return null;
+    } finally {
+      movingMessage.value = false;
+    }
+  }
+
+  function archiveMessageByRef(target: MessageRef) {
+    return performMoveAction("archive", target);
+  }
+
+  function deleteMessageByRef(target: MessageRef) {
+    return performMoveAction("delete", target);
+  }
+
+  function markMessageSpamByRef(target: MessageRef) {
+    return performMoveAction("spam", target);
+  }
+
+  function moveMessageByRef(target: MessageRef, targetFolderPath: string) {
+    return performMoveAction("move", target, targetFolderPath);
+  }
+
+  function archiveSelectedMessage() {
+    if (!selectedId.value) return Promise.resolve(null);
+    return performMoveAction("archive", selectedId.value);
+  }
+
+  function deleteSelectedMessage() {
+    if (!selectedId.value) return Promise.resolve(null);
+    return performMoveAction("delete", selectedId.value);
+  }
+
+  function markSelectedSpam() {
+    if (!selectedId.value) return Promise.resolve(null);
+    return performMoveAction("spam", selectedId.value);
+  }
+
+  function moveSelectedMessage(targetFolderPath: string) {
+    if (!selectedId.value) return Promise.resolve(null);
+    return performMoveAction("move", selectedId.value, targetFolderPath);
+  }
+
+  async function undoLastMove(): Promise<boolean> {
+    const toast = undoToast.value;
+    if (!toast || locked.value || undoPending.value) return false;
+    clearUndoToastTimer();
+    undoPending.value = true;
+    try {
+      const res = await undoMessageMove({
+        accountId: toast.accountId,
+        messageId: toast.messageId,
+        rfcMessageId: toast.rfcMessageId,
+        currentFolderPath: toast.currentFolderPath,
+        originalFolderPath: toast.originalFolderPath,
+      });
+      if (locked.value) return false;
+      stateVersion.value = Math.max(stateVersion.value, res.stateVersion);
+      undoToast.value = null;
+      await syncFoldersMetadata();
+      await loadMessages(true, { preserveAnchor: true });
+      return res.accepted;
+    } catch (e) {
+      if (handleIpcError(e)) return false;
+      listError.value = extractErrorMessage(e);
+      return false;
+    } finally {
+      undoPending.value = false;
+    }
+  }
+
   // --- 锁屏 / 解锁 / 退出 ---
   async function lock() {
     try {
@@ -897,6 +1222,7 @@ export function useMainWindow() {
   function dispose() {
     clearReaderBodyTimer();
     clearUnlockCountdown();
+    clearUndoToastTimer();
     for (const unlisten of unlisteners) unlisten();
     unlisteners.length = 0;
   }
@@ -929,6 +1255,8 @@ export function useMainWindow() {
     listLoading,
     listError,
     hasMore,
+    currentFolderHasMoreRemote,
+    loadingOlder,
     scrollResetToken,
     searchQuery,
     searchScope,
@@ -940,6 +1268,10 @@ export function useMainWindow() {
     openedMessage,
     readerLoading,
     readerError,
+    allowingRemoteImages,
+    movingMessage,
+    undoToast,
+    undoPending,
     init,
     dispose,
     selectView,
@@ -952,6 +1284,18 @@ export function useMainWindow() {
     retryOpen,
     toggleMessageSeen,
     toggleMessageFlagged,
+    allowOpenedRemoteImages,
+    loadOlderMessages,
+    archiveMessageByRef,
+    deleteMessageByRef,
+    markMessageSpamByRef,
+    moveMessageByRef,
+    archiveSelectedMessage,
+    deleteSelectedMessage,
+    markSelectedSpam,
+    moveSelectedMessage,
+    undoLastMove,
+    dismissUndoToast,
     lock,
     unlock,
     quit,
