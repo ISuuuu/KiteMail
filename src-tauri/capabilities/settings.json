@@ -15,6 +15,12 @@
     "allow-set-app-lock-passcode",
     "allow-manage-trusted-senders",
     "allow-clear-body-caches",
-    "allow-check-app-update"
+    "allow-check-app-update",
+    "allow-list-accounts",
+    "allow-verify-account",
+    "allow-save-account",
+    "allow-delete-account",
+    "allow-set-account-enabled",
+    "allow-start-microsoft-oauth"
   ]
 }

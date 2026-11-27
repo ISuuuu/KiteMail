@@ -68,6 +68,7 @@
         </div>
         <template v-else>
           <GeneralPage v-if="activeTab.id === 'general'" :state="state" />
+          <AccountsPage v-else-if="activeTab.id === 'mailAccounts'" />
           <template v-else-if="activeTab.id === 'appearance'">
             <AppearancePanel :state="state" />
           </template>
@@ -109,6 +110,7 @@ import {
   StoragePanel,
 } from "../preferences/panels";
 import { usePreferences } from "../preferences/usePreferences";
+import AccountsPage from "./AccountsPage.vue";
 import GeneralPage from "./GeneralPage.vue";
 import PlaceholderPage from "./PlaceholderPage.vue";
 import SettingsIcon from "./SettingsIcon.vue";
