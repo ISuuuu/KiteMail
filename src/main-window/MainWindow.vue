@@ -17,7 +17,7 @@
       @lock="state.lock"
       @toggleDarkMode="state.layout.toggleDarkMode"
       @compose="openNewCompose()"
-      @openAccounts="openAccountsModal()"
+      @openAccounts="openAccountManager()"
       @openAttachments="attachmentGalleryOpen = true"
       @openContacts="contactsModalOpen = true"
       @openCommandPalette="commandPaletteOpen = true"
@@ -433,6 +433,17 @@ function openAccountsModal() {
   accountsModalOpen.value = true;
 }
 
+/**
+ * GPUI open_account_manager 等价（菜单 / 命令面板入口）：打开独立设置窗并定位「邮箱账号」页
+ * （openSettingsWindow 携带 ?tab=mailAccounts 载体）；浏览器（IPC 不可用）回落旧账号弹窗。
+ */
+function openAccountManager() {
+  void openSettingsWindow("mailAccounts").then((opened) => {
+    if (opened) return;
+    openAccountsModal();
+  });
+}
+
 async function onAccountsChanged() {
   await state.init();
 }
@@ -766,7 +777,7 @@ function executePaletteCommand(commandId: string) {
       contactsModalOpen.value = true;
       break;
     case "tools.accounts":
-      openAccountsModal();
+      openAccountManager();
       break;
     case "tools.preferences":
       openPreferencesModal("appearance");

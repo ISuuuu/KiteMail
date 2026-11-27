@@ -25,13 +25,28 @@ fn activate_existing(app: &AppHandle) -> Option<tauri::WebviewWindow> {
 }
 
 /// 打开（或激活）独立设置窗口。由主窗口偏好设置入口（侧栏菜单 / 命令面板 / Ctrl+,）调用。
+///
+/// `tab`（WP-10）：入口定位载体（对应 GPUI `SettingsOpenTarget::Tab`，如账号管理入口
+/// 携带 "mailAccounts"），拼入设置窗 URL 由前端 SettingsWindow 解析 `?tab=`；
+/// 仅在新建窗口时生效，重复打开仅激活既有窗口。
 #[tauri::command]
-pub fn open_settings_window(app: AppHandle) -> Result<(), IpcError> {
+pub fn open_settings_window(app: AppHandle, tab: Option<String>) -> Result<(), IpcError> {
     if activate_existing(&app).is_some() {
         return Ok(());
     }
 
-    let url = WebviewUrl::App("index.html?window=settings".into());
+    // 页签 id 白名单：仅允许字母数字与下划线，避免 URL 拼注异常
+    let tab_segment = match tab.as_deref().map(str::trim) {
+        Some(t)
+            if !t.is_empty()
+                && t.len() <= 40
+                && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+        {
+            format!("&tab={t}")
+        }
+        _ => String::new(),
+    };
+    let url = WebviewUrl::App(format!("index.html?window=settings{tab_segment}").into());
     let _window = WebviewWindowBuilder::new(&app, SETTINGS_WINDOW_LABEL, url)
         .title(SETTINGS_WINDOW_TITLE)
         .inner_size(SETTINGS_WINDOW_WIDTH, SETTINGS_WINDOW_HEIGHT)

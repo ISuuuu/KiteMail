@@ -1,29 +1,44 @@
 <template>
   <div ref="rootRef" class="km-combo">
     <button
+      ref="buttonRef"
       type="button"
       class="km-combo-btn"
       :class="{ open }"
       :disabled="disabled"
       aria-haspopup="listbox"
       :aria-expanded="open"
+      :aria-activedescendant="open ? menuId : undefined"
       :title="title"
       @click.stop="toggle"
-      @keydown.down.prevent="open = true"
+      @keydown.down.prevent="onArrowDown"
+      @keydown.up.prevent="onArrowUp"
+      @keydown.enter.prevent="onEnter"
       @keydown.escape.prevent="open = false"
+      @keydown.tab="open = false"
+      @keydown.home.prevent="open && (highlighted = 0)"
+      @keydown.end.prevent="open && (highlighted = options.length - 1)"
     >
       <span class="km-combo-label">{{ currentLabel }}</span>
       <SettingsIcon name="chevron-down" :size="12" class="km-combo-chevron" />
     </button>
 
-    <ul v-if="open" class="km-combo-menu" role="listbox">
+    <ul
+      v-if="open"
+      :id="menuId"
+      class="km-combo-menu"
+      role="listbox"
+    >
       <li
-        v-for="opt in options"
+        v-for="(opt, idx) in options"
+        :id="`${menuId}-opt-${idx}`"
         :key="opt.value"
         class="km-combo-item"
         role="option"
+        :class="{ highlighted: idx === highlighted }"
         :aria-selected="opt.value === modelValue"
         @click.stop="choose(opt.value)"
+        @mousemove="highlighted = idx"
       >
         <span class="km-combo-check">
           <SettingsIcon
@@ -45,6 +60,8 @@ import SettingsIcon from "./SettingsIcon.vue";
 /**
  * 静态选项下拉（对齐 GPUI widgets.rs#combo_button）：
  * outline 紧凑按钮 + 弹出菜单，当前项前显示勾选标记。
+ * 键盘导航（WP-10）：焦点保持在按钮上（aria-activedescendant），
+ * ↓/↑ 循环移动高亮、Enter 确认高亮项、Esc 关闭、Home/End 跳首尾、Tab 关闭。
  */
 export interface ComboOption {
   label: string;
@@ -61,19 +78,66 @@ const props = defineProps<{
 const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 
 const rootRef = ref<HTMLElement | null>(null);
+const buttonRef = ref<HTMLButtonElement | null>(null);
 const open = ref(false);
+const highlighted = ref(0);
+
+// 同页多个 ComboSelect 需要互不冲突的菜单 / 选项元素 id（aria-activedescendant）
+const menuId = `km-combo-menu-${Math.random().toString(36).slice(2, 9)}`;
 
 const currentLabel = computed(
   () => props.options.find((o) => o.value === props.modelValue)?.label ?? props.modelValue
 );
 
+function openMenu() {
+  if (props.disabled || open.value) return;
+  const selectedIndex = props.options.findIndex((o) => o.value === props.modelValue);
+  highlighted.value = selectedIndex >= 0 ? selectedIndex : 0;
+  open.value = true;
+}
+
 function toggle() {
   if (props.disabled) return;
-  open.value = !open.value;
+  if (open.value) {
+    open.value = false;
+  } else {
+    openMenu();
+  }
+}
+
+function moveHighlight(delta: number) {
+  if (!open.value) {
+    openMenu();
+    return;
+  }
+  const count = props.options.length;
+  if (count === 0) return;
+  // 循环移动（对齐 GPUI 菜单上下键循环选择）
+  highlighted.value = (highlighted.value + delta + count) % count;
+}
+
+function onArrowDown() {
+  moveHighlight(1);
+}
+
+function onArrowUp() {
+  moveHighlight(-1);
+}
+
+function onEnter() {
+  if (!open.value) {
+    openMenu();
+    return;
+  }
+  const opt = props.options[highlighted.value];
+  if (opt) {
+    choose(opt.value);
+  }
 }
 
 function choose(value: string) {
   open.value = false;
+  buttonRef.value?.focus();
   if (value !== props.modelValue) {
     emit("update:modelValue", value);
   }
@@ -167,7 +231,8 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.km-combo-item:hover {
+.km-combo-item:hover,
+.km-combo-item.highlighted {
   background: var(--km-hover-bg);
 }
 

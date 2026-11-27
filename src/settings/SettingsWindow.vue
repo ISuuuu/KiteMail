@@ -20,7 +20,7 @@
         >
           <SettingsIcon :name="searchOpen ? 'close' : 'search'" :size="14" />
         </button>
-        <WindowControls v-if="narrowOnlySidebar" />
+        <WindowControls v-if="narrowOnlySidebar" @close="requestCloseWindow" />
       </header>
 
       <!-- 搜索输入框（展开时自动聚焦，Esc 收起） -->
@@ -110,7 +110,7 @@
             {{ accountChrome.busy ? "正在保存…" : "保存" }}
           </button>
         </div>
-        <WindowControls />
+        <WindowControls @close="requestCloseWindow" />
       </header>
 
       <div
@@ -181,7 +181,9 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { KNOWN_THEMES, resolveDarkMode } from "../main-window/usePaneLayout";
+import { isTauriRuntime } from "./windowEnv";
 import type { FullPreferencesDto } from "../preferences/types";
 import { usePreferences } from "../preferences/usePreferences";
 import {
@@ -218,6 +220,7 @@ import WindowControls from "./WindowControls.vue";
 import {
   DEFAULT_SETTINGS_TAB,
   SETTINGS_TAB_GROUPS,
+  SETTINGS_TABS,
   computeSidebarWidth,
   findSettingsTab,
   isNarrowViewport,
@@ -364,6 +367,79 @@ function onSettingsKeydown(e: KeyboardEvent) {
   }
 }
 
+// ---- 入口定位与默认页签（WP-10，对照 GPUI app.rs#L11619 open_preferences） ----
+// GPUI 载体为持久偏好 settings_open_accounts；该字段不在前端偏好 IPC 契约内，
+// 这里以 URL 参数 ?tab=<页签 id> 作为最小等价载体（新建窗口时由入口方携带）。
+function initialTabFromUrl(): SettingsTabId | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const tab = new URLSearchParams(window.location.search).get("tab");
+    if (!tab) return null;
+    const meta = SETTINGS_TABS.find((t) => t.id === tab);
+    return meta ? meta.id : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---- Ctrl+W / Esc 逐层收合与关窗守卫（WP-10，对照 GPUI mod.rs#L2677 CloseOverlay） ----
+let keyboardListenerAttached = false;
+
+/** 原生关窗（浏览器预览无 Tauri 桥，安全跳过）。 */
+function closeNativeWindow() {
+  if (!isTauriRuntime()) return;
+  void getCurrentWindow().close();
+}
+
+/**
+ * 宿主关窗入口：账号编辑态脏数据时挂起未保存守卫（GPUI request_leave_editor 语义），
+ * 返回 true 表示已被守卫拦截（壳层暂不关窗）。
+ */
+function requestCloseWindow(): boolean {
+  if (accountsPageRef.value?.requestHostClose()) {
+    return true;
+  }
+  closeNativeWindow();
+  return false;
+}
+
+function onKeyDown(event: KeyboardEvent) {
+  // Ctrl+W 关窗（守卫拦截时显示未保存横幅而非关窗）
+  if (event.ctrlKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "w") {
+    event.preventDefault();
+    event.stopPropagation();
+    requestCloseWindow();
+    return;
+  }
+  if (event.key !== "Escape") {
+    return;
+  }
+  // ComboSelect 菜单打开时优先由其自身 Esc 关闭（GPUI CloseOverlay 优先级）
+  if (document.querySelector(".km-combo-menu")) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  // 逐层收合（GPUI mod.rs#L2690 CloseOverlay 顺序的等价实现）：
+  // 1) 未保存守卫横幅 → 取消（留在编辑页）
+  if (accountsPageRef.value?.pendingLeave) {
+    accountsPageRef.value.cancelPendingLeave();
+    return;
+  }
+  // 2) 账号编辑态 → 先回账号列表（脏数据由守卫挂起，见 useAccountLayers.requestBack）
+  if (activeTab.value.id === "mailAccounts" && accountChrome.editorActive) {
+    accountsPageRef.value?.backToAccountList();
+    return;
+  }
+  // 3) 窄窗内容 → 回导航
+  if (narrow.value && narrowShowContent.value) {
+    narrowShowContent.value = false;
+    return;
+  }
+  // 4) 最外层 → 守卫感知关窗
+  requestCloseWindow();
+}
+
 // 窗口拉宽脱离窄窗时复位分支状态，回到常规双栏。
 watch(narrow, (isNarrow, prev) => {
   if (prev && !isNarrow) {
@@ -398,6 +474,12 @@ function onSystemSchemeChange() {
 }
 
 onMounted(() => {
+  // 入口定位：URL ?tab= 参数（settings_open_accounts / 账号管理入口的最小等价载体），
+  // 未携带时默认「常规」（GPUI open_preferences）。
+  const initialTab = initialTabFromUrl();
+  if (initialTab) {
+    activeTabId.value = initialTab;
+  }
   // 加载偏好数据；页签路由由设置窗本地 activeTabId 管理，不写入旧弹窗的 6 页签状态。
   void state.init();
   window.addEventListener("keydown", onSettingsKeydown);
@@ -418,6 +500,11 @@ onMounted(() => {
     schemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
     schemeQuery.addEventListener("change", onSystemSchemeChange);
   }
+  // Ctrl+W / Esc 逐层收合（GPUI mod.rs#L2677）：capture 确保先于页内输入处理
+  if (!keyboardListenerAttached) {
+    window.addEventListener("keydown", onKeyDown, true);
+    keyboardListenerAttached = true;
+  }
 });
 
 onBeforeUnmount(() => {
@@ -430,6 +517,10 @@ onBeforeUnmount(() => {
   resizeObserver = null;
   schemeQuery?.removeEventListener("change", onSystemSchemeChange);
   schemeQuery = null;
+  if (keyboardListenerAttached) {
+    window.removeEventListener("keydown", onKeyDown, true);
+    keyboardListenerAttached = false;
+  }
 });
 </script>
 

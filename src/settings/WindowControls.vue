@@ -35,7 +35,12 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import SettingsIcon from "./SettingsIcon.vue";
 import { isTauriRuntime } from "./windowEnv";
 
-/** 同排窗体按钮：最小化 / 最大化还原 / 关闭（GPUI render_window_controls）。 */
+/**
+ * 同排窗体按钮：最小化 / 最大化还原 / 关闭（GPUI render_window_controls）。
+ * 关闭改为上抛事件（WP-10）：壳层经账号编辑未保存守卫后再执行原生关窗。
+ */
+const emit = defineEmits<{ close: [] }>();
+
 function onMinimize() {
   if (!isTauriRuntime()) return;
   void getCurrentWindow().minimize();
@@ -47,8 +52,7 @@ function onToggleMaximize() {
 }
 
 function onClose() {
-  if (!isTauriRuntime()) return;
-  void getCurrentWindow().close();
+  emit("close");
 }
 </script>
 
