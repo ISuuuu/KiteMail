@@ -508,12 +508,14 @@ test("dev-tauri 多 worktree 参数解析、配置构造与空闲回环端口探
   });
   assert.equal(invocation.envPatch.KITEMAIL_DEV_PORT, "1455");
   assert.equal(invocation.envPatch.KITEMAIL_DEMO, "1");
+  // 双 `--`：第一个后是 runner（cargo）参数（留空），第二个后才是应用参数
   assert.deepEqual(invocation.args, [
     "tauri",
     "dev",
     "--config",
     '{"build":{"devUrl":"http://127.0.0.1:1455"}}',
     "--no-watch",
+    "--",
     "--",
     "--demo",
   ]);

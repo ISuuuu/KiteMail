@@ -110,7 +110,9 @@ export function buildTauriDevInvocation({
     appArgs.unshift("--demo");
   }
   if (appArgs.length > 0) {
-    args.push("--", ...appArgs);
+    // Tauri CLI 约定（tauri dev --help）：第一个 `--` 后是 runner（cargo）参数，
+    // 第二个 `--` 后才是应用参数。单 `--` 会把应用参数误传给 cargo 导致构建失败。
+    args.push("--", "--", ...appArgs);
   }
   const envPatch = {
     KITEMAIL_DEV_PORT: String(port),

@@ -54,6 +54,8 @@ const props = withDefaults(
 const emit = defineEmits<{
   /** 编辑态顶栏状态（壳层据此渲染标题与 返回/移除/保存） */
   chrome: [chrome: { editorActive: boolean; title: string; canRemove: boolean; busy: boolean }];
+  /** 守卫放行后的关窗动作（未保存横幅「放弃更改 / 保存」后触发，WP-10） */
+  closeWindow: [];
 }>();
 
 const accountState = useAccounts();
@@ -65,12 +67,17 @@ const {
   snapshotBaseline,
   startCreateFlow,
   requestBack,
+  requestClose,
   onRowSelect,
   discardPendingLeave,
   saveAndLeave,
   onEditorSaved,
   onEditorRemoved,
-} = useAccountLayers({ state: accountState });
+} = useAccountLayers({
+  state: accountState,
+  // 关窗离开动作（useAccountLayers 层面）：设置窗壳层负责原生关窗
+  onClose: () => emit("closeWindow"),
+});
 
 onMounted(() => {
   void accountState.init().then(() => snapshotBaseline());
@@ -111,6 +118,17 @@ defineExpose({
   backToAccountList,
   toggleRemoveConfirm,
   saveFromChrome,
+  // ---- WP-10：壳层 Esc / Ctrl+W 逐层收合所需（经 useAccountLayers 委托） ----
+  /** 未保存守卫横幅是否挂起 */
+  pendingLeave,
+  /** 取消未保存守卫横幅（GPUI Esc 清 pending_leave_action） */
+  cancelPendingLeave() {
+    pendingLeave.value = null;
+  },
+  /** 宿主关窗入口：编辑态脏 → 挂起守卫返回 true（壳层暂不关窗） */
+  requestHostClose(): boolean {
+    return requestClose();
+  },
 });
 
 // 拖拽排序暂无持久化 IPC（Tauri 命令清单未含 reorder），把手仅作视觉呈现；后端支持后在此接线。
