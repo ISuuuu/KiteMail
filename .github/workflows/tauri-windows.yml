@@ -1,18 +1,6 @@
 name: Tauri Windows x64
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths:
-      - "src/**"
-      - "src-tauri/**"
-      - "crates/mail-core/**"
-      - "crates/windows-mail-reader/**"
-      - "package.json"
-      - "pnpm-lock.yaml"
-      - "vite.config.ts"
-      - ".github/workflows/tauri-windows.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -76,5 +64,5 @@ jobs:
       - name: Check root Cargo workspace
         run: cargo check --workspace --target x86_64-pc-windows-msvc --locked
 
-      - name: Build Tauri preview binary (no-bundle)
+      - name: Build Tauri binary (no-bundle)
         run: pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle

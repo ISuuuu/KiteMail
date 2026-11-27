@@ -1,9 +1,9 @@
 [package]
-name = "kitemail-tauri-preview"
+name = "kitemail"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "KiteMail Tauri 2 desktop preview host"
+description = "KiteMail Tauri 2 desktop client"
 
 [workspace]
 members = ["."]

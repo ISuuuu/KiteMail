@@ -1,14 +1,14 @@
 //! 单实例保护与同资料目录单进程写入锁。
 //!
-//! 启动时先抢占预览版独立命名互斥量 `Local\KiteMail_Preview_SingleInstance_Mutex`；
+//! 启动时先抢占全局单实例命名互斥量 `Local\KiteMail_SingleInstance_Mutex`；
 //! 若已有实例在运行，则尝试将其主窗口还原到前台并退出当前进程。
 //! 同时按解析后的资料目录路径派生独立互斥量，防止两个不同配置/实例并发写入同一资料目录。
 
 use std::path::Path;
 
-/// 预览版独立命名互斥量名（与 GPUI 主程序 `Local\KiteMail_SingleInstance_Mutex` 隔离）。
-pub const PREVIEW_MUTEX_NAME: &str = "Local\\KiteMail_Preview_SingleInstance_Mutex";
-const MAIN_WINDOW_TITLE: &str = "KiteMail Preview";
+/// 正式单实例互斥量名（沿用既有 Windows 发行版命名约定，防止重复启动）。
+pub const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\KiteMail_SingleInstance_Mutex";
+const MAIN_WINDOW_TITLE: &str = "KiteMail";
 
 /// 根据资料目录生成唯一的局部命名互斥量名，保证同一资料目录同一时间仅单进程写入。
 pub fn data_dir_mutex_name(data_dir: &Path) -> String {
@@ -26,7 +26,7 @@ pub fn data_dir_mutex_name(data_dir: &Path) -> String {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
-    format!("Local\\KiteMail_Preview_DataDir_{hash:016x}")
+    format!("Local\\KiteMail_DataDir_{hash:016x}")
 }
 
 #[cfg(target_os = "windows")]
@@ -34,7 +34,7 @@ mod win {
     use core::ffi::c_void;
     use std::path::Path;
 
-    use super::{data_dir_mutex_name, MAIN_WINDOW_TITLE, PREVIEW_MUTEX_NAME};
+    use super::{data_dir_mutex_name, MAIN_WINDOW_TITLE, SINGLE_INSTANCE_MUTEX_NAME};
 
     type Handle = *mut c_void;
     type Hwnd = *mut c_void;
@@ -89,9 +89,9 @@ mod win {
         }
     }
 
-    /// 抢占预览版单实例互斥量；若已有实例则唤醒其主窗口并返回 `None`。
+    /// 抢占单实例互斥量；若已有实例则唤醒其主窗口并返回 `None`。
     pub fn acquire_or_activate() -> Option<SingleInstanceGuard> {
-        match acquire_named(PREVIEW_MUTEX_NAME) {
+        match acquire_named(SINGLE_INSTANCE_MUTEX_NAME) {
             Some(guard) => Some(guard),
             None => {
                 unsafe {
@@ -231,7 +231,7 @@ mod win {
 
         #[test]
         fn named_mutex_allows_only_one_owner() {
-            let name = format!("Local\\KiteMail_Preview_Test_{}", uuid::Uuid::new_v4());
+            let name = format!("Local\\KiteMail_Test_{}", uuid::Uuid::new_v4());
             let first = acquire_named(&name);
             assert!(first.is_some(), "首次创建互斥量应当成功");
             assert!(acquire_named(&name).is_none(), "重复获取应判定已有实例");

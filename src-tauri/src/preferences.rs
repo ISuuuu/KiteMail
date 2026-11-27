@@ -88,8 +88,8 @@ pub fn resolve_preview_data_dir_with(
         .join(PREVIEW_DATA_DIR_NAME)
 }
 
-/// Resolve the isolated Live-mode data directory:
-/// `KITEMAIL_DATA_DIR` > `KITEMAIL_PREVIEW_DATA_DIR` > portable `<exe_dir>\data-preview` > `%LOCALAPPDATA%\KiteMailPreview`.
+/// Resolve the formal Live-mode data directory:
+/// `KITEMAIL_DATA_DIR` > `KITEMAIL_PREVIEW_DATA_DIR` > portable `<exe_dir>\data` > `%LOCALAPPDATA%\KiteMail`.
 pub fn resolve_live_data_dir_with(
     mail_env: Option<&str>,
     preview_env: Option<&str>,
@@ -103,17 +103,10 @@ pub fn resolve_live_data_dir_with(
     if let Some(raw) = preview_env.map(str::trim).filter(|s| !s.is_empty()) {
         return PathBuf::from(raw);
     }
-    if is_portable {
-        if let Some(dir) = exe_dir {
-            return dir.join("data-preview");
-        }
-    }
-    local_app_data
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(PREVIEW_DATA_DIR_NAME)
+    resolve_data_dir(None, is_portable, exe_dir, local_app_data)
 }
 
+#[allow(dead_code)]
 pub fn production_default_data_dir_with(
     is_portable: bool,
     exe_dir: Option<&Path>,
@@ -160,6 +153,7 @@ fn normalized_path_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+#[allow(dead_code)]
 /// Verify that neither `data_dir` nor its resolved `mail_data_dir` points to any production default path.
 pub fn verify_isolated_live_dirs(
     data_dir: &Path,
@@ -188,7 +182,8 @@ pub fn verify_isolated_live_dirs(
     Ok(mail_dir)
 }
 
-/// Resolve and verify the active Live-mode data directory.
+/// Resolve the active Live-mode data directory (preserving `%LOCALAPPDATA%\KiteMail` / `<exe_dir>\data`
+/// as well as custom `KITEMAIL_DATA_DIR` or explicit `KITEMAIL_PREVIEW_DATA_DIR`).
 pub fn resolve_and_verify_live_data_dir() -> Result<(PathBuf, PathBuf), String> {
     let mail_env = std::env::var("KITEMAIL_DATA_DIR").ok();
     let preview_env = std::env::var("KITEMAIL_PREVIEW_DATA_DIR").ok();
@@ -206,21 +201,7 @@ pub fn resolve_and_verify_live_data_dir() -> Result<(PathBuf, PathBuf), String> 
         local_app_data.as_deref(),
     );
 
-    let mut prod_dirs = vec![production_default_data_dir_with(
-        false,
-        exe_dir.as_deref(),
-        local_app_data.as_deref(),
-    )];
-    if is_portable {
-        prod_dirs.push(production_default_data_dir_with(
-            true,
-            exe_dir.as_deref(),
-            local_app_data.as_deref(),
-        ));
-    }
-
-    let mail_dir = verify_isolated_live_dirs(&data_dir, &prod_dirs)?;
-    kitemail_mail_core::config::validate_isolated_data_dir(&data_dir, None)?;
+    let mail_dir = resolve_mail_data_dir_in(&data_dir);
     Ok((data_dir, mail_dir))
 }
 
@@ -875,14 +856,24 @@ mod tests {
     }
 
     #[test]
-    fn live_data_dir_prefers_env_falls_back_to_preview_and_rejects_production_dirs() {
+    fn live_data_dir_prefers_env_falls_back_to_production_and_checks_isolation_helper() {
         let local = temp_dir("prod-root");
         let prod_dir = production_default_data_dir_with(false, None, Some(&local));
         assert_eq!(prod_dir, local.join("KiteMail"));
 
         let fallback = resolve_live_data_dir_with(None, None, false, None, Some(&local));
-        assert_eq!(fallback, local.join("KiteMailPreview"));
-        assert!(verify_isolated_live_dirs(&fallback, std::slice::from_ref(&prod_dir)).is_ok());
+        assert_eq!(fallback, prod_dir);
+
+        let portable =
+            resolve_live_data_dir_with(None, None, true, Some(&local.join("app")), Some(&local));
+        assert_eq!(portable, local.join("app").join("data"));
+
+        let preview_override =
+            resolve_live_data_dir_with(None, Some(r"D:\OtherPreview"), false, None, Some(&local));
+        assert_eq!(preview_override, PathBuf::from(r"D:\OtherPreview"));
+        assert!(
+            verify_isolated_live_dirs(&preview_override, std::slice::from_ref(&prod_dir)).is_ok()
+        );
 
         let env_custom = temp_dir("live-env");
         let resolved_env = resolve_live_data_dir_with(
@@ -895,7 +886,7 @@ mod tests {
         assert_eq!(resolved_env, env_custom);
         assert!(verify_isolated_live_dirs(&resolved_env, std::slice::from_ref(&prod_dir)).is_ok());
 
-        // Reject data_dir pointing directly to production default directory.
+        // Reject data_dir pointing directly to production default directory when explicit isolation helper is called.
         let direct_prod = verify_isolated_live_dirs(&prod_dir, std::slice::from_ref(&prod_dir));
         assert!(direct_prod.is_err());
 

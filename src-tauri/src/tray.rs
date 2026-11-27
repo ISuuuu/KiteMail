@@ -535,7 +535,7 @@ mod win {
                 .name("kitemail-tauri-tray".to_string())
                 .spawn(move || unsafe {
                     let hinstance = GetModuleHandleW(core::ptr::null());
-                    let class_name = to_wide_null("KiteMailPreviewTrayWindowClass");
+                    let class_name = to_wide_null("KiteMailTrayWindowClass");
                     let wc = WndClassExW {
                         cb_size: core::mem::size_of::<WndClassExW>() as u32,
                         style: 0,
@@ -552,7 +552,7 @@ mod win {
                     };
                     RegisterClassExW(&wc);
 
-                    let window_title = to_wide_null("KiteMail Preview Tray");
+                    let window_title = to_wide_null("KiteMail Tray");
                     let hwnd = CreateWindowExW(
                         0,
                         class_name.as_ptr(),

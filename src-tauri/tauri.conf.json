@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "kitemail-tauri-preview",
+  "productName": "kitemail",
   "version": "0.1.0",
-  "identifier": "com.kitemail.desktop.preview",
+  "identifier": "com.kitemail.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "KiteMail Preview",
+        "title": "KiteMail",
         "width": 1280,
         "height": 800,
         "minWidth": 900,

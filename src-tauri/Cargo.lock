@@ -1886,6 +1886,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitemail"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs 5.0.1",
+ "kitemail-mail-core",
+ "kitemail-windows-mail-reader",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "url",
+ "uuid",
+ "windows",
+]
+
+[[package]]
 name = "kitemail-mail-core"
 version = "0.1.0"
 dependencies = [
@@ -1910,24 +1928,6 @@ dependencies = [
  "ureq",
  "url",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "kitemail-tauri-preview"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dirs 5.0.1",
- "kitemail-mail-core",
- "kitemail-windows-mail-reader",
- "raw-window-handle",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "url",
- "uuid",
- "windows",
 ]
 
 [[package]]

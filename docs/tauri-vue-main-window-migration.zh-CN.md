@@ -289,20 +289,18 @@ pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
    - 完整偏好设置、安全锁、远图白名单、缓存与更新（`src-tauri/src/settings.rs`、`src/preferences/`）：`get_full_preferences`、`update_full_preferences`、`set_app_lock_passcode`（PBKDF2 校验与脱敏）、`manage_trusted_senders`、`clear_body_caches`、`check_app_update`（复用 `kitemail_mail_core::update::check`）。
    - 命令面板与单键快捷键（`src/command-palette/`）：`Ctrl+K` 命令面板、`?` 快捷键帮助、`/` 搜索及受 `singleKeyShortcuts` 与 IME / 输入焦 / 弹窗守卫控制的单键操作（`c/r/a/f/e/s/u/j/k/#`）。
 
-### 10.2 P4 正式发行切换核对清单（切换 `kitemail.exe` 前执行）
+### 10.2 P4 正式发行切换清单与当前切换状态
 
-在正式将发布入口从 GPUI 切换到 Tauri 2 之前（当前 [Windows 发布流程](../.github/workflows/windows.yml) 仍保持 GPUI 构建不变），须逐项完成并签署以下检查：
+正式发行入口已切换为 Tauri 2 + Vue 3（仍保留 GPUI 源码在 `crates/app` 供工作区编译校验，待首个正式版本真机及发布 Tag 验证后视需要再行下线）：
 
-1. **产物标识与二进制命名对齐**
-   - [ ] 更新 `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml`：`productName` / 二进制名改为 `kitemail`（产出 `kitemail.exe`），应用标识符、图标与版本与原发行一致。
-2. **安装程序、便携包与自动更新清单**
-   - [ ] 核对 [NSIS 安装脚本](../.github/nsis/kitemail.nsi)：静默/被动更新参数 `/P` `/UPDATE` `/R` `/PID=`、注册表 `Software\KiteMail` 安装目录继承与互斥量 `Local\KiteMail.Setup`。
-   - [ ] 核对便携模式 `portable.flag` 判定及升级兼容：验证 `portable.flag` 存在时数据目录落在 `<exe_dir>\data`，安装版落在 `%LOCALAPPDATA%\KiteMail`（或 `KITEMAIL_DATA_DIR`）。
-   - [ ] 核对 [更新器](../crates/mail-core/src/update.rs) 与 `latest.json` 平台键（`windows-x86_64` / `windows-x86_64-portable`）下载校验与覆盖升级流程。
-3. **存量数据与隔离目录升级回滚实测**
-   - [ ] 使用老版本 GPUI 真实数据副本（含 `accounts.toml`、`preferences.toml`、Windows Credential Manager 凭据、自定义 `mail_data_dir`、草稿箱 `local_drafts` 与待发队列 `outbox`、应用锁 `passcode`）在隔离目录升级启动 Tauri 版 `kitemail.exe`，验证账号、邮件缓存、草稿与解锁零丢失。
-   - [ ] 验证从 Tauri 新版回滚回原 GPUI 版本的数据库与配置文件前向/后向兼容性。
-4. **Windows 真机端到端与性能验收**
-   - [ ] 执行 `pwsh -File .\scripts\benchmark-demo.ps1` 比对 GPUI 与 Tauri 版本冷启动耗时及含 WebView2 进程树内存占用。
-   - [ ] 实机验证 WebView2 阅读器遮挡隐藏、DPI 缩放、系统托盘最小化/关闭、自动锁定与邮件通知点击唤醒。
-   - [ ] 切换 `.github/workflows/windows.yml`（或合并 `.github/workflows/tauri-windows.yml`）完成正式签发归档。
+1. **产物标识、单实例与正式资料目录对齐（已完成配置与编译验证）**
+   - [x] `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`：`productName` 与二进制名已改为 `kitemail`（产出 `src-tauri/target/x86_64-pc-windows-msvc/release/kitemail.exe`），应用标识改为 `com.kitemail.desktop`，主窗口标题改为 `KiteMail`，并注入 `KITEMAIL_VERSION`。
+   - [x] `src-tauri/src/single_instance.rs` 与 `src-tauri/src/tray.rs`：单实例互斥量统一切换为 `Local\KiteMail_SingleInstance_Mutex`（与原版保持互斥），托盘窗口类改为 `KiteMailTrayWindowClass`。
+   - [x] `src-tauri/src/preferences.rs`：正式 `Live` 模式改回沿用 `kitemail_mail_core::config::resolve_data_dir`（`KITEMAIL_DATA_DIR` > `KITEMAIL_PREVIEW_DATA_DIR` > 便携 `<exe_dir>\data` > 安装 `%LOCALAPPDATA%\KiteMail`），直接无缝读取原版邮件与账号数据；`--demo` 模式继续隔离在预览目录，不触碰正式资料。
+2. **安装程序、便携包与正式发布工作流切换（已完成配置切换）**
+   - [x] 更新 [NSIS 安装脚本](../.github/nsis/kitemail.nsi) 默认 `BUILD_DIR` 指向 `..\..\src-tauri\target\x86_64-pc-windows-msvc\release`，沿用 `/P` `/UPDATE` `/R` `/PID=`、注册表 `Software\KiteMail` 与 `Local\KiteMail.Setup` 协议。
+   - [x] 更新 [Windows 正式发布工作流](../.github/workflows/windows.yml)：接入 `pnpm build`、`pnpm test`、`src-tauri` 测试、`pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle`、NSIS 安装包、便携 ZIP（含 `portable.flag`）与 `latest.json` 生成（`windows-x86_64` / `windows-x86_64-portable`）。
+   - [x] 辅助工作流 [tauri-windows.yml](../.github/workflows/tauri-windows.yml) 调整为 `workflow_dispatch` 手动触发，避免与主发布工作流重复运行。
+3. **发版前仍需实机验证项**
+   - [ ] 使用老版本 GPUI 真实数据副本（含 `accounts.toml`、`preferences.toml`、Windows Credential Manager 凭据、自定义 `mail_data_dir`、草稿箱与待发队列、应用锁 `passcode`）实机升级启动 Tauri 版 `kitemail.exe`，并验证回滚兼容性。
+   - [ ] 在 Windows 桌面实机验证 WebView2 遮挡隐藏、DPI 缩放、托盘关闭/唤醒、浏览器 OAuth 回调及首个 `v*` Release Tag 的 `makensis` + `latest.json` 在线更新全链路。

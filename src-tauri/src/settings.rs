@@ -22,6 +22,11 @@ use crate::dto::{
 use crate::mail_session::MailSession;
 use crate::preferences::{to_full_preferences_dto, VALID_APP_LOCK_IDLE_MINUTES};
 
+/// 构建版本：发布流水线注入 `KITEMAIL_VERSION`（标签去掉 v），本地构建回落到 Cargo 版本。
+pub fn app_version() -> &'static str {
+    option_env!("KITEMAIL_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 fn non_empty_opt(s: &str) -> Option<String> {
     let trimmed = s.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -75,7 +80,7 @@ impl MailSession {
             data_dir,
             mail_data_dir,
             storage_stats,
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_version: app_version().to_string(),
             is_portable: update::is_portable(),
             state_version: self.state_version(),
         })
@@ -405,7 +410,7 @@ impl MailSession {
             return Err(IpcError::locked(None));
         }
 
-        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        let current_version = app_version().to_string();
         let target = update::current_target().to_string();
 
         if self.mode == AppMode::Demo {
@@ -510,8 +515,8 @@ mod tests {
     use crate::dto::{ReaderPositionDto, UnlockAppInput};
     use crate::mail_session::tests::{make_live_test_session, make_test_session};
     use crate::preferences::{
-        production_default_data_dir_with, resolve_live_data_dir_with,
-        resolve_preview_data_dir_with, verify_isolated_live_dirs, PreferencesStore,
+        resolve_live_data_dir_with, resolve_preview_data_dir_with, verify_isolated_live_dirs,
+        PreferencesStore,
     };
     use kitemail_mail_core::config::{
         load_accounts_in, resolve_data_dir, save_accounts_in, save_preferences_in, AccountConfig,
@@ -764,8 +769,11 @@ mod tests {
         assert_eq!(preview_portable, exe_dir.join("data-preview"));
         let live_portable =
             resolve_live_data_dir_with(None, None, true, Some(&exe_dir), Some(&local_app_data));
-        assert_eq!(live_portable, exe_dir.join("data-preview"));
-        assert!(verify_isolated_live_dirs(&live_portable, &[prod_portable]).is_ok());
+        assert_eq!(live_portable, prod_portable);
+        let live_installed =
+            resolve_live_data_dir_with(None, None, false, Some(&exe_dir), Some(&local_app_data));
+        assert_eq!(live_installed, local_app_data.join("KiteMail"));
+        assert!(verify_isolated_live_dirs(&preview_portable, &[prod_portable]).is_ok());
 
         // Target strings match mail-core installer vs portable contract.
         assert_ne!(TARGET_INSTALLER, TARGET_PORTABLE);

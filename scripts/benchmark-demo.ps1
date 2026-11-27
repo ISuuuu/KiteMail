@@ -32,7 +32,7 @@ if (-not $GpuiExe) {
     $GpuiExe = Join-Path $repoRoot "target\x86_64-pc-windows-msvc\release\kitemail.exe"
 }
 if (-not $TauriExe) {
-    $TauriExe = Join-Path $repoRoot "src-tauri\target\x86_64-pc-windows-msvc\release\kitemail-tauri-preview.exe"
+    $TauriExe = Join-Path $repoRoot "src-tauri\target\x86_64-pc-windows-msvc\release\kitemail.exe"
 }
 
 function ConvertTo-Megabytes {
@@ -362,7 +362,7 @@ $targets = @(
         BuildHint = "Build with: cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc --locked"
     },
     @{
-        Name      = "Tauri+Vue (kitemail-tauri-preview)"
+        Name      = "Tauri+Vue (kitemail.exe)"
         ExePath   = $TauriExe
         BuildHint = "Build with: pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle"
     }

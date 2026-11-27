@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=capabilities/main.json");
     println!("cargo:rerun-if-changed=tauri.conf.json");
+    println!("cargo:rerun-if-env-changed=KITEMAIL_VERSION");
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "main_bootstrap",

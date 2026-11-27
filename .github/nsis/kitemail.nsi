@@ -16,7 +16,7 @@ Unicode True
 !endif
 
 !ifndef BUILD_DIR
-  !define BUILD_DIR "..\..\target\x86_64-pc-windows-msvc\release"
+  !define BUILD_DIR "..\..\src-tauri\target\x86_64-pc-windows-msvc\release"
 !endif
 
 !ifndef OUT_DIR

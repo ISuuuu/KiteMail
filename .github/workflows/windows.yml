@@ -13,6 +13,12 @@ on:
       - "Cargo.lock"
       - "crates/**"
       - "data/**"
+      - "src/**"
+      - "src-tauri/**"
+      - "tests/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "vite.config.ts"
       - "tools/release-notes.sh"
       - "CHANGELOG.md"
       - ".github/nsis/**"
@@ -44,6 +50,17 @@ jobs:
         shell: pwsh
         run: echo "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -53,16 +70,37 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "check-v1"
+          workspaces: |
+            . -> target
+            src-tauri -> src-tauri/target
+          prefix-key: "check-v2"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Run frontend unit tests
+        run: pnpm test
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Verify release binary target
-        run: cargo check -p kitemail --bin kitemail --target x86_64-pc-windows-msvc --locked
+      - name: Check Tauri Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
-      - name: Run unit tests
+      - name: Check root Cargo workspace
+        run: cargo check --workspace --target x86_64-pc-windows-msvc --locked
+
+      - name: Run root workspace unit tests
         run: cargo test --workspace --target x86_64-pc-windows-msvc --locked
+
+      - name: Verify Tauri release binary target
+        run: cargo check --manifest-path src-tauri/Cargo.toml --bin kitemail --target x86_64-pc-windows-msvc --locked
+
+      - name: Run Tauri unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked
 
   build-windows-x64:
     name: Build Windows x64
@@ -77,6 +115,17 @@ jobs:
         with:
           ref: ${{ needs.check.outputs.checkout_sha }}
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -85,7 +134,13 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "release-v1"
+          workspaces: |
+            . -> target
+            src-tauri -> src-tauri/target
+          prefix-key: "release-v2"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Resolve version
         id: version
@@ -116,15 +171,15 @@ jobs:
             throw 'NSIS not found'
           }
 
-      - name: Build release binary
+      - name: Build Tauri release binary
         shell: pwsh
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
           KITEMAIL_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $exe = 'target/x86_64-pc-windows-msvc/release/kitemail.exe'
+          $exe = 'src-tauri/target/x86_64-pc-windows-msvc/release/kitemail.exe'
           Remove-Item -Force -ErrorAction SilentlyContinue $exe
-          cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc --locked
+          pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path $exe)) { throw "Expected release binary was not produced: $exe" }
 
@@ -135,7 +190,7 @@ jobs:
           # VIProductVersion 只接受四段纯数字，去掉预发布后缀。
           $vi = ($version -split '-')[0] + '.0'
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          makensis /DVERSION=$version /DVI_VERSION=$vi .github/nsis/kitemail.nsi
+          makensis /DVERSION=$version /DVI_VERSION=$vi /DBUILD_DIR=..\..\src-tauri\target\x86_64-pc-windows-msvc\release .github/nsis/kitemail.nsi
           $setup = "dist/KiteMail_${version}_x64-setup.exe"
           if (-not (Test-Path $setup)) { throw "Installer was not produced: $setup" }
 
@@ -145,7 +200,7 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $stage = "dist/KiteMail_v${version}_portable"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target/x86_64-pc-windows-msvc/release/kitemail.exe" $stage
+          Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/kitemail.exe" $stage
           # 便携版标记：客户端据此选择 zip 就地更新，而不是运行安装包。
           New-Item -ItemType File -Path "$stage/portable.flag" | Out-Null
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/KiteMail_v${version}_portable.zip" -Force
