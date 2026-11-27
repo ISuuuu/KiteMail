@@ -9,11 +9,12 @@
             <span class="km-gen-row-title">单页加载邮件数</span>
           </div>
           <div class="km-gen-row-control">
-            <select v-model.number="pageSize" class="km-gen-combo" aria-label="单页加载邮件数">
-              <option v-for="opt in PAGE_SIZE_OPTIONS" :key="opt.value" :value="opt.value">
-                {{ opt.label }}
-              </option>
-            </select>
+            <ComboSelect
+              :options="PAGE_SIZE_OPTIONS"
+              :modelValue="String(pageSize)"
+              title="单页加载邮件数"
+              @update:modelValue="pageSize = Number($event)"
+            />
           </div>
         </div>
       </div>
@@ -29,16 +30,12 @@
             <span class="km-gen-row-desc">按设定分钟轮询所有已配置邮箱的新邮件</span>
           </div>
           <div class="km-gen-row-control">
-            <select
-              :value="state.preferences.value.autoSyncMinutes"
-              class="km-gen-combo"
-              aria-label="自动后台同步间隔"
-              @change="onSyncIntervalChange"
-            >
-              <option v-for="opt in SYNC_INTERVAL_OPTIONS" :key="opt.value" :value="opt.value">
-                {{ opt.label }}
-              </option>
-            </select>
+            <ComboSelect
+              :options="SYNC_INTERVAL_OPTIONS"
+              :modelValue="String(state.preferences.value.autoSyncMinutes)"
+              title="自动后台同步间隔"
+              @update:modelValue="setSyncInterval"
+            />
           </div>
         </div>
 
@@ -127,18 +124,15 @@
             <span class="km-gen-row-desc">内置 4 种提示音（对齐 Linux 版）</span>
           </div>
           <div class="km-gen-row-control km-gen-sound-control">
-            <select
-              v-model="notificationSound"
-              class="km-gen-combo"
+            <ComboSelect
+              :options="NOTIFICATION_SOUND_OPTIONS"
+              :modelValue="notificationSound"
               :disabled="
                 !state.preferences.value.desktopNotifications || !notificationSoundEnabled
               "
-              aria-label="提示音选择"
-            >
-              <option v-for="opt in NOTIFICATION_SOUND_OPTIONS" :key="opt.value" :value="opt.value">
-                {{ opt.label }}
-              </option>
-            </select>
+              title="提示音选择"
+              @update:modelValue="notificationSound = $event"
+            />
             <!-- 音频后端暂未接入：试听恒为禁用态（对齐 GPUI btn-sound-preview disabled(true)） -->
             <button
               type="button"
@@ -200,6 +194,7 @@
 
 <script setup lang="ts">
 import { reactive, ref } from "vue";
+import ComboSelect from "./ComboSelect.vue";
 import PillSwitch from "./PillSwitch.vue";
 import SettingsIcon from "./SettingsIcon.vue";
 import type { FullPreferencesDto } from "../preferences/types";
@@ -214,17 +209,17 @@ import type { PrefsPanelState } from "../preferences/panels/state";
 const props = defineProps<{ state: PrefsPanelState }>();
 
 const PAGE_SIZE_OPTIONS = [
-  { label: "50 封 / 页", value: 50 },
-  { label: "100 封 / 页", value: 100 },
-  { label: "200 封 / 页", value: 200 },
+  { label: "50 封 / 页", value: "50" },
+  { label: "100 封 / 页", value: "100" },
+  { label: "200 封 / 页", value: "200" },
 ] as const;
 
 const SYNC_INTERVAL_OPTIONS = [
-  { label: "仅手动同步", value: 0 },
-  { label: "每 1 分钟", value: 1 },
-  { label: "每 5 分钟", value: 5 },
-  { label: "每 15 分钟", value: 15 },
-  { label: "每 30 分钟", value: 30 },
+  { label: "仅手动同步", value: "0" },
+  { label: "每 1 分钟", value: "1" },
+  { label: "每 5 分钟", value: "5" },
+  { label: "每 15 分钟", value: "15" },
+  { label: "每 30 分钟", value: "30" },
 ] as const;
 
 const NOTIFICATION_SOUND_OPTIONS = [
@@ -279,8 +274,8 @@ function setBoolPref(field: "pushEnabled" | "desktopNotifications" | "notificati
   void props.state.updatePreference({ [field]: value } as Partial<FullPreferencesDto>);
 }
 
-function onSyncIntervalChange(ev: Event) {
-  const num = Number((ev.target as HTMLSelectElement).value);
+function setSyncInterval(value: string) {
+  const num = Number(value);
   if (!Number.isFinite(num)) return;
   void props.state.updatePreference({ autoSyncMinutes: num });
 }
@@ -377,29 +372,6 @@ function onSyncIntervalChange(ev: Event) {
 
 .km-gen-sound-control {
   gap: 6px;
-}
-
-.km-gen-combo {
-  appearance: none;
-  -webkit-appearance: none;
-  height: 30px;
-  padding: 0 26px 0 12px;
-  border-radius: var(--km-radius-md);
-  border: 1px solid var(--km-border);
-  background-color: transparent;
-  color: var(--km-text);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23707074' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
-  background-size: 12px;
-}
-
-.km-gen-combo:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
 }
 
 .km-gen-preview-btn {

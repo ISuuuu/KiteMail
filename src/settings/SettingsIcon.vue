@@ -59,6 +59,9 @@ const paths: Record<string, string> = {
   square: '<rect x="5.5" y="5.5" width="13" height="13" rx="1.5"/>',
   close: '<path d="m6 6 12 12"/><path d="M18 6 6 18"/>',
   "arrow-left": '<path d="M19 12H5"/><path d="m12 19-7-7 7-7"/>',
+  "arrow-up": '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>',
+  "arrow-down": '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
   play: '<path d="M7 4.5v15l12-7.5Z"/>',
   "chevron-down": '<path d="m6 9 6 6 6-6"/>',
 };

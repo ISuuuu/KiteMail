@@ -4,17 +4,13 @@
 
     <div class="km-card">
       <div class="km-field-row">
-        <label for="km-pref-read-mark" class="km-label">自动标记已读策略</label>
-        <select
-          id="km-pref-read-mark"
-          :value="state.preferences.value.readMarkMode"
-          class="km-select"
-          @change="onSelectString(state, 'readMarkMode', $event)"
-        >
-          <option value="shown">打开邮件立即标为已读</option>
-          <option value="delay">停留 2 秒后标为已读</option>
-          <option value="manual">仅手动标记已读</option>
-        </select>
+        <span class="km-label" id="km-pref-read-mark-label">自动标记已读策略</span>
+        <ComboSelect
+          :options="READ_MARK_OPTIONS"
+          :modelValue="state.preferences.value.readMarkMode"
+          aria-label="自动标记已读策略"
+          @update:modelValue="(v) => onSelectStringValue(state, 'readMarkMode', v)"
+        />
       </div>
 
       <label class="km-toggle-row">
@@ -82,8 +78,15 @@
 </template>
 
 <script setup lang="ts">
-import { onCheckbox, onNumberInput, onSelectString, onTextInput } from "./fieldBinders";
+import ComboSelect from "../../settings/ComboSelect.vue";
+import { onCheckbox, onNumberInput, onSelectStringValue, onTextInput } from "./fieldBinders";
 import type { PrefsPanelState } from "./state";
 
 defineProps<{ state: PrefsPanelState }>();
+
+const READ_MARK_OPTIONS = [
+  { label: "打开邮件立即标为已读", value: "shown" },
+  { label: "停留 2 秒后标为已读", value: "delay" },
+  { label: "仅手动标记已读", value: "manual" },
+] as const;
 </script>
