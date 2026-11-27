@@ -3501,6 +3501,7 @@ dependencies = [
  "gpui-kit",
  "html5ever",
  "kitemail-mail-core",
+ "kitemail-windows-mail-reader",
  "markup5ever_rcdom",
  "raw-window-handle",
  "rfd",
@@ -3535,6 +3536,17 @@ dependencies = [
  "ureq",
  "url",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "kitemail-windows-mail-reader"
+version = "0.1.0"
+dependencies = [
+ "data-url",
+ "kitemail-mail-core",
+ "url",
+ "webview2-com",
+ "windows 0.61.3",
 ]
 
 [[package]]
