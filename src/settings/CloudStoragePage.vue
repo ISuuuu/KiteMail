@@ -15,7 +15,7 @@
       <h4 class="km-xp-group-title">超大附件自动转存</h4>
       <p class="km-xp-group-desc">写信附件体积超过阈值时提示上传到云盘并插入分享链接</p>
       <div class="km-xp-card">
-        <div class="km-xp-row">
+        <div class="km-xp-row" id="sp-cloud-threshold">
           <div class="km-xp-row-text">
             <span class="km-xp-row-title">自动上传阈值</span>
             <span class="km-xp-row-desc">支持 Nextcloud / WebDAV / S3 / Dropbox</span>
@@ -37,7 +37,7 @@
     <!-- 云存储账号列表 + 添加表单 -->
     <section class="km-xp-group">
       <h4 class="km-xp-group-title">云存储账号</h4>
-      <div class="km-xp-card">
+      <div class="km-xp-card" id="sp-cloud-accounts">
         <div v-if="accounts.length === 0" class="km-xp-empty">
           尚未添加云存储账号。
         </div>

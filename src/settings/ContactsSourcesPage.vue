@@ -14,7 +14,7 @@
     <section class="km-xp-group">
       <h4 class="km-xp-group-title">自动收集</h4>
       <div class="km-xp-card">
-        <div class="km-xp-row">
+        <div class="km-xp-row" id="sp-contacts-auto-collect">
           <div class="km-xp-row-text">
             <span class="km-xp-row-title">自动收集发件人与收件人</span>
             <span class="km-xp-row-desc">
@@ -32,7 +32,7 @@
     <!-- 远程通讯录源（CardDAV）列表 + 添加表单 -->
     <section class="km-xp-group">
       <h4 class="km-xp-group-title">远程通讯录源（CardDAV）</h4>
-      <div class="km-xp-card">
+      <div class="km-xp-card" id="sp-contacts-sources">
         <div v-if="sources.length === 0" class="km-xp-empty">
           尚未添加外部 CardDAV 通讯录源。
         </div>

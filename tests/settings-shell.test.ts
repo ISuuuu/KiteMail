@@ -158,14 +158,9 @@ test("设置搜索：索引覆盖与锚点约定", () => {
   for (const entry of SEARCH_ENTRIES) {
     assert.ok(entry.title.length > 0);
   }
-  // 三个并行开发中页允许无锚点（切页不滚动），其余必须有锚点
-  const deferred = new Set(["cloudStorage", "translation", "contactsSources"]);
+  // 全部索引项必须有锚点（云存储/翻译/通讯录源三页已补齐行级/卡片级锚点）
   for (const entry of SEARCH_ENTRIES) {
-    if (deferred.has(entry.tabId)) {
-      assert.equal(entry.anchorId, null, entry.id);
-    } else {
-      assert.ok(entry.anchorId && entry.anchorId.startsWith("sp-"), entry.id);
-    }
+    assert.ok(entry.anchorId && entry.anchorId.startsWith("sp-"), entry.id);
   }
   // 高亮时长 1.6s
   assert.equal(HIGHLIGHT_MS, 1600);

@@ -15,7 +15,7 @@
       <h4 class="km-xp-group-title">翻译引擎</h4>
       <p class="km-xp-group-desc">仅在您点击翻译时发送邮件文本到所选引擎</p>
       <div class="km-xp-card">
-        <div class="km-xp-row">
+        <div class="km-xp-row" id="sp-translation-engine">
           <div class="km-xp-row-text">
             <span class="km-xp-row-title">翻译服务</span>
             <span class="km-xp-row-desc">支持 LibreTranslate / DeepL / Google / 本地 LLM</span>
@@ -68,7 +68,7 @@
     <section class="km-xp-group">
       <h4 class="km-xp-group-title">目标语言与入口</h4>
       <div class="km-xp-card">
-        <div class="km-xp-row">
+        <div class="km-xp-row" id="sp-translation-targets">
           <div class="km-xp-row-text">
             <span class="km-xp-row-title">翻译目标语言</span>
           </div>

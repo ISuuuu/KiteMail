@@ -5,8 +5,8 @@
  * 标题前缀命中 4 > 标题包含 3 > 页签名包含 2 > 关键词包含 1，
  * 同分按索引顺序，最多返回 60 条。
  *
- * 定位：anchorId 为目标设置行的 DOM id；null 表示本轮仅支持「切页不滚动」
- * （并行代理正在开发的云存储/翻译/通讯录源三页，锚点留待 WP10 补齐）。
+ * 定位：anchorId 为目标设置行的 DOM id，全部索引项均有锚点
+ * （云存储/翻译/通讯录源三页为行级/卡片级锚点）。
  * 高亮样式与时长见 HIGHLIGHT_CLASS / HIGHLIGHT_MS（对齐 widgets.rs#L113 / SEARCH_HIGHLIGHT_MS）。
  */
 
@@ -232,10 +232,13 @@ export const SEARCH_ENTRIES: readonly PrefSearchEntry[] = [
   e("smart-folders-page", "smartFolders", "智能文件夹与查询", "sp-smart-folders-page", "smart folder query virtual 智能文件夹 查询"),
   e("senders-page", "senders", "发件人黑名单", "sp-senders-page", "sender block blacklist 发件人 黑名单 拦截"),
   e("openpgp-page", "openPgp", "OpenPGP 密钥与信任", "sp-openpgp-page", "pgp key fingerprint trust 密钥 指纹 信任"),
-  // ---- 账号组三页（并行代理 B 开发中，本轮切页不滚动） ----
-  e("cloud-storage-page", "cloudStorage", "云存储与自动转存", null, "cloud storage webdav s3 nextcloud 云存储 转存 附件"),
-  e("translation-page", "translation", "翻译引擎与目标语言", null, "translation deepl libretranslate 翻译 引擎 语言"),
-  e("contacts-sources-page", "contactsSources", "通讯录源与自动收集", null, "contacts carddav sync 通讯录 源 同步"),
+  // ---- 账号组三页（锚点已补齐：行级/卡片级） ----
+  e("cloud-storage-page", "cloudStorage", "云存储与自动转存", "sp-cloud-threshold", "cloud storage webdav s3 nextcloud 云存储 转存 附件 阈值"),
+  e("cloud-accounts", "cloudStorage", "云存储账号列表", "sp-cloud-accounts", "cloud account webdav nextcloud 云盘 云存储 账号 分享 链接"),
+  e("translation-page", "translation", "翻译引擎与目标语言", "sp-translation-engine", "translation deepl libretranslate 翻译 引擎 语言 服务"),
+  e("translation-targets", "translation", "翻译目标语言与入口", "sp-translation-targets", "translation target language reader composer 目标语言 入口 阅读 写信"),
+  e("contacts-sources-page", "contactsSources", "通讯录源与自动收集", "sp-contacts-auto-collect", "contacts carddav sync collect 通讯录 源 同步 收集"),
+  e("contacts-sources-list", "contactsSources", "远程通讯录源（CardDAV）", "sp-contacts-sources", "carddav remote source 通讯录 源 远程 添加"),
 ];
 
 export interface ScoredSearchEntry extends PrefSearchEntry {
