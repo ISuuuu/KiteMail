@@ -17,7 +17,7 @@
         生成可移植的 TOML 备份文件（仅包含偏好设置与账号服务器参数；不包含密码、OAuth 令牌和本地邮件）
       </p>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-backup-export">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">导出当前偏好与账号配置</span>
             <span class="km-sp-row-desc">保存为 .toml 文件以便迁移或重装后快速恢复</span>
@@ -36,7 +36,7 @@
       <h4 class="km-sp-title">导入与恢复配置</h4>
       <p class="km-sp-desc">选择先前导出的 .toml 备份文件，预览内容后确认写回配置文件并立即应用</p>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-backup-import">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">从备份文件恢复</span>
             <span class="km-sp-row-desc">不会覆盖现有 Windows 凭据管理器中的密码或令牌</span>

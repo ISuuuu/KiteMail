@@ -7,7 +7,7 @@
         开启后由本页决定侧边栏、列表与阅读器的布局，替代其他设置页的同类项；Ctrl+Shift+F 或主菜单可随时切换
       </p>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-focus-enabled">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">启用专注模式</span>
             <span class="km-sp-row-desc">
@@ -19,7 +19,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+        <div class="km-sp-row" :class="{ disabled: !focusEnabled }" id="sp-focusStartEnabled">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">启动时自动进入专注模式</span>
           </div>
@@ -36,7 +36,7 @@
       <div class="km-sp-card">
         <template v-for="(row, idx) in SIDEBAR_ROWS" :key="row.key">
           <div v-if="idx > 0" class="km-sp-sep" />
-          <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+          <div :id="`sp-${row.key}`" class="km-sp-row" :class="{ disabled: !focusEnabled }">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
               <span v-if="row.desc" class="km-sp-row-desc">{{ row.desc }}</span>
@@ -58,7 +58,7 @@
       <div class="km-sp-card">
         <template v-for="(row, idx) in UNIFIED_ROWS" :key="row.key">
           <div v-if="idx > 0" class="km-sp-sep" />
-          <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+          <div :id="`sp-${row.key}`" class="km-sp-row" :class="{ disabled: !focusEnabled }">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
             </div>
@@ -79,7 +79,7 @@
       <div class="km-sp-card">
         <template v-for="(row, idx) in SECTION_ROWS" :key="row.key">
           <div v-if="idx > 0" class="km-sp-sep" />
-          <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+          <div :id="`sp-${row.key}`" class="km-sp-row" :class="{ disabled: !focusEnabled }">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
             </div>
@@ -98,7 +98,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">消息列表</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+        <div class="km-sp-row" :class="{ disabled: !focusEnabled }" id="sp-focus-layout">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">布局</span>
             <span class="km-sp-row-desc">卡片双行或单行表格；自动在宽窗使用单行</span>
@@ -114,7 +114,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+        <div class="km-sp-row" :class="{ disabled: !focusEnabled }" id="sp-focusColumnHeadings">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">显示列标题</span>
           </div>
@@ -123,7 +123,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+        <div class="km-sp-row" :class="{ disabled: !focusEnabled }" id="sp-focus-preview-lines">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">摘要行数</span>
             <span class="km-sp-row-desc">列表卡片显示的正文预览行数</span>
@@ -140,7 +140,7 @@
         </div>
         <template v-for="(row, idx) in LIST_ROWS" :key="row.key">
           <div class="km-sp-sep" />
-          <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+          <div :id="`sp-${row.key}`" class="km-sp-row" :class="{ disabled: !focusEnabled }">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
               <span v-if="row.desc" class="km-sp-row-desc">{{ row.desc }}</span>
@@ -160,7 +160,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">阅读</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+        <div class="km-sp-row" :class="{ disabled: !focusEnabled }" id="sp-focusFoldToolbar">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">折叠阅读器工具栏</span>
             <span class="km-sp-row-desc">每个按钮收进其 ⋯ 菜单。</span>
@@ -170,7 +170,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row" :class="{ disabled: !focusEnabled }">
+        <div class="km-sp-row" :class="{ disabled: !focusEnabled }" id="sp-focusReaderView">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">简化阅读视图</span>
             <span class="km-sp-row-desc">打开邮件即进入简化阅读视图。</span>

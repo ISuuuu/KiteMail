@@ -11,7 +11,7 @@
     </div>
 
     <!-- 自定义标签组（GPUI extra_pages.rs#render_tags） -->
-    <section class="km-xp-group">
+    <section class="km-xp-group" id="sp-tags-page">
       <h4 class="km-xp-group-title">自定义标签（本地会话）</h4>
       <p class="km-xp-group-desc">支持调色板颜色圆点与 1..9 数字快捷键绑定</p>
       <div class="km-xp-card">

@@ -11,7 +11,7 @@
     </div>
 
     <!-- 立即运行（GPUI extra_pages.rs#L1656） -->
-    <section class="km-xp-group">
+    <section class="km-xp-group" id="sp-filters-page">
       <h4 class="km-xp-group-title">立即运行</h4>
       <p class="km-xp-group-desc">
         对本地 SQLite 缓存的现有邮件执行已启用的过滤规则（标为已读 / 标星 / 移动或归档）

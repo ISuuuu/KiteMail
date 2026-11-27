@@ -4,7 +4,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">侧边栏区段与折叠</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-default-view">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">启动时默认打开视图</span>
             <span class="km-sp-row-desc">选择每次冷启动定位的视图或恢复上一次阅读的文件夹</span>
@@ -20,7 +20,7 @@
         </div>
         <template v-for="(row, idx) in TOP_ROWS" :key="row.key">
           <div class="km-sp-sep" />
-          <div class="km-sp-row">
+          <div :id="`sp-${row.key}`" class="km-sp-row">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
               <span v-if="row.desc" class="km-sp-row-desc">{{ row.desc }}</span>
@@ -40,7 +40,7 @@
       <div class="km-sp-card">
         <template v-for="(row, idx) in UNIFIED_ROWS" :key="row.key">
           <div v-if="idx > 0" class="km-sp-sep" />
-          <div class="km-sp-row">
+          <div :id="`sp-${row.key}`" class="km-sp-row">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
             </div>
@@ -61,7 +61,7 @@
       <div class="km-sp-card">
         <template v-for="(row, idx) in SECTION_ROWS" :key="row.key">
           <div v-if="idx > 0" class="km-sp-sep" />
-          <div class="km-sp-row">
+          <div :id="`sp-${row.key}`" class="km-sp-row">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
             </div>

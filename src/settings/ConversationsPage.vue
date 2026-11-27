@@ -4,7 +4,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">会话线程与卡片显示</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-threadNewestFirst">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">按最新回复置顶排列会话卡片</span>
             <span class="km-sp-row-desc">关闭则按历史顺序从最早一封向下浏览</span>
@@ -17,7 +17,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-fold-mode">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">自动折叠多封会话卡片</span>
             <span class="km-sp-row-desc">切换后会立即重新应用当前打开会话的默认折叠状态</span>
@@ -32,7 +32,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-card-attachments">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">在各会话卡片中展示附件</span>
             <span class="km-sp-row-desc">每张卡片单独列出其附件预览、大小与保存动作</span>

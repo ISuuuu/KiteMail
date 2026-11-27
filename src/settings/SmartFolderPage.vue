@@ -11,7 +11,7 @@
     </div>
 
     <!-- 智能文件夹（GPUI extra_pages.rs#render_smart_folders） -->
-    <section class="km-xp-group">
+    <section class="km-xp-group" id="sp-smart-folders-page">
       <h4 class="km-xp-group-title">智能文件夹（动态虚拟视图）</h4>
       <p class="km-xp-group-desc">支持搜索语法如 from:alice is:unread has:attachment</p>
       <div class="km-xp-card">

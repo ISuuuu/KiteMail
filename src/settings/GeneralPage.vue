@@ -4,7 +4,7 @@
     <section class="km-gen-group">
       <h4 class="km-gen-group-title">分页加载</h4>
       <div class="km-gen-card">
-        <div class="km-gen-row">
+        <div class="km-gen-row" id="sp-page-size">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">单页加载邮件数</span>
           </div>
@@ -24,7 +24,7 @@
     <section class="km-gen-group">
       <h4 class="km-gen-group-title">同步与通知</h4>
       <div class="km-gen-card">
-        <div class="km-gen-row">
+        <div class="km-gen-row" id="sp-auto-sync">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">自动后台同步间隔</span>
             <span class="km-gen-row-desc">按设定分钟轮询所有已配置邮箱的新邮件</span>
@@ -41,7 +41,7 @@
 
         <div class="km-gen-sep" />
 
-        <div class="km-gen-row">
+        <div class="km-gen-row" id="sp-push">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">启用实时推送（IMAP IDLE / 增量脉冲）</span>
             <span class="km-gen-row-desc">在后台维持实时监听连接以便秒级感知新邮件到达</span>
@@ -56,7 +56,7 @@
 
         <div class="km-gen-sep" />
 
-        <div class="km-gen-row">
+        <div class="km-gen-row" id="sp-metered">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">按流量计费连接省流</span>
             <span class="km-gen-row-desc">使用按流量计费的网络时仅收取新邮件，不预取其余内容</span>
@@ -69,7 +69,7 @@
 
         <div class="km-gen-sep" />
 
-        <div class="km-gen-row">
+        <div class="km-gen-row" id="sp-desktop-notifications">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">新邮件桌面通知</span>
             <span class="km-gen-row-desc">同步发现新增未读邮件时通过 Windows 托盘弹出提示</span>
@@ -84,7 +84,7 @@
 
         <div class="km-gen-sep" />
 
-        <div class="km-gen-row" :class="{ disabled: !state.preferences.value.desktopNotifications }">
+        <div class="km-gen-row" :class="{ disabled: !state.preferences.value.desktopNotifications }" id="sp-notification-content">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">在桌面通知中显示发件人与主题</span>
             <span class="km-gen-row-desc">关闭后通知仅提示「收到新邮件 / 封数」，保护锁屏及旁观隐私</span>
@@ -100,7 +100,7 @@
 
         <div class="km-gen-sep" />
 
-        <div class="km-gen-row" :class="{ disabled: !state.preferences.value.desktopNotifications }">
+        <div class="km-gen-row" :class="{ disabled: !state.preferences.value.desktopNotifications }" id="sp-notification-sound">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">新邮件提示音</span>
             <span class="km-gen-row-desc">收到新邮件时随通知播放提示音（音频后端暂缺，先保存选择）</span>
@@ -118,7 +118,7 @@
         <div
           class="km-gen-row"
           :class="{ disabled: !state.preferences.value.desktopNotifications }"
-        >
+         id="sp-notification-sound-choice">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">提示音选择</span>
             <span class="km-gen-row-desc">内置 4 种提示音（对齐 Linux 版）</span>
@@ -147,7 +147,7 @@
 
         <div class="km-gen-sep" />
 
-        <div class="km-gen-row">
+        <div class="km-gen-row" id="sp-send-sound">
           <div class="km-gen-row-text">
             <span class="km-gen-row-title">发送邮件提示音</span>
             <span class="km-gen-row-desc">邮件发出时播放提示音（音频后端暂缺，先保存选择）</span>
@@ -170,6 +170,7 @@
         <template v-for="(btn, idx) in NOTIFICATION_BUTTONS" :key="btn.key">
           <div v-if="idx > 0" class="km-gen-sep" />
           <div
+            :id="`sp-notify-${btn.key}`"
             class="km-gen-row"
             :class="{ disabled: !state.preferences.value.desktopNotifications || !rowSensitive(btn.key) }"
           >

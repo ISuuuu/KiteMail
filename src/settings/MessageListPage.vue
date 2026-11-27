@@ -40,7 +40,7 @@
     <section class="km-sp-group">
       <h4 class="km-sp-title">行样式与分组</h4>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-compactList">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">紧凑列表行</span>
             <span class="km-sp-row-desc">以更紧凑的单/双行高度展示更多邮件条目</span>
@@ -53,7 +53,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-showAvatars">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">显示发件人头像</span>
             <span class="km-sp-row-desc">隐藏后保留左侧未读状态蓝点与对齐间距</span>
@@ -66,7 +66,7 @@
           </div>
         </div>
         <div class="km-sp-sep" />
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-listGroupByDate">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">按日期分组显示</span>
             <span class="km-sp-row-desc">按时间排序时显示「今天 / 昨天 / 本周 / 更早」分组头</span>
@@ -87,7 +87,7 @@
       <div class="km-sp-card">
         <template v-for="(row, idx) in BAR_ROWS" :key="row.key">
           <div v-if="idx > 0" class="km-sp-sep" />
-          <div class="km-sp-row">
+          <div :id="`sp-${row.key}`" class="km-sp-row">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ row.label }}</span>
             </div>
@@ -104,7 +104,7 @@
       <h4 class="km-sp-title">列顺序与显隐</h4>
       <p class="km-sp-desc">单行宽表模式显示的列，从左到右排序；主题列为弹性列恒在显示</p>
       <div class="km-sp-card">
-        <div class="km-sp-row">
+        <div class="km-sp-row" id="sp-listShowHeadings">
           <div class="km-sp-row-text">
             <span class="km-sp-row-title">显示列标题栏</span>
             <span class="km-sp-row-desc">宽表模式在列表顶部显示可点击排序的列头</span>
@@ -117,7 +117,7 @@
         <!-- 已显示列：上移 / 下移 / 移除 -->
         <template v-for="(col, idx) in shownColumns" :key="`shown-${col}`">
           <div class="km-sp-sep" />
-          <div class="km-sp-row">
+          <div :id="`sp-col-${col}`" class="km-sp-row">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ columnLabel(col) }}</span>
             </div>
@@ -157,7 +157,7 @@
         <!-- 隐藏列：显示 -->
         <template v-for="col in hiddenColumns" :key="`hidden-${col}`">
           <div class="km-sp-sep" />
-          <div class="km-sp-row">
+          <div :id="`sp-col-${col}`" class="km-sp-row">
             <div class="km-sp-row-text">
               <span class="km-sp-row-title">{{ columnLabel(col) }}</span>
             </div>
@@ -174,7 +174,7 @@
           </div>
         </template>
 
-        <div class="km-sp-footer">
+        <div id="sp-columns-restore" class="km-sp-footer">
           <button type="button" class="km-sp-outline-btn" @click="restoreColumns">
             恢复默认列
           </button>

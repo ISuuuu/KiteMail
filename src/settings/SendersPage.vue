@@ -43,7 +43,7 @@
     </div>
 
     <!-- 已屏蔽发件人黑名单 -->
-    <section class="km-xp-group km-xp-group-wide">
+    <section class="km-xp-group km-xp-group-wide" id="sp-senders-page">
       <h4 class="km-xp-group-title">已屏蔽发件人黑名单（{{ blocked.length }}）</h4>
       <p class="km-xp-group-desc">支持填写完整邮箱（user@example.com）或域名（example.com）</p>
       <div class="km-xp-card">
