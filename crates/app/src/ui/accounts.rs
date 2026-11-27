@@ -135,7 +135,7 @@ pub(crate) const ACCOUNT_PROVIDERS: &[AccountProvider] = &[
         id: "qq",
         label: "QQ 邮箱",
         kind: ProviderKind::Preset,
-        brand: None,
+        brand: Some("qq"),
         featured_on_welcome: true,
         imap_host: "imap.qq.com",
         imap_port: 993,
@@ -149,7 +149,7 @@ pub(crate) const ACCOUNT_PROVIDERS: &[AccountProvider] = &[
         id: "netease163",
         label: "网易 163",
         kind: ProviderKind::Preset,
-        brand: None,
+        brand: Some("netease163"),
         featured_on_welcome: true,
         imap_host: "imap.163.com",
         imap_port: 993,
@@ -163,7 +163,7 @@ pub(crate) const ACCOUNT_PROVIDERS: &[AccountProvider] = &[
         id: "netease126",
         label: "网易 126",
         kind: ProviderKind::Preset,
-        brand: None,
+        brand: Some("netease126"),
         featured_on_welcome: true,
         imap_host: "imap.126.com",
         imap_port: 993,
@@ -177,7 +177,7 @@ pub(crate) const ACCOUNT_PROVIDERS: &[AccountProvider] = &[
         id: "exmail",
         label: "腾讯企业邮",
         kind: ProviderKind::Preset,
-        brand: None,
+        brand: Some("exmail"),
         featured_on_welcome: true,
         imap_host: "imap.exmail.qq.com",
         imap_port: 993,
@@ -191,7 +191,7 @@ pub(crate) const ACCOUNT_PROVIDERS: &[AccountProvider] = &[
         id: "aliyun_qiye",
         label: "阿里企业邮",
         kind: ProviderKind::Preset,
-        brand: None,
+        brand: Some("aliyun_qiye"),
         featured_on_welcome: true,
         imap_host: "imap.qiye.aliyun.com",
         imap_port: 993,
@@ -356,7 +356,21 @@ pub(crate) fn brand_for_account(acc: &AccountConfig) -> Option<&'static str> {
         .map(|(_, d)| d.to_ascii_lowercase())
         .unwrap_or_default();
 
-    if host.contains("outlook.")
+    if host.contains("exmail.qq.com") {
+        Some("exmail")
+    } else if host.contains("imap.qq.com")
+        || matches!(domain.as_str(), "qq.com" | "foxmail.com" | "vip.qq.com")
+    {
+        Some("qq")
+    } else if host.contains("163.com") || matches!(domain.as_str(), "163.com" | "vip.163.com") {
+        Some("netease163")
+    } else if host.contains("126.com")
+        || matches!(domain.as_str(), "126.com" | "yeah.net" | "vip.126.com")
+    {
+        Some("netease126")
+    } else if host.contains("qiye.aliyun.com") || host.contains("mxhichina.com") {
+        Some("aliyun_qiye")
+    } else if host.contains("outlook.")
         || host.contains("office365.")
         || host.contains("hotmail.")
         || matches!(

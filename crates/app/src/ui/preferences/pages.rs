@@ -3133,7 +3133,7 @@ fn render_privacy(
     stack
         .child(setting_group(
             "应用锁屏密码",
-            Some("设置本地密码后，无操作或切到后台超过设定时间将自动锁定界面；每次重新打开软件也需输入密码解锁"),
+            Some("设置本地密码后，无操作或切到后台超过设定时间将自动锁定界面；锁定状态下重启软件仍需输入密码解锁"),
             CARD_MAX_WIDTH,
             lock_rows,
             p,

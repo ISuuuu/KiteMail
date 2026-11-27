@@ -29,9 +29,9 @@ pub(crate) fn render(
 
     let p = theme::current(cx);
     let wordmark_path = if app.dark_mode {
-        "welcome/wordmark-white.png"
+        "welcome/kitemail-wordmark-white.png"
     } else {
-        "welcome/wordmark-black.png"
+        "welcome/kitemail-wordmark-black.png"
     };
 
     let cooldown_remaining = app
@@ -107,7 +107,7 @@ pub(crate) fn render(
                                 .gap_2()
                                 .child(
                                     img(wordmark_path)
-                                        .h(px(28.0))
+                                        .h(px(30.0))
                                         .object_fit(ObjectFit::Contain),
                                 )
                                 .child(

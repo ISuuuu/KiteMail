@@ -43,9 +43,31 @@ use crate::app::{
     ToggleFocusMode, ToggleFullscreen, UndoLastMove, ViewMessageSource, ZoomIn, ZoomOut, ZoomReset,
 };
 
-const WORDMARK_BLACK: &[u8] = include_bytes!("../../../data/welcome/wordmark-black.png");
-const WORDMARK_WHITE: &[u8] = include_bytes!("../../../data/welcome/wordmark-white.png");
+const KITEMAIL_WORDMARK_BLACK: &[u8] =
+    include_bytes!("../../../data/welcome/kitemail-wordmark-black.png");
+const KITEMAIL_WORDMARK_WHITE: &[u8] =
+    include_bytes!("../../../data/welcome/kitemail-wordmark-white.png");
 const BRAND_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "brands/qq.png",
+        include_bytes!("../../../data/brands/qq.png"),
+    ),
+    (
+        "brands/netease163.png",
+        include_bytes!("../../../data/brands/netease163.png"),
+    ),
+    (
+        "brands/netease126.png",
+        include_bytes!("../../../data/brands/netease126.png"),
+    ),
+    (
+        "brands/exmail.png",
+        include_bytes!("../../../data/brands/exmail.png"),
+    ),
+    (
+        "brands/aliyun_qiye.png",
+        include_bytes!("../../../data/brands/aliyun_qiye.png"),
+    ),
     (
         "brands/outlook.png",
         include_bytes!("../../../data/brands/outlook.png"),
@@ -129,8 +151,12 @@ struct HylkiAssets;
 impl AssetSource for HylkiAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         match path {
-            "welcome/wordmark-black.png" => Ok(Some(Cow::Borrowed(WORDMARK_BLACK))),
-            "welcome/wordmark-white.png" => Ok(Some(Cow::Borrowed(WORDMARK_WHITE))),
+            "welcome/kitemail-wordmark-black.png" => {
+                Ok(Some(Cow::Borrowed(KITEMAIL_WORDMARK_BLACK)))
+            }
+            "welcome/kitemail-wordmark-white.png" => {
+                Ok(Some(Cow::Borrowed(KITEMAIL_WORDMARK_WHITE)))
+            }
             _ => {
                 if let Some((_, bytes)) = BRAND_ASSETS
                     .iter()
@@ -145,9 +171,12 @@ impl AssetSource for HylkiAssets {
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut items = AllAssets.list(path)?;
-        for extra in ["welcome/wordmark-black.png", "welcome/wordmark-white.png"]
-            .into_iter()
-            .chain(BRAND_ASSETS.iter().map(|(asset_path, _)| *asset_path))
+        for extra in [
+            "welcome/kitemail-wordmark-black.png",
+            "welcome/kitemail-wordmark-white.png",
+        ]
+        .into_iter()
+        .chain(BRAND_ASSETS.iter().map(|(asset_path, _)| *asset_path))
         {
             if extra.starts_with(path) {
                 items.push(extra.into());
@@ -453,11 +482,11 @@ mod tests {
     #[test]
     fn all_assets_serves_ui_lucide_icons_and_wordmarks() {
         assert!(HylkiAssets
-            .load("welcome/wordmark-black.png")
+            .load("welcome/kitemail-wordmark-black.png")
             .unwrap()
             .is_some());
         assert!(HylkiAssets
-            .load("welcome/wordmark-white.png")
+            .load("welcome/kitemail-wordmark-white.png")
             .unwrap()
             .is_some());
         for icon in [

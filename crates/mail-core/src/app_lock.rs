@@ -1,5 +1,7 @@
 //! 应用锁屏密码校验（PBKDF2-HMAC-SHA256）、防暴力破解退避与自动锁定状态机。
 
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -20,6 +22,30 @@ const DERIVED_KEY_LEN: usize = 32;
 
 /// 后台「立即锁定」的防抖宽限时长，避免弹出菜单或系统瞬时失焦触发误锁。
 pub const BACKGROUND_IMMEDIATE_GRACE: Duration = Duration::from_millis(1500);
+
+const LOCK_STATE_FILE_NAME: &str = "app_lock.state";
+
+/// 查询数据目录中是否记录了「处于锁定状态」（用于防止锁定后重启绕过）。
+pub fn is_lock_persisted_in(data_dir: &Path) -> bool {
+    data_dir.join(LOCK_STATE_FILE_NAME).is_file()
+}
+
+/// 持久化或清除「处于锁定状态」标记（仅在锁定后重启时要求重新解锁）。
+pub fn set_lock_persisted_in(data_dir: &Path, locked: bool) -> Result<(), String> {
+    let path = data_dir.join(LOCK_STATE_FILE_NAME);
+    if locked {
+        fs::create_dir_all(data_dir)
+            .map_err(|e| format!("创建锁屏状态目录失败 ({}): {e}", data_dir.display()))?;
+        fs::write(&path, b"locked\n")
+            .map_err(|e| format!("写入锁屏状态失败 ({}): {e}", path.display()))
+    } else {
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("清除锁屏状态失败 ({}): {e}", path.display())),
+        }
+    }
+}
 
 /// 校验新设置的锁屏密码是否满足最小/最大长度与非纯空白要求。
 pub fn validate_new_passcode(passcode: &str) -> Result<(), String> {
@@ -607,5 +633,23 @@ mod tests {
         assert_eq!(BackgroundLockPolicy::Immediate.as_pref_str(), "immediate");
         assert_eq!(BackgroundLockPolicy::Minutes(15).as_pref_str(), "15");
         assert_eq!(BackgroundLockPolicy::Never.as_pref_str(), "never");
+    }
+
+    #[test]
+    fn persisted_lock_state_roundtrip_and_missing_is_false() {
+        let dir = std::env::temp_dir().join(format!("hylki-lock-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(!is_lock_persisted_in(&dir));
+        set_lock_persisted_in(&dir, false).expect("clearing absent state succeeds");
+        assert!(!is_lock_persisted_in(&dir));
+
+        set_lock_persisted_in(&dir, true).expect("persisting locked state succeeds");
+        assert!(is_lock_persisted_in(&dir));
+
+        set_lock_persisted_in(&dir, false).expect("clearing persisted state succeeds");
+        assert!(!is_lock_persisted_in(&dir));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

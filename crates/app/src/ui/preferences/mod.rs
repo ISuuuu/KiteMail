@@ -26,7 +26,7 @@ use kitemail_mail_core::config::{
 };
 use kitemail_mail_core::secrets;
 
-use crate::app::{CloseOverlay, CloseSettingsWindow, FocusSearch, HylkiApp};
+use crate::app::{CloseOverlay, CloseSettingsWindow, FocusSearch, HylkiApp, LockApp};
 use crate::theme::{self, HylkiPalette};
 use crate::ui::accounts::{self, AccountFormState};
 use crate::ui::preferences::search::{filter_search_items, PrefSearchItem};
@@ -2671,6 +2671,13 @@ impl Render for SettingsWindow {
             }))
             .on_action(cx.listener(|this, _: &CloseSettingsWindow, window, cx| {
                 this.close_window(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &LockApp, _window, cx| {
+                this.app.update(cx, |app, cx| {
+                    if !app.app_locked && app.has_app_lock_passcode() {
+                        app.lock_app(cx);
+                    }
+                });
             }))
             .on_action(cx.listener(|this, _: &CloseOverlay, window, cx| {
                 if this.mail_dir_switching {

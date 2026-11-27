@@ -605,7 +605,7 @@ pub(crate) fn render(
                         .gap_2()
                         // 白色 Wordmark（蓝底固定用白色版）与当前步骤标题。
                         .child(
-                            img("welcome/wordmark-white.png")
+                            img("welcome/kitemail-wordmark-white.png")
                                 .h(px(44.0))
                                 .object_fit(ObjectFit::Contain),
                         )
