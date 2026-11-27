@@ -272,3 +272,85 @@ export function pgpKeyTitle(key: Pick<PgpKeyItem, "name" | "email">): string {
 export function pgpKeySubtitle(key: Pick<PgpKeyItem, "fingerprint" | "hasSecret">): string {
   return `指纹: ${key.fingerprint} · ${key.hasSecret ? "含私钥" : "仅公钥"}`;
 }
+
+// ---------- 云存储（对照 extra_pages.rs#render_cloud_storage） ----------
+
+export interface CloudStorageItem {
+  id: number;
+  provider: string;
+  name: string;
+  serverUrl: string;
+  username: string;
+  bucketOrPath: string;
+  enabled: boolean;
+}
+
+export const CLOUD_PROVIDERS: ReadonlyArray<{ label: string; value: string }> = [
+  { label: "Nextcloud", value: "Nextcloud" },
+  { label: "WebDAV", value: "WebDAV" },
+  { label: "Amazon S3 / 兼容对象存储", value: "S3" },
+  { label: "Dropbox", value: "Dropbox" },
+];
+
+export const CLOUD_THRESHOLD_OPTIONS: ReadonlyArray<{ label: string; value: string }> = [
+  { label: "关闭自动上传", value: "0" },
+  { label: "超过 10 MB", value: "10" },
+  { label: "超过 25 MB（推荐）", value: "25" },
+  { label: "超过 50 MB", value: "50" },
+  { label: "超过 100 MB", value: "100" },
+];
+
+/** 阈值标签：未知值回落「超过 25 MB（推荐）」（对照 GPUI unwrap_or）。 */
+export function cloudThresholdLabel(mb: number): string {
+  return (
+    CLOUD_THRESHOLD_OPTIONS.find((o) => o.value === String(mb))?.label ?? "超过 25 MB（推荐）"
+  );
+}
+
+/** 云存储 / 通讯录源行说明：`{服务商} · {地址} ({用户名})`。 */
+export function serviceEntrySubtitle(
+  provider: string,
+  serverUrl: string,
+  username: string
+): string {
+  return `${provider} · ${serverUrl} (${username})`;
+}
+
+// ---------- 通讯录源（对照 extra_pages.rs#render_contacts_sources） ----------
+
+export interface ContactSourceItem {
+  id: number;
+  provider: string;
+  name: string;
+  serverUrl: string;
+  username: string;
+  enabled: boolean;
+}
+
+export const CONTACT_PROVIDERS: ReadonlyArray<{ label: string; value: string }> = [
+  { label: "通用 CardDAV", value: "CardDAV" },
+  { label: "iCloud 通讯录", value: "iCloud" },
+  { label: "Nextcloud 通讯录", value: "Nextcloud" },
+  { label: "Fastmail 通讯录", value: "Fastmail" },
+];
+
+// ---------- 翻译（对照 extra_pages.rs#render_translation） ----------
+
+export const TRANSLATION_ENGINES: ReadonlyArray<{ label: string; value: string }> = [
+  { label: "关闭", value: "off" },
+  { label: "LibreTranslate（自建/开源）", value: "libretranslate" },
+  { label: "DeepL API", value: "deepl" },
+  { label: "Google Translate", value: "google" },
+  { label: "本地 LLM（复用本机推理服务）", value: "local_llm" },
+];
+
+export const TRANSLATION_TARGETS: ReadonlyArray<{ label: string; value: string }> = [
+  { label: "跟随应用界面语言", value: "system" },
+  { label: "简体中文 (zh-CN)", value: "zh-CN" },
+  { label: "English (en)", value: "en" },
+  { label: "日本語 (ja)", value: "ja" },
+  { label: "한국어 (ko)", value: "ko" },
+  { label: "Français (fr)", value: "fr" },
+  { label: "Deutsch (de)", value: "de" },
+  { label: "Español (es)", value: "es" },
+];

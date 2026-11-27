@@ -244,6 +244,11 @@
   width: 100%;
 }
 
+/* 表单内右对齐保存行（翻译服务地址） */
+.km-xp-save-line {
+  justify-content: flex-end;
+}
+
 .km-xp-flex-1 {
   flex: 1;
   min-width: 0;
