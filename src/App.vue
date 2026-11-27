@@ -9,15 +9,23 @@
       <p class="km-error-msg">{{ state.error.value }}</p>
       <button type="button" class="km-retry-btn" @click="state.init()">重试</button>
     </div>
-    <div v-else-if="state.locked.value" class="km-lock-screen">
-      <p class="km-lock-title">KiteMail 已锁定</p>
-      <p class="km-lock-desc">解锁后可继续查看邮件内容</p>
-    </div>
+    <LockScreen
+      v-else-if="state.locked.value"
+      :hasPasscode="state.hasPasscode.value"
+      :lockedReason="state.lockedReason.value"
+      :submitting="state.unlockSubmitting.value"
+      :error="state.unlockError.value"
+      :retryAfterSecs="state.unlockRetryAfterSecs.value"
+      :mode="state.mode.value"
+      @unlock="state.unlock"
+      @quit="state.quit"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
 import MainWindow from "./main-window/MainWindow.vue";
+import LockScreen from "./main-window/LockScreen.vue";
 import { provideMainWindow } from "./main-window/useMainWindow";
 
 const state = provideMainWindow();

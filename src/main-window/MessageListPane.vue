@@ -126,8 +126,9 @@
     <!-- 列表摘要栏 -->
     <div class="km-list-subbar">
       <span class="km-total-text">共 {{ total.toLocaleString() }} 封</span>
-      <span v-if="syncStatus?.syncing" class="km-sync-text">
-        {{ syncStatus.message || "正在同步…" }}
+      <span v-if="syncStatus?.syncing" class="km-sync-text" role="status">
+        <span class="km-sync-spinner" aria-hidden="true" />
+        <span>{{ syncStatus.message || "正在同步邮件…" }}</span>
       </span>
       <span v-else-if="hasActiveFilter" class="km-filter-summary">
         已启用筛选
@@ -149,7 +150,13 @@
       aria-label="邮件列表"
       @scroll="onScroll"
     >
-      <div v-if="loading && messages.length === 0" class="km-list-empty">
+      <div v-if="cacheReady === false && messages.length === 0" class="km-list-empty" role="status">
+        <span class="km-initial-spinner" aria-hidden="true" />
+        <p class="km-empty-title">正在初始化离线缓存并同步邮件…</p>
+        <p v-if="syncStatus?.message" class="km-empty-sub">{{ syncStatus.message }}</p>
+      </div>
+
+      <div v-else-if="loading && messages.length === 0" class="km-list-empty">
         正在加载邮件列表…
       </div>
 
@@ -190,6 +197,8 @@
             :compact="compactList"
             :showAvatar="showAvatars"
             @select="emit('selectMessage', $event)"
+            @toggleSeen="(ref, seen) => emit('toggleSeen', ref, seen)"
+            @toggleFlagged="(ref, flagged) => emit('toggleFlagged', ref, flagged)"
           />
         </div>
       </div>
@@ -212,7 +221,7 @@ import type {
   SearchScope,
   SyncStatusDto,
 } from "../ipc/types";
-import type { MessageGroup } from "./useMainWindow";
+import { computeAnchorScrollTop, type MessageGroup } from "./useMainWindow";
 import MessageRow from "./MessageRow.vue";
 
 const SORT_OPTIONS: ReadonlyArray<{ value: MessageSort; label: string }> = [
@@ -246,10 +255,13 @@ const props = defineProps<{
   showAvatars: boolean;
   scrollResetToken?: number;
   syncStatus?: SyncStatusDto;
+  cacheReady?: boolean;
 }>();
 
 const emit = defineEmits<{
   selectMessage: [ref: MessageRef];
+  toggleSeen: [ref: MessageRef, seen: boolean];
+  toggleFlagged: [ref: MessageRef, flagged: boolean];
   setSearch: [query: string];
   setScope: [scope: SearchScope];
   setSort: [sort: MessageSort];
@@ -455,10 +467,13 @@ function onScroll() {
   });
 }
 
+let lastHandledScrollResetToken = props.scrollResetToken ?? 0;
+
 // 切文件夹/新搜索时回到首屏
 watch(
   () => props.scrollResetToken,
-  () => {
+  (token) => {
+    lastHandledScrollResetToken = token ?? 0;
     nextTick(() => {
       if (viewportRef.value) {
         viewportRef.value.scrollTop = 0;
@@ -466,6 +481,36 @@ watch(
       }
     });
   }
+);
+
+// 增量 mail-changed / 刷新时尽量保持当前滚动锚点
+watch(
+  virtualLayout,
+  (nextLayout, prevLayout) => {
+    const token = props.scrollResetToken ?? 0;
+    if (token !== lastHandledScrollResetToken) return;
+    if (!viewportRef.value || !prevLayout || prevLayout.items.length === 0 || nextLayout.items.length === 0) {
+      return;
+    }
+    const currentTop = viewportRef.value.scrollTop;
+    if (currentTop <= 0) return;
+    const selectedKey = props.selectedId
+      ? `${props.selectedId.accountId}:${props.selectedId.messageId}`
+      : null;
+    const anchoredTop = computeAnchorScrollTop(
+      prevLayout.items,
+      nextLayout.items,
+      currentTop,
+      selectedKey
+    );
+    nextTick(() => {
+      if (viewportRef.value && (props.scrollResetToken ?? 0) === lastHandledScrollResetToken) {
+        viewportRef.value.scrollTop = anchoredTop;
+        scrollTop.value = anchoredTop;
+      }
+    });
+  },
+  { flush: "pre" }
 );
 
 // 键盘上下选信时确保选中行在视口内可见
@@ -708,6 +753,48 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   font-size: 11px;
+  color: var(--km-text-muted);
+}
+
+.km-sync-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--km-accent);
+  font-weight: 500;
+}
+
+.km-sync-spinner,
+.km-initial-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, var(--km-accent) 25%, transparent);
+  border-top-color: var(--km-accent);
+  animation: km-list-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.km-initial-spinner {
+  width: 22px;
+  height: 22px;
+}
+
+@keyframes km-list-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.km-empty-title {
+  margin: 0;
+  font-weight: 600;
+  color: var(--km-text);
+}
+
+.km-empty-sub {
+  margin: 0;
+  font-size: 12px;
   color: var(--km-text-muted);
 }
 

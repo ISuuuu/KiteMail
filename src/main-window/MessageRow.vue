@@ -1,6 +1,7 @@
 <template>
-  <button
-    type="button"
+  <div
+    role="option"
+    tabindex="0"
     class="km-message-row"
     :class="{
       selected,
@@ -10,15 +11,30 @@
     }"
     :aria-selected="selected"
     @click="emit('select', { accountId: message.accountId, messageId: message.id })"
+    @keydown.enter.prevent="emit('select', { accountId: message.accountId, messageId: message.id })"
+    @keydown.space.prevent="emit('select', { accountId: message.accountId, messageId: message.id })"
   >
     <!-- 单行宽表模式 (>= 600px) -->
     <template v-if="wide">
-      <span class="km-unread-slot">
-        <span v-if="message.unread" class="km-unread-dot" title="未读" />
-      </span>
-      <span class="km-star-slot" :class="{ flagged: message.flagged }">
+      <button
+        type="button"
+        class="km-row-action-btn km-unread-slot"
+        :title="message.unread ? '标为已读' : '标为未读'"
+        :aria-label="message.unread ? '标为已读' : '标为未读'"
+        @click.stop="emit('toggleSeen', { accountId: message.accountId, messageId: message.id }, message.unread)"
+      >
+        <span class="km-unread-dot" :class="{ read: !message.unread }" />
+      </button>
+      <button
+        type="button"
+        class="km-row-action-btn km-star-slot"
+        :class="{ flagged: message.flagged }"
+        :title="message.flagged ? '取消星标' : '加上星标'"
+        :aria-label="message.flagged ? '取消星标' : '加上星标'"
+        @click.stop="emit('toggleFlagged', { accountId: message.accountId, messageId: message.id }, !message.flagged)"
+      >
         {{ message.flagged ? "★" : "☆" }}
-      </span>
+      </button>
       <span class="km-wide-sender">{{ senderDisplay }}</span>
       <span class="km-wide-subject-wrap">
         <span class="km-wide-subject">{{ message.subject || "(无主题)" }}</span>
@@ -36,16 +52,31 @@
       <div v-if="showAvatar" class="km-row-avatar" :style="{ backgroundColor: avatarBg }">
         {{ avatarInitial }}
       </div>
-      <span class="km-unread-slot">
-        <span v-if="message.unread" class="km-unread-dot" title="未读" />
-      </span>
+      <button
+        type="button"
+        class="km-row-action-btn km-unread-slot"
+        :title="message.unread ? '标为已读' : '标为未读'"
+        :aria-label="message.unread ? '标为已读' : '标为未读'"
+        @click.stop="emit('toggleSeen', { accountId: message.accountId, messageId: message.id }, message.unread)"
+      >
+        <span class="km-unread-dot" :class="{ read: !message.unread }" />
+      </button>
       <div class="km-card-content">
         <div class="km-card-top">
           <span class="km-card-sender">{{ senderDisplay }}</span>
           <span class="km-card-badges">
             <span v-if="message.threadCount > 1" class="km-thread-chip">{{ message.threadCount }}</span>
             <span v-if="message.hasAttachment" class="km-attach-icon" title="含附件">📎</span>
-            <span v-if="message.flagged" class="km-star-slot flagged" title="已加星标">★</span>
+            <button
+              type="button"
+              class="km-row-action-btn km-star-slot km-card-star"
+              :class="{ flagged: message.flagged }"
+              :title="message.flagged ? '取消星标' : '加上星标'"
+              :aria-label="message.flagged ? '取消星标' : '加上星标'"
+              @click.stop="emit('toggleFlagged', { accountId: message.accountId, messageId: message.id }, !message.flagged)"
+            >
+              {{ message.flagged ? "★" : "☆" }}
+            </button>
             <span class="km-date-text">{{ message.dateDisplay }}</span>
           </span>
         </div>
@@ -64,7 +95,7 @@
         </div>
       </div>
     </template>
-  </button>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -81,6 +112,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   select: [ref: MessageRef];
+  toggleSeen: [ref: MessageRef, seen: boolean];
+  toggleFlagged: [ref: MessageRef, flagged: boolean];
 }>();
 
 const AVATAR_COLORS = [
@@ -159,12 +192,22 @@ const avatarBg = computed(() => {
   background: var(--km-accent-soft-hover);
 }
 
-.km-unread-slot {
-  width: 10px;
-  flex-shrink: 0;
+.km-row-action-btn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  border-radius: var(--km-radius-sm);
+}
+
+.km-unread-slot {
+  width: 14px;
+  height: 18px;
+  flex-shrink: 0;
 }
 
 .km-unread-dot {
@@ -172,6 +215,27 @@ const avatarBg = computed(() => {
   height: 8px;
   border-radius: 999px;
   background: var(--km-accent);
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.km-unread-dot.read {
+  background: transparent;
+  border: 1.5px solid var(--km-text-muted);
+  opacity: 0;
+}
+
+.km-message-row:hover .km-unread-dot.read,
+.km-unread-slot:focus-visible .km-unread-dot.read {
+  opacity: 0.55;
+}
+
+.km-card-star:not(.flagged) {
+  opacity: 0;
+}
+
+.km-message-row:hover .km-card-star:not(.flagged),
+.km-card-star:focus-visible {
+  opacity: 0.65;
 }
 
 .km-row-avatar {

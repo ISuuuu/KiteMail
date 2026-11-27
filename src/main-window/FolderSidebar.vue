@@ -24,22 +24,33 @@
 
       <span v-if="!isRail" class="km-brand-title">KiteMail</span>
 
-      <button
-        v-if="!isRail"
-        type="button"
-        class="km-icon-btn"
-        :class="{ spinning: syncing }"
-        title="刷新邮件 (F5)"
-        aria-label="刷新邮件"
-        @click="emit('refresh')"
-      >
-        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-          <path
-            fill="currentColor"
-            d="M13.5 8a5.5 5.5 0 1 1-1.38-3.65L10.5 6h4V2l-1.52 1.52A7 7 0 1 0 15 8h-1.5Z"
-          />
-        </svg>
-      </button>
+      <div v-if="!isRail" class="km-sidebar-header-actions">
+        <button
+          v-if="hasPasscode"
+          type="button"
+          class="km-icon-btn"
+          title="锁定应用"
+          aria-label="锁定应用"
+          @click="emit('lock')"
+        >
+          🔒
+        </button>
+        <button
+          type="button"
+          class="km-icon-btn"
+          :class="{ spinning: syncing }"
+          title="刷新邮件 (F5)"
+          aria-label="刷新邮件"
+          @click="emit('refresh')"
+        >
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M13.5 8a5.5 5.5 0 1 1-1.38-3.65L10.5 6h4V2l-1.52 1.52A7 7 0 1 0 15 8h-1.5Z"
+            />
+          </svg>
+        </button>
+      </div>
     </header>
 
     <!-- 滚动导航区 -->
@@ -132,6 +143,16 @@
       <span v-if="!isRail" class="km-mode-badge">
         {{ mode === "demo" ? "演示模式 (--demo)" : "本地工作区" }}
       </span>
+      <button
+        v-else-if="hasPasscode"
+        type="button"
+        class="km-icon-btn"
+        title="锁定应用"
+        aria-label="锁定应用"
+        @click="emit('lock')"
+      >
+        🔒
+      </button>
       <span v-else class="km-mode-dot" :title="mode === 'demo' ? '演示模式' : '本地工作区'" />
     </footer>
   </aside>
@@ -154,12 +175,14 @@ const props = defineProps<{
   width: number;
   syncing?: boolean;
   mode?: "demo" | "live";
+  hasPasscode?: boolean;
 }>();
 
 const emit = defineEmits<{
   selectView: [view: ViewDto];
   toggleCollapse: [];
   refresh: [];
+  lock: [];
 }>();
 
 const collapsedAccounts = ref<Set<number>>(new Set());
@@ -263,6 +286,12 @@ function avatarInitial(name: string): string {
   font-size: 14px;
   font-weight: 700;
   letter-spacing: 0.01em;
+}
+
+.km-sidebar-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .km-icon-btn {

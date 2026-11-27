@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 
 import {
@@ -19,20 +20,37 @@ import {
   validateReaderPosition,
 } from "../src/main-window/usePaneLayout.ts";
 import {
+  computeAnchorScrollTop,
   dateGroupLabel,
+  findMessageByRef,
   mergePagedMessages,
   shouldApplyListResponse,
   shouldApplyOpenResponse,
+  useMainWindow,
 } from "../src/main-window/useMainWindow.ts";
 import {
+  emitMockEvent,
   extractErrorMessage,
+  getMockRecordedReaderLayouts,
+  isLockedError,
   listMessages,
   mainBootstrap,
+  normalizeSyncStatusEvent,
   openMessage,
+  resetMockSession,
+  setMessageFlagged,
+  setMessageSeen,
   setReaderLayout,
   updateMainPreferences,
 } from "../src/ipc/main-window.ts";
 import type { MessageSummaryDto } from "../src/ipc/types.ts";
+import {
+  buildTauriDevConfig,
+  buildTauriDevInvocation,
+  findFreeLoopbackPort,
+  isPortConflictOutput,
+  parseDevTauriArgs,
+} from "../scripts/dev-tauri.mjs";
 
 test("listWideNext 迟滞阈值完全对齐 (600 进入 / <560 退出)", () => {
   assert.equal(LIST_WIDE_ON, 600);
@@ -268,5 +286,243 @@ test("theme.css 包含全部 7 套内置主题的亮暗语义色与星标金", (
   for (const theme of ["system", "default", "midnight", "tidal", "rose", "earth", "forest"]) {
     assert.ok(css.includes(`:root[data-theme="${theme}"][data-color-mode="light"]`));
     assert.ok(css.includes(`:root[data-theme="${theme}"][data-color-mode="dark"]`));
+  }
+});
+
+test("锁屏清空全部敏感状态与阅读器，解锁校验与退避恢复视图", async () => {
+  resetMockSession({ locked: false, hasPasscode: true, passcode: "pass-9527" });
+  const win = useMainWindow();
+  await win.init();
+
+  assert.equal(win.locked.value, false);
+  assert.equal(win.hasPasscode.value, true);
+  assert.ok(win.accounts.value.length > 0);
+  assert.ok(win.folders.value.length > 0);
+  assert.ok(win.messages.value.length > 0);
+
+  win.setSearch("KiteMail");
+  await new Promise((r) => setTimeout(r, 10));
+  win.selectMessage({ accountId: 1, messageId: 1 });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(win.openedMessage.value !== null);
+
+  await win.lock();
+  assert.equal(win.locked.value, true);
+  assert.equal(win.accounts.value.length, 0);
+  assert.equal(win.folders.value.length, 0);
+  assert.equal(win.messages.value.length, 0);
+  assert.equal(win.selectedId.value, null);
+  assert.equal(win.openedMessage.value, null);
+  assert.equal(win.searchQuery.value, "");
+  assert.ok(
+    getMockRecordedReaderLayouts().some((layout) => layout.visible === false),
+    "锁屏时应发送 visible: false 隐藏原生阅读器"
+  );
+
+  // 连续输错 5 次触发退避倒计时
+  for (let i = 0; i < 4; i++) {
+    const ok = await win.unlock("wrong");
+    assert.equal(ok, false);
+    assert.equal(win.unlockRetryAfterSecs.value, 0);
+  }
+  const fifthOk = await win.unlock("wrong");
+  assert.equal(fifthOk, false);
+  assert.equal(win.unlockRetryAfterSecs.value, 5);
+  assert.ok(win.unlockError.value?.includes("5 秒"));
+
+  // 重置冷却后输入正确密码可解锁并重新 bootstrap 恢复视图
+  resetMockSession({ locked: true, hasPasscode: true, passcode: "pass-9527" });
+  win.unlockRetryAfterSecs.value = 0;
+  const unlocked = await win.unlock("pass-9527");
+  assert.equal(unlocked, true);
+  assert.equal(win.locked.value, false);
+  assert.ok(win.accounts.value.length > 0);
+  assert.ok(win.folders.value.length > 0);
+  assert.ok(win.messages.value.length > 0);
+
+  win.dispose();
+  resetMockSession();
+});
+
+test("LOCKED 结构化错误触发锁屏并清空已加载邮件状态", async () => {
+  assert.equal(isLockedError({ code: "LOCKED", message: "已锁定", retryable: false }), true);
+  assert.equal(isLockedError({ code: "INTERNAL_ERROR", message: "err", retryable: true }), false);
+  assert.equal(isLockedError(new Error("LOCKED")), false);
+
+  resetMockSession({ locked: false, hasPasscode: true });
+  const win = useMainWindow();
+  await win.init();
+  assert.ok(win.messages.value.length > 0);
+
+  // 模拟后端单独进入锁定状态，使后续 IPC 返回 code === "LOCKED"
+  resetMockSession({ locked: true, hasPasscode: true });
+  await assert.rejects(
+    () =>
+      listMessages({
+        requestId: "locked-req",
+        view: { kind: "unifiedInbox" },
+        query: "",
+        scope: "thisFolder",
+        sort: "dateNewest",
+        filter: {},
+        offset: 0,
+        limit: 50,
+      }),
+    (err: unknown) => isLockedError(err)
+  );
+
+  await win.toggleMessageSeen({ accountId: 1, messageId: 1 }, true);
+  assert.equal(win.locked.value, true);
+  assert.equal(win.accounts.value.length, 0);
+  assert.equal(win.folders.value.length, 0);
+  assert.equal(win.messages.value.length, 0);
+
+  win.dispose();
+  resetMockSession();
+});
+
+test("set_message_seen 与 set_message_flagged Mock 状态联动及未读统计更新", async () => {
+  resetMockSession({ locked: false });
+  const win = useMainWindow();
+  await win.init();
+
+  const target = findMessageByRef(win.messages.value, { accountId: 1, messageId: 1 });
+  assert.ok(target);
+  assert.equal(target.unread, true);
+  assert.equal(target.flagged, true);
+
+  const inboxBefore = win.folders.value.find((f) => f.id === 1)?.unreadCount ?? 0;
+
+  win.selectMessage({ accountId: 1, messageId: 1 });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(win.openedMessage.value?.flagged, true);
+
+  await win.toggleMessageSeen({ accountId: 1, messageId: 1 }, true);
+  const afterSeen = findMessageByRef(win.messages.value, { accountId: 1, messageId: 1 });
+  assert.equal(afterSeen?.unread, false);
+  const inboxAfter = win.folders.value.find((f) => f.id === 1)?.unreadCount ?? 0;
+  assert.equal(inboxAfter, Math.max(0, inboxBefore - 1));
+
+  await win.toggleMessageFlagged({ accountId: 1, messageId: 1 }, false);
+  const afterFlag = findMessageByRef(win.messages.value, { accountId: 1, messageId: 1 });
+  assert.equal(afterFlag?.flagged, false);
+  assert.equal(win.openedMessage.value?.flagged, false);
+
+  // 直接调用底层 Mock IPC 验证状态版本号递增与返回值契约
+  const seenOut = await setMessageSeen({ accountId: 1, messageId: 1, seen: false });
+  assert.equal(seenOut.unread, true);
+  const flagOut = await setMessageFlagged({ accountId: 1, messageId: 1, flagged: true });
+  assert.equal(flagOut.flagged, true);
+
+  win.dispose();
+  resetMockSession();
+});
+
+test("main://mail-changed 保持选中邮件、不重置 scrollResetToken 并正确计算锚点偏移", async () => {
+  const prevLayout = [
+    { type: "header", key: "hdr:今天", top: 0, height: 28 },
+    { type: "row", key: "1:1", top: 28, height: 90 },
+    { type: "row", key: "1:2", top: 118, height: 90 },
+    { type: "row", key: "1:3", top: 208, height: 90 },
+  ];
+  const nextLayout = [
+    { type: "header", key: "hdr:今天", top: 0, height: 28 },
+    { type: "row", key: "1:999", top: 28, height: 90 },
+    { type: "row", key: "1:1", top: 118, height: 90 },
+    { type: "row", key: "1:2", top: 208, height: 90 },
+    { type: "row", key: "1:3", top: 298, height: 90 },
+  ];
+  // 原 scrollTop=150 停在 1:2 (top=118) 内部偏移 +32 处，上方新增 1 封邮件后应锚定到 208+32=240
+  assert.equal(computeAnchorScrollTop(prevLayout, nextLayout, 150, "1:2"), 240);
+
+  resetMockSession({ locked: false });
+  const win = useMainWindow();
+  await win.init();
+  win.selectMessage({ accountId: 1, messageId: 2 });
+  await new Promise((r) => setTimeout(r, 10));
+  const tokenBefore = win.scrollResetToken.value;
+
+  emitMockEvent("main://mail-changed", {
+    stateVersion: win.stateVersion.value + 5,
+    reason: "folderSynced",
+  });
+  await new Promise((r) => setTimeout(r, 20));
+
+  assert.equal(win.scrollResetToken.value, tokenBefore);
+  assert.deepEqual(win.selectedId.value, { accountId: 1, messageId: 2 });
+  assert.equal(win.openedMessage.value?.messageId, 2);
+
+  // SyncStatusEvent 兼容嵌套与扁平两种载荷
+  const nested = normalizeSyncStatusEvent({
+    stateVersion: 10,
+    syncStatus: { syncing: true, message: "同步中", lastSyncAt: null },
+  });
+  assert.equal(nested.stateVersion, 10);
+  assert.equal(nested.syncStatus.syncing, true);
+  assert.equal(nested.syncStatus.message, "同步中");
+
+  const flat = normalizeSyncStatusEvent({
+    stateVersion: 11,
+    syncing: false,
+    message: null,
+    lastSyncAt: 1700000000,
+  });
+  assert.equal(flat.stateVersion, 11);
+  assert.equal(flat.syncStatus.lastSyncAt, 1700000000);
+
+  win.dispose();
+  resetMockSession();
+});
+
+test("dev-tauri 多 worktree 参数解析、配置构造与空闲回环端口探测", async () => {
+  const parsed = parseDevTauriArgs(["--demo", "--port", "1455", "--verbose", "--", "--extra"], {
+    KITEMAIL_DEMO: "0",
+  });
+  assert.equal(parsed.demo, true);
+  assert.equal(parsed.preferredPort, 1455);
+  assert.deepEqual(parsed.extraTauriArgs, ["--verbose"]);
+  assert.deepEqual(parsed.extraAppArgs, ["--extra"]);
+
+  const parsedFromEnv = parseDevTauriArgs([], { KITEMAIL_DEMO: "1", KITEMAIL_DEV_PORT: "1520" });
+  assert.equal(parsedFromEnv.demo, true);
+  assert.equal(parsedFromEnv.preferredPort, 1520);
+
+  assert.equal(
+    buildTauriDevConfig(1455),
+    JSON.stringify({ build: { devUrl: "http://127.0.0.1:1455" } })
+  );
+
+  const invocation = buildTauriDevInvocation({
+    port: 1455,
+    demo: true,
+    extraTauriArgs: ["--no-watch"],
+  });
+  assert.equal(invocation.envPatch.KITEMAIL_DEV_PORT, "1455");
+  assert.equal(invocation.envPatch.KITEMAIL_DEMO, "1");
+  assert.deepEqual(invocation.args, [
+    "tauri",
+    "dev",
+    "--config",
+    '{"build":{"devUrl":"http://127.0.0.1:1455"}}',
+    "--no-watch",
+    "--",
+    "--demo",
+  ]);
+
+  assert.equal(isPortConflictOutput("Error: Port 1420 is already in use"), true);
+  assert.equal(isPortConflictOutput("listen EADDRINUSE: address already in use 127.0.0.1:1420"), true);
+  assert.equal(isPortConflictOutput("VITE v6.4.6 ready in 120 ms"), false);
+
+  // 占用一个回环端口，验证 findFreeLoopbackPort 自动跳过并选择新空闲端口
+  const busyServer = net.createServer();
+  await new Promise<void>((resolve) => busyServer.listen(0, "127.0.0.1", () => resolve()));
+  const busyAddr = busyServer.address();
+  assert.ok(busyAddr && typeof busyAddr === "object");
+  try {
+    const freePort = await findFreeLoopbackPort({ preferredPort: busyAddr.port });
+    assert.ok(Number.isInteger(freePort) && freePort > 0 && freePort < 65536);
+    assert.notEqual(freePort, busyAddr.port);
+  } finally {
+    await new Promise<void>((resolve) => busyServer.close(() => resolve()));
   }
 });

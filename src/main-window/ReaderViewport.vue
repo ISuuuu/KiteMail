@@ -1,15 +1,22 @@
 <template>
   <div ref="viewportRef" class="km-reader-viewport">
-    <!-- 加载状态 -->
-    <div v-if="bodyStatus === 'loading'" class="km-body-state">
-      <span>正在加载邮件正文…</span>
+    <!-- 加载骨架 -->
+    <div v-if="bodyStatus === 'loading'" class="km-body-skeleton" aria-busy="true" aria-label="正在加载邮件正文">
+      <div class="km-body-sk-head">
+        <span class="km-body-spinner" aria-hidden="true" />
+        <span>正在加载邮件正文…</span>
+      </div>
+      <div class="km-body-sk-line w-85" />
+      <div class="km-body-sk-line w-92" />
+      <div class="km-body-sk-line w-70" />
+      <div class="km-body-sk-line w-60" />
     </div>
 
     <!-- 不可用 / 错误回退状态 -->
     <div v-else-if="bodyStatus === 'unavailable'" class="km-body-unavailable">
       <div class="km-unavailable-banner" role="alert">
-        <span>{{ errorMessage || "正文阅读器暂不可用" }}</span>
-        <button type="button" class="km-retry-btn" @click="emit('retry')">重试</button>
+        <span>{{ errorMessage || "正文阅读器暂不可用，请重试" }}</span>
+        <button type="button" class="km-retry-btn" @click="emit('retry')">重试正文</button>
       </div>
       <pre v-if="plainText" class="km-plain-body">{{ plainText }}</pre>
     </div>
@@ -59,7 +66,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import type { BodyStatus, RectDto, ThreadMessageDto } from "../ipc/types";
-import { isTauri, setReaderLayout } from "../ipc/main-window";
+import { isTauri, nextReaderLayoutRevision, setReaderLayout } from "../ipc/main-window";
 
 const props = defineProps<{
   readerSessionId: string;
@@ -91,7 +98,6 @@ const nativeHostActive = computed(
 );
 
 // 几何与可见性同步（ResizeObserver + rAF 每帧最多一次 set_reader_layout）
-let layoutRevision = 0;
 let rafId: number | null = null;
 let ro: ResizeObserver | null = null;
 let lastSentSession = "";
@@ -145,7 +151,7 @@ function flushLayoutSync(forceHide = false, sessionOverride?: string) {
     nativeHostActive.value &&
     valid;
 
-  layoutRevision += 1;
+  const layoutRevision = nextReaderLayoutRevision();
   lastSentSession = sessionId;
   lastSentVisible = shouldBeVisible;
 
@@ -229,6 +235,71 @@ onUnmounted(() => {
   box-shadow: var(--km-shadow-card);
   overflow: hidden;
   position: relative;
+}
+
+.km-body-skeleton {
+  flex: 1 1 auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.km-body-sk-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--km-text-muted);
+  margin-bottom: 4px;
+}
+
+.km-body-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, var(--km-accent) 25%, transparent);
+  border-top-color: var(--km-accent);
+  animation: km-body-spin 0.8s linear infinite;
+}
+
+.km-body-sk-line {
+  height: 12px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--km-text-muted) 16%, transparent);
+  animation: km-body-pulse 1.3s ease-in-out infinite;
+}
+
+.km-body-sk-line.w-85 {
+  width: 85%;
+}
+
+.km-body-sk-line.w-92 {
+  width: 92%;
+}
+
+.km-body-sk-line.w-70 {
+  width: 70%;
+}
+
+.km-body-sk-line.w-60 {
+  width: 60%;
+}
+
+@keyframes km-body-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes km-body-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
 }
 
 .km-body-state,
