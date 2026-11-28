@@ -5,6 +5,7 @@ import {
   clearBodyCaches,
   extractErrorMessage,
   getFullPreferences,
+  installAppUpdate,
   isLockedError,
   manageTrustedSenders,
   setAppLockPasscode,
@@ -12,6 +13,7 @@ import {
 } from "./ipc";
 import type {
   CheckAppUpdateOutput,
+  InstallAppUpdateOutput,
   FullPreferencesDto,
   FullPreferencesPatch,
   PasscodeStatus,
@@ -71,6 +73,7 @@ export function usePreferences(options?: UsePreferencesOptions) {
   const sendersBusy = ref(false);
   const cacheBusy = ref(false);
   const checkingUpdate = ref(false);
+  const installingUpdate = ref(false);
 
   const loadError = ref<string | null>(null);
   const banner = ref<PreferencesBanner | null>(null);
@@ -381,6 +384,22 @@ export function usePreferences(options?: UsePreferencesOptions) {
     }
   }
 
+  async function installUpdate(): Promise<InstallAppUpdateOutput | null> {
+    if (installingUpdate.value) return null;
+    installingUpdate.value = true;
+    banner.value = null;
+    try {
+      const res = await installAppUpdate();
+      banner.value = { kind: res.started ? "info" : "success", text: res.message };
+      return res;
+    } catch (err) {
+      handleError(err, "安装更新失败");
+      return null;
+    } finally {
+      installingUpdate.value = false;
+    }
+  }
+
   function dispose(): void {
     disposed = true;
     clearPasscodeFields();
@@ -398,6 +417,7 @@ export function usePreferences(options?: UsePreferencesOptions) {
     sendersBusy,
     cacheBusy,
     checkingUpdate,
+    installingUpdate,
     loadError,
     banner,
     preferences,
@@ -424,6 +444,7 @@ export function usePreferences(options?: UsePreferencesOptions) {
     clearTrustedSenders,
     clearCaches,
     checkForUpdates,
+    installUpdate,
     dispose,
   };
 }

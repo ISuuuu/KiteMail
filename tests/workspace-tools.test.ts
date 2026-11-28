@@ -334,6 +334,12 @@ test("远图白名单增删清空、正文缓存清理、字节格式化与检�
   assert.equal(update.updateAvailable, true);
   assert.equal(update.latestVersion, "0.3.0");
 
+  // 应用内安装更新：由 installUpdate 统一处理状态与提示
+  const install = await mgr.installUpdate();
+  assert.ok(install);
+  assert.equal(mgr.installingUpdate.value, false);
+  assert.ok(mgr.banner.value && mgr.banner.value.text.length > 0);
+
   // 直接验证 IPC 函数在 LOCKED 下拒绝
   __resetPreferencesMock({ locked: true });
   await assert.rejects(() => updateFullPreferences({ compactList: true }), isLockedError);

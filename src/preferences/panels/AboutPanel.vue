@@ -38,6 +38,15 @@
         <p v-if="state.updateResult.value.notes" class="km-update-notes">
           {{ state.updateResult.value.notes }}
         </p>
+        <button
+          v-if="state.updateResult.value.updateAvailable"
+          type="button"
+          class="km-btn km-btn-primary"
+          :disabled="state.installingUpdate.value"
+          @click="state.installUpdate()"
+        >
+          {{ state.installingUpdate.value ? "安装中…" : "下载并安装更新" }}
+        </button>
         <a
           v-if="state.updateResult.value.downloadUrl"
           :href="state.updateResult.value.downloadUrl"

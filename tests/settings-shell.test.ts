@@ -196,6 +196,15 @@ test("系统页「打开目录」接通 open_data_directory：配置目录 data�
   assert.equal(source.includes("尚未接入 Tauri IPC"), false, "占位提示应已删除");
 });
 
+test("关于页发现新版本时提供应用内安装入口", () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/preferences/panels/AboutPanel.vue"),
+    "utf8"
+  );
+  assert.ok(source.includes("state.installUpdate()"), "发现新版本时应可触发应用内安装");
+  assert.ok(source.includes("state.installingUpdate.value"), "安装中应禁用按钮");
+});
+
 test("更改邮件存储目录弹层不再假装会话内记录，改为退出应用后手动迁移指引", () => {
   const source = readSystemPageSource();
   assert.equal(source.includes("仅在会话内记录"), false);
