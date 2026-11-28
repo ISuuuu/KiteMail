@@ -453,6 +453,8 @@
                 sendAction("card-allow-remote:" + msgId);
             } else if (action === "load-body" && msgId) {
                 sendAction("card-load-body:" + msgId);
+            } else if (action === "open-att" && actionBtn.dataset.attId) {
+                sendAction("card-open-att:" + actionBtn.dataset.attId);
             } else if (action === "save-att" && actionBtn.dataset.attId) {
                 sendAction("card-save-att:" + actionBtn.dataset.attId);
             } else if (action === "save-all-atts" && msgId) {
@@ -463,12 +465,25 @@
                 sendAction("card-mdn:" + msgId + ":" + actionBtn.dataset.decision);
             } else if (action === "toggle-raw" && msgId) {
                 sendAction("card-toggle-raw:" + msgId);
+            } else if (action === "toggle-rcpts") {
+                const card = actionBtn.closest(".km-card");
+                const rcpts = card ? card.querySelector(".km-rcpts") : null;
+                if (rcpts) {
+                    const isHidden = rcpts.hasAttribute("hidden");
+                    if (isHidden) {
+                        rcpts.removeAttribute("hidden");
+                    } else {
+                        rcpts.setAttribute("hidden", "");
+                    }
+                    actionBtn.classList.toggle("open", isHidden);
+                    actionBtn.setAttribute("aria-expanded", isHidden ? "true" : "false");
+                }
             }
             return;
         }
 
         const hdr = target.closest(".km-hdr");
-        if (hdr && !target.closest("button, a")) {
+        if (hdr && !target.closest("button, a, .km-rcpts")) {
             const card = hdr.closest(".km-card");
             if (!card || !card.dataset.msgId) return;
             const msgId = card.dataset.msgId;
@@ -570,6 +585,152 @@
             if (star) {
                 star.classList.toggle("on", Boolean(item.flagged));
             }
+        }
+    };
+
+    const findState = { marks: [], cur: -1 };
+
+    function ensureFindCss(doc) {
+        if (!doc || doc.getElementById("km-find-css")) return;
+        const st = doc.createElement("style");
+        st.id = "km-find-css";
+        st.textContent = ".km-find-hit{background:rgba(255,198,0,0.45);color:#000;border-radius:3px;box-shadow:0 0 0 1px rgba(255,198,0,0.55);}.km-find-hit.current{background:#ffc600;box-shadow:0 0 0 2px #f59e0b;}";
+        (doc.head || doc.documentElement).appendChild(st);
+    }
+
+    function collectFindDocs() {
+        const docs = [document];
+        for (const frame of document.querySelectorAll("iframe.km-frame")) {
+            const card = frame.closest(".km-card");
+            if (card && card.classList.contains("km-folded")) continue;
+            try {
+                if (frame.contentDocument && frame.contentDocument.body) {
+                    docs.push(frame.contentDocument);
+                }
+            } catch (_) {}
+        }
+        return docs;
+    }
+
+    function postFindCount() {
+        const cur = findState.marks.length ? findState.cur + 1 : 0;
+        sendAction("find-count:" + cur + ":" + findState.marks.length);
+    }
+
+    function showActiveFind() {
+        for (let i = 0; i < findState.marks.length; i++) {
+            findState.marks[i].className = "km-find-hit" + (i === findState.cur ? " current" : "");
+        }
+        postFindCount();
+        const mark = findState.marks[findState.cur];
+        if (!mark) return;
+        const doc = mark.ownerDocument;
+        if (doc === document) {
+            mark.scrollIntoView({ block: "center" });
+            return;
+        }
+        for (const frame of document.querySelectorAll("iframe.km-frame")) {
+            try {
+                if (frame.contentDocument === doc) {
+                    const r = mark.getBoundingClientRect();
+                    const fr = frame.getBoundingClientRect();
+                    window.scrollTo({
+                        top: Math.max(0, Math.round(window.scrollY + fr.top + r.top - window.innerHeight / 2)),
+                    });
+                    break;
+                }
+            } catch (_) {}
+        }
+    }
+
+    function findMarkY(mark) {
+        const doc = mark.ownerDocument;
+        const r = mark.getBoundingClientRect();
+        if (doc === document) return r.top + window.scrollY;
+        for (const frame of document.querySelectorAll("iframe.km-frame")) {
+            try {
+                if (frame.contentDocument === doc) {
+                    return frame.getBoundingClientRect().top + window.scrollY + r.top;
+                }
+            } catch (_) {}
+        }
+        return r.top;
+    }
+
+    window.kmFindClear = function () {
+        for (const m of findState.marks) {
+            const p = m.parentNode;
+            if (!p) continue;
+            while (m.firstChild) p.insertBefore(m.firstChild, m);
+            p.removeChild(m);
+            p.normalize();
+        }
+        findState.marks = [];
+        findState.cur = -1;
+    };
+
+    window.kmFindStep = function (dir) {
+        if (!findState.marks.length) return;
+        const step = dir < 0 ? -1 : 1;
+        findState.cur = (findState.cur + step + findState.marks.length) % findState.marks.length;
+        showActiveFind();
+    };
+
+    window.kmFind = function (rawQuery) {
+        window.kmFindClear();
+        const q = (rawQuery || "").trim().toLowerCase();
+        if (!q) {
+            postFindCount();
+            return;
+        }
+        for (const doc of collectFindDocs()) {
+            ensureFindCss(doc);
+            const root = doc.body || doc.documentElement;
+            if (!root) continue;
+            const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+            const nodes = [];
+            let node;
+            while ((node = walker.nextNode())) {
+                const parent = node.parentNode;
+                const pname = parent && parent.nodeName;
+                if (pname === "SCRIPT" || pname === "STYLE" || pname === "NOSCRIPT") continue;
+                if (doc === document && parent && typeof parent.closest === "function") {
+                    if (parent.closest(".km-folded .km-details, .km-rcpts[hidden], .km-menu")) continue;
+                }
+                if (node.nodeValue && node.nodeValue.toLowerCase().indexOf(q) >= 0) {
+                    nodes.push(node);
+                }
+            }
+            for (const textNode of nodes) {
+                const text = textNode.nodeValue;
+                const lower = text.toLowerCase();
+                let pos = 0;
+                let idx;
+                const frag = doc.createDocumentFragment();
+                let had = false;
+                while ((idx = lower.indexOf(q, pos)) >= 0) {
+                    had = true;
+                    frag.appendChild(doc.createTextNode(text.slice(pos, idx)));
+                    const span = doc.createElement("span");
+                    span.className = "km-find-hit";
+                    span.textContent = text.slice(idx, idx + q.length);
+                    frag.appendChild(span);
+                    findState.marks.push(span);
+                    pos = idx + q.length;
+                }
+                frag.appendChild(doc.createTextNode(text.slice(pos)));
+                if (had && textNode.parentNode) {
+                    textNode.parentNode.replaceChild(frag, textNode);
+                }
+            }
+        }
+        findState.marks = findState.marks.filter((m) => m.getClientRects().length > 0);
+        if (findState.marks.length) {
+            findState.marks.sort((a, b) => findMarkY(a) - findMarkY(b));
+            findState.cur = 0;
+            showActiveFind();
+        } else {
+            postFindCount();
         }
     };
 

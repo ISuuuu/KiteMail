@@ -20,7 +20,7 @@ use kitemail_mail_core::verify::{check_sender_summary, SenderTrust};
 use kitemail_mail_core::{MessageDetail, ThreadMessage};
 
 use crate::dark::{adapt_colors_for_dark, pin_color_scheme};
-use crate::document::{escape_html, find_html_tag, reader_body_colors, DocumentAppearance};
+use crate::document::{escape_html, find_html_tag, DocumentAppearance};
 
 /// Starred amber gold color (`#e5a50a`).
 pub const STAR_GOLD: u32 = 0xe5_a5_0a;
@@ -238,15 +238,31 @@ impl ThreadPalette {
             )
         });
         Self {
-            canvas: appearance.canvas_bg.clone(),
-            surface_raised: if appearance.dark {
-                "#363636".to_string()
+            canvas: if appearance.dark {
+                "#131315".to_string()
             } else {
-                "#ffffff".to_string()
+                "#f1f1f1".to_string()
             },
-            border: appearance.border_color.clone(),
-            text: appearance.text_color.clone(),
-            text_muted: appearance.muted_color.clone(),
+            surface_raised: if appearance.dark {
+                "#222226".to_string()
+            } else {
+                "#fafafa".to_string()
+            },
+            border: if appearance.dark {
+                "rgba(255,255,255,0.09)".to_string()
+            } else {
+                "rgba(0,0,0,0.08)".to_string()
+            },
+            text: if appearance.dark {
+                "#f3f4f6".to_string()
+            } else {
+                "#2e2e32".to_string()
+            },
+            text_muted: if appearance.dark {
+                "#a1a1aa".to_string()
+            } else {
+                "#707074".to_string()
+            },
             accent: appearance.accent_color.clone(),
             accent_border,
             accent_soft,
@@ -299,31 +315,65 @@ pub struct ThreadDocContext<'a> {
     pub initial_anchor: Option<(u32, i32)>,
 }
 
+/// Optional extended options for thread document rendering (keeps `ThreadDocContext` stable).
+#[derive(Clone, Debug, Default)]
+pub struct ThreadRenderExtra<'a> {
+    pub reading_view: bool,
+    pub card_tags: &'a [(u32, Vec<(String, String)>)],
+}
+
+fn card_surface_colors(dark: bool) -> (&'static str, &'static str) {
+    if dark {
+        ("#1d1d20", "#f3f4f6")
+    } else {
+        ("#ffffff", "#2e2e32")
+    }
+}
+
+fn count_recipients(recipients: &str, cc: &str) -> usize {
+    recipients
+        .split(',')
+        .chain(cc.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .count()
+}
+
 fn build_card_frame_html(
     body_text: &str,
     body_html: Option<&str>,
     block_remote: bool,
     card_dark: bool,
     zoom_percent: u32,
+    reading_view: bool,
 ) -> (String, usize) {
-    let (source_html, blocked_images) =
-        if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
-            if block_remote {
-                strip_remote_images_for_webview(raw_html)
-            } else {
-                (raw_html.to_string(), 0)
-            }
+    let (source_html, blocked_images) = if reading_view {
+        let plain_src = if !body_text.trim().is_empty() {
+            plain_text_to_html(body_text)
+        } else if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
+            let stripped = strip_remote_images_for_webview(raw_html).0;
+            stripped
         } else {
-            (plain_text_to_html(body_text), 0)
+            plain_text_to_html("")
         };
+        (plain_src, 0)
+    } else if let Some(raw_html) = body_html.filter(|s| !s.trim().is_empty()) {
+        if block_remote {
+            strip_remote_images_for_webview(raw_html)
+        } else {
+            (raw_html.to_string(), 0)
+        }
+    } else {
+        (plain_text_to_html(body_text), 0)
+    };
 
-    let html = if card_dark {
+    let html = if card_dark && !reading_view {
         adapt_colors_for_dark(&source_html)
     } else {
         source_html
     };
     let html = pin_color_scheme(&html, card_dark);
-    let (bg, fg) = reader_body_colors(card_dark);
+    let (bg, fg) = card_surface_colors(card_dark);
     let scheme = if card_dark { "dark" } else { "light" };
     let img_src = if block_remote {
         "data:"
@@ -333,8 +383,13 @@ fn build_card_frame_html(
     let meta_csp = format!(
         "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src {img_src}; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">"
     );
+    let reading_css = if reading_view {
+        "body{max-width:68ch!important;font-size:14.5px!important;line-height:1.75!important;letter-spacing:0.01em!important;}body *{max-width:100%!important;font-family:inherit!important;background:transparent!important;color:inherit!important;}"
+    } else {
+        ""
+    };
     let style = format!(
-        "<style>:root{{color-scheme:{scheme};zoom:{}%}}html{{display:flow-root!important;height:auto!important;min-height:0!important;overflow-y:hidden!important}}body{{height:auto!important;min-height:0!important}}:where(body){{margin:0;background-color:{bg};color:{fg};font:14px/1.6 system-ui,\"Segoe UI\",sans-serif}}img{{max-width:100%;height:auto}}</style>",
+        "<style>:root{{color-scheme:{scheme};zoom:{}%}}html{{display:flow-root!important;height:auto!important;min-height:0!important;overflow-y:hidden!important}}body{{height:auto!important;min-height:0!important}}:where(body){{margin:0;background-color:{bg};color:{fg};font:14px/1.6 system-ui,\"Segoe UI\",sans-serif}}img{{max-width:100%;height:auto}}{reading_css}</style>",
         zoom_percent.clamp(50, 250)
     );
     let lower = html.to_ascii_lowercase();
@@ -355,7 +410,7 @@ fn build_card_frame_html(
 fn container_css(ctx: &ThreadDocContext<'_>) -> String {
     let p = ctx.palette;
     let scheme = if ctx.app_dark_mode { "dark" } else { "light" };
-    let (card_bg, _) = reader_body_colors(ctx.app_dark_mode);
+    let (card_bg, _) = card_surface_colors(ctx.app_dark_mode);
     let canvas = &p.canvas;
     let raised = &p.surface_raised;
     let border = &p.border;
@@ -383,35 +438,42 @@ fn container_css(ctx: &ThreadDocContext<'_>) -> String {
     } else {
         "0 8px 24px rgba(0,0,0,0.14)"
     };
+    let pill_bg = if ctx.app_dark_mode {
+        "rgba(255,255,255,0.08)"
+    } else {
+        "rgba(0,0,0,0.06)"
+    };
 
     format!(
         "\
 :root{{color-scheme:{scheme};--km-canvas:{canvas};--km-card:{card_bg};--km-raised:{raised};\
 --km-border:{border};--km-text:{text};--km-muted:{muted};--km-accent:{accent};\
 --km-accent-border:{accent_border};--km-accent-soft:{accent_soft};--km-danger:{danger};\
---km-danger-border:{danger_border};--km-danger-bg:{danger_bg};--km-star:{star_hex};}}\
+--km-danger-border:{danger_border};--km-danger-bg:{danger_bg};--km-star:{star_hex};--km-pill-bg:{pill_bg};}}\
 *{{box-sizing:border-box;}}\
 html,body{{margin:0;padding:0;background:var(--km-canvas);color:var(--km-text);\
 font:{base_px:.2}px/1.5 system-ui,\"Segoe UI\",sans-serif;}}\
-body{{padding:12px 24px 24px;}}\
+body{{padding:14px 14px 20px;}}\
 ::-webkit-scrollbar{{width:8px;height:8px;}}\
 ::-webkit-scrollbar-thumb{{background:{scroll_thumb};border-radius:4px;}}\
 ::-webkit-scrollbar-track{{background:transparent;}}\
 .km-card{{background:var(--km-card);border:1px solid var(--km-border);border-radius:12px;\
-padding:20px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}}\
+padding:18px 20px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}}\
 .km-card:last-child{{margin-bottom:0;}}\
-.km-card.km-current{{border-color:var(--km-accent-border);}}\
-.km-card.km-folded{{background:var(--km-raised);padding:12px 20px;}}\
-.km-hdr{{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;min-width:0;}}\
-.km-ava{{width:34px;height:34px;border-radius:50%;flex:none;display:flex;align-items:center;\
-justify-content:center;color:#fff;font-weight:700;font-size:14.28px;}}\
-.km-card.km-folded .km-ava{{width:28px;height:28px;font-size:11.76px;}}\
-.km-sender-col{{min-width:0;display:flex;flex-direction:column;flex:0 1 auto;}}\
-.km-card.km-folded .km-sender-col{{flex-direction:row;align-items:center;gap:8px;flex:1;}}\
-.km-name{{font-size:{base_px:.2}px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}\
+.km-card.km-current{{box-shadow:0 1px 3px rgba(0,0,0,0.06);}}\
+.km-card.km-folded{{background:var(--km-card);padding:12px 20px;}}\
+.km-hdr{{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;min-width:0;}}\
+.km-ava{{width:32px;height:32px;border-radius:50%;flex:none;display:flex;align-items:center;\
+justify-content:center;color:#fff;font-weight:700;font-size:13px;}}\
+.km-card.km-folded .km-ava{{width:28px;height:28px;font-size:11.5px;}}\
+.km-sender-col{{min-width:0;display:flex;flex-direction:row;align-items:baseline;gap:6px;flex:0 1 auto;}}\
+.km-card.km-folded .km-sender-col{{align-items:center;gap:8px;flex:1;}}\
+.km-name{{font-size:{base_px:.2}px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;}}\
 .km-card.km-folded .km-name{{font-weight:600;flex:none;max-width:220px;}}\
-.km-email{{font-size:{small_px:.2}px;color:var(--km-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}\
+.km-email{{font-size:{small_px:.2}px;color:var(--km-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;}}\
 .km-card.km-folded .km-email{{display:none;}}\
+.km-tag-pill{{flex:none;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;line-height:1.25;white-space:nowrap;}}\
+.km-card.km-folded .km-tag-pill{{display:none;}}\
 .km-snippet{{display:none;font-size:{small_px:.2}px;color:var(--km-muted);white-space:nowrap;\
 overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;}}\
 .km-card.km-folded .km-snippet{{display:block;}}\
@@ -420,6 +482,10 @@ overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;}}\
 .km-badge{{flex:none;padding:2px 8px;border-radius:999px;font-size:{small_px:.2}px;\
 background:var(--km-canvas);border:1px solid currentColor;line-height:1.3;}}\
 .km-card.km-folded .km-badge{{display:none;}}\
+.km-rcpt-toggle{{flex:none;border:0;border-radius:6px;padding:3px 9px;font-size:{small_px:.2}px;\
+background:var(--km-pill-bg);color:var(--km-muted);cursor:pointer;line-height:1.25;white-space:nowrap;}}\
+.km-rcpt-toggle:hover,.km-rcpt-toggle.open{{color:var(--km-text);filter:brightness(0.95);}}\
+.km-card.km-folded .km-rcpt-toggle{{display:none;}}\
 .km-star-dot{{display:none;color:var(--km-star);font-size:{small_px:.2}px;flex:none;}}\
 .km-star-dot.on{{display:inline-flex;}}\
 .km-date{{flex:none;font-size:{small_px:.2}px;color:var(--km-muted);white-space:nowrap;}}\
@@ -428,9 +494,10 @@ color:var(--km-muted);cursor:pointer;display:inline-flex;align-items:center;just
 font-size:16px;line-height:1;}}\
 .km-more-btn:hover{{background:var(--km-accent-soft);color:var(--km-text);}}\
 .km-card.km-folded .km-details{{display:none;}}\
-.km-details{{display:flex;flex-direction:column;gap:12px;margin-top:8px;}}\
-.km-rcpts{{padding-left:42px;display:flex;flex-direction:column;gap:2px;font-size:{small_px:.2}px;color:var(--km-muted);}}\
-.km-rcpts div{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}\
+.km-details{{display:flex;flex-direction:column;gap:12px;margin-top:10px;}}\
+.km-rcpts{{padding-left:42px;display:flex;flex-direction:column;gap:3px;font-size:{small_px:.2}px;color:var(--km-muted);user-select:text;}}\
+.km-rcpts[hidden]{{display:none;}}\
+.km-rcpts div{{overflow-wrap:anywhere;}}\
 .km-banner{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 12px;\
 border-radius:8px;font-size:{small_px:.2}px;background:var(--km-canvas);border:1px solid var(--km-border);}}\
 .km-banner.km-banner-col{{flex-direction:column;align-items:stretch;gap:6px;padding:8px 12px;}}\
@@ -444,17 +511,25 @@ border-radius:6px;padding:4px 10px;font-size:{small_px:.2}px;cursor:pointer;line
 .km-btn.ghost{{border-color:transparent;background:transparent;color:var(--km-muted);}}\
 .km-btn.ghost:hover{{background:var(--km-accent-soft);color:var(--km-text);}}\
 .km-pan{{overflow-x:auto;border-radius:6px;}}\
-.km-pan.km-picked{{border:1px solid var(--km-border);border-radius:8px;padding:8px;}}\
+.km-pan.km-picked{{border:1px solid var(--km-border);border-radius:8px;padding:10px 12px;}}\
 iframe.km-frame{{width:100%;border:0;display:block;min-height:24px;visibility:hidden;}}\
 iframe.km-frame.km-live{{visibility:visible;}}\
 .km-raw{{margin:0;padding:12px;border-radius:8px;background:var(--km-canvas);border:1px solid var(--km-border);\
 font-family:ui-monospace,Consolas,monospace;font-size:{raw_font_px:.2}px;white-space:pre-wrap;overflow-wrap:anywhere;}}\
 .km-loading{{padding:20px 0;text-align:center;font-size:{base_px:.2}px;color:var(--km-muted);}}\
-.km-atts{{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-top:10px;border-top:1px solid var(--km-border);}}\
-.km-att-chip{{display:inline-flex;align-items:center;gap:8px;padding:4px 8px;border-radius:8px;\
-border:1px solid var(--km-border);background:var(--km-canvas);font-size:{small_px:.2}px;}}\
-.km-att-name{{max-width:240px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}\
-.km-att-size{{color:var(--km-muted);}}\
+.km-atts{{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-top:10px;}}\
+.km-att-chip{{display:inline-flex;align-items:stretch;border-radius:8px;\
+border:1px solid var(--km-border);background:var(--km-pill-bg);font-size:{small_px:.2}px;overflow:hidden;}}\
+.km-att-open{{appearance:none;border:0;background:transparent;color:var(--km-text);display:inline-flex;align-items:center;gap:6px;\
+padding:5px 10px;font-size:{small_px:.2}px;cursor:pointer;}}\
+.km-att-open:hover{{background:var(--km-accent-soft);}}\
+.km-att-icon{{display:inline-flex;align-items:center;color:var(--km-muted);flex:none;}}\
+.km-att-icon.is-pdf{{color:#e01b24;}}\
+.km-att-name{{max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500;}}\
+.km-att-size{{color:var(--km-muted);font-size:11px;}}\
+.km-att-dl{{appearance:none;border:0;border-left:1px solid var(--km-border);background:transparent;color:var(--km-muted);\
+display:inline-flex;align-items:center;justify-content:center;padding:0 9px;cursor:pointer;}}\
+.km-att-dl:hover{{background:var(--km-accent-soft);color:var(--km-text);}}\
 .km-menu{{position:fixed;z-index:9999;min-width:176px;padding:4px;border-radius:8px;\
 background:var(--km-raised);border:1px solid var(--km-border);box-shadow:{menu_shadow};\
 display:flex;flex-direction:column;gap:2px;}}\
@@ -475,6 +550,14 @@ pointer-events:none;opacity:0;transition:opacity 100ms ease;}}\
 
 /// Build the full thread container HTML document and report whether any card allows remote images.
 pub fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, bool) {
+    build_thread_document_with_extra(ctx, &ThreadRenderExtra::default())
+}
+
+/// Build the full thread container HTML document with extended reading-view and tag-pill options.
+pub fn build_thread_document_with_extra(
+    ctx: &ThreadDocContext<'_>,
+    extra: &ThreadRenderExtra<'_>,
+) -> (Vec<u8>, bool) {
     let mut any_remote_allowed = false;
     let mut cards_html = String::new();
 
@@ -561,6 +644,7 @@ pub fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, bool) {
             )
         } else {
             if !card.block_remote
+                && !extra.reading_view
                 && tm
                     .body_html
                     .as_deref()
@@ -574,13 +658,14 @@ pub fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, bool) {
                 card.block_remote,
                 card.card_dark,
                 ctx.zoom_percent,
+                extra.reading_view,
             );
             let src_attr = if card.is_collapsed {
                 "data-km-srcdoc"
             } else {
                 "srcdoc"
             };
-            let (picked_bg, _) = reader_body_colors(card.card_dark);
+            let (picked_bg, _) = card_surface_colors(card.card_dark);
             let picked_class = if card.card_dark != ctx.app_dark_mode {
                 " km-picked"
             } else {
@@ -610,9 +695,15 @@ pub fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, bool) {
             classes.push_str(" km-folded");
         }
 
+        let (card_bg, card_fg) = card_surface_colors(card.card_dark);
+        let card_inline_style = if card.card_dark != ctx.app_dark_mode {
+            format!(" style=\"background:{card_bg};color:{card_fg}\"")
+        } else {
+            String::new()
+        };
         let _ = write!(
             cards_html,
-            "<section class=\"{classes}\" data-msg-id=\"{}\" data-flagged=\"{}\" data-exporting=\"{}\" data-raw=\"{}\" data-demo=\"{}\" data-unsub=\"{}\">",
+            "<section class=\"{classes}\" data-msg-id=\"{}\" data-flagged=\"{}\" data-exporting=\"{}\" data-raw=\"{}\" data-demo=\"{}\" data-unsub=\"{}\"{card_inline_style}>",
             tm.id,
             u8::from(tm.flagged),
             u8::from(card.eml_exporting),
@@ -634,9 +725,20 @@ pub fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, bool) {
                 escape_html(&sender_email)
             );
         }
+        cards_html.push_str("</div>");
+        if let Some((_, tags)) = extra.card_tags.iter().find(|(id, _)| *id == tm.id) {
+            for (tag_name, tag_color) in tags {
+                let _ = write!(
+                    cards_html,
+                    "<span class=\"km-tag-pill\" style=\"background:{};color:#fff\">{}</span>",
+                    escape_html(tag_color),
+                    escape_html(tag_name),
+                );
+            }
+        }
         let _ = write!(
             cards_html,
-            "</div><div class=\"km-snippet\">{}</div><div class=\"km-spacer\"></div>",
+            "<div class=\"km-snippet\">{}</div><div class=\"km-spacer\"></div>",
             escape_html(&snippet)
         );
         if let Some((label, color)) = trust_badge {
@@ -644,6 +746,24 @@ pub fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, bool) {
                 cards_html,
                 "<span class=\"km-badge\" style=\"color:{color}\">{}</span>",
                 escape_html(label)
+            );
+        }
+        let rcpt_count = count_recipients(&tm.recipients, &tm.cc);
+        if rcpt_count > 0 {
+            let rcpt_label = format!("{rcpt_count} 位收件人");
+            let open_cls = if ctx.always_show_recipients {
+                " open"
+            } else {
+                ""
+            };
+            let expanded_attr = if ctx.always_show_recipients {
+                "true"
+            } else {
+                "false"
+            };
+            let _ = write!(
+                cards_html,
+                "<button type=\"button\" class=\"km-rcpt-toggle{open_cls}\" data-action=\"toggle-rcpts\" aria-expanded=\"{expanded_attr}\" title=\"展开或收起收件人详情\">{rcpt_label}</button>"
             );
         }
         let _ = write!(
@@ -655,11 +775,16 @@ pub fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, bool) {
 
         cards_html.push_str("<div class=\"km-details\">");
 
-        if ctx.always_show_recipients {
+        {
             let rcpts = recipient_list(&tm.recipients);
             let ccs = recipient_list(&tm.cc);
             if !rcpts.is_empty() || !ccs.is_empty() {
-                cards_html.push_str("<div class=\"km-rcpts\">");
+                let hidden_attr = if ctx.always_show_recipients {
+                    ""
+                } else {
+                    " hidden"
+                };
+                let _ = write!(cards_html, "<div class=\"km-rcpts\"{hidden_attr}>");
                 if !rcpts.is_empty() {
                     let _ = write!(cards_html, "<div>收件人：{}</div>", escape_html(&rcpts));
                 }
@@ -770,13 +895,17 @@ pub fn build_thread_document(ctx: &ThreadDocContext<'_>) -> (Vec<u8>, bool) {
                 } else {
                     "下载并保存附件"
                 };
+                let is_pdf = att.mime_type.eq_ignore_ascii_case("application/pdf")
+                    || att.filename.to_ascii_lowercase().ends_with(".pdf");
+                let icon_cls = if is_pdf { " is-pdf" } else { "" };
+                let file_svg = "<svg viewBox=\"0 0 16 16\" width=\"13\" height=\"13\" aria-hidden=\"true\"><path fill=\"currentColor\" d=\"M4 1.5A1.5 1.5 0 0 0 2.5 3v10A1.5 1.5 0 0 0 4 14.5h8a1.5 1.5 0 0 0 1.5-1.5V5.621a1.5 1.5 0 0 0-.44-1.06L10.44 1.94A1.5 1.5 0 0 0 9.379 1.5H4Zm5 1.75L12.25 6.5H9.5a.5.5 0 0 1-.5-.5V3.25Z\"/></svg>";
+                let dl_svg = "<svg viewBox=\"0 0 16 16\" width=\"13\" height=\"13\" aria-hidden=\"true\"><path fill=\"currentColor\" d=\"M8 2a.75.75 0 0 1 .75.75v6.19l2.22-2.22a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 1 1 1.06-1.06l2.22 2.22V2.75A.75.75 0 0 1 8 2ZM3.25 12.5a.75.75 0 0 0 0 1.5h9.5a.75.75 0 0 0 0-1.5h-9.5Z\"/></svg>";
                 let _ = write!(
                     cards_html,
-                    "<div class=\"km-att-chip\"><span class=\"km-att-name\" title=\"{}\">{}</span><span class=\"km-att-size\">{}</span><button type=\"button\" class=\"km-btn ghost\" title=\"{tip}\" data-action=\"save-att\" data-att-id=\"{}\">保存</button></div>",
-                    escape_html(&att.filename),
-                    escape_html(&att.filename),
-                    escape_html(&size_label),
-                    att.id
+                    "<div class=\"km-att-chip\"><button type=\"button\" class=\"km-att-open\" title=\"打开或预览附件\" data-action=\"open-att\" data-att-id=\"{att_id}\"><span class=\"km-att-icon{icon_cls}\">{file_svg}</span><span class=\"km-att-name\" title=\"{esc_name}\">{esc_name}</span><span class=\"km-att-size\">{esc_size}</span></button><button type=\"button\" class=\"km-att-dl\" title=\"{tip}\" data-action=\"save-att\" data-att-id=\"{att_id}\">{dl_svg}</button></div>",
+                    att_id = att.id,
+                    esc_name = escape_html(&att.filename),
+                    esc_size = escape_html(&size_label),
                 );
             }
             if tm.attachments.len() >= 2 {

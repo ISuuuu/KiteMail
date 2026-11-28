@@ -15,6 +15,8 @@ pub const EVENT_LOCK_STATE: &str = "main://lock-state";
 pub const EVENT_OUTBOX_UPDATED: &str = "main://outbox-updated";
 pub const EVENT_DRAFT_SAVED: &str = "main://draft-saved";
 pub const EVENT_ACCOUNT_EVENT: &str = "main://account-event";
+pub const EVENT_THREAD_CARD_ACTION: &str = "main://thread-card-action";
+pub const EVENT_READER_FIND_RESULT: &str = "main://reader-find-result";
 
 /// Structured IPC error returned by all main-window Tauri commands.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1972,6 +1974,120 @@ pub struct CheckAppUpdateOutput {
     pub pub_date: Option<String>,
     pub download_url: Option<String>,
     pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMessageTagsInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMessageTagsOutput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub tags: Vec<String>,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetReaderViewOptionsInput {
+    pub account_id: u32,
+    pub message_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetReaderViewOptionsInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    #[serde(default)]
+    pub per_message_dark: Option<Option<bool>>,
+    #[serde(default)]
+    pub reading_view: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReaderViewOptionsOutput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub per_message_dark: Option<bool>,
+    pub reading_view: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReaderFindInput {
+    pub reader_session_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub step: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReaderFindOutput {
+    pub dispatched: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReaderFindResultEvent {
+    pub reader_session_id: String,
+    pub current: u32,
+    pub total: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadCardActionKindDto {
+    Reply,
+    ReplyAll,
+    Forward,
+    OpenAttachment,
+    SaveAttachment,
+    SaveAllAttachments,
+    CopyBody,
+    ExportEml,
+    Mdn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadCardActionEvent {
+    pub kind: ThreadCardActionKindDto,
+    pub account_id: u32,
+    pub message_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAttachmentInput {
+    pub attachment_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAttachmentOutput {
+    pub opened: bool,
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickDirectoryOutput {
+    pub cancelled: bool,
+    pub path: Option<String>,
 }
 
 #[cfg(test)]

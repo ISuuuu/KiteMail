@@ -6,14 +6,16 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::dto::{
-    AllowRemoteImagesInput, AllowRemoteImagesOutput, IpcError, ListMessagesInput,
-    ListMessagesOutput, ListThreadSummariesInput, ListThreadSummariesOutput,
+    AllowRemoteImagesInput, AllowRemoteImagesOutput, GetReaderViewOptionsInput, IpcError,
+    ListMessagesInput, ListMessagesOutput, ListThreadSummariesInput, ListThreadSummariesOutput,
     LoadOlderMessagesInput, LoadOlderMessagesOutput, LockAppOutput, MainBootstrapDto,
     MainPreferencesDto, MainPreferencesPatch, MessageActionInput, MessageMoveOutput,
-    MoveMessageInput, OpenMessageInput, OpenMessageOutput, RefreshMailInput, RefreshMailOutput,
-    SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput, SetMessageSeenOutput,
-    SetReaderLayoutInput, SetReaderLayoutOutput, UndoMessageMoveInput, UndoMessageMoveOutput,
-    UnlockAppInput, UnlockAppOutput, MAIN_WINDOW_LABEL,
+    MoveMessageInput, OpenMessageInput, OpenMessageOutput, ReaderFindInput, ReaderFindOutput,
+    ReaderViewOptionsOutput, RefreshMailInput, RefreshMailOutput, SetMessageFlaggedInput,
+    SetMessageFlaggedOutput, SetMessageSeenInput, SetMessageSeenOutput, SetMessageTagsInput,
+    SetMessageTagsOutput, SetReaderLayoutInput, SetReaderLayoutOutput, SetReaderViewOptionsInput,
+    TagItemDto, UndoMessageMoveInput, UndoMessageMoveOutput, UnlockAppInput, UnlockAppOutput,
+    MAIN_WINDOW_LABEL,
 };
 use crate::mail_session::{MailSession, MAX_QUERY_LEN};
 use crate::preferences::PreferencesStore;
@@ -202,6 +204,64 @@ pub fn undo_message_move(
     input: UndoMessageMoveInput,
 ) -> Result<UndoMessageMoveOutput, IpcError> {
     state.session.undo_message_move(&input)
+}
+
+#[tauri::command]
+pub fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagItemDto>, IpcError> {
+    state.session.list_tags()
+}
+
+#[tauri::command]
+pub fn set_message_tags(
+    state: State<'_, AppState>,
+    input: SetMessageTagsInput,
+) -> Result<SetMessageTagsOutput, IpcError> {
+    state.session.set_message_tags(&input)
+}
+
+#[tauri::command]
+pub fn unmark_message_spam(
+    state: State<'_, AppState>,
+    input: MessageActionInput,
+) -> Result<MessageMoveOutput, IpcError> {
+    state.session.unmark_message_spam(&input)
+}
+
+#[tauri::command]
+pub fn get_reader_view_options(
+    state: State<'_, AppState>,
+    input: GetReaderViewOptionsInput,
+) -> Result<ReaderViewOptionsOutput, IpcError> {
+    state.session.get_reader_view_options(&input)
+}
+
+#[tauri::command]
+pub fn set_reader_view_options(
+    state: State<'_, AppState>,
+    input: SetReaderViewOptionsInput,
+) -> Result<ReaderViewOptionsOutput, IpcError> {
+    state.session.set_reader_view_options(&input)
+}
+
+#[tauri::command]
+pub fn find_in_reader(
+    state: State<'_, AppState>,
+    input: ReaderFindInput,
+) -> Result<ReaderFindOutput, IpcError> {
+    state.session.find_in_reader(&input)
+}
+
+#[tauri::command]
+pub fn close_main_window(window: WebviewWindow) -> Result<(), IpcError> {
+    if window.label() != MAIN_WINDOW_LABEL {
+        return Err(IpcError::invalid_input(
+            "仅允许主窗口调用关窗接口",
+            None,
+        ));
+    }
+    window
+        .close()
+        .map_err(|e| IpcError::internal(format!("关闭主窗口失败: {e}"), None))
 }
 
 #[tauri::command]

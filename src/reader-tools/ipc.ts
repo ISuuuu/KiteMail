@@ -20,8 +20,11 @@ import type {
   GetMessagePrintHtmlOutput,
   ListCachedAttachmentsInput,
   ListCachedAttachmentsOutput,
+  OpenAttachmentInput,
+  OpenAttachmentOutput,
   OpenMessageWindowInput,
   OpenMessageWindowOutput,
+  PickDirectoryOutput,
   SaveAllAttachmentsInput,
   SaveAllAttachmentsOutput,
   SaveAttachmentInput,
@@ -270,6 +273,8 @@ let mockCustomMessages = new Map<string, OpenMessageOutput>();
 let mockFailPreviewMessage: string | null = null;
 let mockFailSaveMessage: string | null = null;
 let mockDefaultDestDir = "C:\\Users\\Demo\\Downloads\\KiteMail";
+let mockPickedDir: string | null = "C:\\Users\\Demo\\Downloads\\KiteMail";
+const mockOpenedAttachmentIds: number[] = [];
 
 function makeLockedError(): IpcError {
   return {
@@ -711,6 +716,43 @@ export async function openMessageWindow(
   };
 }
 
+export async function openAttachment(
+  input: OpenAttachmentInput
+): Promise<OpenAttachmentOutput> {
+  if (isTauri()) {
+    return tauriInvoke<OpenAttachmentOutput>("open_attachment", { input });
+  }
+  if (mockLocked) return Promise.reject(makeLockedError());
+
+  const att = mockAttachments.find((item) => item.id === input.attachmentId);
+  const filename = att?.filename ?? `attachment-${input.attachmentId}.bin`;
+  if (att) {
+    att.downloaded = true;
+  }
+  mockOpenedAttachmentIds.push(input.attachmentId);
+  const path = `${mockDefaultDestDir}\\opened-attachments\\${filename}`;
+  return {
+    opened: true,
+    path,
+    message: `已打开附件 ${filename}`,
+  };
+}
+
+export async function pickDirectory(): Promise<PickDirectoryOutput> {
+  if (isTauri()) {
+    return tauriInvoke<PickDirectoryOutput>("pick_directory");
+  }
+  if (mockLocked) return Promise.reject(makeLockedError());
+  if (!mockPickedDir) {
+    return { cancelled: true, path: null };
+  }
+  return { cancelled: false, path: mockPickedDir };
+}
+
+export function getMockOpenedAttachmentIds(): readonly number[] {
+  return mockOpenedAttachmentIds;
+}
+
 // ---------- 测试重置辅助（仅作用于 Mock 传输层） ----------
 
 export function __resetReaderToolsMock(options?: {
@@ -720,12 +762,18 @@ export function __resetReaderToolsMock(options?: {
   failPreviewMessage?: string | null;
   failSaveMessage?: string | null;
   destDir?: string;
+  pickedDir?: string | null;
 }): void {
   mockLocked = options?.locked ?? false;
   mockStateVersion = 1;
   mockFailPreviewMessage = options?.failPreviewMessage ?? null;
   mockFailSaveMessage = options?.failSaveMessage ?? null;
   mockDefaultDestDir = options?.destDir ?? "C:\\Users\\Demo\\Downloads\\KiteMail";
+  mockPickedDir =
+    options && "pickedDir" in options
+      ? (options.pickedDir ?? null)
+      : mockDefaultDestDir;
+  mockOpenedAttachmentIds.length = 0;
   mockAttachments = (options?.attachments ?? DEFAULT_MOCK_ATTACHMENTS).map((a) => ({ ...a }));
   mockCustomMessages = new Map();
   if (options?.customMessages) {

@@ -67,6 +67,16 @@ import type {
   ViewDto,
   MessageSort,
   IpcError,
+  TagItemDto,
+  SetMessageTagsInput,
+  SetMessageTagsOutput,
+  GetReaderViewOptionsInput,
+  SetReaderViewOptionsInput,
+  ReaderViewOptionsOutput,
+  ReaderFindInput,
+  ReaderFindOutput,
+  ReaderFindResultEvent,
+  ThreadCardActionEvent,
 } from "./types";
 
 // ---------- 传输层检测 ----------
@@ -326,6 +336,8 @@ const mockRecordedReaderLayouts: SetReaderLayoutInput[] = [];
 const mockAllowedRemoteMessages = new Set<string>();
 const mockAllowedRemoteSenders = new Set<string>();
 const mockFolderHasMoreRemote = new Map<number, boolean>([[1, true]]);
+const mockPerMessageDark = new Map<string, boolean>();
+let mockReadingView = false;
 
 const DEFAULT_MOCK_PREFS: MainPreferencesDto = {
   themeId: "system",
@@ -442,11 +454,13 @@ function mockCooldownSecs(failedAttempts: number): number {
 }
 
 const MOCK_TAGS: readonly TagItemDto[] = [
-  { id: 1, name: "重要", color: "#e01b24", shortcut: 1 },
-  { id: 2, name: "工作", color: "#3584e4", shortcut: 2 },
-  { id: 3, name: "个人", color: "#26a269", shortcut: 3 },
-  { id: 4, name: "待办", color: "#e66100", shortcut: 4 },
-  { id: 5, name: "项目", color: "#9141ac", shortcut: 5 },
+  { id: 1, name: "Work", color: "#3584e4", shortcut: 1 },
+  { id: 2, name: "Personal", color: "#26a269", shortcut: 2 },
+  { id: 3, name: "重要", color: "#e01b24", shortcut: 3 },
+  { id: 4, name: "工作", color: "#3584e4", shortcut: 4 },
+  { id: 5, name: "待办", color: "#e66100", shortcut: 5 },
+  { id: 6, name: "财务", color: "#10b981", shortcut: 6 },
+  { id: 7, name: "项目", color: "#9141ac", shortcut: 7 },
 ];
 let mockTemplates: MailTemplateDto[] = [];
 
@@ -472,12 +486,16 @@ interface MockBus {
   "main://sync-status": EventHandler<SyncStatusEvent>[];
   "main://reader-status": EventHandler<ReaderStatusEvent>[];
   "main://lock-state": EventHandler<LockStateEvent>[];
+  "main://thread-card-action": EventHandler<ThreadCardActionEvent>[];
+  "main://reader-find-result": EventHandler<ReaderFindResultEvent>[];
 }
 const mockBus: MockBus = {
   "main://mail-changed": [],
   "main://sync-status": [],
   "main://reader-status": [],
   "main://lock-state": [],
+  "main://thread-card-action": [],
+  "main://reader-find-result": [],
 };
 
 function mockListen<K extends keyof MockBus>(
@@ -1137,6 +1155,125 @@ export async function markMessageSpam(input: MessageActionInput): Promise<Messag
   return moveMockMessageToFolder(input.accountId, input.messageId, "Junk");
 }
 
+export async function unmarkMessageSpam(input: MessageActionInput): Promise<MessageMoveOutput> {
+  if (isTauri()) return tauriInvoke<MessageMoveOutput>("unmark_message_spam", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  const msg = getMockMessages().find(
+    (m) => m.id === input.messageId && m.accountId === input.accountId
+  );
+  if (!msg) {
+    return Promise.reject({
+      code: "MESSAGE_NOT_FOUND",
+      message: `未找到邮件 #${input.messageId}`,
+      retryable: false,
+    } satisfies IpcError);
+  }
+  const folderLower = msg.folderPath.trim().toLowerCase();
+  if (!folderLower.includes("junk") && !folderLower.includes("spam")) {
+    return Promise.reject({
+      code: "INVALID_INPUT",
+      message: "仅垃圾邮件文件夹中的邮件可执行恢复操作",
+      retryable: false,
+    } satisfies IpcError);
+  }
+  return moveMockMessageToFolder(input.accountId, input.messageId, "INBOX");
+}
+
+export async function listTags(): Promise<TagItemDto[]> {
+  if (isTauri()) return tauriInvoke<TagItemDto[]>("list_tags");
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  return MOCK_TAGS.map((t) => ({ ...t }));
+}
+
+export async function setMessageTags(input: SetMessageTagsInput): Promise<SetMessageTagsOutput> {
+  if (isTauri()) return tauriInvoke<SetMessageTagsOutput>("set_message_tags", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  const msg = getMockMessages().find(
+    (m) => m.id === input.messageId && m.accountId === input.accountId
+  );
+  if (!msg) {
+    return Promise.reject({
+      code: "MESSAGE_NOT_FOUND",
+      message: `未找到邮件 #${input.messageId}`,
+      retryable: false,
+    } satisfies IpcError);
+  }
+  const normalized: string[] = [];
+  for (const raw of input.tags) {
+    const trimmed = raw.trim();
+    if (trimmed && !normalized.includes(trimmed)) {
+      normalized.push(trimmed);
+    }
+  }
+  msg.tags = normalized;
+  mockStateVersion += 1;
+  emitMock("main://mail-changed", {
+    stateVersion: mockStateVersion,
+    reason: "tagsUpdated",
+    accountId: msg.accountId,
+    folderId: msg.folderId,
+    messageId: msg.id,
+  });
+  return {
+    accountId: input.accountId,
+    messageId: input.messageId,
+    tags: [...normalized],
+    stateVersion: mockStateVersion,
+  };
+}
+
+export async function getReaderViewOptions(
+  input: GetReaderViewOptionsInput
+): Promise<ReaderViewOptionsOutput> {
+  if (isTauri()) {
+    return tauriInvoke<ReaderViewOptionsOutput>("get_reader_view_options", { input });
+  }
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  const key = `${input.accountId}:${input.messageId}`;
+  return {
+    accountId: input.accountId,
+    messageId: input.messageId,
+    perMessageDark: mockPerMessageDark.has(key) ? (mockPerMessageDark.get(key) ?? null) : null,
+    readingView: mockReadingView,
+  };
+}
+
+export async function setReaderViewOptions(
+  input: SetReaderViewOptionsInput
+): Promise<ReaderViewOptionsOutput> {
+  if (isTauri()) {
+    return tauriInvoke<ReaderViewOptionsOutput>("set_reader_view_options", { input });
+  }
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  const key = `${input.accountId}:${input.messageId}`;
+  if ("perMessageDark" in input && input.perMessageDark !== undefined) {
+    if (input.perMessageDark === null) {
+      mockPerMessageDark.delete(key);
+    } else {
+      mockPerMessageDark.set(key, input.perMessageDark);
+    }
+  }
+  if (typeof input.readingView === "boolean") {
+    mockReadingView = input.readingView;
+  }
+  return {
+    accountId: input.accountId,
+    messageId: input.messageId,
+    perMessageDark: mockPerMessageDark.has(key) ? (mockPerMessageDark.get(key) ?? null) : null,
+    readingView: mockReadingView,
+  };
+}
+
+export async function findInReader(input: ReaderFindInput): Promise<ReaderFindOutput> {
+  if (isTauri()) return tauriInvoke<ReaderFindOutput>("find_in_reader", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+  return { dispatched: false };
+}
+
+export async function closeMainWindow(): Promise<void> {
+  if (isTauri()) return tauriInvoke<void>("close_main_window");
+}
+
 export async function moveMessage(input: MoveMessageInput): Promise<MessageMoveOutput> {
   if (isTauri()) return tauriInvoke<MessageMoveOutput>("move_message", { input });
   if (mockLocked) return Promise.reject(makeLockedIpcError());
@@ -1224,6 +1361,8 @@ export function resetMockSession(options?: {
   mockAllowedRemoteSenders.clear();
   mockFolderHasMoreRemote.clear();
   mockFolderHasMoreRemote.set(1, options?.inboxHasMoreRemote ?? true);
+  mockPerMessageDark.clear();
+  mockReadingView = false;
 }
 
 export function getMockRecordedReaderLayouts(): readonly SetReaderLayoutInput[] {
@@ -1257,4 +1396,22 @@ export async function onReaderStatus(handler: (e: ReaderStatusEvent) => void): P
 export async function onLockState(handler: (e: LockStateEvent) => void): Promise<UnlistenFn> {
   if (isTauri()) return tauriListen<LockStateEvent>("main://lock-state", handler);
   return mockListen("main://lock-state", handler);
+}
+
+export async function onThreadCardAction(
+  handler: (e: ThreadCardActionEvent) => void
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<ThreadCardActionEvent>("main://thread-card-action", handler);
+  }
+  return mockListen("main://thread-card-action", handler);
+}
+
+export async function onReaderFindResult(
+  handler: (e: ReaderFindResultEvent) => void
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<ReaderFindResultEvent>("main://reader-find-result", handler);
+  }
+  return mockListen("main://reader-find-result", handler);
 }

@@ -27,6 +27,9 @@ import type {
   MessageRef,
   ReaderPosition,
   MessageMoveOutput,
+  TagItemDto,
+  ThreadCardActionEvent,
+  ReaderFindResultEvent,
 } from "../ipc/types";
 import {
   isTauri,
@@ -46,13 +49,22 @@ import {
   archiveMessage,
   deleteMessage,
   markMessageSpam,
+  unmarkMessageSpam,
   moveMessage,
   undoMessageMove,
+  listTags,
+  setMessageTags,
+  getReaderViewOptions,
+  setReaderViewOptions,
+  findInReader,
+  closeMainWindow,
   quitApp,
   onMailChanged,
   onSyncStatus,
   onReaderStatus,
   onLockState,
+  onThreadCardAction,
+  onReaderFindResult,
   extractErrorMessage,
   isLockedError,
   normalizeSyncStatusEvent,
@@ -417,6 +429,16 @@ export function useMainWindow() {
   const movingMessage = ref(false);
   const undoToast = ref<UndoToastState | null>(null);
   const undoPending = ref(false);
+  const availableTags = ref<TagItemDto[]>([]);
+  const perMessageDark = ref<boolean | null>(null);
+  const readingView = ref(false);
+  const readerFindOpen = ref(false);
+  const readerFindQuery = ref("");
+  const readerFindCurrent = ref(0);
+  const readerFindTotal = ref(0);
+  const readerFindStepToken = ref(0);
+  const readerFindStepDelta = ref(1);
+  let threadCardActionHandler: ((e: ThreadCardActionEvent) => void) | null = null;
 
   // 解订阅句柄
   const unlisteners: Array<() => void> = [];
@@ -424,6 +446,12 @@ export function useMainWindow() {
   // --- 派生 ---
   const selectedMessage = computed(() => findMessageByRef(messages.value, selectedId.value));
   const selectedUnread = computed(() => selectedMessage.value?.unread ?? false);
+  const selectedTags = computed<string[]>(() => selectedMessage.value?.tags ?? []);
+  const openedAccountEmail = computed(() => {
+    const msg = openedMessage.value;
+    if (!msg) return "";
+    return accounts.value.find((acc) => acc.id === msg.accountId)?.email ?? "";
+  });
 
   const currentFolderHasMoreRemote = computed(() => {
     const view = currentView.value;
@@ -558,6 +586,13 @@ export function useMainWindow() {
     openedMessage.value = null;
     readerLoading.value = false;
     readerError.value = null;
+    availableTags.value = [];
+    perMessageDark.value = null;
+    readingView.value = false;
+    readerFindOpen.value = false;
+    readerFindQuery.value = "";
+    readerFindCurrent.value = 0;
+    readerFindTotal.value = 0;
     searchQuery.value = "";
     filterSet.value = {};
     expandedThreadKeys.value = new Set();
@@ -823,11 +858,24 @@ export function useMainWindow() {
   }
 
   // --- 刷新 ---
+  async function loadTagsCatalog() {
+    if (locked.value) return;
+    try {
+      const list = await listTags();
+      availableTags.value = list;
+      if (list.length > 0 || tags.value.length === 0) {
+        tags.value = list;
+      }
+    } catch (e) {
+      if (handleIpcError(e)) return;
+    }
+  }
+
   async function refresh() {
     if (locked.value) return;
     try {
       await refreshMail({ view: currentView.value });
-      await loadMessages(true, { preserveAnchor: true });
+      await Promise.all([loadMessages(true, { preserveAnchor: true }), loadTagsCatalog()]);
     } catch (e) {
       if (handleIpcError(e)) return;
       listError.value = extractErrorMessage(e);
@@ -854,6 +902,28 @@ export function useMainWindow() {
     }, READER_BODY_TIMEOUT_MS);
   }
 
+  function isOpenedMessageNative(): boolean {
+    const msg = openedMessage.value;
+    if (!msg || !isTauri() || msg.bodyStatus !== "ready") return false;
+    return msg.hasHtml || msg.threadMessages.length > 1;
+  }
+
+  async function syncReaderViewOptions(accountId: number, messageId: number) {
+    try {
+      const res = await getReaderViewOptions({ accountId, messageId });
+      if (
+        !locked.value &&
+        openedMessage.value?.accountId === accountId &&
+        openedMessage.value?.messageId === messageId
+      ) {
+        perMessageDark.value = res.perMessageDark;
+        readingView.value = res.readingView;
+      }
+    } catch (e) {
+      handleIpcError(e);
+    }
+  }
+
   // --- 打开邮件正文 ---
   async function fetchOpenedMessage(target: MessageRef) {
     if (locked.value || layout.prefs.value.readerPosition === "off") {
@@ -865,6 +935,9 @@ export function useMainWindow() {
     const requestId = `open-${epoch}-${target.accountId}-${target.messageId}`;
     activeOpenRequestId = requestId;
     openedMessage.value = null;
+    perMessageDark.value = null;
+    readerFindCurrent.value = 0;
+    readerFindTotal.value = 0;
     readerLoading.value = true;
     readerError.value = null;
 
@@ -889,10 +962,13 @@ export function useMainWindow() {
         lastReaderSessionId = result.readerSessionId;
         openedMessage.value = result;
         readerLoading.value = result.bodyStatus === "loading";
+        void syncReaderViewOptions(result.accountId, result.messageId);
         if (result.bodyStatus === "loading") {
           scheduleReaderBodyTimeout(epoch, result.readerSessionId);
         } else if (result.bodyStatus === "unavailable") {
           readerError.value = "正文暂不可用，请点击重试";
+        } else if (readerFindOpen.value && readerFindQuery.value.trim()) {
+          void runReaderFind(readerFindQuery.value);
         }
       }
     } catch (e) {
@@ -912,6 +988,9 @@ export function useMainWindow() {
       activeOpenRequestId = "";
       selectedId.value = null;
       openedMessage.value = null;
+      perMessageDark.value = null;
+      readerFindCurrent.value = 0;
+      readerFindTotal.value = 0;
       readerLoading.value = false;
       readerError.value = null;
       return;
@@ -1115,7 +1194,7 @@ export function useMainWindow() {
   }
 
   async function performMoveAction(
-    kind: "archive" | "delete" | "spam" | "move",
+    kind: "archive" | "delete" | "spam" | "unspam" | "move",
     target: MessageRef,
     targetFolderPath?: string
   ): Promise<MessageMoveOutput | null> {
@@ -1134,6 +1213,8 @@ export function useMainWindow() {
         res = await deleteMessage(target);
       } else if (kind === "spam") {
         res = await markMessageSpam(target);
+      } else if (kind === "unspam") {
+        res = await unmarkMessageSpam(target);
       } else {
         if (!targetFolderPath) return null;
         res = await moveMessage({ ...target, targetFolderPath });
@@ -1162,7 +1243,9 @@ export function useMainWindow() {
             ? "已移至已删除"
             : kind === "spam"
               ? "已标记为垃圾邮件"
-              : `已移动到 ${resolveFolderDisplayName(res.accountId, res.targetFolderPath)}`;
+              : kind === "unspam"
+                ? "已移出垃圾邮件"
+                : `已移动到 ${resolveFolderDisplayName(res.accountId, res.targetFolderPath)}`;
       showUndoToast(label, res);
 
       await syncFoldersMetadata();
@@ -1208,9 +1291,157 @@ export function useMainWindow() {
     return performMoveAction("spam", selectedId.value);
   }
 
+  function unmarkSelectedSpam() {
+    if (!selectedId.value) return Promise.resolve(null);
+    return performMoveAction("unspam", selectedId.value);
+  }
+
   function moveSelectedMessage(targetFolderPath: string) {
     if (!selectedId.value) return Promise.resolve(null);
     return performMoveAction("move", selectedId.value, targetFolderPath);
+  }
+
+  // --- 标签 / 单封邮件亮暗 / 阅读视图 / 正文查找 ---
+  async function setOpenedMessageTags(tags: string[]) {
+    const target = selectedId.value ?? (openedMessage.value
+      ? { accountId: openedMessage.value.accountId, messageId: openedMessage.value.messageId }
+      : null);
+    if (locked.value || !target) return null;
+    try {
+      const res = await setMessageTags({
+        accountId: target.accountId,
+        messageId: target.messageId,
+        tags,
+      });
+      if (locked.value) return null;
+      stateVersion.value = Math.max(stateVersion.value, res.stateVersion);
+      messages.value = messages.value.map((m) =>
+        m.accountId === res.accountId && m.id === res.messageId
+          ? { ...m, tags: [...res.tags] }
+          : m
+      );
+      return res;
+    } catch (e) {
+      if (handleIpcError(e)) return null;
+      listError.value = extractErrorMessage(e);
+      return null;
+    }
+  }
+
+  async function togglePerMessageDark() {
+    const msg = openedMessage.value;
+    if (locked.value || !msg) return null;
+    const effective = perMessageDark.value ?? layout.effectiveDark.value;
+    const nextDark = perMessageDark.value === null ? !effective : null;
+    try {
+      const res = await setReaderViewOptions({
+        accountId: msg.accountId,
+        messageId: msg.messageId,
+        perMessageDark: nextDark,
+      });
+      if (!locked.value) {
+        perMessageDark.value = res.perMessageDark;
+        readingView.value = res.readingView;
+      }
+      return res;
+    } catch (e) {
+      if (handleIpcError(e)) return null;
+      readerError.value = extractErrorMessage(e);
+      return null;
+    }
+  }
+
+  async function toggleReadingView() {
+    const msg = openedMessage.value;
+    if (locked.value || !msg) return null;
+    const nextReading = !readingView.value;
+    try {
+      const res = await setReaderViewOptions({
+        accountId: msg.accountId,
+        messageId: msg.messageId,
+        readingView: nextReading,
+      });
+      if (!locked.value) {
+        perMessageDark.value = res.perMessageDark;
+        readingView.value = res.readingView;
+      }
+      return res;
+    } catch (e) {
+      if (handleIpcError(e)) return null;
+      readerError.value = extractErrorMessage(e);
+      return null;
+    }
+  }
+
+  function openReaderFind() {
+    readerFindOpen.value = true;
+  }
+
+  function closeReaderFind() {
+    readerFindOpen.value = false;
+    readerFindQuery.value = "";
+    readerFindCurrent.value = 0;
+    readerFindTotal.value = 0;
+    const msg = openedMessage.value;
+    if (msg && isOpenedMessageNative()) {
+      void findInReader({
+        readerSessionId: msg.readerSessionId,
+        query: "",
+      }).catch(() => {});
+    }
+  }
+
+  function toggleReaderFind() {
+    if (readerFindOpen.value) {
+      closeReaderFind();
+    } else {
+      openReaderFind();
+    }
+  }
+
+  async function runReaderFind(query: string, step?: number) {
+    readerFindQuery.value = query;
+    const msg = openedMessage.value;
+    if (!msg || locked.value) {
+      readerFindCurrent.value = 0;
+      readerFindTotal.value = 0;
+      return;
+    }
+    if (isOpenedMessageNative()) {
+      try {
+        await findInReader({
+          readerSessionId: msg.readerSessionId,
+          query,
+          ...(step !== undefined ? { step } : {}),
+        });
+      } catch (e) {
+        if (handleIpcError(e)) return;
+      }
+      return;
+    }
+    if (step !== undefined) {
+      readerFindStepDelta.value = step;
+      readerFindStepToken.value += 1;
+    }
+  }
+
+  function updateFallbackFindResult(current: number, total: number) {
+    readerFindCurrent.value = current;
+    readerFindTotal.value = total;
+  }
+
+  function registerThreadCardActionHandler(
+    handler: ((e: ThreadCardActionEvent) => void) | null
+  ) {
+    threadCardActionHandler = handler;
+  }
+
+  async function closeWindow() {
+    try {
+      await closeMainWindow();
+    } catch (e) {
+      error.value = extractErrorMessage(e);
+    }
   }
 
   async function undoLastMove(): Promise<boolean> {
@@ -1406,8 +1637,24 @@ export function useMainWindow() {
         readerError.value = e.detail ?? e.message ?? "正文加载失败，请点击重试";
       } else if (e.bodyStatus === "ready") {
         readerError.value = null;
+        if (readerFindOpen.value && readerFindQuery.value.trim()) {
+          void runReaderFind(readerFindQuery.value);
+        }
       }
     }
+  }
+
+  function handleReaderFindResult(e: ReaderFindResultEvent) {
+    if (locked.value) return;
+    if (openedMessage.value && openedMessage.value.readerSessionId === e.readerSessionId) {
+      readerFindCurrent.value = e.current;
+      readerFindTotal.value = e.total;
+    }
+  }
+
+  function handleThreadCardAction(e: ThreadCardActionEvent) {
+    if (locked.value) return;
+    threadCardActionHandler?.(e);
   }
 
   // --- 初始化 ---
@@ -1431,6 +1678,8 @@ export function useMainWindow() {
           })
         );
         unlisteners.push(await onReaderStatus(handleReaderStatus));
+        unlisteners.push(await onReaderFindResult(handleReaderFindResult));
+        unlisteners.push(await onThreadCardAction(handleThreadCardAction));
         unlisteners.push(
           await onLockState((e) => {
             const wasLocked = locked.value;
@@ -1469,7 +1718,7 @@ export function useMainWindow() {
         tags.value = bootstrap.tags ?? [];
         templates.value = bootstrap.templates ?? [];
         currentView.value = bootstrap.currentView;
-        await loadMessages(true);
+        await Promise.all([loadMessages(true), loadTagsCatalog()]);
       }
     } catch (e) {
       if (!handleIpcError(e)) {
@@ -1531,13 +1780,24 @@ export function useMainWindow() {
     selectedId,
     selectedMessage,
     selectedUnread,
+    selectedTags,
     openedMessage,
+    openedAccountEmail,
     readerLoading,
     readerError,
     allowingRemoteImages,
     movingMessage,
     undoToast,
     undoPending,
+    availableTags,
+    perMessageDark,
+    readingView,
+    readerFindOpen,
+    readerFindQuery,
+    readerFindCurrent,
+    readerFindTotal,
+    readerFindStepToken,
+    readerFindStepDelta,
     init,
     dispose,
     selectView,
@@ -1564,7 +1824,18 @@ export function useMainWindow() {
     archiveSelectedMessage,
     deleteSelectedMessage,
     markSelectedSpam,
+    unmarkSelectedSpam,
     moveSelectedMessage,
+    setOpenedMessageTags,
+    togglePerMessageDark,
+    toggleReadingView,
+    openReaderFind,
+    closeReaderFind,
+    toggleReaderFind,
+    runReaderFind,
+    updateFallbackFindResult,
+    registerThreadCardActionHandler,
+    closeWindow,
     undoLastMove,
     dismissUndoToast,
     lock,

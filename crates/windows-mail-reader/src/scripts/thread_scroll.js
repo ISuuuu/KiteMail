@@ -201,4 +201,108 @@
             }
         }, 30);
     }
+
+    const findState = { marks: [], cur: -1 };
+
+    function ensureFindCss(doc) {
+        if (!doc || doc.getElementById("km-find-css")) return;
+        const st = doc.createElement("style");
+        st.id = "km-find-css";
+        st.textContent = ".km-find-hit{background:rgba(255,198,0,0.45);color:#000;border-radius:3px;box-shadow:0 0 0 1px rgba(255,198,0,0.55);}.km-find-hit.current{background:#ffc600;box-shadow:0 0 0 2px #f59e0b;}";
+        (doc.head || doc.documentElement).appendChild(st);
+    }
+
+    function postFindCount() {
+        const cur = findState.marks.length ? findState.cur + 1 : 0;
+        try {
+            window.chrome.webview.postMessage("find-count:" + cur + ":" + findState.marks.length);
+        } catch (_) {}
+    }
+
+    function showActiveFind() {
+        for (let i = 0; i < findState.marks.length; i++) {
+            findState.marks[i].className = "km-find-hit" + (i === findState.cur ? " current" : "");
+        }
+        postFindCount();
+        const mark = findState.marks[findState.cur];
+        if (mark) {
+            mark.scrollIntoView({ block: "center" });
+        }
+    }
+
+    window.kmFindClear = function () {
+        for (const m of findState.marks) {
+            const p = m.parentNode;
+            if (!p) continue;
+            while (m.firstChild) p.insertBefore(m.firstChild, m);
+            p.removeChild(m);
+            p.normalize();
+        }
+        findState.marks = [];
+        findState.cur = -1;
+    };
+
+    window.kmFindStep = function (dir) {
+        if (!findState.marks.length) return;
+        const step = dir < 0 ? -1 : 1;
+        findState.cur = (findState.cur + step + findState.marks.length) % findState.marks.length;
+        showActiveFind();
+    };
+
+    window.kmFind = function (rawQuery) {
+        window.kmFindClear();
+        const q = (rawQuery || "").trim().toLowerCase();
+        if (!q) {
+            postFindCount();
+            return;
+        }
+        let doc = null;
+        try {
+            doc = frame.contentDocument;
+        } catch (_) {}
+        if (!doc || !doc.body) {
+            postFindCount();
+            return;
+        }
+        ensureFindCss(doc);
+        const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
+        const nodes = [];
+        let node;
+        while ((node = walker.nextNode())) {
+            const pname = node.parentNode && node.parentNode.nodeName;
+            if (pname === "SCRIPT" || pname === "STYLE" || pname === "NOSCRIPT") continue;
+            if (node.nodeValue && node.nodeValue.toLowerCase().indexOf(q) >= 0) {
+                nodes.push(node);
+            }
+        }
+        for (const textNode of nodes) {
+            const text = textNode.nodeValue;
+            const lower = text.toLowerCase();
+            let pos = 0;
+            let idx;
+            const frag = doc.createDocumentFragment();
+            let had = false;
+            while ((idx = lower.indexOf(q, pos)) >= 0) {
+                had = true;
+                frag.appendChild(doc.createTextNode(text.slice(pos, idx)));
+                const span = doc.createElement("span");
+                span.className = "km-find-hit";
+                span.textContent = text.slice(idx, idx + q.length);
+                frag.appendChild(span);
+                findState.marks.push(span);
+                pos = idx + q.length;
+            }
+            frag.appendChild(doc.createTextNode(text.slice(pos)));
+            if (had && textNode.parentNode) {
+                textNode.parentNode.replaceChild(frag, textNode);
+            }
+        }
+        findState.marks = findState.marks.filter((m) => m.getClientRects().length > 0);
+        if (findState.marks.length) {
+            findState.cur = 0;
+            showActiveFind();
+        } else {
+            postFindCount();
+        }
+    };
 })();

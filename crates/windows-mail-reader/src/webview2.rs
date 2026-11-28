@@ -1221,9 +1221,11 @@ fn record_thread_action(state: &Rc<RefCell<State>>, source: &str, message: &str)
     };
     let should_flush = {
         let mut inner = state.borrow_mut();
+        let allow_mode = inner.mode == DocumentMode::ThreadContainer
+            || matches!(action, WebViewAction::FindCount { .. });
         if inner.closed
             || !inner.loaded
-            || inner.mode != DocumentMode::ThreadContainer
+            || !allow_mode
             || !allow_main_navigation(source, inner.version)
         {
             return false;

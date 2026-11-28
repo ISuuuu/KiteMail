@@ -12,6 +12,7 @@ const TEST_FILES = [
   "tests/reader-tools.test.ts",
   "tests/workspace-tools.test.ts",
   "tests/settings-shell.test.ts",
+  "tests/parity-reader-drawer.test.ts",
 ];
 
 const outDir = path.resolve("node_modules/.tmp-test");

@@ -166,11 +166,13 @@ pub enum WebViewAction {
     CardUnsubscribe(u32),
     CardAllowRemote(u32),
     CardLoadBody(u32),
+    CardOpenAttachment(u32),
     CardSaveAttachment(u32),
     CardSaveAllAttachments(u32),
     CardIcsReply { msg_id: u32, status: &'static str },
     CardMdn { msg_id: u32, send: bool },
     ScrollAnchor { msg_id: u32, offset_px: i32 },
+    FindCount { current: u32, total: u32 },
 }
 
 /// Parse and strictly validate a thread-card bridge message from `reader_thread.js`.
@@ -204,8 +206,13 @@ pub fn parse_thread_action(message: &str) -> Option<WebViewAction> {
         ("card-unsub", None) => Some(WebViewAction::CardUnsubscribe(id)),
         ("card-allow-remote", None) => Some(WebViewAction::CardAllowRemote(id)),
         ("card-load-body", None) => Some(WebViewAction::CardLoadBody(id)),
+        ("card-open-att", None) => Some(WebViewAction::CardOpenAttachment(id)),
         ("card-save-att", None) => Some(WebViewAction::CardSaveAttachment(id)),
         ("card-save-all-atts", None) => Some(WebViewAction::CardSaveAllAttachments(id)),
+        ("find-count", Some(raw_total)) => {
+            let total: u32 = raw_total.parse().ok()?;
+            Some(WebViewAction::FindCount { current: id, total })
+        }
         ("card-ics", Some("ACCEPTED")) => Some(WebViewAction::CardIcsReply {
             msg_id: id,
             status: "ACCEPTED",
@@ -397,8 +404,26 @@ mod tests {
             Some(WebViewAction::CardLoadBody(7))
         );
         assert_eq!(
+            parse_thread_action("card-open-att:99"),
+            Some(WebViewAction::CardOpenAttachment(99))
+        );
+        assert_eq!(
             parse_thread_action("card-save-att:99"),
             Some(WebViewAction::CardSaveAttachment(99))
+        );
+        assert_eq!(
+            parse_thread_action("find-count:2:5"),
+            Some(WebViewAction::FindCount {
+                current: 2,
+                total: 5
+            })
+        );
+        assert_eq!(
+            parse_thread_action("find-count:0:0"),
+            Some(WebViewAction::FindCount {
+                current: 0,
+                total: 0
+            })
         );
         assert_eq!(
             parse_thread_action("card-save-all-atts:7"),
