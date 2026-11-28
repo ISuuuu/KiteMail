@@ -9,6 +9,7 @@
     "core:default",
     "allow-main-bootstrap",
     "allow-list-messages",
+    "allow-list-thread-summaries",
     "allow-open-message",
     "allow-set-reader-layout",
     "allow-update-main-preferences",

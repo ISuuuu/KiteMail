@@ -29,6 +29,8 @@ import type {
   MainBootstrapDto,
   ListMessagesInput,
   ListMessagesOutput,
+  ListThreadSummariesInput,
+  ListThreadSummariesOutput,
   OpenMessageInput,
   OpenMessageOutput,
   SetReaderLayoutInput,
@@ -54,12 +56,14 @@ import type {
   MainPreferencesPatch,
   MainPreferencesDto,
   MailChangedEvent,
+  MailTemplateDto,
   SyncStatusEvent,
   SyncStatusDto,
   ReaderStatusEvent,
   LockStateEvent,
   MessageSummaryDto,
   FolderSummaryDto,
+  TagItemDto,
   ViewDto,
   MessageSort,
   IpcError,
@@ -437,6 +441,15 @@ function mockCooldownSecs(failedAttempts: number): number {
   return 60;
 }
 
+const MOCK_TAGS: readonly TagItemDto[] = [
+  { id: 1, name: "重要", color: "#e01b24", shortcut: 1 },
+  { id: 2, name: "工作", color: "#3584e4", shortcut: 2 },
+  { id: 3, name: "个人", color: "#26a269", shortcut: 3 },
+  { id: 4, name: "待办", color: "#e66100", shortcut: 4 },
+  { id: 5, name: "项目", color: "#9141ac", shortcut: 5 },
+];
+let mockTemplates: MailTemplateDto[] = [];
+
 const MOCK_BOOTSTRAP: MainBootstrapDto = {
   mode: "demo",
   locked: false,
@@ -448,6 +461,8 @@ const MOCK_BOOTSTRAP: MainBootstrapDto = {
   currentView: { kind: "unifiedInbox" },
   preferences: { ...DEFAULT_MOCK_PREFS },
   syncStatus: { syncing: false, message: null, lastSyncAt: null },
+  tags: [...MOCK_TAGS],
+  templates: [],
 };
 
 // Mock 事件总线
@@ -504,9 +519,68 @@ function matchesMockView(msg: MessageSummaryDto, view: ViewDto): boolean {
       return msg.folderPath === "Junk";
     case "trash":
       return msg.folderPath === "Trash";
+    case "filters":
+      return msg.unread || msg.flagged || msg.hasAttachment;
+    case "tags":
+      return msg.tags.length > 0;
     case "snoozed":
       return false;
   }
+}
+
+function matchesMockSearchQuery(msg: MessageSummaryDto, rawQuery: string): boolean {
+  const q = rawQuery.trim().toLowerCase();
+  if (!q) return true;
+  const tokens: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  for (const ch of q) {
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (!inQuotes && /\s/.test(ch)) {
+      if (cur) {
+        tokens.push(cur);
+        cur = "";
+      }
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur) tokens.push(cur);
+
+  for (const tok of tokens) {
+    if (tok === "is:unread") {
+      if (!msg.unread) return false;
+      continue;
+    }
+    if (tok === "is:read") {
+      if (msg.unread) return false;
+      continue;
+    }
+    if (tok === "is:starred") {
+      if (!msg.flagged) return false;
+      continue;
+    }
+    if (tok === "has:attachment" || tok === "has:attachments") {
+      if (!msg.hasAttachment) return false;
+      continue;
+    }
+    if (tok.startsWith("tag:")) {
+      const wantTag = tok.slice(4).trim();
+      if (wantTag && !msg.tags.some((t) => t.toLowerCase() === wantTag)) return false;
+      continue;
+    }
+    if (
+      !msg.subject.toLowerCase().includes(tok) &&
+      !msg.sender.toLowerCase().includes(tok) &&
+      !msg.preview.toLowerCase().includes(tok)
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function compareMessages(a: MessageSummaryDto, b: MessageSummaryDto, sort: MessageSort): number {
@@ -558,6 +632,8 @@ export async function mainBootstrap(): Promise<MainBootstrapDto> {
     folders: computeMockFolders(),
     stateVersion: mockStateVersion,
     preferences: { ...mockPrefs },
+    tags: MOCK_TAGS.map((t) => ({ ...t })),
+    templates: mockTemplates.map((t) => ({ ...t, attachmentPaths: [...t.attachmentPaths] })),
   });
 }
 
@@ -570,23 +646,35 @@ export async function listMessages(input: ListMessagesInput): Promise<ListMessag
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
   const todayTs = Math.floor(todayStart.getTime() / 1000);
+  const f = input.filter;
+  const hasQuickFilter = Boolean(
+    f.unread ||
+      f.starred ||
+      f.hasAttachment ||
+      f.today ||
+      f.toMe ||
+      f.fromContacts ||
+      f.highImportance ||
+      f.tagged ||
+      f.dateFromTs != null ||
+      f.dateToTs != null
+  );
 
   const filtered = all.filter((m) => {
-    if (!(q && input.scope === "allFolders")) {
+    if (!((q || hasQuickFilter) && input.scope === "allFolders")) {
       if (!matchesMockView(m, input.view)) return false;
     }
-    if (
-      q &&
-      !m.subject.toLowerCase().includes(q) &&
-      !m.sender.toLowerCase().includes(q) &&
-      !m.preview.toLowerCase().includes(q)
-    ) {
-      return false;
-    }
-    if (input.filter.unread && !m.unread) return false;
-    if (input.filter.starred && !m.flagged) return false;
-    if (input.filter.hasAttachment && !m.hasAttachment) return false;
-    if (input.filter.today && m.dateTs < todayTs) return false;
+    if (f.accountId != null && m.accountId !== f.accountId) return false;
+    if (q && !matchesMockSearchQuery(m, q)) return false;
+    if (f.unread && !m.unread) return false;
+    if (f.starred && !m.flagged) return false;
+    if (f.hasAttachment && !m.hasAttachment) return false;
+    if (f.today && m.dateTs < todayTs) return false;
+    if (f.toMe && !m.recipients.trim()) return false;
+    if (f.highImportance && m.importance <= 0) return false;
+    if (f.tagged && m.tags.length === 0) return false;
+    if (f.dateFromTs != null && m.dateTs < f.dateFromTs) return false;
+    if (f.dateToTs != null && m.dateTs >= f.dateToTs) return false;
     return true;
   });
 
@@ -602,6 +690,46 @@ export async function listMessages(input: ListMessagesInput): Promise<ListMessag
     total: filtered.length,
     hasMore: input.offset + page.length < filtered.length,
     items: page.map((m) => ({ ...m, tags: [...m.tags] })),
+  };
+}
+
+export async function listThreadSummaries(
+  input: ListThreadSummariesInput
+): Promise<ListThreadSummariesOutput> {
+  if (isTauri()) return tauriInvoke<ListThreadSummariesOutput>("list_thread_summaries", { input });
+  if (mockLocked) return Promise.reject(makeLockedIpcError());
+
+  const msg = getMockMessages().find(
+    (m) => m.id === input.messageId && m.accountId === input.accountId
+  );
+  if (!msg || msg.threadCount <= 1) {
+    return {
+      accountId: input.accountId,
+      messageId: input.messageId,
+      items: [],
+    };
+  }
+  const childCount = Math.max(1, msg.threadCount - 1);
+  const items: MessageSummaryDto[] = [];
+  for (let i = 0; i < childCount; i++) {
+    items.push({
+      ...msg,
+      id: msg.id * 100 + i + 1,
+      sender: i === 0 ? msg.sender : `协作者 ${i + 1} <member${i + 1}@example.com>`,
+      preview: i === 0 ? "第一条历史回复摘要。" : `会话第 ${i + 1} 条补充回复。`,
+      dateTs: msg.dateTs - (i + 1) * 1800,
+      dateDisplay: "昨天",
+      unread: false,
+      flagged: false,
+      hasAttachment: false,
+      threadCount: 1,
+      tags: [],
+    });
+  }
+  return {
+    accountId: input.accountId,
+    messageId: input.messageId,
+    items,
   };
 }
 
@@ -1073,6 +1201,7 @@ export function resetMockSession(options?: {
   cooldownMs?: number;
   darkMode?: boolean | null;
   inboxHasMoreRemote?: boolean;
+  templates?: MailTemplateDto[];
 }): void {
   cachedMockAll = null;
   mockStateVersion = 1;
@@ -1083,6 +1212,9 @@ export function resetMockSession(options?: {
   mockFailedAttempts = options?.failedAttempts ?? 0;
   mockUnlockCooldownUntilMs = options?.cooldownMs ? Date.now() + options.cooldownMs : 0;
   mockNextMessageId = MOCK_INBOX_TOTAL + 11;
+  mockTemplates = options?.templates
+    ? options.templates.map((t) => ({ ...t, attachmentPaths: [...t.attachmentPaths] }))
+    : [];
   mockPrefs = {
     ...DEFAULT_MOCK_PREFS,
     ...(options && "darkMode" in options ? { darkMode: options.darkMode ?? null } : {}),

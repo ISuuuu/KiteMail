@@ -39,7 +39,9 @@ export type UnifiedViewKind =
   | "archive"
   | "junk"
   | "trash"
-  | "snoozed";
+  | "snoozed"
+  | "filters"
+  | "tags";
 
 export type ViewDto =
   | { kind: UnifiedViewKind }
@@ -49,6 +51,29 @@ export interface AccountSummaryDto {
   id: number;
   displayName: string;
   email: string;
+  label?: string | null;
+  color?: string | null;
+  emoji?: string | null;
+}
+
+export interface TagItemDto {
+  id: number;
+  name: string;
+  color: string;
+  shortcut?: number | null;
+}
+
+export interface MailTemplateDto {
+  id: number;
+  name: string;
+  toAddr: string;
+  ccAddr: string;
+  bccAddr: string;
+  subject: string;
+  bodyText: string;
+  bodyFormat: string;
+  attachmentPaths: string[];
+  createdAt: number;
 }
 
 export interface FolderSummaryDto {
@@ -94,6 +119,8 @@ export interface MainBootstrapDto {
   currentView: ViewDto;
   preferences: MainPreferencesDto;
   syncStatus: SyncStatusDto;
+  tags?: TagItemDto[];
+  templates?: MailTemplateDto[];
 }
 
 export interface UnlockAppInput {
@@ -156,6 +183,25 @@ export interface MessageFilterDto {
   starred?: boolean;
   hasAttachment?: boolean;
   today?: boolean;
+  toMe?: boolean;
+  fromContacts?: boolean;
+  highImportance?: boolean;
+  tagged?: boolean;
+  dateFromTs?: number | null;
+  dateToTs?: number | null;
+  accountId?: number | null;
+}
+
+export interface ListThreadSummariesInput {
+  accountId: number;
+  messageId: number;
+  subject?: string;
+}
+
+export interface ListThreadSummariesOutput {
+  accountId: number;
+  messageId: number;
+  items: MessageSummaryDto[];
 }
 
 export interface ListMessagesInput {

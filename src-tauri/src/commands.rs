@@ -7,12 +7,13 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::dto::{
     AllowRemoteImagesInput, AllowRemoteImagesOutput, IpcError, ListMessagesInput,
-    ListMessagesOutput, LoadOlderMessagesInput, LoadOlderMessagesOutput, LockAppOutput,
-    MainBootstrapDto, MainPreferencesDto, MainPreferencesPatch, MessageActionInput,
-    MessageMoveOutput, MoveMessageInput, OpenMessageInput, OpenMessageOutput, RefreshMailInput,
-    RefreshMailOutput, SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput,
-    SetMessageSeenOutput, SetReaderLayoutInput, SetReaderLayoutOutput, UndoMessageMoveInput,
-    UndoMessageMoveOutput, UnlockAppInput, UnlockAppOutput, MAIN_WINDOW_LABEL,
+    ListMessagesOutput, ListThreadSummariesInput, ListThreadSummariesOutput,
+    LoadOlderMessagesInput, LoadOlderMessagesOutput, LockAppOutput, MainBootstrapDto,
+    MainPreferencesDto, MainPreferencesPatch, MessageActionInput, MessageMoveOutput,
+    MoveMessageInput, OpenMessageInput, OpenMessageOutput, RefreshMailInput, RefreshMailOutput,
+    SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput, SetMessageSeenOutput,
+    SetReaderLayoutInput, SetReaderLayoutOutput, UndoMessageMoveInput, UndoMessageMoveOutput,
+    UnlockAppInput, UnlockAppOutput, MAIN_WINDOW_LABEL,
 };
 use crate::mail_session::{MailSession, MAX_QUERY_LEN};
 use crate::preferences::PreferencesStore;
@@ -57,6 +58,14 @@ pub fn list_messages(
         ));
     }
     state.session.list_messages(&input)
+}
+
+#[tauri::command]
+pub fn list_thread_summaries(
+    state: State<'_, AppState>,
+    input: ListThreadSummariesInput,
+) -> Result<ListThreadSummariesOutput, IpcError> {
+    state.session.list_thread_summaries(&input)
 }
 
 #[tauri::command]
