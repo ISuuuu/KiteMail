@@ -42,82 +42,160 @@
       @overlayChange="state.layout.setOverlayOpen"
     />
 
-    <!-- 侧栏分隔把手 -->
-    <PaneSplitter
-      v-if="!state.layout.isRail.value"
-      direction="vertical"
-      label="调整侧栏宽度"
-      :value="state.layout.prefs.value.sidebarWidth"
-      :min="SIDEBAR_MIN_WIDTH"
-      :max="SIDEBAR_MAX_WIDTH"
-      @dragStart="dragBaseSidebar = state.layout.prefs.value.sidebarWidth"
-      @drag="(delta) => state.layout.onSidebarResize(dragBaseSidebar + delta)"
-      @dragEnd="state.layout.flushSave()"
-      @step="(delta) => state.layout.onSidebarResize(state.layout.prefs.value.sidebarWidth + delta)"
-    />
+    <!-- 右侧邮件区（切换通讯录/附件视图时卸载阅读区及原生 WebView2 宿主，避免遮挡） -->
+    <template v-if="activeWorkspaceView === 'mail'">
+      <!-- 侧栏分隔把手 -->
+      <PaneSplitter
+        v-if="!state.layout.isRail.value"
+        direction="vertical"
+        label="调整侧栏宽度"
+        :value="state.layout.prefs.value.sidebarWidth"
+        :min="SIDEBAR_MIN_WIDTH"
+        :max="SIDEBAR_MAX_WIDTH"
+        @dragStart="dragBaseSidebar = state.layout.prefs.value.sidebarWidth"
+        @drag="(delta) => state.layout.onSidebarResize(dragBaseSidebar + delta)"
+        @dragEnd="state.layout.flushSave()"
+        @step="(delta) => state.layout.onSidebarResize(state.layout.prefs.value.sidebarWidth + delta)"
+      />
 
-    <!-- 中栏：列表（Right 模式定宽，Below/Off 模式铺满） -->
-    <div class="km-list-column" :style="listColumnStyle">
-      <div class="km-list-slot" :style="listSlotStyle">
-        <MessageListPane
-          :messages="state.messages.value"
-          :groupedMessages="state.groupedMessages.value"
-          :total="state.listTotal.value"
-          :loading="state.listLoading.value"
-          :error="state.listError.value"
-          :hasMore="state.hasMore.value"
-          :hasMoreRemote="state.currentFolderHasMoreRemote.value"
-          :loadingOlder="state.loadingOlder.value"
-          :searchQuery="state.searchQuery.value"
-          :searchScope="state.searchScope.value"
-          :sortMode="state.sortMode.value"
-          :filterSet="state.filterSet.value"
-          :selectedId="state.selectedId.value"
-          :listWide="state.layout.listWide.value"
-          :readerPosition="state.layout.prefs.value.readerPosition"
-          :compactList="state.layout.prefs.value.compactList"
-          :showAvatars="state.layout.prefs.value.showAvatars"
-          :isRail="state.layout.isRail.value"
-          :effectiveDark="state.layout.effectiveDark.value"
-          :tagsMeta="state.tags.value"
-          :collapsedDayGroups="state.collapsedDayGroups.value"
-          :expandedThreadKeys="state.expandedThreadKeys.value"
-          :threadChildren="state.threadChildren.value"
-          :scrollResetToken="state.scrollResetToken.value"
-          :syncStatus="state.syncStatus.value"
-          :cacheReady="state.cacheReady.value"
-          @selectMessage="state.selectMessage"
-          @toggleSeen="state.toggleMessageSeen"
-          @toggleFlagged="state.toggleMessageFlagged"
-          @toggleThread="state.toggleThreadExpand"
-          @toggleDayGroup="state.toggleDayGroup"
-          @toggleSidebar="state.layout.toggleSidebarCollapsed"
-          @setSearch="state.setSearch"
-          @setScope="state.setScope"
-          @setSort="state.setSort"
-          @setFilter="state.setFilter"
-          @refresh="state.refresh"
-          @loadMore="state.loadMore"
-          @loadOlder="state.loadOlderMessages()"
-          @overlayChange="state.layout.setOverlayOpen"
-        />
+      <!-- 中栏：列表（Right 模式定宽，Below/Off 模式铺满） -->
+      <div class="km-list-column" :style="listColumnStyle">
+        <div class="km-list-slot" :style="listSlotStyle">
+          <MessageListPane
+            :messages="state.messages.value"
+            :groupedMessages="state.groupedMessages.value"
+            :total="state.listTotal.value"
+            :loading="state.listLoading.value"
+            :error="state.listError.value"
+            :hasMore="state.hasMore.value"
+            :hasMoreRemote="state.currentFolderHasMoreRemote.value"
+            :loadingOlder="state.loadingOlder.value"
+            :searchQuery="state.searchQuery.value"
+            :searchScope="state.searchScope.value"
+            :sortMode="state.sortMode.value"
+            :filterSet="state.filterSet.value"
+            :selectedId="state.selectedId.value"
+            :listWide="state.layout.listWide.value"
+            :readerPosition="state.layout.prefs.value.readerPosition"
+            :compactList="state.layout.prefs.value.compactList"
+            :showAvatars="state.layout.prefs.value.showAvatars"
+            :isRail="state.layout.isRail.value"
+            :effectiveDark="state.layout.effectiveDark.value"
+            :tagsMeta="state.tags.value"
+            :collapsedDayGroups="state.collapsedDayGroups.value"
+            :expandedThreadKeys="state.expandedThreadKeys.value"
+            :threadChildren="state.threadChildren.value"
+            :scrollResetToken="state.scrollResetToken.value"
+            :syncStatus="state.syncStatus.value"
+            :cacheReady="state.cacheReady.value"
+            @selectMessage="state.selectMessage"
+            @toggleSeen="state.toggleMessageSeen"
+            @toggleFlagged="state.toggleMessageFlagged"
+            @toggleThread="state.toggleThreadExpand"
+            @toggleDayGroup="state.toggleDayGroup"
+            @toggleSidebar="state.layout.toggleSidebarCollapsed"
+            @setSearch="state.setSearch"
+            @setScope="state.setScope"
+            @setSort="state.setSort"
+            @setFilter="state.setFilter"
+            @refresh="state.refresh"
+            @loadMore="state.loadMore"
+            @loadOlder="state.loadOlderMessages()"
+            @overlayChange="state.layout.setOverlayOpen"
+          />
+        </div>
+
+        <!-- Below 模式：列表下方阅读区 -->
+        <template v-if="state.layout.prefs.value.readerPosition === 'below'">
+          <PaneSplitter
+            direction="horizontal"
+            label="调整列表与阅读区高度"
+            :value="state.layout.prefs.value.listBelowHeight"
+            :min="BELOW_LIST_MIN_HEIGHT"
+            @dragStart="dragBaseBelow = state.layout.prefs.value.listBelowHeight"
+            @drag="(delta) => state.layout.onBelowResize(dragBaseBelow + delta)"
+            @dragEnd="state.layout.flushSave()"
+            @step="(delta) => state.layout.onBelowResize(state.layout.prefs.value.listBelowHeight + delta)"
+          />
+          <ReaderPane
+            ref="belowReaderPaneRef"
+            :isBelow="true"
+            :message="state.openedMessage.value"
+            :loading="state.readerLoading.value"
+            :error="state.readerError.value"
+            :selectedUnread="state.selectedUnread.value"
+            :readerPosition="state.layout.prefs.value.readerPosition"
+            :themeId="state.layout.prefs.value.themeId"
+            :darkMode="state.layout.prefs.value.darkMode"
+            :effectiveDark="state.layout.effectiveDark.value"
+            :followSystem="state.layout.followSystemScheme.value"
+            :overlayOccluded="state.layout.overlayOccluded.value"
+            :zoomPercent="state.layout.prefs.value.readerZoomPercent"
+            :folders="state.folders.value"
+            :allowingRemoteImages="state.allowingRemoteImages.value"
+            :movingMessage="state.movingMessage.value"
+            :accountEmail="state.openedAccountEmail.value"
+            :availableTags="state.availableTags.value"
+            :selectedTags="state.selectedTags.value"
+            :perMessageDark="state.perMessageDark.value"
+            :readingView="state.readingView.value"
+            :findOpen="state.readerFindOpen.value"
+            :findQuery="state.readerFindQuery.value"
+            :findCurrent="state.readerFindCurrent.value"
+            :findTotal="state.readerFindTotal.value"
+            :findStepToken="state.readerFindStepToken.value"
+            :findStepDelta="state.readerFindStepDelta.value"
+            @retry="state.retryOpen"
+            @reply="openReplyCompose('reply')"
+            @replyAll="openReplyCompose('replyAll')"
+            @forward="openReplyCompose('forward')"
+            @toggleSeen="(seen) => state.selectedId.value && state.toggleMessageSeen(state.selectedId.value, seen)"
+            @toggleFlagged="(flagged) => state.selectedId.value && state.toggleMessageFlagged(state.selectedId.value, flagged)"
+            @setReaderPosition="state.layout.setReaderPosition"
+            @setTheme="state.layout.setTheme"
+            @setDarkMode="state.layout.setDarkMode"
+            @toggleDarkMode="state.layout.toggleDarkMode"
+            @toggleFollowSystem="state.layout.toggleFollowSystem"
+            @allowRemoteImages="state.allowOpenedRemoteImages"
+            @archive="state.archiveSelectedMessage()"
+            @markSpam="state.markSelectedSpam()"
+            @unmarkSpam="state.unmarkSelectedSpam()"
+            @delete="state.deleteSelectedMessage()"
+            @moveToFolder="state.moveSelectedMessage"
+            @openStandalone="openStandaloneReader('read')"
+            @print="openStandaloneReader('print')"
+            @openAttachments="activeReaderPane()?.expandAttachments()"
+            @setTags="state.setOpenedMessageTags"
+            @togglePerMessageDark="state.togglePerMessageDark()"
+            @toggleReadingView="state.toggleReadingView()"
+            @toggleFind="state.toggleReaderFind()"
+            @closeFind="state.closeReaderFind()"
+            @findQuery="(q) => state.runReaderFind(q)"
+            @findStep="(delta) => state.runReaderFind(state.readerFindQuery.value, delta)"
+            @fallbackFindResult="(res) => state.updateFallbackFindResult(res.current, res.total)"
+            @cardAction="handleCardAction"
+            @closeWindow="state.closeWindow()"
+            @overlayChange="state.layout.setOverlayOpen"
+          />
+        </template>
       </div>
 
-      <!-- Below 模式：列表下方阅读区 -->
-      <template v-if="state.layout.prefs.value.readerPosition === 'below'">
+      <!-- Right 模式：右侧阅读区 -->
+      <template v-if="state.layout.prefs.value.readerPosition === 'right'">
         <PaneSplitter
-          direction="horizontal"
-          label="调整列表与阅读区高度"
-          :value="state.layout.prefs.value.listBelowHeight"
-          :min="BELOW_LIST_MIN_HEIGHT"
-          @dragStart="dragBaseBelow = state.layout.prefs.value.listBelowHeight"
-          @drag="(delta) => state.layout.onBelowResize(dragBaseBelow + delta)"
+          direction="vertical"
+          label="调整列表栏宽度"
+          :value="state.layout.listVisualWidth.value"
+          :min="LIST_MIN_WIDTH"
+          :max="state.layout.maxListWidth.value"
+          @dragStart="dragBaseList = state.layout.listVisualWidth.value"
+          @drag="(delta) => state.layout.onListResize(dragBaseList + delta)"
           @dragEnd="state.layout.flushSave()"
-          @step="(delta) => state.layout.onBelowResize(state.layout.prefs.value.listBelowHeight + delta)"
+          @step="(delta) => state.layout.onListResize(state.layout.listVisualWidth.value + delta)"
         />
         <ReaderPane
-          ref="belowReaderPaneRef"
-          :isBelow="true"
+          ref="rightReaderPaneRef"
+          class="km-reader-column"
           :message="state.openedMessage.value"
           :loading="state.readerLoading.value"
           :error="state.readerError.value"
@@ -176,82 +254,26 @@
           @overlayChange="state.layout.setOverlayOpen"
         />
       </template>
-    </div>
-
-    <!-- Right 模式：右侧阅读区 -->
-    <template v-if="state.layout.prefs.value.readerPosition === 'right'">
-      <PaneSplitter
-        direction="vertical"
-        label="调整列表栏宽度"
-        :value="state.layout.listVisualWidth.value"
-        :min="LIST_MIN_WIDTH"
-        :max="state.layout.maxListWidth.value"
-        @dragStart="dragBaseList = state.layout.listVisualWidth.value"
-        @drag="(delta) => state.layout.onListResize(dragBaseList + delta)"
-        @dragEnd="state.layout.flushSave()"
-        @step="(delta) => state.layout.onListResize(state.layout.listVisualWidth.value + delta)"
-      />
-      <ReaderPane
-        ref="rightReaderPaneRef"
-        class="km-reader-column"
-        :message="state.openedMessage.value"
-        :loading="state.readerLoading.value"
-        :error="state.readerError.value"
-        :selectedUnread="state.selectedUnread.value"
-        :readerPosition="state.layout.prefs.value.readerPosition"
-        :themeId="state.layout.prefs.value.themeId"
-        :darkMode="state.layout.prefs.value.darkMode"
-        :effectiveDark="state.layout.effectiveDark.value"
-        :followSystem="state.layout.followSystemScheme.value"
-        :overlayOccluded="state.layout.overlayOccluded.value"
-        :zoomPercent="state.layout.prefs.value.readerZoomPercent"
-        :folders="state.folders.value"
-        :allowingRemoteImages="state.allowingRemoteImages.value"
-        :movingMessage="state.movingMessage.value"
-        :accountEmail="state.openedAccountEmail.value"
-        :availableTags="state.availableTags.value"
-        :selectedTags="state.selectedTags.value"
-        :perMessageDark="state.perMessageDark.value"
-        :readingView="state.readingView.value"
-        :findOpen="state.readerFindOpen.value"
-        :findQuery="state.readerFindQuery.value"
-        :findCurrent="state.readerFindCurrent.value"
-        :findTotal="state.readerFindTotal.value"
-        :findStepToken="state.readerFindStepToken.value"
-        :findStepDelta="state.readerFindStepDelta.value"
-        @retry="state.retryOpen"
-        @reply="openReplyCompose('reply')"
-        @replyAll="openReplyCompose('replyAll')"
-        @forward="openReplyCompose('forward')"
-        @toggleSeen="(seen) => state.selectedId.value && state.toggleMessageSeen(state.selectedId.value, seen)"
-        @toggleFlagged="(flagged) => state.selectedId.value && state.toggleMessageFlagged(state.selectedId.value, flagged)"
-        @setReaderPosition="state.layout.setReaderPosition"
-        @setTheme="state.layout.setTheme"
-        @setDarkMode="state.layout.setDarkMode"
-        @toggleDarkMode="state.layout.toggleDarkMode"
-        @toggleFollowSystem="state.layout.toggleFollowSystem"
-        @allowRemoteImages="state.allowOpenedRemoteImages"
-        @archive="state.archiveSelectedMessage()"
-        @markSpam="state.markSelectedSpam()"
-        @unmarkSpam="state.unmarkSelectedSpam()"
-        @delete="state.deleteSelectedMessage()"
-        @moveToFolder="state.moveSelectedMessage"
-        @openStandalone="openStandaloneReader('read')"
-        @print="openStandaloneReader('print')"
-        @openAttachments="activeReaderPane()?.expandAttachments()"
-        @setTags="state.setOpenedMessageTags"
-        @togglePerMessageDark="state.togglePerMessageDark()"
-        @toggleReadingView="state.toggleReadingView()"
-        @toggleFind="state.toggleReaderFind()"
-        @closeFind="state.closeReaderFind()"
-        @findQuery="(q) => state.runReaderFind(q)"
-        @findStep="(delta) => state.runReaderFind(state.readerFindQuery.value, delta)"
-        @fallbackFindResult="(res) => state.updateFallbackFindResult(res.current, res.total)"
-        @cardAction="handleCardAction"
-        @closeWindow="state.closeWindow()"
-        @overlayChange="state.layout.setOverlayOpen"
-      />
     </template>
+
+    <!-- 内嵌通讯录与全局附件图库工作区视图 -->
+    <ContactsModal
+      v-else-if="activeWorkspaceView === 'contacts'"
+      :open="true"
+      :embedded="true"
+      @close="closeContactsView()"
+      @composeTo="onComposeToContact"
+      @closeWindow="state.closeWindow()"
+    />
+
+    <AttachmentGalleryModal
+      v-else-if="activeWorkspaceView === 'attachments'"
+      :open="true"
+      :embedded="true"
+      @close="closeAttachmentsView()"
+      @openMessage="onGalleryOpenMessage"
+      @closeWindow="state.closeWindow()"
+    />
 
     <!-- 底部操作撤销 Toast -->
     <div
@@ -281,7 +303,10 @@
     </div>
 
     <!-- Off 模式浮动入口：允许在隐藏阅读区时切回阅读位置或主题 -->
-    <div v-if="state.layout.prefs.value.readerPosition === 'off'" class="km-off-bar">
+    <div
+      v-if="activeWorkspaceView === 'mail' && state.layout.prefs.value.readerPosition === 'off'"
+      class="km-off-bar"
+    >
       <button
         type="button"
         class="km-off-chip"
@@ -329,15 +354,7 @@
       @overlayChange="state.layout.setOverlayOpen"
     />
 
-    <!-- Wave 3：全局附件图库 / 独立读信打印 / 通讯录 / 设置 / 命令面板与快捷键 -->
-    <AttachmentGalleryModal
-      :open="attachmentGalleryOpen"
-      @update:open="(v) => { attachmentGalleryOpen = v; if (!v && activeWorkspaceView === 'attachments') activeWorkspaceView = 'mail'; }"
-      @close="closeAttachmentsView()"
-      @openMessage="onGalleryOpenMessage"
-      @overlayChange="state.layout.setOverlayOpen"
-    />
-
+    <!-- Wave 3：独立读信打印 / 设置 / 命令面板与快捷键 -->
     <StandaloneMessageModal
       :open="standaloneOpen"
       :target="standaloneTarget"
@@ -347,14 +364,6 @@
       @reply="openComposeFromStandalone('reply', $event)"
       @replyAll="openComposeFromStandalone('replyAll', $event)"
       @forward="openComposeFromStandalone('forward', $event)"
-      @overlayChange="state.layout.setOverlayOpen"
-    />
-
-    <ContactsModal
-      :open="contactsModalOpen"
-      @update:open="(v) => { contactsModalOpen = v; if (!v && activeWorkspaceView === 'contacts') activeWorkspaceView = 'mail'; }"
-      @close="closeContactsView()"
-      @composeTo="onComposeToContact"
       @overlayChange="state.layout.setOverlayOpen"
     />
 
@@ -388,7 +397,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import FolderSidebar from "./FolderSidebar.vue";
 import MessageListPane from "./MessageListPane.vue";
 import ReaderPane from "./ReaderPane.vue";
@@ -577,11 +586,9 @@ function activeReaderPane() {
     : rightReaderPaneRef.value;
 }
 
-const attachmentGalleryOpen = ref(false);
 const standaloneOpen = ref(false);
 const standaloneTarget = ref<StandaloneMessageTarget | null>(null);
 const standaloneMode = ref<StandaloneReaderMode>("read");
-const contactsModalOpen = ref(false);
 const preferencesModalOpen = ref(false);
 const preferencesInitialTab = ref<PreferenceTabId>("appearance");
 const commandPaletteOpen = ref(false);
@@ -591,8 +598,6 @@ const activeWorkspaceView = ref<"mail" | "contacts" | "attachments">("mail");
 
 function onSidebarSelectView(view: ViewDto) {
   activeWorkspaceView.value = "mail";
-  contactsModalOpen.value = false;
-  attachmentGalleryOpen.value = false;
   state.selectView(view);
 }
 
@@ -603,19 +608,14 @@ function onSidebarApplyFilter(options: {
   filter?: MessageFilterDto;
 }) {
   activeWorkspaceView.value = "mail";
-  contactsModalOpen.value = false;
-  attachmentGalleryOpen.value = false;
   state.applySidebarFilter(options);
 }
 
 function openContactsView() {
   activeWorkspaceView.value = "contacts";
-  attachmentGalleryOpen.value = false;
-  contactsModalOpen.value = true;
 }
 
 function closeContactsView() {
-  contactsModalOpen.value = false;
   if (activeWorkspaceView.value === "contacts") {
     activeWorkspaceView.value = "mail";
   }
@@ -623,12 +623,9 @@ function closeContactsView() {
 
 function openAttachmentsView() {
   activeWorkspaceView.value = "attachments";
-  contactsModalOpen.value = false;
-  attachmentGalleryOpen.value = true;
 }
 
 function closeAttachmentsView() {
-  attachmentGalleryOpen.value = false;
   if (activeWorkspaceView.value === "attachments") {
     activeWorkspaceView.value = "mail";
   }
@@ -639,19 +636,19 @@ const hasAnyOpenModal = computed(
     compose.open.value ||
     accountsModalOpen.value ||
     showWelcome.value ||
-    attachmentGalleryOpen.value ||
     standaloneOpen.value ||
-    contactsModalOpen.value ||
     preferencesModalOpen.value ||
     commandPaletteOpen.value ||
     shortcutsHelpOpen.value
 );
 
 const commandPaletteItems = computed<CommandPaletteItem[]>(() => {
-  const hasSelection = Boolean(state.selectedId.value);
-  const hasMessage = Boolean(state.openedMessage.value);
+  const inMailView = activeWorkspaceView.value === "mail";
+  const hasSelection = inMailView && Boolean(state.selectedId.value);
+  const hasMessage = inMailView && Boolean(state.openedMessage.value);
   const hasAttachments = Boolean(
-    state.openedMessage.value &&
+    inMailView &&
+      state.openedMessage.value &&
       (state.openedMessage.value.attachments.length > 0 ||
         state.openedMessage.value.threadMessages.some(
           (tm) => (tm.attachments?.length ?? 0) > 0
@@ -851,14 +848,14 @@ function openComposeFromStandalone(mode: ComposeMode, msg: OpenMessageOutput) {
 }
 
 function onGalleryOpenMessage(accountId: number, messageId: number) {
-  attachmentGalleryOpen.value = false;
+  closeAttachmentsView();
   standaloneTarget.value = { accountId, messageId };
   standaloneMode.value = "read";
   standaloneOpen.value = true;
 }
 
 function onComposeToContact(email: string, name: string) {
-  contactsModalOpen.value = false;
+  closeContactsView();
   const formatted = name && name.trim() ? `${name.trim()} <${email}>` : email;
   const defaultAccountId =
     state.currentView.value.kind === "accountFolder"
@@ -941,10 +938,10 @@ function executePaletteCommand(commandId: string) {
       activeReaderPane()?.expandAttachments();
       break;
     case "tools.attachments":
-      attachmentGalleryOpen.value = true;
+      openAttachmentsView();
       break;
     case "tools.contacts":
-      contactsModalOpen.value = true;
+      openContactsView();
       break;
     case "tools.accounts":
       openAccountManager();
@@ -953,7 +950,12 @@ function executePaletteCommand(commandId: string) {
       openPreferencesModal("appearance");
       break;
     case "search.focus":
-      window.dispatchEvent(new CustomEvent("km-focus-search"));
+      if (activeWorkspaceView.value !== "mail") {
+        activeWorkspaceView.value = "mail";
+        void nextTick(() => window.dispatchEvent(new CustomEvent("km-focus-search")));
+      } else {
+        window.dispatchEvent(new CustomEvent("km-focus-search"));
+      }
       break;
     case "mail.refresh":
       void state.refresh();
@@ -1071,10 +1073,12 @@ function onKeyDown(e: KeyboardEvent) {
   // 中文 IME 组合输入期间保持编辑键优先
   if (e.isComposing || e.key === "Process" || e.keyCode === 229) return;
 
-  // Ctrl+F: 聚焦搜索框
+  // Ctrl+F: 聚焦邮件搜索框（仅在邮件视图中拦截）
   if (e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
-    e.preventDefault();
-    window.dispatchEvent(new CustomEvent("km-focus-search"));
+    if (activeWorkspaceView.value === "mail") {
+      e.preventDefault();
+      window.dispatchEvent(new CustomEvent("km-focus-search"));
+    }
     return;
   }
 
@@ -1099,10 +1103,10 @@ function onKeyDown(e: KeyboardEvent) {
     return;
   }
 
-  // Ctrl+K 命令面板 & 单键快捷键（严格尊重 IME / 输入焦 / 模态弹窗与设置开关）
+  // Ctrl+K 命令面板 & 单键快捷键（在通讯录/附件内嵌视图中屏蔽邮件单键快捷键，保留 Ctrl+K）
   const shortcutMatch = matchSingleKeyShortcut(e, {
     singleKeyShortcuts: singleKeyShortcuts.value,
-    hasOpenModal: hasAnyOpenModal.value,
+    hasOpenModal: hasAnyOpenModal.value || activeWorkspaceView.value !== "mail",
     isInputFocused: isEditableFocused(),
   });
   if (shortcutMatch.matched && shortcutMatch.commandId) {
@@ -1141,8 +1145,14 @@ function onKeyDown(e: KeyboardEvent) {
     }
   }
 
-  // 上/下键选邮件 & Delete 删除选中邮件（输入控件聚焦时不拦截）
-  if (isEditableFocused()) return;
+  // 上/下键选邮件 & Delete 删除选中邮件（非邮件视图、模态打开或输入控件聚焦时不拦截）
+  if (
+    hasAnyOpenModal.value ||
+    activeWorkspaceView.value !== "mail" ||
+    isEditableFocused()
+  ) {
+    return;
+  }
   if (!e.ctrlKey && !e.altKey && !e.shiftKey) {
     if (e.key === "ArrowUp") {
       e.preventDefault();
