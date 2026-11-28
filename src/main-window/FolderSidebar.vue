@@ -135,6 +135,43 @@
             </button>
           </div>
 
+          <div class="km-theme-grid" role="group" aria-label="应用配色主题">
+            <button
+              v-for="theme in BUILTIN_THEMES"
+              :key="theme.id"
+              type="button"
+              class="km-theme-swatch-btn"
+              :class="{ active: themeId === theme.id }"
+              :title="theme.label"
+              :aria-pressed="themeId === theme.id"
+              @click="runMenuAction(() => emit('setTheme', theme.id))"
+            >
+              <span
+                class="km-theme-swatch-dot"
+                :style="{ backgroundColor: theme.swatch }"
+                aria-hidden="true"
+              />
+              <span class="km-theme-swatch-label">{{ theme.label }}</span>
+              <svg
+                v-if="themeId === theme.id"
+                class="km-theme-swatch-check"
+                viewBox="0 0 16 16"
+                width="11"
+                height="11"
+                aria-hidden="true"
+              >
+                <path
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="m3.5 8.5 3 3 6-6.5"
+                />
+              </svg>
+            </button>
+          </div>
+
           <div class="km-menu-divider" />
           <button type="button" class="km-menu-item" role="menuitem" @click="runMenuAction(() => emit('openCommandPalette'))">
             <span>命令面板</span>
@@ -868,16 +905,17 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import type {
-  AccountSummaryDto,
-  FolderSummaryDto,
-  MailTemplateDto,
-  MessageFilterDto,
-  ReaderPosition,
-  SearchScope,
-  TagItemDto,
-  UnifiedViewKind,
-  ViewDto,
+import {
+  BUILTIN_THEMES,
+  type AccountSummaryDto,
+  type FolderSummaryDto,
+  type MailTemplateDto,
+  type MessageFilterDto,
+  type ReaderPosition,
+  type SearchScope,
+  type TagItemDto,
+  type UnifiedViewKind,
+  type ViewDto,
 } from "../ipc/types";
 import {
   SIDEBAR_FILTER_RULES,
@@ -904,6 +942,7 @@ const props = withDefaults(
     syncing?: boolean;
     mode?: "demo" | "live";
     hasPasscode?: boolean;
+    themeId?: string;
     darkMode?: boolean | null;
     effectiveDark?: boolean;
     readerPosition?: ReaderPosition;
@@ -917,6 +956,7 @@ const props = withDefaults(
     syncing: false,
     mode: "demo",
     hasPasscode: false,
+    themeId: "system",
     darkMode: null,
     effectiveDark: false,
     readerPosition: "right",
@@ -933,6 +973,7 @@ const emit = defineEmits<{
   quit: [];
   toggleDarkMode: [];
   setDarkMode: [darkMode: boolean | null];
+  setTheme: [themeId: string];
   setReaderPosition: [position: ReaderPosition];
   compose: [];
   composeFromTemplate: [template: MailTemplateDto];
@@ -1450,7 +1491,9 @@ onUnmounted(() => {
 .km-main-menu {
   right: 0;
   top: 34px;
-  width: 220px;
+  width: 226px;
+  max-height: calc(100vh - 52px);
+  overflow-y: auto;
 }
 
 .km-sidebar.rail .km-main-menu {
@@ -1545,6 +1588,60 @@ onUnmounted(() => {
   border-color: var(--km-accent);
   color: #ffffff;
   font-weight: 600;
+}
+
+.km-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 2px 4px 4px;
+}
+
+.km-theme-swatch-btn {
+  height: 26px;
+  padding: 0 7px;
+  border: 1px solid var(--km-border);
+  border-radius: var(--km-radius-sm);
+  background: transparent;
+  color: var(--km-text);
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.km-theme-swatch-btn:hover {
+  background: var(--km-hover-bg);
+}
+
+.km-theme-swatch-btn.active {
+  border-color: var(--km-accent);
+  background: var(--km-accent-soft);
+  color: var(--km-accent);
+  font-weight: 600;
+}
+
+.km-theme-swatch-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.14);
+}
+
+.km-theme-swatch-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.km-theme-swatch-check {
+  flex-shrink: 0;
 }
 
 /* 中部导航滚动区 */

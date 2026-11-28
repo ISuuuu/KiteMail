@@ -137,7 +137,22 @@
                   <span class="km-swatch-dot" :style="{ backgroundColor: tag.color }" />
                   <span>{{ tag.name }}</span>
                 </span>
-                <span v-if="hasTag(tag.name)">✓</span>
+                <svg
+                  v-if="hasTag(tag.name)"
+                  viewBox="0 0 16 16"
+                  width="12"
+                  height="12"
+                  aria-hidden="true"
+                >
+                  <path
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="m3.5 8.5 3 3 6-6.5"
+                  />
+                </svg>
               </button>
             </div>
           </div>
@@ -342,6 +357,7 @@
 
         <!-- 窗口关闭按钮（并入顶部工具栏最右侧） -->
         <button
+          v-if="showWindowClose"
           type="button"
           class="km-tool-icon-btn km-tool-close"
           title="关闭主窗口"
@@ -360,7 +376,26 @@
 
     <!-- 空状态 -->
     <div v-if="!message && !loading && !error" class="km-reader-empty">
-      <div class="km-empty-icon" aria-hidden="true">✉</div>
+      <div class="km-empty-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="34" height="34" fill="none" aria-hidden="true">
+          <rect
+            x="3"
+            y="5"
+            width="18"
+            height="14"
+            rx="2.5"
+            stroke="currentColor"
+            stroke-width="1.5"
+          />
+          <path
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            d="m3.8 6.2 8.2 6.3 8.2-6.3"
+          />
+        </svg>
+      </div>
       <p>选择一封邮件查看正文</p>
     </div>
 
@@ -473,7 +508,15 @@
             aria-label="关闭查找"
             @click="emit('closeFind')"
           >
-            ✕
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                d="m4 4 8 8m0-8-8 8"
+              />
+            </svg>
           </button>
         </div>
 
@@ -595,6 +638,7 @@ const props = withDefaults(
     findTotal?: number;
     findStepToken?: number;
     findStepDelta?: number;
+    showWindowClose?: boolean;
   }>(),
   {
     availableTags: () => [],
@@ -605,6 +649,7 @@ const props = withDefaults(
     findQuery: "",
     findCurrent: 0,
     findTotal: 0,
+    showWindowClose: true,
   }
 );
 
@@ -1067,7 +1112,9 @@ defineExpose({
 }
 
 .km-empty-icon {
-  font-size: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   opacity: 0.4;
 }
 
@@ -1138,10 +1185,10 @@ defineExpose({
 }
 
 .km-reader-subject-header {
-  padding: 4px 16px 12px 21px;
+  padding: 4px 16px 10px 21px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   background: var(--km-reader-header-bg, #fafafb);
   border-bottom: 1px solid var(--km-border);
   flex-shrink: 0;
@@ -1232,10 +1279,14 @@ defineExpose({
 .km-find-nav-btn {
   width: 24px;
   height: 24px;
+  padding: 0;
   border: none;
   border-radius: var(--km-radius-sm);
   background: transparent;
   color: var(--km-text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
 }
 
