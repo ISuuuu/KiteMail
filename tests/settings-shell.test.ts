@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+
+import { __resetPreferencesMock, openDataDirectory } from "../src/preferences/ipc.ts";
 
 import {
   DEFAULT_SETTINGS_TAB,
@@ -164,4 +168,40 @@ test("设置搜索：索引覆盖与锚点约定", () => {
   }
   // 高亮时长 1.6s
   assert.equal(HIGHLIGHT_MS, 1600);
+});
+
+function readSystemPageSource(): string {
+  return fs.readFileSync(path.join(process.cwd(), "src/settings/SystemPage.vue"), "utf8");
+}
+
+test("系统页「打开目录」接通 open_data_directory：配置目录 data、邮件目录 mail", async () => {
+  __resetPreferencesMock({
+    dataDir: "C:\\Demo\\KiteMailData",
+    mailDataDir: "C:\\Demo\\KiteMailData\\mail",
+  });
+
+  // mock 传输层与 Tauri 后端共用同一契约：data→配置目录，mail→邮件目录
+  const dataRes = await openDataDirectory("data");
+  assert.equal(dataRes.opened, true);
+  assert.equal(dataRes.path, "C:\\Demo\\KiteMailData");
+  const mailRes = await openDataDirectory("mail");
+  assert.equal(mailRes.opened, true);
+  assert.equal(mailRes.path, "C:\\Demo\\KiteMailData\\mail");
+
+  const source = readSystemPageSource();
+  // 两个入口分别传 data / mail，openDir 统一交给 openDataDirectory
+  assert.ok(source.includes("openDir('data')"), "程序配置目录应传 kind=data");
+  assert.ok(source.includes("openDir('mail')"), "邮件存储目录应传 kind=mail");
+  assert.ok(source.includes("await openDataDirectory(kind)"), "openDir 应走 openDataDirectory");
+  assert.equal(source.includes("尚未接入 Tauri IPC"), false, "占位提示应已删除");
+});
+
+test("更改邮件存储目录弹层不再假装会话内记录，改为退出应用后手动迁移指引", () => {
+  const source = readSystemPageSource();
+  assert.equal(source.includes("仅在会话内记录"), false);
+  assert.equal(source.includes("仍要继续"), false);
+  assert.ok(source.includes("不支持在运行中切换邮件存储目录"));
+  // 迁移步骤中的两个路径取自组件状态，避免硬编码
+  assert.ok(source.includes("${mailDir}"));
+  assert.ok(source.includes("${dataDir}"));
 });

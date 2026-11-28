@@ -113,7 +113,7 @@
             <button
               type="button"
               class="km-sp-outline-btn"
-              @click="openDir('程序配置目录', state.dataDir.value)"
+              @click="openDir('data')"
             >
               打开目录
             </button>
@@ -138,7 +138,7 @@
             <button
               type="button"
               class="km-sp-outline-btn"
-              @click="openDir('邮件存储目录', state.mailDataDir.value)"
+              @click="openDir('mail')"
             >
               打开目录
             </button>
@@ -255,13 +255,13 @@
       @confirm="confirmClearCache"
     />
 
-    <!-- 更改邮件存储目录确认（GPUI 目录切换弹层；切换 IPC 待接线） -->
+    <!-- 更改邮件存储目录（GPUI 目录切换弹层的等价说明；当前版本不提供运行时切换） -->
     <ConfirmDialog
       v-model:open="mailDirDialogOpen"
       title="更改邮件存储目录"
-      message="选择新的邮件存储目录后，现有缓存将迁移或关联到新目录。"
-      description="当前版本尚未接入目录选择与迁移 IPC，确认后将仅在会话内记录本次选择（见缺口清单）。"
-      confirmLabel="仍要继续"
+      message="当前版本不支持在运行中切换邮件存储目录：数据库、同步任务与发件箱都会独占当前目录，需要退出应用后手动迁移。"
+      :description="mailDirDialogDescription"
+      confirmLabel="查看手动步骤"
       cancelLabel="取消"
       @confirm="onMailDirDialogConfirm"
     />
@@ -275,13 +275,15 @@ import ConfirmDialog from "../accounts/ConfirmDialog.vue";
 import ComboSelect from "./ComboSelect.vue";
 import PillSwitch from "./PillSwitch.vue";
 import { formatBytes } from "../preferences/usePreferences";
-import type { FullPreferencesDto } from "../preferences/types";
+import { extractErrorMessage, openDataDirectory } from "../preferences/ipc";
+import type { DataDirectoryKind, FullPreferencesDto } from "../preferences/types";
 import type { PrefsPanelState } from "../preferences/panels/state";
 
 /**
  * 「系统」页（对齐 GPUI pages.rs#render_system）。
- * 托盘/快捷键/数据目录/占用统计/清缓存/检查更新/关于直连既有 IPC；
- * 自启动、链接打开方式、全屏、状态栏置顶、保留时长与目录切换/打开为会话内状态（IPC 缺口）。
+ * 托盘/快捷键/打开数据目录/占用统计/清缓存/检查更新/关于直连既有 IPC；
+ * 自启动、链接打开方式、全屏、状态栏置顶、保留时长为会话内状态；
+ * 邮件存储目录切换后端无运行时迁移命令，改为指引用户在退出应用后手动迁移。
  */
 const props = defineProps<{ state: PrefsPanelState }>();
 
@@ -303,11 +305,11 @@ const feedback = ref<{ ok: boolean; text: string } | null>(null);
 const clearCacheDialogOpen = ref(false);
 const mailDirDialogOpen = ref(false);
 
-function showFeedback(ok: boolean, text: string) {
+function showFeedback(ok: boolean, text: string, durationMs = 3200) {
   feedback.value = { ok, text };
   window.setTimeout(() => {
     feedback.value = null;
-  }, 3200);
+  }, durationMs);
 }
 
 function setBoolPref(
@@ -335,13 +337,30 @@ function confirmClearCache() {
   });
 }
 
+const mailDirDialogDescription = computed(() => {
+  const dataDir = props.state.dataDir.value || "-";
+  const mailDir = props.state.mailDataDir.value || "-";
+  return [
+    "手动迁移步骤：",
+    "1) 完全退出 KiteMail（含托盘图标）；",
+    `2) 将当前邮件目录 ${mailDir} 整体移动到新位置；`,
+    `3) 编辑 ${dataDir} 下的 storage.toml，把 mail_data_dir 改为新路径；`,
+    "4) 重新启动 KiteMail 生效。",
+  ].join("");
+});
+
 function onMailDirDialogConfirm() {
   mailDirDialogOpen.value = false;
-  showFeedback(false, "邮件存储目录切换尚未接入 Tauri IPC（见缺口清单）");
+  showFeedback(true, mailDirDialogDescription.value, 15000);
 }
 
-function openDir(label: string, dir: string) {
-  showFeedback(false, `「打开${label}」尚未接入 Tauri IPC（${dir || "-"}）`);
+async function openDir(kind: DataDirectoryKind) {
+  try {
+    const res = await openDataDirectory(kind);
+    showFeedback(res.opened, res.message);
+  } catch (err) {
+    showFeedback(false, extractErrorMessage(err));
+  }
 }
 
 // ---- 会话内状态（对齐 mail-core 字段默认值；链接打开方式与保留时长为独立字符串项） ----
