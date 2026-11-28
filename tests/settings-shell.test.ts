@@ -89,6 +89,30 @@ test("windowEnv：URL 参数 ?window=settings 判定设置窗，浏览器环境�
   assert.equal(isSettingsWindow(), false);
 });
 
+test("主窗口入口不静态引入设置窗：SettingsWindow 走动态 import 按需加载", () => {
+  const appVue = fs.readFileSync(path.join(process.cwd(), "src/App.vue"), "utf8");
+  // 静态导入会让整套设置面板进入主窗口首屏 bundle
+  assert.equal(appVue.includes('import SettingsWindow from "./settings/SettingsWindow.vue"'), false);
+  assert.match(appVue, /await import\("\.\/settings\/SettingsWindow\.vue"\)/);
+  // 仅设置窗判定为真时触发加载，主窗口不请求设置 chunk
+  assert.match(appVue, /if \(isSettings\) \{\s*void loadSettingsModule\(\);/);
+  // 异步 chunk 加载失败保留可见兜底与重试入口，不白屏
+  assert.match(appVue, /正在打开偏好设置…/);
+  assert.match(appVue, /偏好设置加载失败/);
+  assert.match(appVue, /@click="loadSettingsModule"/);
+});
+
+test("设置窗仍复用 ?window=settings&tab=... 入口与重复打开切页事件", () => {
+  const source = fs.readFileSync(path.join(process.cwd(), "src/settings/SettingsWindow.vue"), "utf8");
+  // 初始页签仍来自 URL tab 参数，未知 id 由 findSettingsTab 回落默认页签
+  assert.match(source, /new URLSearchParams\(window\.location\.search\)\.get\("tab"\)/);
+  assert.match(source, /const initialTab = initialTabFromUrl\(\);/);
+  // 重复打开激活既有窗口时由 Rust 侧 emit，设置窗订阅后切页
+  assert.match(source, /settings:\/\/select-tab/);
+  // 设置窗首帧后自行 show，异步加载后仍由组件挂载驱动显窗
+  assert.match(source, /win\s*\.show\(\)/);
+});
+
 test("阅读器工具栏默认布局对齐 GPUI ReaderToolbarLayout::default", () => {
   assert.equal(TOOLBAR_ITEMS.length, 13);
   const layout = defaultToolbarLayout();
