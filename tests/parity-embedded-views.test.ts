@@ -122,9 +122,9 @@ test("AttachmentGalleryModal.vue 支持 embedded 内嵌模式、48px 顶栏、�
     /<Teleport to="body" :disabled="!embedded">[\s\S]*?class="km-lightbox-overlay"[\s\S]*?v-if="isLightboxImage"[\s\S]*?<iframe[\s\S]*?v-else-if="isLightboxPdf"[\s\S]*?class="km-lightbox-pdf"/
   );
 
-  // 卡片缩略图兼容 preview.thumbnailDataUrl || preview.dataUrl
-  assert.match(src, /thumbnailDataUrl\?:\s*string \| null/);
-  assert.match(src, /preview\.thumbnailDataUrl \|\| preview\.dataUrl/);
+  // 卡片缩略图统一走轻量缩略图缓存，不再复用完整预览的 dataUrl
+  assert.match(src, /resolveDrawerThumbUrl\(item, state\.thumbUrls\.value\)/);
+  assert.match(src, /state\.prefetchThumbnails\([\s\S]*?isPdf: isPdfAttachment\(item\)/);
   assert.match(src, /:src="cardThumbnailUrl\(item\)!"/);
 
   // 内部按钮均为 button，确保命中交互白名单不触发拖拽

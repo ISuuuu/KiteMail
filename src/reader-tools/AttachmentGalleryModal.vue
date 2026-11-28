@@ -372,13 +372,10 @@ import {
   decodeTextPreviewDataUrl,
   formatAttachmentSize,
   isPdfAttachment,
+  resolveDrawerThumbUrl,
   useAttachments,
 } from "./useAttachments";
-import type {
-  AttachmentFilterKind,
-  CachedAttachmentDto,
-  FetchAttachmentPreviewOutput,
-} from "./types";
+import type { AttachmentFilterKind, CachedAttachmentDto } from "./types";
 
 const OVERLAY_ID = "attachment-gallery";
 
@@ -411,10 +408,6 @@ const searchInputRef = ref<HTMLInputElement | null>(null);
 const searchDraft = ref("");
 const zoomPercent = ref(100);
 let searchTimer: ReturnType<typeof setTimeout> | null = null;
-
-type PreviewWithThumb = FetchAttachmentPreviewOutput & {
-  thumbnailDataUrl?: string | null;
-};
 
 let overlayReportedOpen = false;
 function reportOverlay(next: boolean) {
@@ -452,11 +445,7 @@ const isLightboxPdf = computed(() => {
 });
 
 function cardThumbnailUrl(item: CachedAttachmentDto): string | null {
-  const preview = state.previewCache.value[item.id] as PreviewWithThumb | undefined;
-  if (!preview) return null;
-  return item.isImage
-    ? preview.thumbnailDataUrl || preview.dataUrl || null
-    : preview.thumbnailDataUrl || null;
+  return resolveDrawerThumbUrl(item, state.thumbUrls.value);
 }
 
 const previewableIds = computed(() => state.filteredItems.value.map((item) => item.id));
@@ -470,11 +459,14 @@ function extensionLabel(filename: string): string {
 }
 
 function prefetchVisibleImageThumbnails() {
-  for (const item of state.filteredItems.value) {
-    if (item.isImage && !state.previewCache.value[item.id]) {
-      void state.fetchPreview(item.id);
-    }
-  }
+  // 仅调度当前页可见项，缩略图并发与缓存上限由 composable 控制
+  void state.prefetchThumbnails(
+    state.filteredItems.value.map((item) => ({
+      id: item.id,
+      isImage: item.isImage,
+      isPdf: isPdfAttachment(item),
+    }))
+  );
 }
 
 async function reloadGallery() {
@@ -606,6 +598,7 @@ watch(
     } else {
       detachGlobalListeners();
       closeLightbox();
+      state.invalidateThumbnails();
       state.clearStatus();
     }
   }
@@ -633,6 +626,8 @@ onUnmounted(() => {
     searchTimer = null;
   }
   detachGlobalListeners();
+  state.invalidateThumbnails();
+  state.clearThumbnails();
   reportOverlay(false);
 });
 </script>

@@ -361,7 +361,6 @@ import {
   decodeTextPreviewDataUrl,
   formatAttachmentSize,
   isPdfAttachment,
-  prefetchDrawerThumbnails,
   resolveDrawerThumbUrl,
   sortDrawerAttachments,
   useAttachments,
@@ -504,7 +503,7 @@ watch(
 );
 
 function cachedThumbUrl(item: DrawerAttachmentItem): string | null {
-  return resolveDrawerThumbUrl(item, state.previewCache.value);
+  return resolveDrawerThumbUrl(item, state.thumbUrls.value);
 }
 
 function badgeTextFor(att: DrawerAttachmentItem): string {
@@ -553,11 +552,7 @@ async function saveAllAttachmentsPicker() {
 }
 
 function prefetchPreviewThumbnails() {
-  void prefetchDrawerThumbnails(
-    aggregatedItems.value,
-    state.previewCache.value,
-    state.fetchPreview
-  );
+  void state.prefetchThumbnails(aggregatedItems.value);
 }
 
 function toggleExpanded() {
@@ -642,15 +637,22 @@ function onKeyDown(e: KeyboardEvent) {
   }
 }
 
-watch(aggregatedItems, () => {
-  if (expanded.value) {
-    prefetchPreviewThumbnails();
+watch(
+  // 只在附件集合真正变化（切邮件）时重置，避免父组件重建数组导致反复取消
+  () => aggregatedItems.value.map((item) => item.id).join(","),
+  () => {
+    state.invalidateThumbnails();
+    if (expanded.value) {
+      prefetchPreviewThumbnails();
+    }
   }
-});
+);
 
 watch(expanded, (isExpanded) => {
   if (isExpanded) {
     prefetchPreviewThumbnails();
+  } else {
+    state.invalidateThumbnails();
   }
 });
 
@@ -659,6 +661,8 @@ watch(
   (nextOpen) => {
     if (nextOpen) {
       prefetchPreviewThumbnails();
+    } else {
+      state.invalidateThumbnails();
     }
   }
 );
@@ -681,6 +685,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   ro?.disconnect();
+  state.invalidateThumbnails();
+  state.closePreview();
   reportLightboxOverlay(false);
 });
 

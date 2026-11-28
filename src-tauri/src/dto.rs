@@ -1602,6 +1602,9 @@ pub struct ListCachedAttachmentsOutput {
 #[serde(rename_all = "camelCase")]
 pub struct FetchAttachmentPreviewInput {
     pub attachment_id: u32,
+    /// 仅生成缩略图：不返回原文件数据，只返回受限尺寸的小图（附件抽屉/图库使用）。
+    #[serde(default)]
+    pub thumbnail_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2663,5 +2666,16 @@ mod tests {
         }))
         .expect("legacy FetchAttachmentPreviewOutput");
         assert_eq!(legacy_preview.thumbnail_data_url, None);
+
+        let legacy_input: FetchAttachmentPreviewInput =
+            serde_json::from_value(json!({ "attachmentId": 7 }))
+                .expect("legacy FetchAttachmentPreviewInput");
+        assert_eq!(legacy_input.attachment_id, 7);
+        assert!(!legacy_input.thumbnail_only, "缺省应按完整预览处理");
+
+        let thumb_input: FetchAttachmentPreviewInput =
+            serde_json::from_value(json!({ "attachmentId": 7, "thumbnailOnly": true }))
+                .expect("thumbnail-only FetchAttachmentPreviewInput");
+        assert!(thumb_input.thumbnail_only);
     }
 }

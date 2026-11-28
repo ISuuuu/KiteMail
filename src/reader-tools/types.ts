@@ -35,6 +35,17 @@ export interface ListCachedAttachmentsOutput {
 
 export interface FetchAttachmentPreviewInput {
   attachmentId: number;
+  /** 仅要缩略图：不返回原文件数据，只返回受限尺寸的小图 */
+  thumbnailOnly?: boolean;
+}
+
+/** 缩略图结果：只含小图 data URL，不含原文件 */
+export interface FetchAttachmentThumbnailOutput {
+  attachmentId: number;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  thumbnailDataUrl: string | null;
 }
 
 export interface FetchAttachmentPreviewOutput {

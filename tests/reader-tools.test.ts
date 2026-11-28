@@ -105,7 +105,54 @@ test("图片与文档预览缓存命中，避免重复拉取 IPC", async () => {
 
   state.closePreview();
   assert.equal(state.activePreview.value, null);
+  assert.deepEqual(state.previewCache.value, {});
   state.reset();
+  __resetReaderToolsMock();
+});
+
+test("完整预览只保留当前项，图库翻页按页调度缩略图并在关闭时释放", async () => {
+  __resetReaderToolsMock();
+  const state = useAttachments({ pageSize: 5 });
+  await state.loadGallery(true);
+
+  const pageIds = state.filteredItems.value.map((item) => item.id);
+  assert.equal(pageIds.length, 5);
+
+  await state.prefetchThumbnails(state.filteredItems.value);
+  for (const item of state.filteredItems.value) {
+    if (item.isImage) {
+      assert.ok(state.thumbUrls.value[item.id], `图片 ${item.filename} 应有缩略图`);
+    } else {
+      assert.equal(state.thumbUrls.value[item.id], undefined, `文档 ${item.filename} 不应有缩略图`);
+    }
+  }
+  assert.deepEqual(state.previewCache.value, {}, "缩略图不写入完整预览缓存");
+
+  // 图库翻页：追加下一页后只为新页排缩略图，已缓存的保持不动
+  const firstPageThumbs = { ...state.thumbUrls.value };
+  await state.loadMore();
+  assert.equal(state.items.value.length, 10);
+  await state.prefetchThumbnails(state.filteredItems.value);
+  for (const [id, url] of Object.entries(firstPageThumbs)) {
+    assert.equal(state.thumbUrls.value[Number(id)], url, "已缓存缩略图不被重写");
+  }
+  assert.ok(Object.keys(state.thumbUrls.value).length > Object.keys(firstPageThumbs).length);
+
+  // 完整预览按当前项替换，关闭即释放
+  await state.openPreview(pageIds[0]);
+  assert.ok(state.previewCache.value[pageIds[0]]);
+  await state.openPreview(pageIds[1]);
+  assert.equal(state.previewCache.value[pageIds[0]], undefined);
+  assert.ok(state.previewCache.value[pageIds[1]]);
+
+  state.closePreview();
+  assert.deepEqual(state.previewCache.value, {});
+  assert.equal(state.activePreview.value, null);
+
+  // 重置清空缩略图缓存
+  assert.ok(Object.keys(state.thumbUrls.value).length > 0);
+  state.reset();
+  assert.deepEqual(state.thumbUrls.value, {});
   __resetReaderToolsMock();
 });
 
