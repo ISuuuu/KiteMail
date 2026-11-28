@@ -558,6 +558,8 @@
         :htmlBody="message.htmlBody"
         :threadMessages="message.threadMessages"
         :overlayOccluded="Boolean(overlayOccluded)"
+        :nativeLayoutApplied="nativeLayoutApplied"
+        :nativeLayoutVisible="nativeLayoutVisible"
         :errorMessage="error"
         :zoomPercent="zoomPercent"
         :accountId="message.accountId"
@@ -622,6 +624,8 @@ const props = withDefaults(
     effectiveDark?: boolean;
     followSystem?: boolean;
     overlayOccluded?: boolean;
+    nativeLayoutApplied?: boolean;
+    nativeLayoutVisible?: boolean;
     zoomPercent?: number;
     isBelow?: boolean;
     folders?: FolderSummaryDto[];

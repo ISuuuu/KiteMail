@@ -796,6 +796,7 @@ pub(crate) struct LiveSessionState {
     pub(crate) next_undo_token: u64,
     pub(crate) waiters: LiveWaiters,
     pub(crate) cache_ready: bool,
+    pub(crate) snapshots_hydrated: bool,
     pub(crate) syncing_accounts: HashSet<u32>,
     pub(crate) synced_on_open_folders: HashSet<(u32, u32)>,
     pub(crate) mock_send_idempotency: HashMap<(u32, String), (u32, u64, Option<i64>)>,
@@ -821,6 +822,7 @@ impl LiveSessionState {
             next_undo_token: 1,
             waiters: LiveWaiters::default(),
             cache_ready: false,
+            snapshots_hydrated: false,
             syncing_accounts: HashSet::new(),
             synced_on_open_folders: HashSet::new(),
             mock_send_idempotency: HashMap::new(),
@@ -1338,17 +1340,21 @@ impl MailSession {
         }
     }
 
-    /// Build and boot a Live-mode session: read-only cache first screen + `MailWorkerHandle` event loop.
+    /// Build and boot a Live-mode session without blocking startup on heavy SQLite folder/draft/outbox reads.
     pub fn new_live(
         data_dir: PathBuf,
         prefs: Arc<PreferencesStore>,
         reader: Arc<ReaderManager>,
         emitter: Arc<dyn MainEventEmitter>,
     ) -> Arc<Self> {
+        let total_started = Instant::now();
+        let accounts_started = Instant::now();
         let accounts = config::load_accounts_in(&data_dir).unwrap_or_default();
         let account_dtos: Vec<AccountSummaryDto> =
             accounts.iter().map(AccountSummaryDto::from).collect();
+        let accounts_ms = accounts_started.elapsed().as_secs_f64() * 1000.0;
 
+        let lock_started = Instant::now();
         let (passcode_hash, initial_locked) = match secrets::load_app_lock_hash() {
             Ok(Some(hash)) => {
                 let persisted = app_lock::is_lock_persisted_in(&data_dir)
@@ -1365,45 +1371,22 @@ impl MailSession {
         if initial_locked {
             reader.set_locked(true);
         }
+        let lock_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
 
-        let mut folders_by_account: HashMap<u32, Vec<FolderSummaryDto>> = HashMap::new();
-        let mut drafts_cache: Vec<LocalDraft> = Vec::new();
-        let mut outbox_cache: HashMap<u32, Vec<OutboxItem>> = HashMap::new();
-        let cache_ready = if config::global_db_in(&data_dir).exists() {
-            match CacheStore::open_for_data_dir_read_only(&data_dir) {
-                Ok(cache) => {
-                    for acc in &accounts {
-                        if let Ok(folders) = cache.list_folders(acc.id) {
-                            folders_by_account.insert(
-                                acc.id,
-                                folders.iter().map(FolderSummaryDto::from).collect(),
-                            );
-                        }
-                        if let Ok(items) = cache.list_outbox(acc.id) {
-                            outbox_cache.insert(acc.id, items);
-                        }
-                    }
-                    if let Ok(drafts) = cache.list_drafts() {
-                        drafts_cache = drafts;
-                    }
-                    true
-                }
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
-
+        // Defer folder/draft/outbox snapshot reads off the window reveal critical path;
+        // `bootstrap()` hydrates folders once lock state is confirmed unlocked, while
+        // the background worker warms up drafts/outbox/first page asynchronously.
+        let folders_by_account: HashMap<u32, Vec<FolderSummaryDto>> = HashMap::new();
         let raw_prefs = prefs.snapshot_raw();
         let initial_view =
-            resolve_initial_live_view(&raw_prefs, &accounts, &folders_by_account, cache_ready);
+            resolve_initial_live_view(&raw_prefs, &accounts, &folders_by_account, false);
 
         let enabled_ids: HashSet<u32> = accounts
             .iter()
             .filter(|a| a.enabled)
             .map(|a| a.id)
             .collect();
-        let initial_syncing = !enabled_ids.is_empty();
+        let initial_syncing = !enabled_ids.is_empty() && !initial_locked;
         let sync_status = SyncStatusDto {
             syncing: initial_syncing,
             message: if initial_syncing {
@@ -1419,10 +1402,13 @@ impl MailSession {
         live_state.account_configs = accounts;
         live_state.accounts = account_dtos;
         live_state.folders_by_account = folders_by_account;
-        live_state.drafts_cache = drafts_cache;
-        live_state.outbox_cache = outbox_cache;
-        live_state.cache_ready = cache_ready;
-        live_state.syncing_accounts = enabled_ids;
+        live_state.cache_ready = false;
+        live_state.snapshots_hydrated = false;
+        live_state.syncing_accounts = if initial_locked {
+            HashSet::new()
+        } else {
+            enabled_ids
+        };
 
         let session = Arc::new(Self {
             mode: AppMode::Live,
@@ -1459,7 +1445,14 @@ impl MailSession {
             read_mark_delay: DEFAULT_READ_MARK_DELAY,
         });
         session.bind_self(&session);
+        let worker_started = Instant::now();
         session.spawn_live_worker(data_dir);
+        let worker_ms = worker_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[startup] new_live: locked={}, accounts_ms={accounts_ms:.2}, lock_ms={lock_ms:.2}, worker_spawn_ms={worker_ms:.2}, total_ms={:.2}",
+            initial_locked,
+            total_started.elapsed().as_secs_f64() * 1000.0
+        );
         session
     }
 
@@ -1494,18 +1487,16 @@ impl MailSession {
         let (sender, events_rx) = worker_handle.split();
         let worker = Arc::new(RealMailWorkerSink { sender });
 
-        let (has_accounts, cache_ready) = {
+        let has_accounts = {
             let mut live = self.live.lock().expect("live mutex poisoned");
             live.worker = Some(worker.clone());
-            (!live.account_configs.is_empty(), live.cache_ready)
+            !live.account_configs.is_empty()
         };
 
-        if has_accounts {
-            // Startup already hydrated folder/draft/outbox snapshots synchronously from read-only cache;
-            // only run full cache warmup when no local cache DB existed yet.
-            if !cache_ready {
-                worker.send(MailRequest::LoadAllCached);
-            }
+        if has_accounts && !self.is_locked() {
+            // Startup defers local SQLite snapshots off the critical path; warm them up in background
+            // once lock state is confirmed unlocked.
+            worker.send(MailRequest::LoadAllCached);
             worker.send(MailRequest::SyncAllAccounts {
                 user_initiated: false,
             });
@@ -1695,10 +1686,11 @@ impl MailSession {
     }
 
     pub fn bootstrap(&self) -> MainBootstrapDto {
+        let total_started = Instant::now();
         let locked = self.is_locked();
         let has_passcode = self.has_passcode();
         let state_version = self.state_version();
-        let current_view = self.current_view();
+        let mut current_view = self.current_view();
         let preferences = self.prefs.snapshot_dto();
         let sync_status = self
             .sync_status
@@ -1707,6 +1699,10 @@ impl MailSession {
             .clone();
 
         if locked {
+            eprintln!(
+                "[startup] session.bootstrap: locked=true elapsed_ms={:.2}",
+                total_started.elapsed().as_secs_f64() * 1000.0
+            );
             return MainBootstrapDto {
                 mode: self.mode,
                 locked: true,
@@ -1726,7 +1722,7 @@ impl MailSession {
         match self.mode {
             AppMode::Demo => {
                 let demo = self.demo.lock().expect("demo mutex poisoned");
-                MainBootstrapDto {
+                let dto = MainBootstrapDto {
                     mode: self.mode,
                     locked: false,
                     has_passcode,
@@ -1739,12 +1735,43 @@ impl MailSession {
                     sync_status,
                     tags: Self::demo_tag_catalog(),
                     templates: Vec::new(),
-                }
+                };
+                eprintln!(
+                    "[startup] session.bootstrap: mode=demo elapsed_ms={:.2}",
+                    total_started.elapsed().as_secs_f64() * 1000.0
+                );
+                dto
             }
             AppMode::Live => {
-                let live = self.live.lock().expect("live mutex poisoned");
-                let (tags, templates) = if config::global_db_in(&live.data_dir).exists() {
-                    if let Ok(cache) = CacheStore::open_for_data_dir_read_only(&live.data_dir) {
+                let (data_dir, account_configs, needs_folder_hydration) = {
+                    let live = self.live.lock().expect("live mutex poisoned");
+                    (
+                        live.data_dir.clone(),
+                        live.account_configs.clone(),
+                        !live.snapshots_hydrated,
+                    )
+                };
+
+                let mut folders_ms = 0.0;
+                let mut tags_templates_ms = 0.0;
+                let mut hydrated_folders: Option<HashMap<u32, Vec<FolderSummaryDto>>> = None;
+                let (tags, templates) = if config::global_db_in(&data_dir).exists() {
+                    if let Ok(cache) = CacheStore::open_for_data_dir_read_only(&data_dir) {
+                        if needs_folder_hydration {
+                            let f_started = Instant::now();
+                            let mut map = HashMap::new();
+                            for acc in &account_configs {
+                                if let Ok(folders) = cache.list_folders(acc.id) {
+                                    map.insert(
+                                        acc.id,
+                                        folders.iter().map(FolderSummaryDto::from).collect(),
+                                    );
+                                }
+                            }
+                            hydrated_folders = Some(map);
+                            folders_ms = f_started.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        let tt_started = Instant::now();
                         let tags = cache
                             .list_tags()
                             .unwrap_or_default()
@@ -1757,6 +1784,7 @@ impl MailSession {
                             .iter()
                             .map(MailTemplateDto::from)
                             .collect();
+                        tags_templates_ms = tt_started.elapsed().as_secs_f64() * 1000.0;
                         (tags, templates)
                     } else {
                         (Vec::new(), Vec::new())
@@ -1764,14 +1792,44 @@ impl MailSession {
                 } else {
                     (Vec::new(), Vec::new())
                 };
+
+                let (cache_ready, accounts, folders) = {
+                    let mut live = self.live.lock().expect("live mutex poisoned");
+                    if let Some(map) = hydrated_folders {
+                        for (acc_id, list) in map {
+                            live.folders_by_account.entry(acc_id).or_insert(list);
+                        }
+                        live.cache_ready = true;
+                        live.snapshots_hydrated = true;
+                        let raw_prefs = self.prefs.snapshot_raw();
+                        let validated_view = resolve_initial_live_view(
+                            &raw_prefs,
+                            &live.account_configs,
+                            &live.folders_by_account,
+                            true,
+                        );
+                        *self
+                            .current_view
+                            .lock()
+                            .expect("current_view mutex poisoned") = validated_view;
+                        current_view = validated_view;
+                    }
+                    (live.cache_ready, live.accounts.clone(), live.all_folders())
+                };
+                eprintln!(
+                    "[startup] session.bootstrap: mode=live cache_ready={} folders={} folders_ms={folders_ms:.2} tags_templates_ms={tags_templates_ms:.2} total_ms={:.2}",
+                    cache_ready,
+                    folders.len(),
+                    total_started.elapsed().as_secs_f64() * 1000.0
+                );
                 MainBootstrapDto {
                     mode: self.mode,
                     locked: false,
                     has_passcode,
-                    cache_ready: live.cache_ready,
+                    cache_ready,
                     state_version,
-                    accounts: live.accounts.clone(),
-                    folders: live.all_folders(),
+                    accounts,
+                    folders,
                     current_view,
                     preferences,
                     sync_status,
@@ -2743,6 +2801,9 @@ impl MailSession {
                     plain_text: None,
                     has_html: None,
                     html_body: None,
+                    layout_applied: None,
+                    layout_visible: None,
+                    stage: Some("bodyTimeout".to_string()),
                 });
             }
         }
@@ -3610,6 +3671,9 @@ impl MailSession {
                     plain_text: None,
                     has_html: None,
                     html_body: None,
+                    layout_applied: None,
+                    layout_visible: None,
+                    stage: Some("bodyFailed".to_string()),
                 });
             }
         }
@@ -4047,6 +4111,23 @@ impl MailSession {
             }
             self.locked.store(false, Ordering::SeqCst);
             self.reader.set_locked(false);
+            if self.mode == AppMode::Live {
+                let (worker, should_warm) = {
+                    let live = self.live.lock().expect("live mutex poisoned");
+                    (
+                        live.worker.clone(),
+                        !live.snapshots_hydrated && !live.account_configs.is_empty(),
+                    )
+                };
+                if should_warm {
+                    if let Some(w) = worker {
+                        w.send(MailRequest::LoadAllCached);
+                        w.send(MailRequest::SyncAllAccounts {
+                            user_initiated: false,
+                        });
+                    }
+                }
+            }
             let ver = self.bump_state_version();
             self.emitter.emit_lock_state(LockStateEvent {
                 state_version: ver,
@@ -5696,7 +5777,8 @@ pub(crate) mod tests {
             _: crate::window_lifecycle::PhysicalRect,
             _: crate::window_lifecycle::PhysicalRect,
             _: bool,
-        ) {
+        ) -> Result<(), String> {
+            Ok(())
         }
         fn set_visible(&self, _: bool) {}
         fn set_zoom(&self, _: u32) {}
@@ -5855,6 +5937,7 @@ pub(crate) mod tests {
         live.accounts = vec![AccountSummaryDto::from(&acc)];
         live.folders_by_account = folders_by_account;
         live.cache_ready = cache_ready;
+        live.snapshots_hydrated = cache_ready;
 
         let session = Arc::new(MailSession {
             mode: AppMode::Live,
@@ -7618,6 +7701,38 @@ pub(crate) mod tests {
             })
             .expect("unified retry remains available");
         assert!(retry_out.has_more_remote);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_hydrates_folders_only_when_unlocked_and_skips_when_locked() {
+        let (session, _, _, _, dir) = make_live_test_session(true, Some("1234"));
+        {
+            let mut live = session.live.lock().unwrap();
+            live.folders_by_account.clear();
+            live.cache_ready = false;
+            live.snapshots_hydrated = false;
+        }
+
+        // While locked, bootstrap must return immediately with empty folders and NOT hydrate cache.
+        session.lock_app(Some("manual"));
+        let locked_boot = session.bootstrap();
+        assert!(locked_boot.locked);
+        assert!(!locked_boot.cache_ready);
+        assert!(locked_boot.folders.is_empty());
+        assert!(!session.live.lock().unwrap().snapshots_hydrated);
+
+        // Unlock first, then bootstrap hydrates folders from read-only cache.
+        let unlocked = session.unlock_app(&UnlockAppInput {
+            passcode: "1234".to_string(),
+        });
+        assert!(unlocked.unlocked);
+        let unlocked_boot = session.bootstrap();
+        assert!(!unlocked_boot.locked);
+        assert!(unlocked_boot.cache_ready);
+        assert_eq!(unlocked_boot.folders.len(), 1);
+        assert!(session.live.lock().unwrap().snapshots_hydrated);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

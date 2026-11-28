@@ -652,6 +652,10 @@ pub struct SetReaderLayoutOutput {
     pub applied: bool,
     pub reader_session_id: String,
     pub layout_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -835,6 +839,12 @@ pub struct ReaderStatusEvent {
     pub has_html: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_applied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_visible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -427,6 +427,8 @@ export function useMainWindow() {
   const openedMessage = ref<OpenMessageOutput | null>(null);
   const readerLoading = ref(false);
   const readerError = ref<string | null>(null);
+  const readerLayoutApplied = ref<boolean | undefined>(undefined);
+  const readerLayoutVisible = ref<boolean | undefined>(undefined);
   const loadingOlder = ref(false);
   const allowingRemoteImages = ref(false);
   const movingMessage = ref(false);
@@ -943,6 +945,8 @@ export function useMainWindow() {
     readerFindTotal.value = 0;
     readerLoading.value = true;
     readerError.value = null;
+    readerLayoutApplied.value = undefined;
+    readerLayoutVisible.value = undefined;
 
     try {
       const result = await openMessage({
@@ -996,6 +1000,8 @@ export function useMainWindow() {
       readerFindTotal.value = 0;
       readerLoading.value = false;
       readerError.value = null;
+      readerLayoutApplied.value = undefined;
+      readerLayoutVisible.value = undefined;
       return;
     }
 
@@ -1011,6 +1017,8 @@ export function useMainWindow() {
       openedMessage.value = null;
       readerLoading.value = false;
       readerError.value = null;
+      readerLayoutApplied.value = undefined;
+      readerLayoutVisible.value = undefined;
       return;
     }
 
@@ -1650,6 +1658,12 @@ export function useMainWindow() {
         hasHtml: e.hasHtml ?? openedMessage.value.hasHtml,
         htmlBody: e.htmlBody ?? openedMessage.value.htmlBody,
       };
+      if (e.layoutApplied !== undefined) {
+        readerLayoutApplied.value = e.layoutApplied;
+      }
+      if (e.layoutVisible !== undefined) {
+        readerLayoutVisible.value = e.layoutVisible;
+      }
       if (e.bodyStatus !== "loading") {
         clearReaderBodyTimer();
         readerLoading.value = false;
@@ -1721,7 +1735,12 @@ export function useMainWindow() {
         );
       }
 
+      const bootstrapStartedAt = typeof performance !== "undefined" ? performance.now() : 0;
       const bootstrap = await mainBootstrap();
+      const bootstrapEndedAt = typeof performance !== "undefined" ? performance.now() : 0;
+      console.info(
+        `[startup] mainBootstrap done locked=${bootstrap.locked} cacheReady=${Boolean(bootstrap.cacheReady)} folders=${bootstrap.folders.length} elapsed_ms=${(bootstrapEndedAt - bootstrapStartedAt).toFixed(1)}`
+      );
       mode.value = bootstrap.mode;
       hasPasscode.value = Boolean(bootstrap.hasPasscode);
       cacheReady.value = bootstrap.cacheReady ?? true;
@@ -1808,6 +1827,8 @@ export function useMainWindow() {
     openedAccountEmail,
     readerLoading,
     readerError,
+    readerLayoutApplied,
+    readerLayoutVisible,
     allowingRemoteImages,
     movingMessage,
     undoToast,

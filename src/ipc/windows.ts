@@ -17,9 +17,12 @@ export async function openSettingsWindow(tab?: string): Promise<boolean> {
 }
 
 /**
- * 首帧绘制完成后显式展示主窗口（避免 WebView2 初始化期间出现白屏闪现）。
+ * 壳层挂载后尽早显式展示主窗口（避免隐藏窗口阻塞动画帧或长期白屏）。
  */
-export async function revealMainWindow(): Promise<void> {
+export async function revealMainWindow(source?: string, stageMs?: number): Promise<void> {
   if (!isTauri()) return;
-  await invoke("reveal_main_window");
+  await invoke("reveal_main_window", {
+    source: source ?? null,
+    stageMs: typeof stageMs === "number" && Number.isFinite(stageMs) ? stageMs : null,
+  });
 }

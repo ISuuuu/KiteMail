@@ -1,9 +1,24 @@
 //! Main window geometry restoration/persistence and logical-to-physical DPI coordinate math.
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use kitemail_mail_core::config::AppPreferences;
 
 use crate::dto::RectDto;
 use crate::preferences::PreferencesStore;
+
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+pub fn record_process_start() {
+    let _ = PROCESS_START.set(Instant::now());
+}
+
+pub fn elapsed_since_process_start_ms() -> f64 {
+    PROCESS_START
+        .get()
+        .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
+}
 
 pub const DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
 pub const DEFAULT_WINDOW_HEIGHT: f32 = 840.0;
@@ -163,7 +178,8 @@ pub fn reveal_main_window_with_geometry(
     window: &tauri::WebviewWindow,
     prefs: &AppPreferences,
     revealed_flag: &std::sync::atomic::AtomicBool,
-) {
+    source: &str,
+) -> Result<bool, String> {
     if revealed_flag
         .compare_exchange(
             false,
@@ -173,16 +189,34 @@ pub fn reveal_main_window_with_geometry(
         )
         .is_err()
     {
-        return;
+        return Ok(false);
     }
-    let _ = window.show();
+    if let Err(err) = window.show() {
+        revealed_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        eprintln!(
+            "[startup] reveal_main_window failed: source={source}, since_process_ms={:.2}, err={err}",
+            elapsed_since_process_start_ms()
+        );
+        return Err(format!("显示主窗口失败: {err}"));
+    }
     if prefs.window_maximized {
-        let _ = window.maximize();
+        if let Err(err) = window.maximize() {
+            eprintln!("[startup] reveal_main_window maximize warning: {err}");
+        }
     }
     if prefs.start_fullscreen {
-        let _ = window.set_fullscreen(true);
+        if let Err(err) = window.set_fullscreen(true) {
+            eprintln!("[startup] reveal_main_window fullscreen warning: {err}");
+        }
     }
-    let _ = window.set_focus();
+    if let Err(err) = window.set_focus() {
+        eprintln!("[startup] reveal_main_window set_focus warning: {err}");
+    }
+    eprintln!(
+        "[startup] reveal_main_window shown: source={source}, since_process_ms={:.2}",
+        elapsed_since_process_start_ms()
+    );
+    Ok(true)
 }
 
 /// Capture and persist current main window geometry from Tauri window state.
@@ -275,10 +309,24 @@ fn show_win32_system_menu_at_cursor(
 pub fn reveal_main_window(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, crate::commands::AppState>,
+    source: Option<String>,
+    stage_ms: Option<f64>,
 ) -> Result<(), crate::dto::IpcError> {
     let raw_prefs = state.prefs.snapshot_raw();
-    reveal_main_window_with_geometry(&window, &raw_prefs, &state.main_window_revealed);
-    Ok(())
+    let trigger = source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("frontend");
+    if let Some(ms) = stage_ms.filter(|v| v.is_finite() && *v >= 0.0) {
+        eprintln!(
+            "[startup] reveal_main_window requested: source={trigger}, frontend_ms={ms:.2}, since_process_ms={:.2}",
+            elapsed_since_process_start_ms()
+        );
+    }
+    reveal_main_window_with_geometry(&window, &raw_prefs, &state.main_window_revealed, trigger)
+        .map(|_| ())
+        .map_err(|err| crate::dto::IpcError::unavailable(err, None))
 }
 
 /// Show the native Windows system menu (Restore/Move/Size/Minimize/Maximize/Close) at the cursor.
@@ -445,5 +493,12 @@ mod tests {
             resolve_window_background_color(&prefs, false),
             tauri::window::Color(29, 25, 41, 255)
         );
+    }
+
+    #[test]
+    fn startup_clock_records_non_negative_elapsed_ms() {
+        record_process_start();
+        let ms = elapsed_since_process_start_ms();
+        assert!(ms.is_finite() && ms >= 0.0);
     }
 }

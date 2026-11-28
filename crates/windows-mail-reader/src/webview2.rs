@@ -28,9 +28,10 @@ use windows::{
             Input::KeyboardAndMouse::{GetFocus, SetFocus},
             Shell::SHCreateMemStream,
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetParent, IsChild, SetWindowPos, ShowWindow,
-                SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
-                WS_CHILD, WS_CLIPCHILDREN,
+                CreateWindowExW, DestroyWindow, GetParent, GetWindowLongPtrW, IsChild,
+                SetWindowPos, ShowWindow, GWL_STYLE, HWND_TOP, SET_WINDOW_POS_FLAGS,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+                WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN, WS_VISIBLE,
             },
         },
     },
@@ -171,6 +172,16 @@ pub enum ReaderEvent {
         msg_id: u32,
         offset_px: i32,
     },
+    LayoutApplied {
+        version: u64,
+        visible: bool,
+        controller_ready: bool,
+    },
+    Error {
+        version: u64,
+        stage: &'static str,
+        detail: String,
+    },
     ProcessFailed {
         version: u64,
     },
@@ -187,6 +198,8 @@ struct State {
     version: u64,
     navigation_id: Option<u64>,
     loaded: bool,
+    layout_applied: bool,
+    last_error: Option<String>,
     links: Vec<(u64, String)>,
     actions: Vec<(u64, WebViewAction)>,
     last_scroll_anchor: Option<(u64, u32, i32)>,
@@ -219,6 +232,8 @@ impl Default for State {
             version: 0,
             navigation_id: None,
             loaded: false,
+            layout_applied: false,
+            last_error: None,
             links: Vec::new(),
             actions: Vec::new(),
             last_scroll_anchor: None,
@@ -260,6 +275,121 @@ impl State {
         } else {
             ReaderLoadStatus::Loading
         }
+    }
+}
+
+fn record_stage_error(state: &Rc<RefCell<State>>, stage: &'static str, detail: String) {
+    eprintln!("[windows-mail-reader] {stage}: {detail}");
+    {
+        let mut inner = state.borrow_mut();
+        if inner.closed {
+            return;
+        }
+        inner.failed = true;
+        inner.layout_applied = false;
+        inner.last_error = Some(format!("{stage}: {detail}"));
+        let version = inner.version;
+        inner.queue_event(ReaderEvent::Error {
+            version,
+            stage,
+            detail,
+        });
+        inner.queue_event(ReaderEvent::StatusChanged {
+            version,
+            status: ReaderLoadStatus::Unavailable,
+        });
+    }
+    flush_events(state);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClipWindowPosPlan {
+    pub insert_after_top: bool,
+    pub flags: SET_WINDOW_POS_FLAGS,
+}
+
+/// Compute Win32 `SetWindowPos` plan for the reader `WS_CHILD` clip window.
+/// Always lifts to `HWND_TOP` (never `SWP_NOZORDER`) and preserves `SWP_NOACTIVATE`
+/// when positioning or showing so Wry's sibling child window cannot occlude the reader.
+pub(crate) fn plan_clip_window_pos(clip_changed: bool, visible: bool) -> Option<ClipWindowPosPlan> {
+    if clip_changed {
+        Some(ClipWindowPosPlan {
+            insert_after_top: true,
+            flags: SWP_NOACTIVATE,
+        })
+    } else if visible {
+        Some(ClipWindowPosPlan {
+            insert_after_top: true,
+            flags: SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+        })
+    } else {
+        None
+    }
+}
+
+unsafe fn apply_clip_window_pos_and_show(
+    clip_window: HWND,
+    clip: RECT,
+    clip_changed: bool,
+    visible: bool,
+    visibility_changed: bool,
+) -> Result<(), (&'static str, String)> {
+    if clip_window.is_invalid() {
+        return Err(("clip_window", "阅读器宿主子窗口句柄无效".to_string()));
+    }
+    if let Some(plan) = plan_clip_window_pos(clip_changed, visible) {
+        let insert_after = plan.insert_after_top.then_some(HWND_TOP);
+        SetWindowPos(
+            clip_window,
+            insert_after,
+            clip.left,
+            clip.top,
+            clip.right - clip.left,
+            clip.bottom - clip.top,
+            plan.flags,
+        )
+        .map_err(|e| ("set_window_pos", format!("SetWindowPos 失败: {e}")))?;
+    }
+    if visibility_changed {
+        let _ = ShowWindow(
+            clip_window,
+            if visible { SW_SHOWNOACTIVATE } else { SW_HIDE },
+        );
+        // ShowWindow 的返回值只表示「此前是否可见」，无法据此判断成败，
+        // 因此回读窗口自身的 WS_VISIBLE 样式位确认显隐是否真的生效。
+        let style = GetWindowLongPtrW(clip_window, GWL_STYLE) as u32;
+        let now_visible = (style & WS_VISIBLE.0) != 0;
+        if now_visible != visible {
+            return Err((
+                "show_window",
+                format!(
+                    "ShowWindow 未生效: 期望{}，实际{}",
+                    if visible { "显示" } else { "隐藏" },
+                    if now_visible { "显示" } else { "隐藏" }
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 导航就绪后重申一次 Z 序（SetWindowPos(HWND_TOP, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)）。
+///
+/// 阅读器只在裁剪矩形变化或可见性翻转时抬到 HWND_TOP；WebView2 完成导航时，
+/// Wry 的同级子窗口可能被重新创建或重新抬升，把已显示的正文重新压到下面。
+/// 导航就绪时重申一次是零成本兜底：不移动、不缩放、不抢焦点，且仅在窗口当前可见时执行。
+fn reassert_clip_z_order(state: &Rc<RefCell<State>>) {
+    let (clip_window, shown) = {
+        let inner = state.borrow();
+        (inner.clip_window, inner.window_shown)
+    };
+    if !shown || clip_window.is_invalid() {
+        return;
+    }
+    let res =
+        unsafe { apply_clip_window_pos_and_show(clip_window, RECT::default(), false, true, false) };
+    if let Err((stage, detail)) = res {
+        record_stage_error(state, stage, detail);
     }
 }
 
@@ -421,18 +551,24 @@ fn create_controller(
                 }
                 return Ok(());
             };
-            let Some(controller) = controller.filter(|_| result.is_ok()) else {
-                {
-                    let mut inner = state.borrow_mut();
-                    inner.failed = true;
-                    let version = inner.version;
-                    inner.queue_event(ReaderEvent::StatusChanged {
-                        version,
-                        status: ReaderLoadStatus::Unavailable,
-                    });
+            let controller = match (result, controller) {
+                (Ok(()), Some(controller)) => controller,
+                (Err(err), _) => {
+                    record_stage_error(
+                        &state,
+                        "create_controller",
+                        format!("WebView2 控制器创建失败: {err}"),
+                    );
+                    return Ok(());
                 }
-                flush_events(&state);
-                return Ok(());
+                (Ok(()), None) => {
+                    record_stage_error(
+                        &state,
+                        "create_controller",
+                        "WebView2 控制器回调未返回实例".to_string(),
+                    );
+                    return Ok(());
+                }
             };
             if state.borrow().closed {
                 unsafe {
@@ -440,65 +576,103 @@ fn create_controller(
                 }
                 return Ok(());
             }
-            if unsafe { configure(&env, &controller, Rc::downgrade(&state)) }.is_err() {
+            if let Err(err) = unsafe { configure(&env, &controller, Rc::downgrade(&state)) } {
                 unsafe {
                     let _ = controller.Close();
                 }
-                {
-                    let mut inner = state.borrow_mut();
-                    inner.failed = true;
-                    let version = inner.version;
-                    inner.queue_event(ReaderEvent::StatusChanged {
-                        version,
-                        status: ReaderLoadStatus::Unavailable,
-                    });
-                }
-                flush_events(&state);
+                record_stage_error(
+                    &state,
+                    "configure_webview2",
+                    format!("WebView2 配置与事件绑定失败: {err}"),
+                );
                 return Ok(());
             }
-            let (bounds, visible, navigate, url, zoom_factor) = {
+            let (
+                clip_window,
+                clip_rect,
+                bounds,
+                visible,
+                has_area,
+                navigate,
+                url,
+                zoom_factor,
+                version,
+            ) = {
                 let mut inner = state.borrow_mut();
+                let clip_window = inner.clip_window;
+                let clip_rect = inner.clip_rect;
                 let bounds = inner.bounds;
-                let visible = inner.visible && inner.has_area;
+                let has_area = inner.has_area;
+                let visible = inner.visible && has_area;
                 let navigate = !inner.document.is_empty();
                 let url = document_url(inner.version);
                 let zoom_factor = inner.zoom_factor;
+                let version = inner.version;
                 inner.controller = Some(controller.clone());
-                (bounds, visible, navigate, url, zoom_factor)
+                (
+                    clip_window,
+                    clip_rect,
+                    bounds,
+                    visible,
+                    has_area,
+                    navigate,
+                    url,
+                    zoom_factor,
+                    version,
+                )
             };
-            unsafe {
-                let _ = controller.SetBounds(bounds);
-                let _ = controller.SetIsVisible(visible);
-                if (zoom_factor - 1.0).abs() > f64::EPSILON {
-                    let _ = controller.SetZoomFactor(zoom_factor);
+            if visible {
+                if let Err((stage, detail)) = unsafe {
+                    apply_clip_window_pos_and_show(clip_window, clip_rect, false, true, true)
+                } {
+                    record_stage_error(&state, stage, detail);
+                    return Ok(());
                 }
             }
-            if navigate && unsafe { navigate_to(&controller, &url) }.is_err() {
+            let apply_res: windows::core::Result<()> = (|| unsafe {
+                controller.SetBounds(bounds)?;
+                controller.SetIsVisible(visible)?;
+                if (zoom_factor - 1.0).abs() > f64::EPSILON {
+                    controller.SetZoomFactor(zoom_factor)?;
+                }
+                Ok(())
+            })();
+            if let Err(err) = apply_res {
+                record_stage_error(
+                    &state,
+                    "controller_initial_layout",
+                    format!("WebView2 控制器初始化布局失败: {err}"),
+                );
+                return Ok(());
+            }
+            if has_area {
                 {
                     let mut inner = state.borrow_mut();
-                    inner.failed = true;
-                    let version = inner.version;
-                    inner.queue_event(ReaderEvent::StatusChanged {
+                    inner.layout_applied = true;
+                    inner.queue_event(ReaderEvent::LayoutApplied {
                         version,
-                        status: ReaderLoadStatus::Unavailable,
+                        visible,
+                        controller_ready: true,
                     });
                 }
                 flush_events(&state);
+            }
+            if let Err(err) = if navigate {
+                unsafe { navigate_to(&controller, &url) }
+            } else {
+                Ok(())
+            } {
+                record_stage_error(&state, "navigate", format!("WebView2 导航启动失败: {err}"));
             }
             Ok(())
         },
     ));
-    if unsafe { create_controller_with_inprivate(environment, parent, &handler) }.is_err() {
-        {
-            let mut inner = state.borrow_mut();
-            inner.failed = true;
-            let version = inner.version;
-            inner.queue_event(ReaderEvent::StatusChanged {
-                version,
-                status: ReaderLoadStatus::Unavailable,
-            });
-        }
-        flush_events(&state);
+    if let Err(err) = unsafe { create_controller_with_inprivate(environment, parent, &handler) } {
+        record_stage_error(
+            &state,
+            "create_controller_call",
+            format!("调用 CreateCoreWebView2Controller 失败: {err}"),
+        );
     }
 }
 
@@ -598,6 +772,7 @@ impl WebView2Host {
         let callback_key = env_key.clone();
         let callback = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
             move |result, environment| {
+                let env_error = result.as_ref().err().map(|e| format!("{e}"));
                 let environment = environment.filter(|_| result.is_ok());
                 let waiters = ENVIRONMENTS.with(|envs| {
                     let mut envs = envs.borrow_mut();
@@ -610,16 +785,11 @@ impl WebView2Host {
                     if let Some(environment) = &environment {
                         create_controller(environment, parent, weak);
                     } else if let Some(state) = weak.upgrade() {
-                        {
-                            let mut inner = state.borrow_mut();
-                            inner.failed = true;
-                            let version = inner.version;
-                            inner.queue_event(ReaderEvent::StatusChanged {
-                                version,
-                                status: ReaderLoadStatus::Unavailable,
-                            });
-                        }
-                        flush_events(&state);
+                        let detail = match &env_error {
+                            Some(err) => format!("创建 WebView2 环境失败: {err}"),
+                            None => "创建 WebView2 环境失败: 未返回环境实例".to_string(),
+                        };
+                        record_stage_error(&state, "create_environment_completed", detail);
                     }
                 }
                 Ok(())
@@ -656,16 +826,11 @@ impl WebView2Host {
             });
             for (_, weak) in waiters {
                 if let Some(state) = weak.upgrade() {
-                    {
-                        let mut inner = state.borrow_mut();
-                        inner.failed = true;
-                        let version = inner.version;
-                        inner.queue_event(ReaderEvent::StatusChanged {
-                            version,
-                            status: ReaderLoadStatus::Unavailable,
-                        });
-                    }
-                    flush_events(&state);
+                    record_stage_error(
+                        &state,
+                        "create_environment",
+                        format!("调用 CreateCoreWebView2EnvironmentWithOptions 失败: {error}"),
+                    );
                 }
             }
             unsafe {
@@ -795,10 +960,20 @@ impl WebView2Host {
 
     /// Update physical content rectangle, clip rectangle, and visibility in one step.
     pub fn set_bounds(&self, content_rect: PixelRect, clip_rect: PixelRect, visible: bool) {
+        let _ = self.try_set_bounds(content_rect, clip_rect, visible);
+    }
+
+    /// Update physical content rectangle, clip rectangle, and visibility, reporting Win32/WebView2 errors.
+    pub fn try_set_bounds(
+        &self,
+        content_rect: PixelRect,
+        clip_rect: PixelRect,
+        visible: bool,
+    ) -> Result<(), String> {
         {
             self.0.borrow_mut().visible = visible;
         }
-        self.apply_clipped_bounds(content_rect.into(), clip_rect.into());
+        self.apply_clipped_bounds(content_rect.into(), clip_rect.into())
     }
 
     /// Update both content and viewport rectangles to `bounds` without changing visibility.
@@ -808,29 +983,45 @@ impl WebView2Host {
 
     /// Update content and clip rectangles in physical pixels without changing visibility.
     pub fn set_clipped_bounds(&self, content: RECT, viewport: RECT) {
-        self.apply_clipped_bounds(content, viewport);
+        let _ = self.apply_clipped_bounds(content, viewport);
     }
 
-    fn apply_clipped_bounds(&self, content: RECT, viewport: RECT) {
+    fn apply_clipped_bounds(&self, content: RECT, viewport: RECT) -> Result<(), String> {
         let result = clipped_rects(content, viewport);
         let has_area = result.is_some();
         let (clip, bounds) = result.unwrap_or_default();
-        let mut state = self.0.borrow_mut();
-        if state.closed {
-            return;
-        }
-        let prev_has_area = state.has_area;
-        let clip_changed = has_area && (!prev_has_area || state.clip_rect != clip);
-        let bounds_changed = state.bounds != bounds || (has_area && !prev_has_area);
-        state.clip_rect = clip;
-        state.bounds = bounds;
-        state.has_area = has_area;
-        let controller = state.controller.clone();
-        let clip_window = state.clip_window;
-        let visible = state.visible && has_area;
-        let visibility_changed = state.window_shown != visible;
-        state.window_shown = visible;
-        drop(state);
+        let (
+            controller,
+            clip_window,
+            visible,
+            clip_changed,
+            bounds_changed,
+            visibility_changed,
+            version,
+        ) = {
+            let mut state = self.0.borrow_mut();
+            if state.closed {
+                return Err("阅读器宿主已关闭".to_string());
+            }
+            let prev_has_area = state.has_area;
+            let clip_changed = has_area && (!prev_has_area || state.clip_rect != clip);
+            let bounds_changed = state.bounds != bounds || (has_area && !prev_has_area);
+            state.clip_rect = clip;
+            state.bounds = bounds;
+            state.has_area = has_area;
+            let visible = state.visible && has_area;
+            let visibility_changed = state.window_shown != visible;
+            state.window_shown = visible;
+            (
+                state.controller.clone(),
+                state.clip_window,
+                visible,
+                clip_changed,
+                bounds_changed,
+                visibility_changed,
+                state.version,
+            )
+        };
         if visibility_changed && visible {
             if let Some(controller) = &controller {
                 self.resume_if_needed(controller);
@@ -839,71 +1030,129 @@ impl WebView2Host {
         if visibility_changed && !visible {
             restore_parent_focus_if_inside(clip_window);
         }
-        unsafe {
-            if clip_changed {
-                let _ = SetWindowPos(
-                    clip_window,
-                    None,
-                    clip.left,
-                    clip.top,
-                    clip.right - clip.left,
-                    clip.bottom - clip.top,
-                    SWP_NOACTIVATE | SWP_NOZORDER,
-                );
-            }
-            if visibility_changed {
-                let _ = ShowWindow(
-                    clip_window,
-                    if visible { SW_SHOWNOACTIVATE } else { SW_HIDE },
-                );
-            }
+        if let Err((stage, detail)) = unsafe {
+            apply_clip_window_pos_and_show(
+                clip_window,
+                clip,
+                clip_changed,
+                visible,
+                visibility_changed,
+            )
+        } {
+            record_stage_error(&self.0, stage, detail.clone());
+            return Err(detail);
         }
-        if let Some(controller) = controller {
-            unsafe {
+        let controller_ready = if let Some(controller) = controller {
+            let res: Result<(), (&'static str, String)> = (|| unsafe {
                 if bounds_changed {
-                    let _ = controller.SetBounds(bounds);
+                    controller
+                        .SetBounds(bounds)
+                        .map_err(|e| ("controller_set_bounds", format!("SetBounds 失败: {e}")))?;
                 }
                 if visibility_changed {
-                    let _ = controller.SetIsVisible(visible);
+                    controller.SetIsVisible(visible).map_err(|e| {
+                        ("controller_set_visible", format!("SetIsVisible 失败: {e}"))
+                    })?;
                 }
+                Ok(())
+            })();
+            if let Err((stage, detail)) = res {
+                record_stage_error(&self.0, stage, detail.clone());
+                return Err(detail);
+            }
+            true
+        } else {
+            false
+        };
+        {
+            let mut state = self.0.borrow_mut();
+            if state.version == version && !state.closed {
+                state.layout_applied = controller_ready;
+                state.queue_event(ReaderEvent::LayoutApplied {
+                    version,
+                    visible,
+                    controller_ready,
+                });
             }
         }
+        flush_events(&self.0);
+        Ok(())
     }
 
     /// Show or hide the WebView2 clip window and controller, restoring focus if needed.
     pub fn set_visible(&self, visible: bool) {
-        let mut state = self.0.borrow_mut();
-        if state.closed {
-            return;
-        }
-        state.visible = visible;
-        let controller = state.controller.clone();
-        let clip_window = state.clip_window;
-        let visible = visible && state.has_area;
-        let visibility_changed = state.window_shown != visible;
-        state.window_shown = visible;
-        drop(state);
-        if !visibility_changed {
-            return;
-        }
-        if visible {
-            if let Some(controller) = &controller {
-                self.resume_if_needed(controller);
+        let _ = self.try_set_visible(visible);
+    }
+
+    /// Show or hide the WebView2 clip window and controller, reporting Win32/WebView2 errors.
+    pub fn try_set_visible(&self, visible: bool) -> Result<(), String> {
+        let (controller, clip_window, visible, visibility_changed, version) = {
+            let mut state = self.0.borrow_mut();
+            if state.closed {
+                return Err("阅读器宿主已关闭".to_string());
             }
-        } else {
-            restore_parent_focus_if_inside(clip_window);
+            state.visible = visible;
+            let visible = visible && state.has_area;
+            let visibility_changed = state.window_shown != visible;
+            state.window_shown = visible;
+            (
+                state.controller.clone(),
+                state.clip_window,
+                visible,
+                visibility_changed,
+                state.version,
+            )
+        };
+        if !visibility_changed && !visible {
+            return Ok(());
         }
-        unsafe {
-            let _ = ShowWindow(
+        if visibility_changed {
+            if visible {
+                if let Some(controller) = &controller {
+                    self.resume_if_needed(controller);
+                }
+            } else {
+                restore_parent_focus_if_inside(clip_window);
+            }
+        }
+        if let Err((stage, detail)) = unsafe {
+            apply_clip_window_pos_and_show(
                 clip_window,
-                if visible { SW_SHOWNOACTIVATE } else { SW_HIDE },
-            );
+                RECT::default(),
+                false,
+                visible,
+                visibility_changed,
+            )
+        } {
+            record_stage_error(&self.0, stage, detail.clone());
+            return Err(detail);
         }
-        if let Some(controller) = controller {
-            unsafe {
-                let _ = controller.SetIsVisible(visible);
+        let controller_ready = if let Some(controller) = controller {
+            if visibility_changed {
+                if let Err(err) = unsafe { controller.SetIsVisible(visible) } {
+                    let detail = format!("SetIsVisible 失败: {err}");
+                    record_stage_error(&self.0, "controller_set_visible", detail.clone());
+                    return Err(detail);
+                }
             }
+            true
+        } else {
+            false
+        };
+        if visibility_changed {
+            let mut state = self.0.borrow_mut();
+            if state.version == version && !state.closed {
+                state.layout_applied = controller_ready;
+                state.queue_event(ReaderEvent::LayoutApplied {
+                    version,
+                    visible,
+                    controller_ready,
+                });
+            }
+            drop(state);
+            flush_events(&self.0);
         }
+        Ok(())
     }
 
     /// Update the WebView2 controller zoom factor (clamped to `0.25..=5.0`).
@@ -1028,6 +1277,8 @@ impl WebView2Host {
             state.suspend_after_load = suspend_after_load;
             state.version = state.version.wrapping_add(1);
             state.loaded = false;
+            state.layout_applied = false;
+            state.last_error = None;
             state.process_failed = false;
             state.navigation_id = None;
             state.links.clear();
@@ -1063,13 +1314,8 @@ impl WebView2Host {
                     let mut state = self.0.borrow_mut();
                     state.navigation_id = None;
                     state.suspend_after_load = false;
-                    state.failed = true;
-                    state.queue_event(ReaderEvent::StatusChanged {
-                        version,
-                        status: ReaderLoadStatus::Unavailable,
-                    });
                 }
-                flush_events(&self.0);
+                record_stage_error(&self.0, "navigate", format!("WebView2 导航失败: {error}"));
                 return Err(error);
             }
         }
@@ -1336,6 +1582,7 @@ unsafe fn configure(
                 if matched {
                     flush_events(&state);
                     maybe_install_bridge_script(&state, view.as_ref());
+                    reassert_clip_z_order(&state);
                 }
             }
             Ok(())
@@ -1356,6 +1603,8 @@ unsafe fn configure(
             flush_events(&state);
             if matched {
                 maybe_install_bridge_script(&state, view.as_ref());
+                // 导航完成是子窗口层级最容易被重置的时刻，重申一帧 Z 序。
+                reassert_clip_z_order(&state);
                 let should_suspend = {
                     let mut inner = state.borrow_mut();
                     let flag = inner.suspend_after_load
@@ -2102,5 +2351,68 @@ mod tests {
         assert_eq!(read_stream(&stream).as_deref(), Some(&png[..]));
         let empty = unsafe { SHCreateMemStream(None) }.unwrap();
         assert!(read_stream(&empty).is_none());
+    }
+
+    #[test]
+    fn clip_window_pos_plan_lifts_to_hwnd_top_without_swp_nozorder() {
+        use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+
+        let moved = plan_clip_window_pos(true, true).expect("clip_changed plans SetWindowPos");
+        assert!(moved.insert_after_top);
+        assert!(moved.flags.contains(SWP_NOACTIVATE));
+        assert!(!moved.flags.contains(SWP_NOZORDER));
+
+        let shown = plan_clip_window_pos(false, true).expect("visible plans z-order lift");
+        assert!(shown.insert_after_top);
+        assert!(shown.flags.contains(SWP_NOACTIVATE));
+        assert!(shown.flags.contains(SWP_NOMOVE));
+        assert!(shown.flags.contains(SWP_NOSIZE));
+        assert!(!shown.flags.contains(SWP_NOZORDER));
+
+        assert!(plan_clip_window_pos(false, false).is_none());
+    }
+
+    #[test]
+    fn dom_ready_and_stage_error_distinguish_navigation_from_layout() {
+        let (tx, rx) = mpsc::channel::<ReaderEvent>();
+        let state = Rc::new(RefCell::new(State {
+            version: 4,
+            navigation_id: Some(9),
+            callback: Some(Rc::new(RefCell::new(move |ev| {
+                let _ = tx.send(ev);
+            }))),
+            ..State::default()
+        }));
+
+        assert!(apply_dom_content_loaded(&mut state.borrow_mut(), 9));
+        flush_events(&state);
+        assert!(state.borrow().loaded);
+        assert!(!state.borrow().layout_applied);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(ReaderEvent::StatusChanged {
+                version: 4,
+                status: ReaderLoadStatus::Ready
+            })
+        );
+
+        record_stage_error(&state, "set_window_pos", "mock failure".to_string());
+        assert!(state.borrow().failed);
+        assert!(!state.borrow().layout_applied);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(ReaderEvent::Error {
+                version: 4,
+                stage: "set_window_pos",
+                detail: "mock failure".to_string()
+            })
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(ReaderEvent::StatusChanged {
+                version: 4,
+                status: ReaderLoadStatus::Unavailable
+            })
+        );
     }
 }
