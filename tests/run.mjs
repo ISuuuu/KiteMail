@@ -14,6 +14,7 @@ const TEST_FILES = [
   "tests/settings-shell.test.ts",
   "tests/parity-reader-drawer.test.ts",
   "tests/parity-shell-polish.test.ts",
+  "tests/parity-embedded-views.test.ts",
 ];
 
 const outDir = path.resolve("node_modules/.tmp-test");

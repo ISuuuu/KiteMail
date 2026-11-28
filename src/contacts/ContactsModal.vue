@@ -1,17 +1,38 @@
 <template>
-  <div
+  <component
+    :is="embedded ? 'section' : 'div'"
     v-if="open"
-    class="km-contacts-backdrop"
-    role="dialog"
-    aria-modal="true"
+    :class="embedded ? 'km-contacts-embedded' : 'km-contacts-backdrop'"
+    :role="embedded ? undefined : 'dialog'"
+    :aria-modal="embedded ? undefined : 'true'"
     aria-labelledby="km-contacts-modal-title"
-    @click.self="closeModal"
+    @click.self="!embedded && closeModal()"
   >
-    <section class="km-contacts-modal">
-      <header class="km-modal-header">
-        <div class="km-modal-title-group">
-          <h2 id="km-contacts-modal-title" class="km-modal-title">通讯录管理</h2>
-          <span class="km-modal-count">{{ state.total.value }} 位联系人</span>
+    <component
+      :is="embedded ? 'div' : 'section'"
+      :class="embedded ? 'km-contacts-embedded-frame' : 'km-contacts-modal'"
+    >
+      <header
+        class="km-modal-header"
+        :data-tauri-drag-region="embedded ? '' : undefined"
+      >
+        <div
+          class="km-modal-title-group"
+          :data-tauri-drag-region="embedded ? '' : undefined"
+        >
+          <h2
+            id="km-contacts-modal-title"
+            class="km-modal-title"
+            :data-tauri-drag-region="embedded ? '' : undefined"
+          >
+            通讯录管理
+          </h2>
+          <span
+            class="km-modal-count"
+            :data-tauri-drag-region="embedded ? '' : undefined"
+          >
+            {{ state.total.value }} 位联系人
+          </span>
         </div>
 
         <div class="km-modal-header-actions">
@@ -46,6 +67,16 @@
             + 新建联系人
           </button>
           <button
+            v-if="embedded"
+            type="button"
+            class="km-btn km-btn-secondary"
+            title="返回邮件视图"
+            @click="closeModal"
+          >
+            返回邮件
+          </button>
+          <button
+            v-else
             type="button"
             class="km-close-btn"
             title="关闭 (Esc)"
@@ -53,6 +84,21 @@
             @click="closeModal"
           >
             ✕
+          </button>
+          <button
+            v-if="embedded"
+            type="button"
+            class="km-window-close-btn"
+            title="关闭主窗口"
+            aria-label="关闭窗口"
+            @click="emit('closeWindow')"
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="m3.7 2.8 4.3 4.3 4.3-4.3.9.9L8.9 8l4.3 4.3-.9.9L8 8.9l-4.3 4.3-.9-.9L7.1 8 2.8 3.7l.9-.9Z"
+              />
+            </svg>
           </button>
         </div>
       </header>
@@ -428,8 +474,8 @@
           </form>
         </main>
       </div>
-    </section>
-  </div>
+    </component>
+  </component>
 </template>
 
 <script setup lang="ts">
@@ -437,21 +483,42 @@ import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { ContactExportFormat } from "./types";
 import { getContactKey, useContacts } from "./useContacts";
 
-const props = defineProps<{
-  open: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    open: boolean;
+    embedded?: boolean;
+  }>(),
+  {
+    embedded: false,
+  }
+);
 
 const emit = defineEmits<{
   "update:open": [open: boolean];
   close: [];
   composeTo: [email: string, name: string];
   overlayChange: [id: string, open: boolean];
+  closeWindow: [];
 }>();
 
 const OVERLAY_ID = "contacts-modal";
 const searchInputRef = ref<HTMLInputElement | null>(null);
 const nameInputRef = ref<HTMLInputElement | null>(null);
 const copiedExport = ref(false);
+
+let overlayReportedOpen = false;
+function reportOverlay(next: boolean) {
+  if (props.embedded) {
+    if (overlayReportedOpen) {
+      overlayReportedOpen = false;
+      emit("overlayChange", OVERLAY_ID, false);
+    }
+    return;
+  }
+  if (overlayReportedOpen === next) return;
+  overlayReportedOpen = next;
+  emit("overlayChange", OVERLAY_ID, next);
+}
 
 const state = useContacts({
   onLocked() {
@@ -537,21 +604,27 @@ async function copyLastExport() {
 
 function closeModal() {
   if (!props.open) return;
-  emit("overlayChange", OVERLAY_ID, false);
+  reportOverlay(false);
   emit("update:open", false);
   emit("close");
 }
 
 function handleKeydown(ev: KeyboardEvent) {
-  if (!props.open) return;
+  if (!props.open || ev.defaultPrevented) return;
+  if (ev.isComposing || ev.key === "Process" || ev.keyCode === 229) return;
   if (ev.key === "Escape") {
+    if (state.importPanelOpen.value) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      state.closeImportPanel();
+      return;
+    }
+    if (props.embedded) {
+      return;
+    }
     ev.preventDefault();
     ev.stopPropagation();
-    if (state.importPanelOpen.value) {
-      state.closeImportPanel();
-    } else {
-      closeModal();
-    }
+    closeModal();
   }
 }
 
@@ -571,20 +644,27 @@ watch(
   () => props.open,
   (isOpen, prevOpen) => {
     if (isOpen && !prevOpen) {
-      emit("overlayChange", OVERLAY_ID, true);
+      reportOverlay(true);
       attachGlobalListeners();
       void state.init();
       void nextTick(() => searchInputRef.value?.focus());
     } else if (!isOpen && prevOpen) {
       detachGlobalListeners();
-      emit("overlayChange", OVERLAY_ID, false);
+      reportOverlay(false);
     }
+  }
+);
+
+watch(
+  () => props.embedded,
+  () => {
+    reportOverlay(props.open);
   }
 );
 
 onMounted(() => {
   if (props.open) {
-    emit("overlayChange", OVERLAY_ID, true);
+    reportOverlay(true);
     attachGlobalListeners();
     void state.init();
     void nextTick(() => searchInputRef.value?.focus());
@@ -593,14 +673,31 @@ onMounted(() => {
 
 onUnmounted(() => {
   detachGlobalListeners();
-  if (props.open) {
-    emit("overlayChange", OVERLAY_ID, false);
-  }
+  reportOverlay(false);
   state.dispose();
 });
 </script>
 
 <style scoped>
+.km-contacts-embedded {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--km-surface);
+  color: var(--km-text);
+}
+
+.km-contacts-embedded-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .km-contacts-backdrop {
   position: fixed;
   inset: 0;
@@ -635,6 +732,27 @@ onUnmounted(() => {
   justify-content: space-between;
   gap: 10px;
   flex-shrink: 0;
+}
+
+.km-contacts-embedded .km-modal-header {
+  height: 48px;
+  min-height: 48px;
+  padding: 0 10px 0 16px;
+}
+
+.km-contacts-embedded .km-modal-title-group {
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.km-contacts-embedded .km-modal-header-actions {
+  flex-wrap: nowrap;
+}
+
+.km-contacts-embedded .km-modal-header .km-btn {
+  height: 28px;
+  padding: 0 10px;
+  white-space: nowrap;
 }
 
 .km-modal-title-group {
@@ -676,6 +794,26 @@ onUnmounted(() => {
 .km-close-btn:hover {
   background: var(--km-hover-bg);
   color: var(--km-text);
+}
+
+.km-window-close-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: var(--km-radius-sm);
+  background: transparent;
+  color: var(--km-text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.km-window-close-btn:hover {
+  background: var(--km-danger-soft);
+  color: var(--km-danger);
 }
 
 .km-modal-body {

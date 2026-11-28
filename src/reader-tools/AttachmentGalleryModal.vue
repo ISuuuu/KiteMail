@@ -1,19 +1,37 @@
 <template>
-  <Teleport to="body">
-    <div
+  <Teleport to="body" :disabled="embedded">
+    <component
+      :is="embedded ? 'section' : 'div'"
       v-if="open"
-      class="km-gallery-backdrop"
-      role="dialog"
-      aria-modal="true"
+      :class="embedded ? 'km-gallery-embedded' : 'km-gallery-backdrop'"
+      :role="embedded ? undefined : 'dialog'"
+      :aria-modal="embedded ? undefined : 'true'"
       aria-label="全局附件图库"
-      @pointerdown.self="closeModal"
+      @pointerdown.self="!embedded && closeModal()"
     >
-      <section class="km-gallery-modal" @keydown="onKeyDown">
+      <component
+        :is="embedded ? 'div' : 'section'"
+        :class="embedded ? 'km-gallery-embedded-frame' : 'km-gallery-modal'"
+      >
         <!-- 顶部标题栏 -->
-        <header class="km-gallery-header">
-          <div class="km-gallery-title-wrap">
-            <h2 class="km-gallery-title">全局附件图库</h2>
-            <span class="km-gallery-count">
+        <header
+          class="km-gallery-header"
+          :data-tauri-drag-region="embedded ? '' : undefined"
+        >
+          <div
+            class="km-gallery-title-wrap"
+            :data-tauri-drag-region="embedded ? '' : undefined"
+          >
+            <h2
+              class="km-gallery-title"
+              :data-tauri-drag-region="embedded ? '' : undefined"
+            >
+              全局附件图库
+            </h2>
+            <span
+              class="km-gallery-count"
+              :data-tauri-drag-region="embedded ? '' : undefined"
+            >
               共 {{ state.total.value }} 项缓存附件
             </span>
           </div>
@@ -28,6 +46,16 @@
               {{ state.loading.value ? "刷新中…" : "刷新" }}
             </button>
             <button
+              v-if="embedded"
+              type="button"
+              class="km-btn"
+              title="返回邮件视图"
+              @click="closeModal"
+            >
+              返回邮件
+            </button>
+            <button
+              v-else
               type="button"
               class="km-icon-btn"
               title="关闭 (Esc)"
@@ -35,6 +63,21 @@
               @click="closeModal"
             >
               ✕
+            </button>
+            <button
+              v-if="embedded"
+              type="button"
+              class="km-window-close-btn"
+              title="关闭主窗口"
+              aria-label="关闭窗口"
+              @click="emit('closeWindow')"
+            >
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="m3.7 2.8 4.3 4.3 4.3-4.3.9.9L8.9 8l4.3 4.3-.9.9L8 8.9l-4.3 4.3-.9-.9L7.1 8 2.8 3.7l.9-.9Z"
+                />
+              </svg>
             </button>
           </div>
         </header>
@@ -138,8 +181,8 @@
                 @click="openLightboxFor(item)"
               >
                 <img
-                  v-if="item.isImage && state.previewCache.value[item.id]"
-                  :src="state.previewCache.value[item.id].dataUrl"
+                  v-if="cardThumbnailUrl(item)"
+                  :src="cardThumbnailUrl(item)!"
                   :alt="item.filename"
                   class="km-card-thumb"
                 />
@@ -208,110 +251,118 @@
             {{ state.loadingMore.value ? "加载中…" : "加载更多" }}
           </button>
         </footer>
-      </section>
+      </component>
 
-      <!-- 内置灯箱大图预览 -->
-      <div
-        v-if="state.activePreview.value"
-        class="km-lightbox-overlay"
-        role="dialog"
-        aria-modal="true"
-        :aria-label="state.activePreview.value.filename"
-        @pointerdown.self="closeLightbox"
-      >
-        <div class="km-lightbox-panel">
-          <header class="km-lightbox-header">
-            <div class="km-lightbox-meta">
-              <strong class="km-lightbox-title">{{ state.activePreview.value.filename }}</strong>
-              <span class="km-lightbox-sub">
-                {{ state.activePreview.value.mimeType }} ·
-                {{ formatAttachmentSize(state.activePreview.value.sizeBytes) }}
-                <template v-if="activeItem">
-                  · {{ activeItem.sender }} · {{ activeItem.subject }}
-                </template>
-              </span>
-            </div>
+      <!-- 内置灯箱大图预览：embedded 模式下保留 Teleport 到 body 覆盖全窗预览体验 -->
+      <Teleport to="body" :disabled="!embedded">
+        <div
+          v-if="state.activePreview.value"
+          class="km-lightbox-overlay"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="state.activePreview.value.filename"
+          @pointerdown.self="closeLightbox"
+        >
+          <div class="km-lightbox-panel">
+            <header class="km-lightbox-header">
+              <div class="km-lightbox-meta">
+                <strong class="km-lightbox-title">{{ state.activePreview.value.filename }}</strong>
+                <span class="km-lightbox-sub">
+                  {{ state.activePreview.value.mimeType }} ·
+                  {{ formatAttachmentSize(state.activePreview.value.sizeBytes) }}
+                  <template v-if="activeItem">
+                    · {{ activeItem.sender }} · {{ activeItem.subject }}
+                  </template>
+                </span>
+              </div>
 
-            <div class="km-lightbox-actions">
+              <div class="km-lightbox-actions">
+                <button
+                  v-if="isLightboxImage"
+                  type="button"
+                  class="km-btn"
+                  @click="zoomPercent = Math.max(50, zoomPercent - 25)"
+                >
+                  -
+                </button>
+                <span v-if="isLightboxImage" class="km-zoom-label">{{ zoomPercent }}%</span>
+                <button
+                  v-if="isLightboxImage"
+                  type="button"
+                  class="km-btn"
+                  @click="zoomPercent = Math.min(250, zoomPercent + 25)"
+                >
+                  +
+                </button>
+                <button
+                  v-if="activeItem"
+                  type="button"
+                  class="km-btn"
+                  @click="emitOpenMessage(activeItem.accountId, activeItem.messageId)"
+                >
+                  查看原邮件
+                </button>
+                <button
+                  type="button"
+                  class="km-btn km-btn-primary"
+                  :disabled="state.savingId.value === state.activePreview.value.attachmentId"
+                  @click="state.saveSingle(state.activePreview.value.attachmentId)"
+                >
+                  保存附件
+                </button>
+                <button
+                  type="button"
+                  class="km-icon-btn"
+                  aria-label="关闭灯箱"
+                  @click="closeLightbox"
+                >
+                  ✕
+                </button>
+              </div>
+            </header>
+
+            <div class="km-lightbox-stage">
               <button
+                v-if="previewableIds.length > 1"
+                type="button"
+                class="km-nav-btn km-nav-prev"
+                aria-label="上一个附件"
+                @click="stepPreview(-1)"
+              >
+                ‹
+              </button>
+
+              <img
                 v-if="isLightboxImage"
-                type="button"
-                class="km-btn"
-                @click="zoomPercent = Math.max(50, zoomPercent - 25)"
-              >
-                -
-              </button>
-              <span v-if="isLightboxImage" class="km-zoom-label">{{ zoomPercent }}%</span>
+                :src="state.activePreview.value.dataUrl"
+                :alt="state.activePreview.value.filename"
+                class="km-lightbox-img"
+                :style="{ transform: `scale(${zoomPercent / 100})` }"
+              />
+              <iframe
+                v-else-if="isLightboxPdf"
+                :src="state.activePreview.value.dataUrl"
+                :title="state.activePreview.value.filename"
+                class="km-lightbox-pdf"
+              />
+              <pre v-else class="km-lightbox-text">{{
+                decodeTextPreviewDataUrl(state.activePreview.value.dataUrl) ?? "该文件类型暂不支持内嵌预览，请点击上方保存后查看。"
+              }}</pre>
+
               <button
-                v-if="isLightboxImage"
+                v-if="previewableIds.length > 1"
                 type="button"
-                class="km-btn"
-                @click="zoomPercent = Math.min(250, zoomPercent + 25)"
+                class="km-nav-btn km-nav-next"
+                aria-label="下一个附件"
+                @click="stepPreview(1)"
               >
-                +
-              </button>
-              <button
-                v-if="activeItem"
-                type="button"
-                class="km-btn"
-                @click="emitOpenMessage(activeItem.accountId, activeItem.messageId)"
-              >
-                查看原邮件
-              </button>
-              <button
-                type="button"
-                class="km-btn km-btn-primary"
-                :disabled="state.savingId.value === state.activePreview.value.attachmentId"
-                @click="state.saveSingle(state.activePreview.value.attachmentId)"
-              >
-                保存附件
-              </button>
-              <button
-                type="button"
-                class="km-icon-btn"
-                aria-label="关闭灯箱"
-                @click="closeLightbox"
-              >
-                ✕
+                ›
               </button>
             </div>
-          </header>
-
-          <div class="km-lightbox-stage">
-            <button
-              v-if="previewableIds.length > 1"
-              type="button"
-              class="km-nav-btn km-nav-prev"
-              aria-label="上一个附件"
-              @click="stepPreview(-1)"
-            >
-              ‹
-            </button>
-
-            <img
-              v-if="isLightboxImage"
-              :src="state.activePreview.value.dataUrl"
-              :alt="state.activePreview.value.filename"
-              class="km-lightbox-img"
-              :style="{ transform: `scale(${zoomPercent / 100})` }"
-            />
-            <pre v-else class="km-lightbox-text">{{
-              decodeTextPreviewDataUrl(state.activePreview.value.dataUrl) ?? "该文件类型暂不支持内嵌预览，请点击上方保存后查看。"
-            }}</pre>
-
-            <button
-              v-if="previewableIds.length > 1"
-              type="button"
-              class="km-nav-btn km-nav-next"
-              aria-label="下一个附件"
-              @click="stepPreview(1)"
-            >
-              ›
-            </button>
           </div>
         </div>
-      </div>
-    </div>
+      </Teleport>
+    </component>
   </Teleport>
 </template>
 
@@ -320,9 +371,14 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   decodeTextPreviewDataUrl,
   formatAttachmentSize,
+  isPdfAttachment,
   useAttachments,
 } from "./useAttachments";
-import type { AttachmentFilterKind, CachedAttachmentDto } from "./types";
+import type {
+  AttachmentFilterKind,
+  CachedAttachmentDto,
+  FetchAttachmentPreviewOutput,
+} from "./types";
 
 const OVERLAY_ID = "attachment-gallery";
 
@@ -332,15 +388,22 @@ const FILTER_TABS: ReadonlyArray<{ value: AttachmentFilterKind; label: string }>
   { value: "documents", label: "文档" },
 ];
 
-const props = defineProps<{
-  open: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    open: boolean;
+    embedded?: boolean;
+  }>(),
+  {
+    embedded: false,
+  }
+);
 
 const emit = defineEmits<{
   "update:open": [open: boolean];
   close: [];
   openMessage: [accountId: number, messageId: number];
   overlayChange: [id: string, open: boolean];
+  closeWindow: [];
 }>();
 
 const state = useAttachments({ pageSize: 12 });
@@ -349,8 +412,19 @@ const searchDraft = ref("");
 const zoomPercent = ref(100);
 let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
+type PreviewWithThumb = FetchAttachmentPreviewOutput & {
+  thumbnailDataUrl?: string | null;
+};
+
 let overlayReportedOpen = false;
 function reportOverlay(next: boolean) {
+  if (props.embedded) {
+    if (overlayReportedOpen) {
+      overlayReportedOpen = false;
+      emit("overlayChange", OVERLAY_ID, false);
+    }
+    return;
+  }
   if (overlayReportedOpen === next) return;
   overlayReportedOpen = next;
   emit("overlayChange", OVERLAY_ID, next);
@@ -367,6 +441,23 @@ const isLightboxImage = computed(() => {
   if (!pv) return false;
   return pv.mimeType.toLowerCase().startsWith("image/") || pv.dataUrl.startsWith("data:image/");
 });
+
+const isLightboxPdf = computed(() => {
+  const pv = state.activePreview.value;
+  if (!pv) return false;
+  return (
+    isPdfAttachment({ mimeType: pv.mimeType, filename: pv.filename }) ||
+    pv.dataUrl.startsWith("data:application/pdf")
+  );
+});
+
+function cardThumbnailUrl(item: CachedAttachmentDto): string | null {
+  const preview = state.previewCache.value[item.id] as PreviewWithThumb | undefined;
+  if (!preview) return null;
+  return item.isImage
+    ? preview.thumbnailDataUrl || preview.dataUrl || null
+    : preview.thumbnailDataUrl || null;
+}
 
 const previewableIds = computed(() => state.filteredItems.value.map((item) => item.id));
 
@@ -454,15 +545,20 @@ function closeModal() {
 }
 
 function onKeyDown(e: KeyboardEvent) {
-  if (!props.open) return;
+  if (!props.open || e.defaultPrevented) return;
   if (e.isComposing || e.key === "Process" || e.keyCode === 229) return;
   if (e.key === "Escape") {
-    e.preventDefault();
-    e.stopPropagation();
     if (state.activePreview.value) {
+      e.preventDefault();
+      e.stopPropagation();
       closeLightbox();
       return;
     }
+    if (props.embedded) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
     closeModal();
     return;
   }
@@ -515,6 +611,13 @@ watch(
   }
 );
 
+watch(
+  () => props.embedded,
+  () => {
+    reportOverlay(props.open);
+  }
+);
+
 onMounted(() => {
   if (props.open) {
     reportOverlay(true);
@@ -535,6 +638,26 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.km-gallery-embedded {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--km-surface);
+  color: var(--km-text);
+  user-select: text;
+}
+
+.km-gallery-embedded-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .km-gallery-backdrop {
   position: fixed;
   inset: 0;
@@ -569,6 +692,22 @@ onUnmounted(() => {
   background: var(--km-sidebar);
   border-bottom: 1px solid var(--km-border);
   flex-shrink: 0;
+}
+
+.km-gallery-embedded .km-gallery-header {
+  height: 48px;
+  min-height: 48px;
+  padding: 0 10px 0 16px;
+  background: var(--km-surface);
+}
+
+.km-gallery-embedded .km-gallery-title-wrap {
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.km-gallery-embedded .km-gallery-header-actions {
+  flex-wrap: nowrap;
 }
 
 .km-gallery-title-wrap {
@@ -914,6 +1053,26 @@ onUnmounted(() => {
   color: var(--km-text);
 }
 
+.km-window-close-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: var(--km-radius-sm);
+  background: transparent;
+  color: var(--km-text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.km-window-close-btn:hover {
+  background: var(--km-danger-soft);
+  color: var(--km-danger);
+}
+
 .km-lightbox-overlay {
   position: fixed;
   inset: 0;
@@ -1002,6 +1161,15 @@ onUnmounted(() => {
   object-fit: contain;
   border-radius: var(--km-radius-sm);
   transition: transform 0.14s ease;
+}
+
+.km-lightbox-pdf {
+  width: 100%;
+  height: 100%;
+  min-height: 360px;
+  border: 1px solid var(--km-border);
+  border-radius: var(--km-radius-sm);
+  background: #ffffff;
 }
 
 .km-lightbox-text {
