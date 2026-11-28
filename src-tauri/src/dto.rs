@@ -1123,6 +1123,8 @@ pub struct SendMailInput {
     pub undo_delay_secs: Option<u32>,
     #[serde(default)]
     pub scheduled_at: Option<i64>,
+    #[serde(default)]
+    pub client_request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1975,6 +1977,76 @@ pub struct CheckAppUpdateOutput {
     pub notes: Option<String>,
     pub pub_date: Option<String>,
     pub download_url: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallAppUpdateOutput {
+    pub started: bool,
+    pub target: String,
+    pub version: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BackupPathInput {
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSettingsBackupOutput {
+    pub saved: bool,
+    pub cancelled: bool,
+    pub path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSettingsBackupOutput {
+    pub cancelled: bool,
+    pub path: Option<String>,
+    pub account_count: usize,
+    pub theme_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSettingsBackupInput {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSettingsBackupOutput {
+    pub imported: bool,
+    pub account_count: usize,
+    pub message: String,
+    pub state_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DataDirectoryKindDto {
+    Data,
+    Mail,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDataDirectoryInput {
+    pub kind: DataDirectoryKindDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDataDirectoryOutput {
+    pub opened: bool,
+    pub path: String,
     pub message: String,
 }
 

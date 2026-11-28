@@ -97,12 +97,18 @@
 <script setup lang="ts">
 import "./page.css";
 import { ref } from "vue";
+import { extractErrorMessage } from "../ipc/main-window";
+import {
+  exportSettingsBackup,
+  importSettingsBackup,
+  previewSettingsBackup,
+} from "../preferences/ipc";
 import type { PrefsPanelState } from "../preferences/panels/state";
 
 /**
  * 「备份」页（对齐 GPUI pages.rs#render_backup）。
- * 备份导出/导入的文件选择与读写尚无对应 Tauri 命令：按钮反馈与
- * 「待确认恢复的备份预览」分组结构完整保留，依赖会话内状态（IPC 缺口清单）。
+ * 导出 / 选择备份文件 / 确认导入均走真实 Tauri 命令：文件选择对话框由后端弹出，
+ * 导入成功后后端会持久化并广播 preferencesUpdated / accountsUpdated 事件。
  */
 defineProps<{ state: PrefsPanelState }>();
 
@@ -122,21 +128,44 @@ function showFeedback(ok: boolean, text: string) {
   }, 3200);
 }
 
-function exportBackup() {
-  showFeedback(false, "备份导出尚未接入 Tauri IPC（见缺口清单）");
+async function exportBackup() {
+  try {
+    const res = await exportSettingsBackup();
+    showFeedback(!res.cancelled, res.message);
+  } catch (err) {
+    showFeedback(false, extractErrorMessage(err));
+  }
 }
 
-function pickBackupFile() {
-  showFeedback(false, "备份导入的文件选择尚未接入 Tauri IPC（见缺口清单）");
+async function pickBackupFile() {
+  try {
+    const res = await previewSettingsBackup();
+    if (res.cancelled) return;
+    pendingImport.value = {
+      path: res.path ?? "",
+      accountCount: res.accountCount,
+      themeId: res.themeId || "默认",
+    };
+    showFeedback(true, res.message);
+  } catch (err) {
+    showFeedback(false, extractErrorMessage(err));
+  }
 }
 
 function cancelImport() {
   pendingImport.value = null;
 }
 
-function confirmImport() {
-  pendingImport.value = null;
-  showFeedback(false, "备份导入尚未接入 Tauri IPC（见缺口清单）");
+async function confirmImport() {
+  const target = pendingImport.value;
+  if (!target) return;
+  try {
+    const res = await importSettingsBackup(target.path);
+    pendingImport.value = null;
+    showFeedback(res.imported, res.message);
+  } catch (err) {
+    showFeedback(false, extractErrorMessage(err));
+  }
 }
 </script>
 

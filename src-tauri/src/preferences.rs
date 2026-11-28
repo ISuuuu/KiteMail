@@ -651,6 +651,14 @@ impl PreferencesStore {
             .clone()
     }
 
+    pub fn reload_from_disk(&self) -> AppPreferences {
+        let mut prefs = load_preferences_in(&self.data_dir).unwrap_or_default();
+        normalize_loaded_preferences(&mut prefs);
+        let mut guard = self.prefs.lock().expect("preferences mutex poisoned");
+        *guard = prefs.clone();
+        prefs
+    }
+
     pub fn snapshot_dto(&self) -> MainPreferencesDto {
         let guard = self.prefs.lock().expect("preferences mutex poisoned");
         to_main_preferences_dto(&guard)

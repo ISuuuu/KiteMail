@@ -347,6 +347,11 @@ enum WorkerCommand {
         request: PageQueryRequest,
         reply: mpsc::SyncSender<Result<MailPage, String>>,
     },
+    FinishMicrosoftOAuth {
+        flow_id: u64,
+        editing_account_id: Option<u32>,
+        outcome: oauth::OAuthLoginOutcome,
+    },
 }
 
 /// Shareable, thread-safe command sender for dispatching [`MailRequest`]s and
@@ -585,6 +590,8 @@ async fn worker_loop(
         Arc::new(std::sync::Mutex::new(HashSet::new()));
     let mut watchers: IdleWatchers = HashMap::new();
     let background = BackgroundTasks::new(data_dir.clone(), tokens.clone(), evt_tx.clone());
+    let mut active_oauth: Option<(u64, Arc<std::sync::atomic::AtomicBool>)> = None;
+    let mut next_oauth_flow_id: u64 = 1;
 
     if let Ok(prefs) = config::load_preferences_in(&data_dir) {
         if prefs.keep_downloads_days > 0 {
@@ -652,9 +659,40 @@ async fn worker_loop(
             continue;
         }
 
+        if let Some(WorkerCommand::FinishMicrosoftOAuth {
+            flow_id,
+            editing_account_id,
+            outcome,
+        }) = cmd
+        {
+            if active_oauth
+                .as_ref()
+                .is_some_and(|(active_id, _)| *active_id == flow_id)
+            {
+                active_oauth = None;
+            }
+            if let Some(cache) = cache_opt.as_mut() {
+                finish_microsoft_oauth_flow(
+                    &data_dir,
+                    cache,
+                    &tokens,
+                    &mut watchers,
+                    &background,
+                    &req_tx,
+                    &evt_tx,
+                    editing_account_id,
+                    outcome,
+                )
+                .await;
+            }
+            continue;
+        }
+
         let mut req = match cmd {
             Some(WorkerCommand::Request(req)) => Some(req),
-            Some(WorkerCommand::QueryPage { .. }) => unreachable!(),
+            Some(WorkerCommand::QueryPage { .. } | WorkerCommand::FinishMicrosoftOAuth { .. }) => {
+                unreachable!()
+            }
             None => None,
         };
 
@@ -685,11 +723,58 @@ async fn worker_loop(
             continue;
         };
         if matches!(req, MailRequest::PrepareQuit) {
+            if let Some((_, cancel)) = active_oauth.take() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if let Some(mut cache) = cache_opt.take() {
                 cache.checkpoint_and_close_all();
             }
             let _ = evt_tx.send(WorkerEvent::QuitPrepared { result: Ok(()) });
             break;
+        }
+        if matches!(req, MailRequest::CancelMicrosoftOAuth) {
+            if let Some((_, cancel)) = active_oauth.take() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            continue;
+        }
+        if let MailRequest::StartMicrosoftOAuth {
+            custom_client_id,
+            login_hint_email,
+            editing_account_id,
+        } = req
+        {
+            if let Some((_, prev_cancel)) = active_oauth.take() {
+                prev_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let flow_id = next_oauth_flow_id;
+            next_oauth_flow_id = next_oauth_flow_id.saturating_add(1);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            active_oauth = Some((flow_id, Arc::clone(&cancel)));
+            let _ = evt_tx.send(WorkerEvent::Status {
+                account_id: None,
+                text: "已打开浏览器，请在微软页面完成 Outlook 授权...".to_string(),
+            });
+            let cmd_tx_oauth = req_tx.cmd_tx.clone();
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    oauth::run_microsoft_oauth_login_cancellable(
+                        &custom_client_id,
+                        login_hint_email.as_deref(),
+                        Some(&cancel),
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    oauth::OAuthLoginOutcome::Failed(format!("OAuth2 登录任务异常: {e}"))
+                });
+                let _ = cmd_tx_oauth.send(WorkerCommand::FinishMicrosoftOAuth {
+                    flow_id,
+                    editing_account_id,
+                    outcome,
+                });
+            });
+            continue;
         }
         if let MailRequest::ChangeMailDataDir {
             target_dir,
@@ -1856,6 +1941,250 @@ async fn run_graph_fast_poll_fallback(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn finish_microsoft_oauth_flow(
+    data_dir: &PathBuf,
+    cache: &mut CacheStore,
+    tokens: &SharedTokenCache,
+    watchers: &mut IdleWatchers,
+    background: &BackgroundTasks,
+    req_tx: &MailWorkerSender,
+    evt_tx: &EventSender,
+    editing_account_id: Option<u32>,
+    outcome: oauth::OAuthLoginOutcome,
+) {
+    let result = match outcome {
+        oauth::OAuthLoginOutcome::Success(res) => res,
+        oauth::OAuthLoginOutcome::Cancelled(reason) => {
+            let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                ok: false,
+                message: reason.clone(),
+            });
+            let _ = evt_tx.send(WorkerEvent::Status {
+                account_id: None,
+                text: reason,
+            });
+            return;
+        }
+        oauth::OAuthLoginOutcome::Failed(err) => {
+            let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                ok: false,
+                message: err.clone(),
+            });
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: None,
+                message: err,
+            });
+            return;
+        }
+    };
+
+    let existing = config::load_accounts_in(data_dir).unwrap_or_default();
+    let account_id = match resolve_oauth_account_match(editing_account_id, &existing, &result.email)
+    {
+        Ok(OAuthAccountMatch::Bind(id)) => id,
+        Ok(OAuthAccountMatch::Rejected) => {
+            let _ = evt_tx.send(WorkerEvent::OAuthRebindRejected {
+                account_id: editing_account_id,
+                returned_email: result.email.clone(),
+            });
+            return;
+        }
+        Err(message) => {
+            let _ = evt_tx.send(WorkerEvent::AccountVerified {
+                ok: false,
+                message: message.clone(),
+            });
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: None,
+                message,
+            });
+            return;
+        }
+    };
+
+    if editing_account_id.is_some() {
+        if let Some(account) = existing.iter().find(|a| a.id == account_id) {
+            if let Err(message) = config::validate_shared_credential_endpoint(data_dir, account) {
+                let _ = evt_tx.send(WorkerEvent::Error {
+                    account_id: Some(account_id),
+                    message,
+                });
+                return;
+            }
+        }
+        config::register_known_data_dir(data_dir);
+        let Some(account) = existing.iter().find(|a| a.id == account_id) else {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: "账号配置不存在，请重新授权".into(),
+            });
+            return;
+        };
+        if !account
+            .email
+            .trim()
+            .eq_ignore_ascii_case(result.email.trim())
+        {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: "授权邮箱与账号不匹配".into(),
+            });
+            return;
+        }
+        let configured_client = if account.oauth_client_id.trim().is_empty() {
+            oauth::DEFAULT_MICROSOFT_CLIENT_ID
+        } else {
+            account.oauth_client_id.trim()
+        };
+        if configured_client != result.client_id {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message: "授权客户端与账号配置不匹配，请保存配置后重新授权".into(),
+            });
+            return;
+        }
+        if let Err(message) = secrets::save_bound_oauth_token(account, result.refresh_token) {
+            let _ = evt_tx.send(WorkerEvent::Error {
+                account_id: Some(account_id),
+                message,
+            });
+            return;
+        }
+        let expires_at =
+            Instant::now() + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
+        tokens
+            .insert(account, result.access_token, expires_at)
+            .await;
+        let _ = evt_tx.send(WorkerEvent::OAuthReauthorized {
+            account_id,
+            email: result.email,
+        });
+        return;
+    }
+
+    let prev = existing.iter().find(|a| a.id == account_id);
+
+    let account = AccountConfig {
+        id: account_id,
+        auth_backend: AuthBackend::MicrosoftGraphOAuth2,
+        oauth_client_id: result.client_id,
+        display_name: prev
+            .map(|p| p.display_name.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(result.display_name),
+        email: result.email.clone(),
+        label: prev.and_then(|p| p.label.clone()),
+        enabled: prev.map(|p| p.enabled).unwrap_or(true),
+        color: prev.and_then(|p| p.color.clone()),
+        emoji: prev.and_then(|p| p.emoji.clone()),
+        avatar: prev.and_then(|p| p.avatar.clone()),
+        use_brand_avatar: prev.map(|p| p.use_brand_avatar).unwrap_or(true),
+        in_unified: prev.map(|p| p.in_unified).unwrap_or(true),
+        push_override: prev.and_then(|p| p.push_override),
+        imap_host: "outlook.office365.com".to_string(),
+        imap_port: 993,
+        imap_security: config::SecurityMode::Tls,
+        imap_username: result.email.clone(),
+        smtp_host: "smtp.office365.com".to_string(),
+        smtp_port: 587,
+        smtp_security: config::SecurityMode::StartTls,
+        smtp_username: result.email,
+        smtp_separate_credentials: false,
+        signature: prev.map(|p| p.signature.clone()).unwrap_or_default(),
+        quota_used_bytes: prev.and_then(|p| p.quota_used_bytes),
+        quota_total_bytes: prev.and_then(|p| p.quota_total_bytes),
+        aliases: prev.map(|p| p.aliases.clone()).unwrap_or_default(),
+        signatures: prev.map(|p| p.signatures.clone()).unwrap_or_default(),
+        default_new_signature: prev.and_then(|p| p.default_new_signature),
+        default_reply_signature: prev.and_then(|p| p.default_reply_signature),
+        special_folders: prev.map(|p| p.special_folders.clone()).unwrap_or_else(|| {
+            config::SpecialFoldersConfig {
+                server_saves_sent: true,
+                ..Default::default()
+            }
+        }),
+        sync_interval_minutes: prev.and_then(|p| p.sync_interval_minutes),
+        download_window_days: prev.map(|p| p.download_window_days).unwrap_or(0),
+        auto_empty_trash_days: prev.map(|p| p.auto_empty_trash_days).unwrap_or(0),
+        auto_empty_junk_days: prev.map(|p| p.auto_empty_junk_days).unwrap_or(0),
+        hidden_folders: prev.map(|p| p.hidden_folders.clone()).unwrap_or_default(),
+        storage_dir: prev.and_then(|p| p.storage_dir.clone()),
+    };
+
+    if let Err(message) = config::validate_shared_credential_endpoint(data_dir, &account) {
+        let _ = evt_tx.send(WorkerEvent::Error {
+            account_id: Some(account_id),
+            message,
+        });
+        return;
+    }
+    if let Err(message) = check_new_account_credential_conflict(&account, prev.is_none()) {
+        let _ = evt_tx.send(WorkerEvent::Error {
+            account_id: Some(account_id),
+            message,
+        });
+        return;
+    }
+    if let Err(message) = secrets::save_bound_oauth_token(&account, result.refresh_token) {
+        let _ = evt_tx.send(WorkerEvent::Error {
+            account_id: Some(account_id),
+            message,
+        });
+        return;
+    }
+    if let Err(e) = config::upsert_account_in(data_dir, account.clone()) {
+        let _ = evt_tx.send(WorkerEvent::Error {
+            account_id: Some(account_id),
+            message: e,
+        });
+        return;
+    }
+    config::register_known_data_dir(data_dir);
+    if let Ok(all_accounts) = config::load_accounts_in(data_dir) {
+        let _ = cache.sync_account_registry(&all_accounts);
+        cache.set_own_emails(all_accounts.iter().map(|a| a.email.clone()).collect());
+    }
+
+    let expires_at =
+        Instant::now() + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
+    tokens
+        .insert(&account, result.access_token, expires_at)
+        .await;
+
+    let _ = evt_tx.send(WorkerEvent::AccountVerified {
+        ok: true,
+        message: "Outlook OAuth2 授权成功，正在同步邮件...".to_string(),
+    });
+    let account_enabled = account.enabled;
+    refresh_account_watcher(watchers, data_dir, &account, req_tx);
+    let _ = evt_tx.send(WorkerEvent::AccountSaved { account });
+    if account_enabled {
+        sync_account_inner(
+            data_dir,
+            cache,
+            tokens,
+            account_id,
+            true,
+            Some(&background.sync_coord),
+            evt_tx,
+        )
+        .await;
+    }
+    let page_size = pref_page_size(data_dir);
+    let allowed = unified_account_ids(data_dir);
+    if let Ok(page) = cache.list_unified_inbox_for_accounts(
+        &allowed,
+        "",
+        QuickFilterSet::default(),
+        MessageSort::DateNewest,
+        0,
+        page_size,
+    ) {
+        let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     data_dir: &PathBuf,
     cache: &mut CacheStore,
@@ -2100,257 +2429,9 @@ async fn handle_request(
             }
         }
 
-        MailRequest::StartMicrosoftOAuth {
-            custom_client_id,
-            login_hint_email,
-            editing_account_id,
-        } => {
-            let _ = evt_tx.send(WorkerEvent::Status {
-                account_id: None,
-                text: "已打开浏览器，请在微软页面完成 Outlook 授权...".to_string(),
-            });
-
-            let sign_in = tokio::task::spawn_blocking(move || {
-                oauth::run_microsoft_oauth_login(&custom_client_id, login_hint_email.as_deref())
-            })
-            .await;
-
-            let result = match sign_in {
-                Ok(Ok(res)) => res,
-                Ok(Err(e)) => {
-                    let _ = evt_tx.send(WorkerEvent::AccountVerified {
-                        ok: false,
-                        message: e.clone(),
-                    });
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: None,
-                        message: e,
-                    });
-                    return;
-                }
-                Err(e) => {
-                    let msg = format!("OAuth2 登录任务异常: {e}");
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: None,
-                        message: msg,
-                    });
-                    return;
-                }
-            };
-
-            let existing = config::load_accounts_in(data_dir).unwrap_or_default();
-            // 先用返回的邮箱核对账号身份：与编辑中账号一致才更新；选择了另一个
-            // 邮箱时保留原账号、凭据与缓存完全不动，提示用户重新授权或走添加流程。
-            // 新增流程授权到已存在的邮箱时直接报错，不静默覆盖已有账号。
-            let account_id =
-                match resolve_oauth_account_match(editing_account_id, &existing, &result.email) {
-                    Ok(OAuthAccountMatch::Bind(id)) => id,
-                    Ok(OAuthAccountMatch::Rejected) => {
-                        let _ = evt_tx.send(WorkerEvent::OAuthRebindRejected {
-                            account_id: editing_account_id,
-                            returned_email: result.email.clone(),
-                        });
-                        return;
-                    }
-                    Err(message) => {
-                        let _ = evt_tx.send(WorkerEvent::AccountVerified {
-                            ok: false,
-                            message: message.clone(),
-                        });
-                        let _ = evt_tx.send(WorkerEvent::Error {
-                            account_id: None,
-                            message,
-                        });
-                        return;
-                    }
-                };
-
-            // 编辑已有账号重新授权：只把新令牌写入 Keyring 与内存令牌缓存，
-            // 账号配置、缓存与同步完全不动，由 UI 保留编辑表单并提示成功。
-            if editing_account_id.is_some() {
-                if let Some(account) = existing.iter().find(|a| a.id == account_id) {
-                    if let Err(message) =
-                        config::validate_shared_credential_endpoint(data_dir, account)
-                    {
-                        let _ = evt_tx.send(WorkerEvent::Error {
-                            account_id: Some(account_id),
-                            message,
-                        });
-                        return;
-                    }
-                }
-                config::register_known_data_dir(data_dir);
-                let Some(account) = existing.iter().find(|a| a.id == account_id) else {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
-                        message: "账号配置不存在，请重新授权".into(),
-                    });
-                    return;
-                };
-                if !account
-                    .email
-                    .trim()
-                    .eq_ignore_ascii_case(result.email.trim())
-                {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
-                        message: "授权邮箱与账号不匹配".into(),
-                    });
-                    return;
-                }
-                let configured_client = if account.oauth_client_id.trim().is_empty() {
-                    oauth::DEFAULT_MICROSOFT_CLIENT_ID
-                } else {
-                    account.oauth_client_id.trim()
-                };
-                if configured_client != result.client_id {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
-                        message: "授权客户端与账号配置不匹配，请保存配置后重新授权".into(),
-                    });
-                    return;
-                }
-                if let Err(message) = secrets::save_bound_oauth_token(account, result.refresh_token)
-                {
-                    let _ = evt_tx.send(WorkerEvent::Error {
-                        account_id: Some(account_id),
-                        message,
-                    });
-                    return;
-                }
-                let expires_at = Instant::now()
-                    + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
-                tokens
-                    .insert(&account, result.access_token, expires_at)
-                    .await;
-                let _ = evt_tx.send(WorkerEvent::OAuthReauthorized {
-                    account_id,
-                    email: result.email,
-                });
-                return;
-            }
-
-            let prev = existing.iter().find(|a| a.id == account_id);
-
-            let account = AccountConfig {
-                id: account_id,
-                auth_backend: AuthBackend::MicrosoftGraphOAuth2,
-                oauth_client_id: result.client_id,
-                display_name: prev
-                    .map(|p| p.display_name.clone())
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or(result.display_name),
-                email: result.email.clone(),
-                label: prev.and_then(|p| p.label.clone()),
-                enabled: prev.map(|p| p.enabled).unwrap_or(true),
-                color: prev.and_then(|p| p.color.clone()),
-                emoji: prev.and_then(|p| p.emoji.clone()),
-                avatar: prev.and_then(|p| p.avatar.clone()),
-                use_brand_avatar: prev.map(|p| p.use_brand_avatar).unwrap_or(true),
-                in_unified: prev.map(|p| p.in_unified).unwrap_or(true),
-                push_override: prev.and_then(|p| p.push_override),
-                imap_host: "outlook.office365.com".to_string(),
-                imap_port: 993,
-                imap_security: config::SecurityMode::Tls,
-                imap_username: result.email.clone(),
-                smtp_host: "smtp.office365.com".to_string(),
-                smtp_port: 587,
-                smtp_security: config::SecurityMode::StartTls,
-                smtp_username: result.email,
-                smtp_separate_credentials: false,
-                signature: prev.map(|p| p.signature.clone()).unwrap_or_default(),
-                quota_used_bytes: prev.and_then(|p| p.quota_used_bytes),
-                quota_total_bytes: prev.and_then(|p| p.quota_total_bytes),
-                aliases: prev.map(|p| p.aliases.clone()).unwrap_or_default(),
-                signatures: prev.map(|p| p.signatures.clone()).unwrap_or_default(),
-                default_new_signature: prev.and_then(|p| p.default_new_signature),
-                default_reply_signature: prev.and_then(|p| p.default_reply_signature),
-                special_folders: prev.map(|p| p.special_folders.clone()).unwrap_or_else(|| {
-                    config::SpecialFoldersConfig {
-                        server_saves_sent: true,
-                        ..Default::default()
-                    }
-                }),
-                sync_interval_minutes: prev.and_then(|p| p.sync_interval_minutes),
-                download_window_days: prev.map(|p| p.download_window_days).unwrap_or(0),
-                auto_empty_trash_days: prev.map(|p| p.auto_empty_trash_days).unwrap_or(0),
-                auto_empty_junk_days: prev.map(|p| p.auto_empty_junk_days).unwrap_or(0),
-                hidden_folders: prev.map(|p| p.hidden_folders.clone()).unwrap_or_default(),
-                storage_dir: prev.and_then(|p| p.storage_dir.clone()),
-            };
-
-            if let Err(message) = config::validate_shared_credential_endpoint(data_dir, &account) {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: Some(account_id),
-                    message,
-                });
-                return;
-            }
-            if let Err(message) = check_new_account_credential_conflict(&account, prev.is_none()) {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: Some(account_id),
-                    message,
-                });
-                return;
-            }
-            if let Err(message) = secrets::save_bound_oauth_token(&account, result.refresh_token) {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: Some(account_id),
-                    message,
-                });
-                return;
-            }
-            if let Err(e) = config::upsert_account_in(data_dir, account.clone()) {
-                let _ = evt_tx.send(WorkerEvent::Error {
-                    account_id: Some(account_id),
-                    message: e,
-                });
-                return;
-            }
-            config::register_known_data_dir(data_dir);
-            if let Ok(all_accounts) = config::load_accounts_in(data_dir) {
-                let _ = cache.sync_account_registry(&all_accounts);
-                cache.set_own_emails(all_accounts.iter().map(|a| a.email.clone()).collect());
-            }
-
-            let expires_at =
-                Instant::now() + Duration::from_secs(result.expires_in_secs.saturating_sub(120));
-            tokens
-                .insert(&account, result.access_token, expires_at)
-                .await;
-
-            let _ = evt_tx.send(WorkerEvent::AccountVerified {
-                ok: true,
-                message: "Outlook OAuth2 授权成功，正在同步邮件...".to_string(),
-            });
-            let account_enabled = account.enabled;
-            refresh_account_watcher(watchers, data_dir, &account, req_tx);
-            let _ = evt_tx.send(WorkerEvent::AccountSaved { account });
-            if account_enabled {
-                sync_account_inner(
-                    data_dir,
-                    cache,
-                    tokens,
-                    account_id,
-                    true,
-                    Some(&background.sync_coord),
-                    evt_tx,
-                )
-                .await;
-            }
-            let page_size = pref_page_size(data_dir);
-            let allowed = unified_account_ids(data_dir);
-            if let Ok(page) = cache.list_unified_inbox_for_accounts(
-                &allowed,
-                "",
-                QuickFilterSet::default(),
-                MessageSort::DateNewest,
-                0,
-                page_size,
-            ) {
-                let _ = evt_tx.send(WorkerEvent::MessagesPageLoaded(page));
-            }
-        }
+        // OAuth 浏览器回调等待已移出工作队列（在 worker_loop 中派发到独立任务）；
+        // 这里保留空分支以满足穷尽匹配。
+        MailRequest::StartMicrosoftOAuth { .. } | MailRequest::CancelMicrosoftOAuth => {}
 
         MailRequest::DeleteAccount { account_id } => {
             stop_account_idle_watcher(watchers, account_id);
@@ -3793,11 +3874,12 @@ async fn handle_request(
             local_draft_id,
             undo_token,
             timing,
+            idempotency_key,
         } => {
             let now_dt = chrono::Utc::now();
             let now = now_dt.timestamp();
             let (due_ts, scheduled) = resolve_send_due_ts(now_dt, timing);
-            let outbox_id = match cache.enqueue_outbox_from_draft(
+            let outcome = match cache.enqueue_outbox_from_draft_idempotent(
                 account_id,
                 &draft.to,
                 &draft.cc,
@@ -3813,8 +3895,9 @@ async fn handle_request(
                 now,
                 due_ts,
                 local_draft_id,
+                idempotency_key.as_deref(),
             ) {
-                Ok(id) => id,
+                Ok(outcome) => outcome,
                 Err(e) => {
                     let recovered_draft_id = cache
                         .upsert_draft(&crate::LocalDraft {
@@ -3844,37 +3927,63 @@ async fn handle_request(
                     return;
                 }
             };
-            // 原草稿交接给发件箱：记录落盘成功后立即删除，保证内容不丢也不重复。
-            if local_draft_id.is_some() {
-                if let Ok(drafts) = cache.list_drafts() {
-                    let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
-                }
-            }
-            // 所有发送模式均先发回执，携带实际持久化的 `send_at` 供 UI 推导进度与退出确认。
-            let _ = evt_tx.send(WorkerEvent::OutboxEnqueued {
-                token: undo_token,
-                account_id,
-                outbox_id,
-                send_at: due_ts,
-                scheduled,
-            });
-            if due_ts.is_none() {
-                send_outbox_item(
-                    data_dir,
-                    cache,
-                    tokens,
-                    account_id,
+            match outcome {
+                crate::cache::EnqueueOutboxOutcome::Enqueued {
                     outbox_id,
-                    Some(background),
-                    evt_tx,
-                )
-                .await;
-            }
-            if let Ok(outbox) = cache.list_outbox(account_id) {
-                let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
-                    account_id,
-                    items: outbox,
-                });
+                    send_at: persisted_due_ts,
+                } => {
+                    // 原草稿交接给发件箱：记录落盘成功后立即删除，保证内容不丢也不重复。
+                    if local_draft_id.is_some() {
+                        if let Ok(drafts) = cache.list_drafts() {
+                            let _ = evt_tx.send(WorkerEvent::DraftsUpdated { drafts });
+                        }
+                    }
+                    // 所有发送模式均先发回执，携带实际持久化的 `send_at` 供 UI 推导进度与退出确认。
+                    let _ = evt_tx.send(WorkerEvent::OutboxEnqueued {
+                        token: undo_token,
+                        account_id,
+                        outbox_id,
+                        send_at: persisted_due_ts,
+                        scheduled,
+                    });
+                    if persisted_due_ts.is_none() {
+                        send_outbox_item(
+                            data_dir,
+                            cache,
+                            tokens,
+                            account_id,
+                            outbox_id,
+                            Some(background),
+                            evt_tx,
+                        )
+                        .await;
+                    }
+                    if let Ok(outbox) = cache.list_outbox(account_id) {
+                        let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                            account_id,
+                            items: outbox,
+                        });
+                    }
+                }
+                crate::cache::EnqueueOutboxOutcome::Deduplicated {
+                    outbox_id,
+                    send_at: persisted_due_ts,
+                } => {
+                    // 幂等命中：直接返回原记录回执，绝不重复写入或再次触发投递。
+                    let _ = evt_tx.send(WorkerEvent::OutboxEnqueued {
+                        token: undo_token,
+                        account_id,
+                        outbox_id,
+                        send_at: persisted_due_ts,
+                        scheduled: persisted_due_ts.is_some() && scheduled,
+                    });
+                    if let Ok(outbox) = cache.list_outbox(account_id) {
+                        let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                            account_id,
+                            items: outbox,
+                        });
+                    }
+                }
             }
         }
 
@@ -3898,18 +4007,31 @@ async fn handle_request(
             account_id,
             outbox_id,
         } => {
-            // 撤销发送：仅删除仍在排队（Queued）的记录；已被领取投递的不可撤销。
-            match cache.delete_queued_outbox(outbox_id) {
-                Ok(true) => {
-                    if let Ok(outbox) = cache.list_outbox(account_id) {
-                        let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
-                            account_id,
-                            items: outbox,
-                        });
+            // 仅删除排队中 / 失败 / 结果待确认的记录；正在投递中（Sending）的不可删除。
+            match cache.delete_removable_outbox(account_id, outbox_id) {
+                Ok(deleted) => {
+                    let _ = evt_tx.send(WorkerEvent::OutboxItemDeleted {
+                        account_id,
+                        outbox_id,
+                        deleted,
+                        message: None,
+                    });
+                    if deleted {
+                        if let Ok(outbox) = cache.list_outbox(account_id) {
+                            let _ = evt_tx.send(WorkerEvent::OutboxUpdated {
+                                account_id,
+                                items: outbox,
+                            });
+                        }
                     }
                 }
-                Ok(false) => {}
                 Err(e) => {
+                    let _ = evt_tx.send(WorkerEvent::OutboxItemDeleted {
+                        account_id,
+                        outbox_id,
+                        deleted: false,
+                        message: Some(e.clone()),
+                    });
                     let _ = evt_tx.send(WorkerEvent::Error {
                         account_id: Some(account_id),
                         message: e,
@@ -5296,6 +5418,7 @@ async fn load_older_messages_inner(
 
     let mut total_fetched = 0usize;
     let mut any_more_remote = false;
+    let mut any_failed = false;
 
     for fid in targets {
         match fetch_older_batch_for_folder(
@@ -5319,12 +5442,18 @@ async fn load_older_messages_inner(
             }
             Ok(None) => {}
             Err(err) => {
+                any_failed = true;
                 let _ = evt_tx.send(WorkerEvent::Error {
                     account_id: Some(err.account_id),
                     message: format!("[{}] 加载更早邮件失败: {}", err.account_email, err.message),
                 });
             }
         }
+    }
+
+    if folder_id == 0 && any_failed {
+        // 部分账号/文件夹拉取失败时保留重试入口，不得误标统一收件箱已加载到底。
+        any_more_remote = true;
     }
 
     let _ = evt_tx.send(WorkerEvent::OlderMessagesLoaded {
@@ -6434,6 +6563,15 @@ mod tests {
         assert!(super::needs_target_credential_check(&edited, &[old]));
     }
     use super::*;
+
+    /// 为单个测试生成唯一的临时目录路径。调用方自行创建并在测试结束时清理。
+    fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
+    }
 
     #[cfg(windows)]
     #[test]
@@ -7809,6 +7947,135 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+
+        sender.send_checked(MailRequest::PrepareQuit).unwrap();
+        let quit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut prepared = false;
+            for evt in events.drain_events() {
+                if matches!(evt, WorkerEvent::QuitPrepared { result: Ok(()) }) {
+                    prepared = true;
+                }
+            }
+            if prepared || sender.send_checked(MailRequest::LoadAllCached).is_err() {
+                break;
+            }
+            assert!(Instant::now() < quit_deadline, "worker 未按预期停止");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(sender);
+        drop(events);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oauth_finish_handles_cancelled_and_failed_without_blocking_worker_loop() {
+        let dir = unique_test_dir("oauth-nonblocking");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = CacheStore::open_for_data_dir(&dir).unwrap();
+        drop(cache);
+
+        let worker = MailWorkerHandle::spawn(dir.clone()).unwrap();
+        let (sender, events) = worker.split();
+
+        // Dispatch a real QueryPage immediately after CancelMicrosoftOAuth;
+        // verify worker loop responds without hanging.
+        sender
+            .send_checked(MailRequest::CancelMicrosoftOAuth)
+            .unwrap();
+        let page = sender
+            .query_page(PageQueryRequest::UnifiedInbox {
+                query: String::new(),
+                filter: MessageFilter::All,
+                quick_filters: QuickFilterSet::default(),
+                sort: MessageSort::DateNewest,
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(page.total, 0);
+
+        // Verify SendDraft with persistent idempotency key creates only ONE outbox item on duplicate requests.
+        let draft = crate::ComposeDraft {
+            to: "dest@example.com".to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "幂等测试".to_string(),
+            body: "正文".to_string(),
+            in_reply_to: String::new(),
+            from_addr: String::new(),
+            reply_to: String::new(),
+            body_format: "plain".to_string(),
+            body_html: None,
+            attachment_paths: Vec::new(),
+        };
+        let key = Some("idem-key-1".to_string());
+        sender
+            .send_checked(MailRequest::SendDraft {
+                account_id: 1,
+                draft: draft.clone(),
+                local_draft_id: None,
+                undo_token: 10,
+                timing: crate::SendTiming::DelaySecs(30),
+                idempotency_key: key.clone(),
+            })
+            .unwrap();
+        sender
+            .send_checked(MailRequest::SendDraft {
+                account_id: 1,
+                draft,
+                local_draft_id: None,
+                undo_token: 11,
+                timing: crate::SendTiming::DelaySecs(30),
+                idempotency_key: key,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut enqueued_ids = Vec::new();
+        while enqueued_ids.len() < 2 {
+            assert!(Instant::now() < deadline, "等待幂等发件回执超时");
+            for evt in events.drain_events() {
+                if let WorkerEvent::OutboxEnqueued { outbox_id, .. } = evt {
+                    enqueued_ids.push(outbox_id);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(enqueued_ids[0], enqueued_ids[1]);
+
+        let cache = CacheStore::open_for_data_dir_read_only(&dir).unwrap();
+        assert_eq!(cache.list_outbox(1).unwrap().len(), 1);
+        drop(cache);
+
+        // Delete outbox item emits OutboxItemDeleted { deleted: true } and clears SQLite.
+        sender
+            .send_checked(MailRequest::DeleteOutboxItem {
+                account_id: 1,
+                outbox_id: enqueued_ids[0],
+            })
+            .unwrap();
+        let del_deadline = Instant::now() + Duration::from_secs(5);
+        let mut got_deleted = false;
+        while !got_deleted {
+            assert!(Instant::now() < del_deadline, "等待删除发件箱回执超时");
+            for evt in events.drain_events() {
+                if let WorkerEvent::OutboxItemDeleted {
+                    outbox_id,
+                    deleted: true,
+                    ..
+                } = evt
+                {
+                    if outbox_id == enqueued_ids[0] {
+                        got_deleted = true;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cache = CacheStore::open_for_data_dir_read_only(&dir).unwrap();
+        assert!(cache.list_outbox(1).unwrap().is_empty());
+        drop(cache);
 
         sender.send_checked(MailRequest::PrepareQuit).unwrap();
         let quit_deadline = Instant::now() + Duration::from_secs(5);

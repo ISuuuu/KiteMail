@@ -375,6 +375,12 @@ impl MailSession {
             .unwrap_or_default()
             .as_core_str()
             .to_string();
+        let idempotency_key = input
+            .client_request_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let compose_draft = ComposeDraft {
             to: input.to.trim().to_string(),
             cc: input.cc.trim().to_string(),
@@ -391,6 +397,24 @@ impl MailSession {
 
         match self.mode {
             AppMode::Demo => {
+                let existing_receipt = {
+                    let demo = self.demo.lock().expect("demo mutex poisoned");
+                    idempotency_key.as_ref().and_then(|key| {
+                        demo.send_idempotency
+                            .get(&(account_id, key.clone()))
+                            .copied()
+                    })
+                };
+                if let Some((outbox_id, undo_token, saved_send_at)) = existing_receipt {
+                    return Ok(SendMailOutput {
+                        accepted: true,
+                        undo_token: undo_token.to_string(),
+                        outbox_id: outbox_id.to_string(),
+                        undo_window_secs,
+                        scheduled_at: saved_send_at.filter(|_| scheduled_at.is_some()),
+                        state_version: self.state_version(),
+                    });
+                }
                 let (outbox_id, undo_token, items, removed_draft) = {
                     let mut demo = self.demo.lock().expect("demo mutex poisoned");
                     let Some(acc) = demo.account_configs.iter().find(|a| a.id == account_id) else {
@@ -435,6 +459,12 @@ impl MailSession {
                         undo_token,
                     };
                     demo.outbox.push(entry);
+                    if let Some(ref key) = idempotency_key {
+                        demo.send_idempotency.insert(
+                            (account_id, key.clone()),
+                            (outbox_id, undo_token, demo_send_at),
+                        );
+                    }
                     (outbox_id, undo_token, demo.outbox_dtos(), removed_draft)
                 };
 
@@ -471,7 +501,7 @@ impl MailSession {
                 })
             }
             AppMode::Live => {
-                let (worker, async_worker, undo_token, rx_opt) = {
+                let (worker, async_worker, undo_token, rx_opt, mock_dedup) = {
                     let mut live = self.live.lock().expect("live mutex poisoned");
                     if let Some(acc) = live.account_configs.iter().find(|a| a.id == account_id) {
                         if !acc.enabled {
@@ -483,10 +513,21 @@ impl MailSession {
                             None,
                         ));
                     }
-                    let undo_token = live.next_undo_token;
-                    live.next_undo_token = live.next_undo_token.saturating_add(1);
                     let worker = live.worker.clone();
                     let is_async = worker.as_ref().is_some_and(|w| w.is_async_worker());
+                    let mock_dedup = if !is_async {
+                        idempotency_key.as_ref().and_then(|key| {
+                            live.mock_send_idempotency
+                                .get(&(account_id, key.clone()))
+                                .copied()
+                        })
+                    } else {
+                        None
+                    };
+                    let undo_token = live.next_undo_token;
+                    if mock_dedup.is_none() {
+                        live.next_undo_token = live.next_undo_token.saturating_add(1);
+                    }
                     let rx_opt = if is_async {
                         let (tx, rx) = mpsc::channel();
                         live.waiters.send_enqueued.insert(undo_token, tx);
@@ -494,8 +535,19 @@ impl MailSession {
                     } else {
                         None
                     };
-                    (worker, is_async, undo_token, rx_opt)
+                    (worker, is_async, undo_token, rx_opt, mock_dedup)
                 };
+
+                if let Some((outbox_id, saved_token, saved_send_at)) = mock_dedup {
+                    return Ok(SendMailOutput {
+                        accepted: true,
+                        undo_token: saved_token.to_string(),
+                        outbox_id: outbox_id.to_string(),
+                        undo_window_secs,
+                        scheduled_at: scheduled_at.or(saved_send_at),
+                        state_version: self.state_version(),
+                    });
+                }
 
                 let Some(w) = worker else {
                     return Err(IpcError::unavailable("邮件后台服务尚未就绪", None));
@@ -507,6 +559,7 @@ impl MailSession {
                     local_draft_id,
                     undo_token,
                     timing,
+                    idempotency_key: idempotency_key.clone(),
                 });
 
                 if async_worker {
@@ -565,6 +618,12 @@ impl MailSession {
                         send_at: demo_send_at,
                     };
                     live.outbox_cache.entry(account_id).or_default().push(item);
+                    if let Some(ref key) = idempotency_key {
+                        live.mock_send_idempotency.insert(
+                            (account_id, key.clone()),
+                            (outbox_id, undo_token, demo_send_at),
+                        );
+                    }
                     (outbox_id, live.combined_outbox_dtos())
                 };
                 let ver = self.bump_state_version();
@@ -1112,22 +1171,36 @@ impl MailSession {
                 }
             }
             AppMode::Live => {
-                let (worker, removed, items) = {
+                let (worker, async_worker, can_delete, rx_opt, items_mock) = {
                     let mut live = self.live.lock().expect("live mutex poisoned");
                     live.refresh_account_outbox_from_db(account_id);
-                    let mut removed = false;
-                    if let Some(list) = live.outbox_cache.get_mut(&account_id) {
-                        if let Some(pos) = list
-                            .iter()
-                            .position(|i| i.id == outbox_id && i.status == OutboxStatus::Queued)
-                        {
-                            list.remove(pos);
-                            removed = true;
-                        }
-                    }
+                    let worker = live.worker.clone();
+                    let is_async = worker.as_ref().is_some_and(|w| w.is_async_worker());
                     let has_db = config::global_db_in(&live.data_dir).exists();
-                    let items = live.combined_outbox_dtos();
-                    (live.worker.clone(), removed || !has_db, items)
+                    let matched_status = live
+                        .outbox_cache
+                        .get(&account_id)
+                        .and_then(|list| list.iter().find(|i| i.id == outbox_id))
+                        .map(|i| i.status);
+                    let can_delete = match matched_status {
+                        Some(OutboxStatus::Sending) => false,
+                        Some(
+                            OutboxStatus::Queued | OutboxStatus::Failed | OutboxStatus::Uncertain,
+                        ) => true,
+                        None => !has_db && worker.is_some(),
+                    };
+                    if !can_delete {
+                        (worker, is_async, false, None, Vec::new())
+                    } else if is_async {
+                        let (tx, rx) = mpsc::channel();
+                        live.waiters.outbox_deleted.insert(outbox_id, tx);
+                        (worker, true, true, Some(rx), Vec::new())
+                    } else {
+                        if let Some(list) = live.outbox_cache.get_mut(&account_id) {
+                            list.retain(|i| i.id != outbox_id);
+                        }
+                        (worker, false, true, None, live.combined_outbox_dtos())
+                    }
                 };
                 let Some(w) = worker else {
                     return Ok(OutboxItemActionOutput {
@@ -1135,7 +1208,7 @@ impl MailSession {
                         state_version: self.state_version(),
                     });
                 };
-                if !removed {
+                if !can_delete {
                     return Ok(OutboxItemActionOutput {
                         accepted: false,
                         state_version: self.state_version(),
@@ -1145,10 +1218,25 @@ impl MailSession {
                     account_id,
                     outbox_id,
                 });
+                if async_worker {
+                    let rx = rx_opt.expect("async delete outbox waiter missing");
+                    let deleted = rx
+                        .recv_timeout(WORKER_WAIT_TIMEOUT)
+                        .map_err(|_| {
+                            let mut live = self.live.lock().expect("live mutex poisoned");
+                            live.waiters.outbox_deleted.remove(&outbox_id);
+                            IpcError::unavailable("删除发件箱记录超时，请刷新后重试", None)
+                        })?
+                        .map_err(|msg| IpcError::internal(msg, None))?;
+                    return Ok(OutboxItemActionOutput {
+                        accepted: deleted,
+                        state_version: self.state_version(),
+                    });
+                }
                 let ver = self.bump_state_version();
                 self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
                     state_version: ver,
-                    items,
+                    items: items_mock,
                     event_kind: OutboxEventKindDto::Updated,
                     undo_token: None,
                     outbox_id: Some(outbox_id.to_string()),
@@ -1344,6 +1432,7 @@ mod tests {
                 local_draft_id: None,
                 undo_delay_secs: None,
                 scheduled_at: None,
+                client_request_id: None,
             })
             .unwrap_err();
         assert_eq!(empty_to.code, "INVALID_INPUT");
@@ -1365,6 +1454,7 @@ mod tests {
                 local_draft_id: None,
                 undo_delay_secs: None,
                 scheduled_at: None,
+                client_request_id: None,
             })
             .unwrap_err();
         assert_eq!(bad_acc.code, "INVALID_INPUT");
@@ -1386,6 +1476,7 @@ mod tests {
                 local_draft_id: None,
                 undo_delay_secs: None,
                 scheduled_at: Some(1_000_000),
+                client_request_id: None,
             })
             .unwrap_err();
         assert_eq!(past_sched.code, "INVALID_INPUT");
@@ -1432,6 +1523,7 @@ mod tests {
                 local_draft_id: Some(draft.draft.id),
                 undo_delay_secs: Some(1),
                 scheduled_at: None,
+                client_request_id: None,
             })
             .expect("enqueue send");
         assert!(sent.accepted);
@@ -1486,10 +1578,23 @@ mod tests {
                 local_draft_id: None,
                 undo_delay_secs: Some(0),
                 scheduled_at: None,
+                client_request_id: None,
             })
             .expect("immediate send");
         assert_eq!(immediate.undo_window_secs, 0);
-        std::thread::sleep(Duration::from_millis(120));
+        let delivery_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < delivery_deadline {
+            if emitter
+                .outbox_updated
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.event_kind == OutboxEventKindDto::Sent)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(emitter
             .outbox_updated
             .lock()
@@ -1555,6 +1660,7 @@ mod tests {
                     local_draft_id: None,
                     undo_delay_secs: None,
                     scheduled_at: None,
+                    client_request_id: None,
                 })
                 .unwrap_err()
                 .code,
@@ -1631,6 +1737,7 @@ mod tests {
                 local_draft_id: Some("1".to_string()),
                 undo_delay_secs: Some(5),
                 scheduled_at: None,
+                client_request_id: None,
             })
             .unwrap();
         assert!(send_out.accepted);
@@ -1676,5 +1783,174 @@ mod tests {
         assert_eq!(undo_in.account_id, "1");
         assert_eq!(undo_in.outbox_id, "7");
         assert_eq!(undo_in.undo_token, "99");
+    }
+
+    #[test]
+    fn send_mail_idempotency_and_outbox_delete_status_contract_work() {
+        let (demo_session, _, demo_dir) = make_demo_arc_session();
+        let first = demo_session
+            .send_mail(&SendMailInput {
+                account_id: "1".to_string(),
+                to: "dup@example.com".to_string(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: "幂等主题".to_string(),
+                body: "内容".to_string(),
+                in_reply_to: None,
+                from_addr: None,
+                reply_to: None,
+                body_format: None,
+                body_html: None,
+                attachment_paths: Vec::new(),
+                local_draft_id: None,
+                undo_delay_secs: Some(10),
+                scheduled_at: None,
+                client_request_id: Some("req-idem-1".to_string()),
+            })
+            .expect("first demo send");
+        let retry = demo_session
+            .send_mail(&SendMailInput {
+                account_id: "1".to_string(),
+                to: "dup@example.com".to_string(),
+                cc: String::new(),
+                bcc: String::new(),
+                subject: "幂等主题".to_string(),
+                body: "内容".to_string(),
+                in_reply_to: None,
+                from_addr: None,
+                reply_to: None,
+                body_format: None,
+                body_html: None,
+                attachment_paths: Vec::new(),
+                local_draft_id: None,
+                undo_delay_secs: Some(10),
+                scheduled_at: None,
+                client_request_id: Some("req-idem-1".to_string()),
+            })
+            .expect("retry demo send");
+        assert_eq!(first.outbox_id, retry.outbox_id);
+        assert_eq!(demo_session.list_outbox().unwrap().items.len(), 1);
+        let _ = std::fs::remove_dir_all(&demo_dir);
+
+        let (live_session, _, _, worker, live_dir) = make_live_test_session(false, None);
+        {
+            let mut live = live_session.live.lock().unwrap();
+            live.outbox_cache.insert(
+                1,
+                vec![
+                    OutboxItem {
+                        id: 1,
+                        account_id: 1,
+                        to_addr: "a@b.com".to_string(),
+                        cc_addr: String::new(),
+                        bcc_addr: String::new(),
+                        subject: "queued".to_string(),
+                        body_text: String::new(),
+                        in_reply_to: String::new(),
+                        from_addr: String::new(),
+                        reply_to: String::new(),
+                        body_format: "plain".to_string(),
+                        body_html: None,
+                        attachment_paths: Vec::new(),
+                        status: OutboxStatus::Queued,
+                        last_error: String::new(),
+                        send_at: None,
+                    },
+                    OutboxItem {
+                        id: 2,
+                        account_id: 1,
+                        to_addr: "a@b.com".to_string(),
+                        cc_addr: String::new(),
+                        bcc_addr: String::new(),
+                        subject: "sending".to_string(),
+                        body_text: String::new(),
+                        in_reply_to: String::new(),
+                        from_addr: String::new(),
+                        reply_to: String::new(),
+                        body_format: "plain".to_string(),
+                        body_html: None,
+                        attachment_paths: Vec::new(),
+                        status: OutboxStatus::Sending,
+                        last_error: String::new(),
+                        send_at: None,
+                    },
+                    OutboxItem {
+                        id: 3,
+                        account_id: 1,
+                        to_addr: "a@b.com".to_string(),
+                        cc_addr: String::new(),
+                        bcc_addr: String::new(),
+                        subject: "failed".to_string(),
+                        body_text: String::new(),
+                        in_reply_to: String::new(),
+                        from_addr: String::new(),
+                        reply_to: String::new(),
+                        body_format: "plain".to_string(),
+                        body_html: None,
+                        attachment_paths: Vec::new(),
+                        status: OutboxStatus::Failed,
+                        last_error: "err".to_string(),
+                        send_at: None,
+                    },
+                    OutboxItem {
+                        id: 4,
+                        account_id: 1,
+                        to_addr: "a@b.com".to_string(),
+                        cc_addr: String::new(),
+                        bcc_addr: String::new(),
+                        subject: "uncertain".to_string(),
+                        body_text: String::new(),
+                        in_reply_to: String::new(),
+                        from_addr: String::new(),
+                        reply_to: String::new(),
+                        body_format: "plain".to_string(),
+                        body_html: None,
+                        attachment_paths: Vec::new(),
+                        status: OutboxStatus::Uncertain,
+                        last_error: "uncertain".to_string(),
+                        send_at: None,
+                    },
+                ],
+            );
+        }
+
+        assert!(
+            live_session
+                .delete_outbox_item(&OutboxItemActionInput {
+                    account_id: "1".to_string(),
+                    outbox_id: "1".to_string(),
+                })
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            !live_session
+                .delete_outbox_item(&OutboxItemActionInput {
+                    account_id: "1".to_string(),
+                    outbox_id: "2".to_string(),
+                })
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            live_session
+                .delete_outbox_item(&OutboxItemActionInput {
+                    account_id: "1".to_string(),
+                    outbox_id: "3".to_string(),
+                })
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            live_session
+                .delete_outbox_item(&OutboxItemActionInput {
+                    account_id: "1".to_string(),
+                    outbox_id: "4".to_string(),
+                })
+                .unwrap()
+                .accepted
+        );
+        assert_eq!(worker.requests.lock().unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(&live_dir);
     }
 }

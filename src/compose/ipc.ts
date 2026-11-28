@@ -115,6 +115,7 @@ let mockSendError: IpcError | null = null;
 
 let mockDrafts: LocalDraftDto[] = [];
 let mockOutbox: OutboxItemDto[] = [];
+let mockSendRequests: SendMailInput[] = [];
 const mockUndoEntries = new Map<string, MockUndoEntry>();
 
 function clearAllMockTimers(): void {
@@ -285,6 +286,7 @@ export async function deleteDraft(input: DeleteDraftInput): Promise<DeleteDraftO
 
 export async function sendMail(input: SendMailInput): Promise<SendMailOutput> {
   if (isTauri()) return tauriInvoke<SendMailOutput>("send_mail", { input });
+  mockSendRequests.push({ ...input });
   if (mockLocked) return Promise.reject(makeLockedError());
   if (mockSendError) return Promise.reject({ ...mockSendError });
 
@@ -544,10 +546,16 @@ export function resetMockComposeState(options?: {
   mockSendError = options?.sendError ?? null;
   mockDrafts = (options?.drafts ?? []).map(cloneDraft);
   mockOutbox = (options?.outbox ?? []).map(cloneOutboxItem);
+  mockSendRequests = [];
 }
 
 export function flushMockOutboxDelivery(outboxId: string): void {
   completeMockDelivery(outboxId);
+}
+
+/** 返回 Mock 传输层收到的发件请求快照（按调用顺序），供幂等键测试断言。 */
+export function getMockSendRequests(): SendMailInput[] {
+  return mockSendRequests.map((req) => ({ ...req }));
 }
 
 export function emitMockComposeEvent<K extends keyof MockComposeBus>(

@@ -422,6 +422,11 @@ fn main() {
             settings::manage_trusted_senders,
             settings::clear_body_caches,
             settings::check_app_update,
+            settings::install_app_update,
+            settings::export_settings_backup,
+            settings::preview_settings_backup,
+            settings::import_settings_backup,
+            settings::open_data_directory,
             window_lifecycle::reveal_main_window,
             window_lifecycle::show_window_system_menu,
         ])

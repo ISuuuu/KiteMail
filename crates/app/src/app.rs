@@ -3473,6 +3473,7 @@ impl HylkiApp {
                         cx,
                     );
                 }
+                WorkerEvent::OutboxItemDeleted { .. } => {}
                 WorkerEvent::MessageArchived {
                     account_id,
                     message_id,
@@ -5165,6 +5166,18 @@ impl HylkiApp {
                     cx.notify();
                 }
             }
+            WebViewAction::CardOpenAttachment(att_id) => {
+                if let Some(att) = detail
+                    .thread_messages
+                    .iter()
+                    .flat_map(|m| m.attachments.iter())
+                    .find(|a| a.id == att_id)
+                {
+                    let filename = att.filename.clone();
+                    self.save_attachment(att_id, &filename, cx);
+                }
+            }
+            WebViewAction::FindCount { .. } => {}
             WebViewAction::ScrollAnchor { .. } => {}
         }
     }
@@ -9034,6 +9047,7 @@ impl HylkiApp {
                 local_draft_id: pending.local_draft_id,
                 undo_token: token,
                 timing,
+                idempotency_key: None,
             };
             let result = self
                 .worker

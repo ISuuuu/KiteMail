@@ -99,9 +99,18 @@ impl MainEventEmitter for TauriMainEventEmitter {
     }
 
     fn emit_lock_state(&self, event: LockStateEvent) {
+        let locked = event.locked;
         let _ = self
             .app_handle
-            .emit_to(MAIN_WINDOW_LABEL, EVENT_LOCK_STATE, event);
+            .emit_to(MAIN_WINDOW_LABEL, EVENT_LOCK_STATE, event.clone());
+        let _ = self.app_handle.emit_to(
+            crate::settings_window::SETTINGS_WINDOW_LABEL,
+            EVENT_LOCK_STATE,
+            event,
+        );
+        if locked {
+            crate::settings_window::close_settings_window(&self.app_handle);
+        }
     }
 
     fn emit_outbox_updated(&self, event: OutboxUpdatedEvent) {
@@ -119,7 +128,12 @@ impl MainEventEmitter for TauriMainEventEmitter {
     fn emit_account_event(&self, event: AccountEvent) {
         let _ = self
             .app_handle
-            .emit_to(MAIN_WINDOW_LABEL, EVENT_ACCOUNT_EVENT, event);
+            .emit_to(MAIN_WINDOW_LABEL, EVENT_ACCOUNT_EVENT, event.clone());
+        let _ = self.app_handle.emit_to(
+            crate::settings_window::SETTINGS_WINDOW_LABEL,
+            EVENT_ACCOUNT_EVENT,
+            event,
+        );
     }
 
     fn emit_thread_card_action(&self, event: ThreadCardActionEvent) {
@@ -205,6 +219,7 @@ pub(crate) struct DemoSessionState {
     pub(crate) outbox: Vec<DemoOutboxEntry>,
     pub(crate) next_outbox_id: u32,
     pub(crate) next_undo_token: u64,
+    pub(crate) send_idempotency: HashMap<(u32, String), (u32, u64, Option<i64>)>,
     pub(crate) next_sent_msg_id: u32,
     pub(crate) user_contacts: Vec<UserContact>,
     pub(crate) next_user_contact_id: u32,
@@ -246,7 +261,10 @@ impl DemoSessionState {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        let accounts = account_configs.iter().map(AccountSummaryDto::from).collect();
+        let accounts = account_configs
+            .iter()
+            .map(AccountSummaryDto::from)
+            .collect();
         let base_folders: Vec<FolderSummaryDto> =
             store.folders.iter().map(FolderSummaryDto::from).collect();
         let inbox = store.all_inbox_messages().to_vec();
@@ -272,6 +290,7 @@ impl DemoSessionState {
             outbox: Vec::new(),
             next_outbox_id: 1,
             next_undo_token: 1,
+            send_idempotency: HashMap::new(),
             next_sent_msg_id: 100_000,
             user_contacts: vec![UserContact {
                 id: 1,
@@ -589,7 +608,8 @@ impl DemoSessionState {
             .iter()
             .find(|f| {
                 f.account_id == account_id
-                    && (f.path.eq_ignore_ascii_case(trimmed) || f.name.eq_ignore_ascii_case(trimmed))
+                    && (f.path.eq_ignore_ascii_case(trimmed)
+                        || f.name.eq_ignore_ascii_case(trimmed))
             })
             .map(|f| (f.id, f.path.clone()))
     }
@@ -754,6 +774,7 @@ pub(crate) struct LiveWaiters {
     pub(crate) draft_saved: VecDeque<mpsc::Sender<Result<u32, String>>>,
     pub(crate) send_enqueued: HashMap<u64, mpsc::Sender<Result<(u32, Option<i64>, bool), String>>>,
     pub(crate) undo_result: HashMap<u64, mpsc::Sender<Result<UndoOutboxOutcome, String>>>,
+    pub(crate) outbox_deleted: HashMap<u32, mpsc::Sender<Result<bool, String>>>,
     pub(crate) verify_account: VecDeque<mpsc::Sender<VerifyAccountOutput>>,
     pub(crate) save_account: HashMap<u32, mpsc::Sender<Result<AccountConfig, String>>>,
     pub(crate) delete_account: HashMap<u32, mpsc::Sender<()>>,
@@ -776,6 +797,8 @@ pub(crate) struct LiveSessionState {
     pub(crate) waiters: LiveWaiters,
     pub(crate) cache_ready: bool,
     pub(crate) syncing_accounts: HashSet<u32>,
+    pub(crate) synced_on_open_folders: HashSet<(u32, u32)>,
+    pub(crate) mock_send_idempotency: HashMap<(u32, String), (u32, u64, Option<i64>)>,
     in_flight_bodies: HashMap<(u32, u32), InFlightBodyEntry>,
     in_flight_gen: u64,
     pub(crate) body_cache: HashMap<(u32, u32), MessageDetail>,
@@ -799,6 +822,8 @@ impl LiveSessionState {
             waiters: LiveWaiters::default(),
             cache_ready: false,
             syncing_accounts: HashSet::new(),
+            synced_on_open_folders: HashSet::new(),
+            mock_send_idempotency: HashMap::new(),
             in_flight_bodies: HashMap::new(),
             in_flight_gen: 0,
             body_cache: HashMap::new(),
@@ -1799,25 +1824,30 @@ impl MailSession {
                     folder_id,
                 } = input.view
                 {
-                    // Switching into a specific account folder schedules a background sync for that
-                    // folder so Outlook Graph folders load remote headers without user manual refresh.
-                    if prev_view != input.view && input.offset == 0 {
-                        let (worker, folder_path) = {
-                            let live = self.live.lock().expect("live mutex poisoned");
+                    // Switching into a specific account folder (or opening a restored non-inbox
+                    // folder for the first time after startup) schedules a deduplicated background
+                    // sync so Outlook Graph / IMAP subfolders load remote headers immediately.
+                    if input.offset == 0 {
+                        let (worker, folder_path, first_open_sync) = {
+                            let mut live = self.live.lock().expect("live mutex poisoned");
+                            let first_open =
+                                live.synced_on_open_folders.insert((account_id, folder_id));
                             let path = live
                                 .folders_by_account
                                 .get(&account_id)
                                 .and_then(|fs| fs.iter().find(|f| f.id == folder_id))
                                 .map(|f| f.path.clone());
-                            (live.worker.clone(), path)
+                            (live.worker.clone(), path, first_open)
                         };
-                        if let (Some(w), Some(path)) = (worker, folder_path) {
-                            w.send(MailRequest::SyncFolder {
-                                account_id,
-                                folder_id,
-                                folder_path: path,
-                                user_initiated: false,
-                            });
+                        if prev_view != input.view || first_open_sync {
+                            if let (Some(w), Some(path)) = (worker, folder_path) {
+                                w.send(MailRequest::SyncFolder {
+                                    account_id,
+                                    folder_id,
+                                    folder_path: path,
+                                    user_initiated: false,
+                                });
+                            }
                         }
                     }
                 }
@@ -2194,9 +2224,10 @@ impl MailSession {
                 if !config::global_db_in(&data_dir).exists() {
                     Vec::new()
                 } else {
-                    let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
-                        IpcError::internal(format!("打开本地只读缓存失败: {e}"), None)
-                    })?;
+                    let cache =
+                        CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
+                            IpcError::internal(format!("打开本地只读缓存失败: {e}"), None)
+                        })?;
                     cache
                         .list_thread_summaries(input.account_id, input.message_id, &input.subject)
                         .map_err(|e| IpcError::internal(format!("加载会话子邮件失败: {e}"), None))?
@@ -2978,6 +3009,41 @@ impl MailSession {
                         });
                     }
                 }
+                WorkerEvent::OutboxItemDeleted {
+                    account_id,
+                    outbox_id,
+                    deleted,
+                    message,
+                } => {
+                    let items = {
+                        let mut live = self.live.lock().expect("live mutex poisoned");
+                        if deleted {
+                            if let Some(list) = live.outbox_cache.get_mut(&account_id) {
+                                list.retain(|item| item.id != outbox_id);
+                            }
+                            live.refresh_account_outbox_from_db(account_id);
+                        }
+                        if let Some(tx) = live.waiters.outbox_deleted.remove(&outbox_id) {
+                            let result = match message {
+                                Some(err) if !deleted => Err(err),
+                                _ => Ok(deleted),
+                            };
+                            let _ = tx.send(result);
+                        }
+                        live.combined_outbox_dtos()
+                    };
+                    if deleted {
+                        let ver = self.bump_state_version();
+                        self.emitter.emit_outbox_updated(OutboxUpdatedEvent {
+                            state_version: ver,
+                            items,
+                            event_kind: OutboxEventKindDto::Updated,
+                            undo_token: None,
+                            outbox_id: Some(outbox_id.to_string()),
+                            message: None,
+                        });
+                    }
+                }
                 WorkerEvent::OutboxEnqueueFailed {
                     token,
                     message,
@@ -3236,14 +3302,29 @@ impl MailSession {
                     {
                         let mut live = self.live.lock().expect("live mutex poisoned");
                         live.cache_ready = true;
-                        for folders in live.folders_by_account.values_mut() {
-                            for f in folders.iter_mut() {
-                                if folder_id == 0 {
-                                    if is_inbox_folder(f) {
+                        if folder_id == 0 {
+                            // 统一收件箱按文件夹分别回写游标：单账号成功结果已由 `FoldersLoaded`
+                            // 按文件夹更新；仅当全部统一账号均确认无更多且无失败时才整体收口。
+                            if !has_more_remote {
+                                let unified_ids = live.unified_account_ids();
+                                let enforce_scope = !live.account_configs.is_empty();
+                                for folders in live.folders_by_account.values_mut() {
+                                    for f in folders.iter_mut() {
+                                        if is_inbox_folder(f)
+                                            && (!enforce_scope
+                                                || unified_ids.contains(&f.account_id))
+                                        {
+                                            f.has_more_remote = false;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            for folders in live.folders_by_account.values_mut() {
+                                for f in folders.iter_mut() {
+                                    if f.id == folder_id {
                                         f.has_more_remote = has_more_remote;
                                     }
-                                } else if f.id == folder_id {
-                                    f.has_more_remote = has_more_remote;
                                 }
                             }
                         }
@@ -3305,12 +3386,16 @@ impl MailSession {
                     let tag_pairs = self.decorate_tag_pairs(&tags);
                     let raw_prefs = self.prefs.snapshot_raw();
                     let appearance = self.current_reader_appearance(raw_prefs.block_remote_images);
-                    self.reader
-                        .rerender_matching_document(account_id, message_id, &appearance, |spec| {
+                    self.reader.rerender_matching_document(
+                        account_id,
+                        message_id,
+                        &appearance,
+                        |spec| {
                             if let Some(ref mut thread) = spec.thread {
                                 thread.card_tags.insert(message_id, tag_pairs);
                             }
-                        });
+                        },
+                    );
                 }
                 WorkerEvent::AttachmentBytesFetched {
                     attachment_id,
@@ -4344,7 +4429,11 @@ impl MailSession {
         let detail = self.load_detail_for_action(input.account_id, input.message_id)?;
         let is_in_spam = {
             let p = detail.folder_path.trim().to_ascii_lowercase();
-            p == "junk" || p == "spam" || p == "junkemail" || p.contains("spam") || p.contains("junk")
+            p == "junk"
+                || p == "spam"
+                || p == "junkemail"
+                || p.contains("spam")
+                || p.contains("junk")
         };
         if !is_in_spam {
             return Err(IpcError::invalid_input(
@@ -4361,9 +4450,8 @@ impl MailSession {
                     .expect("live mutex poisoned")
                     .data_dir
                     .clone();
-                let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
-                    IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None)
-                })?;
+                let cache = CacheStore::open_for_data_dir_read_only(&data_dir)
+                    .map_err(|e| IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None))?;
                 cache
                     .find_inbox_folder(input.account_id)
                     .map_err(|e| IpcError::internal(format!("查询收件箱失败: {e}"), None))?
@@ -4394,9 +4482,8 @@ impl MailSession {
                 if !config::global_db_in(&data_dir).exists() {
                     return Ok(Vec::new());
                 }
-                let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
-                    IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None)
-                })?;
+                let cache = CacheStore::open_for_data_dir_read_only(&data_dir)
+                    .map_err(|e| IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None))?;
                 let items = cache
                     .list_tags()
                     .map_err(|e| IpcError::internal(format!("读取标签列表失败: {e}"), None))?;
@@ -4515,8 +4602,7 @@ impl MailSession {
                                 uids.push(tm.uid);
                             }
                         }
-                        if let Ok(summaries) =
-                            cache.list_summaries_by_uids(detail.folder_id, &uids)
+                        if let Ok(summaries) = cache.list_summaries_by_uids(detail.folder_id, &uids)
                         {
                             for s in summaries {
                                 if !s.tags.is_empty() {
@@ -4568,9 +4654,8 @@ impl MailSession {
                     let live = self.live.lock().expect("live mutex poisoned");
                     (live.data_dir.clone(), live.worker.clone())
                 };
-                let mut cache = CacheStore::open_for_data_dir(&data_dir).map_err(|e| {
-                    IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None)
-                })?;
+                let mut cache = CacheStore::open_for_data_dir(&data_dir)
+                    .map_err(|e| IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None))?;
                 cache
                     .set_message_tags(input.message_id, &normalized)
                     .map_err(|e| IpcError::internal(format!("更新标签失败: {e}"), None))?;
@@ -5319,12 +5404,11 @@ impl ThreadActionHandler for MailSession {
                     .expect("active_reader_session_id mutex poisoned")
                     .clone()
                     .unwrap_or_default();
-                self.emitter
-                    .emit_reader_find_result(ReaderFindResultEvent {
-                        reader_session_id,
-                        current,
-                        total,
-                    });
+                self.emitter.emit_reader_find_result(ReaderFindResultEvent {
+                    reader_session_id,
+                    current,
+                    total,
+                });
             }
         }
     }
@@ -7190,7 +7274,9 @@ pub(crate) mod tests {
         fn prepare_quit(&self) {}
         fn query_page(&self, _req: PageQueryRequest) -> Option<Result<MailPage, String>> {
             self.query_calls.fetch_add(1, Ordering::SeqCst);
-            Some(Err("should not route list query through async worker".to_string()))
+            Some(Err(
+                "should not route list query through async worker".to_string()
+            ))
         }
         fn is_async_worker(&self) -> bool {
             true
@@ -7385,12 +7471,13 @@ pub(crate) mod tests {
             .expect("load_older_messages on outlook inbox");
         assert!(older.accepted);
         assert!(older.has_more_remote);
-        assert!(worker
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|r| matches!(r, MailRequest::LoadOlderMessages { folder_id: 0, limit: 50 })));
+        assert!(worker.requests.lock().unwrap().iter().any(|r| matches!(
+            r,
+            MailRequest::LoadOlderMessages {
+                folder_id: 0,
+                limit: 50
+            }
+        )));
 
         session.process_worker_events(vec![WorkerEvent::OlderMessagesLoaded {
             folder_id: 0,
@@ -7399,6 +7486,138 @@ pub(crate) mod tests {
         }]);
         let boot = session.bootstrap();
         assert!(!boot.folders[0].has_more_remote);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restored_non_inbox_folder_triggers_single_first_sync_and_unified_pagination_preserves_retry()
+    {
+        let (session, _, _, worker, dir) = make_live_test_session(true, None);
+        let custom_fid = 77u32;
+        {
+            let mut live = session.live.lock().unwrap();
+            live.account_configs.push(AccountConfig {
+                id: 2,
+                email: "second@example.com".to_string(),
+                enabled: true,
+                in_unified: true,
+                ..AccountConfig::default()
+            });
+            live.folders_by_account
+                .entry(1)
+                .or_default()
+                .push(FolderSummaryDto {
+                    account_id: 1,
+                    id: custom_fid,
+                    name: "Archive/2026".to_string(),
+                    path: "Archive/2026".to_string(),
+                    unread_count: 0,
+                    total_count: 0,
+                    has_more_remote: true,
+                });
+            live.folders_by_account.insert(
+                2,
+                vec![FolderSummaryDto {
+                    account_id: 2,
+                    id: 201,
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 0,
+                    total_count: 0,
+                    has_more_remote: true,
+                }],
+            );
+        }
+
+        // Simulate startup restoring `current_view` to the non-inbox AccountFolder.
+        let restored = MainViewDto::AccountFolder {
+            account_id: 1,
+            folder_id: custom_fid,
+        };
+        *session.current_view.lock().unwrap() = restored;
+
+        session
+            .list_messages(&ListMessagesInput {
+                request_id: "restored-1".to_string(),
+                view: restored,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: crate::dto::MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 50,
+            })
+            .expect("first open of restored non-inbox folder");
+
+        // Reloading the same restored view must NOT trigger a second SyncFolder.
+        session
+            .list_messages(&ListMessagesInput {
+                request_id: "restored-2".to_string(),
+                view: restored,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: crate::dto::MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 50,
+            })
+            .expect("second open of restored non-inbox folder");
+
+        let sync_count = worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    MailRequest::SyncFolder {
+                        account_id: 1,
+                        folder_id,
+                        ..
+                    } if *folder_id == custom_fid
+                )
+            })
+            .count();
+        assert_eq!(sync_count, 1);
+
+        // Unified pagination: Account 1 finishes (`FoldersLoaded` has_more_remote=false),
+        // Account 2 fails (`OlderMessagesLoaded` has_more_remote=true).
+        // Account 1 stays false while Account 2 stays true and retry remains available.
+        let acc1_inbox_id = session.live.lock().unwrap().folders_by_account[&1][0].id;
+        session.process_worker_events(vec![
+            WorkerEvent::FoldersLoaded {
+                account_id: 1,
+                folders: vec![kitemail_mail_core::FolderSummary {
+                    id: acc1_inbox_id,
+                    account_id: 1,
+                    name: "收件箱".to_string(),
+                    path: "INBOX".to_string(),
+                    unread_count: 0,
+                    total_count: 2,
+                    has_more_remote: false,
+                }],
+            },
+            WorkerEvent::OlderMessagesLoaded {
+                folder_id: 0,
+                fetched_count: 0,
+                has_more_remote: true,
+            },
+        ]);
+
+        let live = session.live.lock().unwrap();
+        assert!(!live.folders_by_account[&1][0].has_more_remote);
+        assert!(live.folders_by_account[&2][0].has_more_remote);
+        drop(live);
+
+        let retry_out = session
+            .load_older_messages(&LoadOlderMessagesInput {
+                view: MainViewDto::UnifiedInbox,
+                limit: 50,
+            })
+            .expect("unified retry remains available");
+        assert!(retry_out.has_more_remote);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

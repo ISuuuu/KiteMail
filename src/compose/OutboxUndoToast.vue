@@ -40,6 +40,7 @@
               重试
             </button>
             <button
+              v-if="item.status !== 'sending'"
               type="button"
               class="km-outbox-btn"
               :disabled="busyOutboxId === item.id"

@@ -22,6 +22,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use account_db::AccountDb;
+pub use global_db::EnqueueOutboxOutcome;
 use global_db::GlobalDb;
 pub use id_codec::{decode_scoped_id, encode_scoped_id};
 use merge::{
@@ -2192,6 +2193,46 @@ impl CacheStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_outbox_from_draft_idempotent(
+        &mut self,
+        account_id: u32,
+        to_addr: &str,
+        cc_addr: &str,
+        bcc_addr: &str,
+        subject: &str,
+        body_text: &str,
+        in_reply_to: &str,
+        from_addr: &str,
+        reply_to: &str,
+        body_format: &str,
+        body_html: Option<&str>,
+        attachment_paths: &[String],
+        created_at: i64,
+        send_at: Option<i64>,
+        local_draft_id: Option<u32>,
+        idempotency_key: Option<&str>,
+    ) -> Result<EnqueueOutboxOutcome, String> {
+        self.global.enqueue_outbox_from_draft_idempotent(
+            account_id,
+            to_addr,
+            cc_addr,
+            bcc_addr,
+            subject,
+            body_text,
+            in_reply_to,
+            from_addr,
+            reply_to,
+            body_format,
+            body_html,
+            attachment_paths,
+            created_at,
+            send_at,
+            local_draft_id,
+            idempotency_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_outbox_from_draft(
         &mut self,
         account_id: u32,
@@ -2289,6 +2330,14 @@ impl CacheStore {
 
     pub fn delete_queued_outbox(&mut self, outbox_id: u32) -> Result<bool, String> {
         self.global.delete_queued_outbox(outbox_id)
+    }
+
+    pub fn delete_removable_outbox(
+        &mut self,
+        account_id: u32,
+        outbox_id: u32,
+    ) -> Result<bool, String> {
+        self.global.delete_removable_outbox(account_id, outbox_id)
     }
 
     pub fn list_outbox(&self, account_id: u32) -> Result<Vec<OutboxItem>, String> {

@@ -625,6 +625,8 @@ export function useCompose(options: UseComposeOptions = {}): UseComposeReturn {
   const stateVersion = ref(0);
 
   let formRevision = 0;
+  let pendingSendRequestId: string | null = null;
+  let pendingSendRevision: number | null = null;
   let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
   let undoTickTimer: ReturnType<typeof setInterval> | null = null;
   let initialized = false;
@@ -956,6 +958,13 @@ export function useCompose(options: UseComposeOptions = {}): UseComposeReturn {
     clearAutoSaveTimer();
     sending.value = true;
 
+    // 幂等键：同一份编辑内容（formRevision 未变）的重试复用同一个 id，
+    // 编辑内容或切换会话后再发则重新生成，避免回执超时重试生成第二条发件记录。
+    if (pendingSendRequestId === null || pendingSendRevision !== formRevision) {
+      pendingSendRequestId = crypto.randomUUID();
+      pendingSendRevision = formRevision;
+    }
+
     const currentSnapshot = snapshotForm(form.value);
     const { body, bodyFormat, bodyHtml } = buildSendBodyPayload(
       form.value.bodyText,
@@ -978,10 +987,12 @@ export function useCompose(options: UseComposeOptions = {}): UseComposeReturn {
       localDraftId: form.value.localDraftId,
       undoDelaySecs: sendOpts.undoDelaySecs ?? null,
       scheduledAt: form.value.scheduledAt,
+      clientRequestId: pendingSendRequestId,
     };
 
     try {
       const res = await sendMail(payload);
+      pendingSendRequestId = null;
       stateVersion.value = Math.max(stateVersion.value, res.stateVersion);
 
       if (currentSnapshot.localDraftId) {

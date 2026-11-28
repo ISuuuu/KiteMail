@@ -9,6 +9,18 @@ use super::id_codec::MAX_SLOT;
 use super::TagItem;
 use crate::{LocalDraft, MailTemplate, OutboxItem, OutboxStatus, UserContact};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnqueueOutboxOutcome {
+    Enqueued {
+        outbox_id: u32,
+        send_at: Option<i64>,
+    },
+    Deduplicated {
+        outbox_id: u32,
+        send_at: Option<i64>,
+    },
+}
+
 pub(crate) struct GlobalDb {
     pub(crate) conn: Connection,
     read_only: bool,
@@ -152,6 +164,15 @@ impl GlobalDb {
                     body_format TEXT NOT NULL DEFAULT '',
                     attachment_paths_json TEXT NOT NULL DEFAULT '[]',
                     created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS send_idempotency (
+                    account_id INTEGER NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    outbox_id INTEGER NOT NULL,
+                    send_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (account_id, idempotency_key)
                 );
                 ",
             )
@@ -672,12 +693,72 @@ impl GlobalDb {
         send_at: Option<i64>,
         local_draft_id: Option<u32>,
     ) -> Result<u32, String> {
+        match self.enqueue_outbox_from_draft_idempotent(
+            account_id,
+            to_addr,
+            cc_addr,
+            bcc_addr,
+            subject,
+            body_text,
+            in_reply_to,
+            from_addr,
+            reply_to,
+            body_format,
+            body_html,
+            attachment_paths,
+            created_at,
+            send_at,
+            local_draft_id,
+            None,
+        )? {
+            EnqueueOutboxOutcome::Enqueued { outbox_id, .. }
+            | EnqueueOutboxOutcome::Deduplicated { outbox_id, .. } => Ok(outbox_id),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_outbox_from_draft_idempotent(
+        &mut self,
+        account_id: u32,
+        to_addr: &str,
+        cc_addr: &str,
+        bcc_addr: &str,
+        subject: &str,
+        body_text: &str,
+        in_reply_to: &str,
+        from_addr: &str,
+        reply_to: &str,
+        body_format: &str,
+        body_html: Option<&str>,
+        attachment_paths: &[String],
+        created_at: i64,
+        send_at: Option<i64>,
+        local_draft_id: Option<u32>,
+        idempotency_key: Option<&str>,
+    ) -> Result<EnqueueOutboxOutcome, String> {
+        let clean_key = idempotency_key.map(str::trim).filter(|k| !k.is_empty());
         let paths_json = serde_json::to_string(attachment_paths)
             .map_err(|e| format!("序列化附件路径失败: {e}"))?;
         let tx = self
             .conn
             .transaction()
             .map_err(|e| format!("启动发件事务失败: {e}"))?;
+        if let Some(key) = clean_key {
+            if let Some((existing_id, existing_send_at)) = tx
+                .query_row(
+                    "SELECT outbox_id, send_at FROM send_idempotency WHERE account_id = ?1 AND idempotency_key = ?2",
+                    params![account_id, key],
+                    |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()
+                .map_err(|e| format!("查询发件幂等记录失败: {e}"))?
+            {
+                return Ok(EnqueueOutboxOutcome::Deduplicated {
+                    outbox_id: existing_id,
+                    send_at: existing_send_at,
+                });
+            }
+        }
         tx.execute(
             "
             INSERT INTO outbox (
@@ -706,6 +787,14 @@ impl GlobalDb {
         )
         .map_err(|e| format!("写入发件箱持久化记录失败: {e}"))?;
         let id = tx.last_insert_rowid() as u32;
+        if let Some(key) = clean_key {
+            tx.execute(
+                "INSERT INTO send_idempotency (account_id, idempotency_key, outbox_id, send_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![account_id, key, id, send_at, created_at],
+            )
+            .map_err(|e| format!("写入发件幂等键失败: {e}"))?;
+        }
         if let Some(draft_id) = local_draft_id {
             tx.execute(
                 "DELETE FROM drafts WHERE id = ?1 AND account_id = ?2",
@@ -714,7 +803,10 @@ impl GlobalDb {
             .map_err(|e| format!("交接草稿失败: {e}"))?;
         }
         tx.commit().map_err(|e| format!("提交发件事务失败: {e}"))?;
-        Ok(id)
+        Ok(EnqueueOutboxOutcome::Enqueued {
+            outbox_id: id,
+            send_at,
+        })
     }
 
     pub(crate) fn update_outbox_status(
@@ -919,6 +1011,11 @@ impl GlobalDb {
             params![outbox_id, account_id],
         )
         .map_err(|e| format!("撤销发件箱记录失败: {e}"))?;
+        tx.execute(
+            "DELETE FROM send_idempotency WHERE outbox_id = ?1 AND account_id = ?2",
+            params![outbox_id, account_id],
+        )
+        .map_err(|e| format!("清理发件幂等键失败: {e}"))?;
         tx.commit().map_err(|e| format!("提交撤销发送失败: {e}"))?;
         Ok(Some(draft_id))
     }
@@ -931,6 +1028,34 @@ impl GlobalDb {
                 params![outbox_id],
             )
             .map_err(|e| format!("删除发件箱记录失败: {e}"))?;
+        if deleted > 0 {
+            let _ = self.conn.execute(
+                "DELETE FROM send_idempotency WHERE outbox_id = ?1",
+                params![outbox_id],
+            );
+        }
+        Ok(deleted > 0)
+    }
+
+    /// 删除可移除状态的发件箱记录（排队中 / 发送失败 / 结果待确认），拒绝删除正在投递中的记录。
+    pub(crate) fn delete_removable_outbox(
+        &mut self,
+        account_id: u32,
+        outbox_id: u32,
+    ) -> Result<bool, String> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM outbox WHERE id = ?1 AND account_id = ?2 AND status IN ('queued', 'failed', 'uncertain')",
+                params![outbox_id, account_id],
+            )
+            .map_err(|e| format!("删除发件箱记录失败: {e}"))?;
+        if deleted > 0 {
+            let _ = self.conn.execute(
+                "DELETE FROM send_idempotency WHERE outbox_id = ?1 AND account_id = ?2",
+                params![outbox_id, account_id],
+            );
+        }
         Ok(deleted > 0)
     }
 

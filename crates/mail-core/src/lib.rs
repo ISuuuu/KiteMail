@@ -639,6 +639,8 @@ pub enum MailRequest {
         login_hint_email: Option<String>,
         editing_account_id: Option<u32>,
     },
+    /// 取消进行中的 Microsoft OAuth2 浏览器授权等待。
+    CancelMicrosoftOAuth,
     DeleteAccount {
         account_id: u32,
     },
@@ -788,6 +790,8 @@ pub enum MailRequest {
         undo_token: u64,
         /// 发送时机（立即 / 缓冲秒数 / 定时发送绝对 UTC 时间戳）。
         timing: SendTiming,
+        /// 持久化幂等键（防止回执超时后重试生成重复发件记录）。
+        idempotency_key: Option<String>,
     },
     RetryOutboxItem {
         account_id: u32,
@@ -1003,6 +1007,13 @@ pub enum WorkerEvent {
         token: u64,
         message: String,
         recovered_draft_id: Option<u32>,
+    },
+    /// 发件箱记录删除结果（持久化完成回执）。
+    OutboxItemDeleted {
+        account_id: u32,
+        outbox_id: u32,
+        deleted: bool,
+        message: Option<String>,
     },
     OutboxEnqueued {
         token: u64,
