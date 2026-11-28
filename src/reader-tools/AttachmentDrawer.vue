@@ -183,8 +183,8 @@
             :style="{ width: `${thumbSize}px`, height: `${thumbSize}px` }"
           >
             <img
-              v-if="item.isImage && cachedDataUrl(item.id)"
-              :src="cachedDataUrl(item.id)!"
+              v-if="(item.isImage || item.isPdf) && cachedThumbUrl(item)"
+              :src="cachedThumbUrl(item)!"
               :alt="item.filename"
               class="km-attach-thumb-img"
             />
@@ -198,6 +198,14 @@
               <span>PDF</span>
             </div>
             <span v-else class="km-attach-badge">{{ badgeTextFor(item) }}</span>
+
+            <span
+              v-if="item.isPdf && cachedThumbUrl(item)"
+              class="km-pdf-corner-badge"
+              aria-hidden="true"
+            >
+              PDF
+            </span>
 
             <!-- 悬停快捷操作 -->
             <div class="km-grid-hover-actions">
@@ -343,6 +351,8 @@ import {
   decodeTextPreviewDataUrl,
   formatAttachmentSize,
   isPdfAttachment,
+  prefetchDrawerThumbnails,
+  resolveDrawerThumbUrl,
   sortDrawerAttachments,
   useAttachments,
 } from "./useAttachments";
@@ -483,8 +493,8 @@ watch(
   }
 );
 
-function cachedDataUrl(id: number): string | null {
-  return state.previewCache.value[id]?.dataUrl ?? null;
+function cachedThumbUrl(item: DrawerAttachmentItem): string | null {
+  return resolveDrawerThumbUrl(item, state.previewCache.value);
 }
 
 function badgeTextFor(att: DrawerAttachmentItem): string {
@@ -532,13 +542,12 @@ async function saveAllAttachmentsPicker() {
   await state.saveManyWithPicker(savableIds.value);
 }
 
-function preloadDrawerImageThumbnails() {
-  for (const item of aggregatedItems.value) {
-    if (!item.isImage) continue;
-    if (!state.previewCache.value[item.id]) {
-      void state.fetchPreview(item.id);
-    }
-  }
+function prefetchPreviewThumbnails() {
+  void prefetchDrawerThumbnails(
+    aggregatedItems.value,
+    state.previewCache.value,
+    state.fetchPreview
+  );
 }
 
 function toggleExpanded() {
@@ -625,7 +634,13 @@ function onKeyDown(e: KeyboardEvent) {
 
 watch(aggregatedItems, () => {
   if (expanded.value) {
-    preloadDrawerImageThumbnails();
+    prefetchPreviewThumbnails();
+  }
+});
+
+watch(expanded, (isExpanded) => {
+  if (isExpanded) {
+    prefetchPreviewThumbnails();
   }
 });
 
@@ -633,7 +648,7 @@ watch(
   () => props.open,
   (nextOpen) => {
     if (nextOpen) {
-      preloadDrawerImageThumbnails();
+      prefetchPreviewThumbnails();
     }
   }
 );
@@ -650,7 +665,7 @@ onMounted(() => {
     ro.observe(drawerRootRef.value);
   }
   if (expanded.value) {
-    preloadDrawerImageThumbnails();
+    prefetchPreviewThumbnails();
   }
 });
 
@@ -883,10 +898,32 @@ defineExpose({
   background: var(--km-accent-soft);
 }
 
+.km-grid-thumb.is-pdf {
+  background: #ffffff;
+}
+
 .km-attach-thumb-img {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  object-position: top center;
+}
+
+.km-pdf-corner-badge {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(224, 27, 36, 0.9);
+  color: #ffffff;
+  font-family: var(--km-font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0.03em;
+  pointer-events: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 }
 
 .km-pdf-thumb {

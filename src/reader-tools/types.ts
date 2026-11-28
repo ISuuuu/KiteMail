@@ -43,6 +43,7 @@ export interface FetchAttachmentPreviewOutput {
   mimeType: string;
   dataUrl: string;
   sizeBytes: number;
+  thumbnailDataUrl?: string | null;
 }
 
 export interface SaveAttachmentInput {

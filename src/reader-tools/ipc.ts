@@ -296,6 +296,100 @@ function makeMessageKey(accountId: number, messageId: number): string {
   return `${accountId}:${messageId}`;
 }
 
+function isMockPdfAttachment(att: CachedAttachmentDto): boolean {
+  const mime = att.mimeType.trim().toLowerCase();
+  return mime === "application/pdf" || att.filename.trim().toLowerCase().endsWith(".pdf");
+}
+
+function encodeAsciiBase64(ascii: string): string {
+  if (typeof btoa === "function") {
+    return btoa(ascii);
+  }
+  const TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let out = "";
+  for (let i = 0; i < ascii.length; i += 3) {
+    const b0 = ascii.charCodeAt(i) & 0xff;
+    const has1 = i + 1 < ascii.length;
+    const has2 = i + 2 < ascii.length;
+    const b1 = has1 ? ascii.charCodeAt(i + 1) & 0xff : 0;
+    const b2 = has2 ? ascii.charCodeAt(i + 2) & 0xff : 0;
+    const triple = (b0 << 16) | (b1 << 8) | b2;
+    out += TABLE[(triple >> 18) & 0x3f];
+    out += TABLE[(triple >> 12) & 0x3f];
+    out += has1 ? TABLE[(triple >> 6) & 0x3f] : "=";
+    out += has2 ? TABLE[triple & 0x3f] : "=";
+  }
+  return out;
+}
+
+function toPdfAsciiLiteral(raw: string, fallback: string): string {
+  const cleaned = raw.replace(/[^\x20-\x7e]+/g, " ").trim();
+  const stem = cleaned.replace(/\.pdf$/i, "").trim();
+  const text = /[a-zA-Z0-9]/.test(stem) ? cleaned : fallback;
+  return text.slice(0, 68).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function buildMockPdfDataUrl(att: CachedAttachmentDto): string {
+  const safeTitle = toPdfAsciiLiteral(att.filename, "KiteMail Mock PDF");
+  const stream =
+    `1 1 1 rg 0 0 612 792 re f\n` +
+    `0.93 0.95 0.99 rg 36 660 540 96 re f\n` +
+    `0.21 0.52 0.89 rg 36 750 540 6 re f\n` +
+    `0.12 0.16 0.24 rg BT /F1 20 Tf 56 716 Td (${safeTitle}) Tj ET\n` +
+    `0.82 0.86 0.91 rg 56 586 500 8 re f 56 566 440 8 re f`;
+  const objs = [
+    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+    "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    `5 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`,
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets: number[] = [];
+  for (const obj of objs) {
+    offsets.push(pdf.length);
+    pdf += obj;
+  }
+  const xrefOffset = pdf.length;
+  pdf += "xref\n0 6\n0000000000 65535 f \n";
+  for (const off of offsets) {
+    pdf += `${String(off).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return `data:application/pdf;base64,${encodeAsciiBase64(pdf)}`;
+}
+
+function buildMockPdfThumbnailUrl(att: CachedAttachmentDto): string {
+  const safeTitle = escapeHtml(att.filename);
+  const safeSender = escapeHtml(att.sender);
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="300" viewBox="0 0 240 300">` +
+    `<rect width="240" height="300" fill="#ffffff"/>` +
+    `<rect x="0" y="0" width="240" height="5" fill="#e01b24"/>` +
+    `<rect x="14" y="16" width="212" height="46" rx="6" fill="#eef3fb"/>` +
+    `<rect x="22" y="24" width="32" height="14" rx="3" fill="#e01b24"/>` +
+    `<text x="38" y="34" text-anchor="middle" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="8.5" font-weight="700">PDF</text>` +
+    `<text x="62" y="35" fill="#182234" font-family="Segoe UI, sans-serif" font-size="11" font-weight="600">${safeTitle}</text>` +
+    `<text x="22" y="53" fill="#5b667a" font-family="Segoe UI, sans-serif" font-size="8.5">${safeSender}</text>` +
+    `<rect x="14" y="76" width="84" height="8" rx="2" fill="#3584e4"/>` +
+    `<rect x="14" y="94" width="212" height="6" rx="2" fill="#d7dfec"/>` +
+    `<rect x="14" y="106" width="194" height="6" rx="2" fill="#d7dfec"/>` +
+    `<rect x="14" y="118" width="204" height="6" rx="2" fill="#d7dfec"/>` +
+    `<rect x="14" y="130" width="142" height="6" rx="2" fill="#d7dfec"/>` +
+    `<rect x="14" y="150" width="212" height="62" rx="6" fill="#f6f8fc" stroke="#dce4f2" stroke-width="1"/>` +
+    `<rect x="24" y="162" width="76" height="6" rx="2" fill="#3584e4"/>` +
+    `<rect x="24" y="176" width="190" height="5" rx="2" fill="#cdd7e8"/>` +
+    `<rect x="24" y="188" width="174" height="5" rx="2" fill="#cdd7e8"/>` +
+    `<rect x="24" y="200" width="128" height="5" rx="2" fill="#cdd7e8"/>` +
+    `<rect x="14" y="226" width="208" height="6" rx="2" fill="#d7dfec"/>` +
+    `<rect x="14" y="238" width="186" height="6" rx="2" fill="#d7dfec"/>` +
+    `<rect x="14" y="250" width="160" height="6" rx="2" fill="#d7dfec"/>` +
+    `<line x1="14" y1="274" x2="226" y2="274" stroke="#e4e9f2" stroke-width="1"/>` +
+    `<text x="14" y="288" fill="#7a8496" font-family="Segoe UI, sans-serif" font-size="8">KiteMail PDF Thumbnail · Page 1</text>` +
+    `</svg>`;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
 function buildMockSvgPreviewUrl(att: CachedAttachmentDto): string {
   const palette = ["#3584e4", "#7253b9", "#2672af", "#1b7d50", "#ae552a", "#b75077"];
   const accent = palette[att.id % palette.length];
@@ -594,6 +688,18 @@ export async function fetchAttachmentPreview(
     return Promise.reject(
       makeNotFoundError("ATTACHMENT_NOT_FOUND", `未找到附件 #${input.attachmentId}`)
     );
+  }
+
+  const isPdf = isMockPdfAttachment(att);
+  if (isPdf) {
+    return {
+      attachmentId: att.id,
+      filename: att.filename,
+      mimeType: "application/pdf",
+      dataUrl: buildMockPdfDataUrl(att),
+      sizeBytes: att.sizeBytes,
+      thumbnailDataUrl: buildMockPdfThumbnailUrl(att),
+    };
   }
 
   return {
