@@ -59,6 +59,9 @@ use crate::reader::{
 pub const MAX_PAGE_LIMIT: usize = 500;
 pub const MAX_QUERY_LEN: usize = 1000;
 const BODY_CACHE_CAPACITY: usize = 64;
+/// 正文缓存字节预算：按 `MessageDetail::estimated_body_bytes` 的正文长度口径累计。
+/// 条数上限单独保留，预算只约束大邮件轮换后的增长；超出时按既有 FIFO 顺序淘汰。
+const BODY_CACHE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 const DEFAULT_BODY_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_READ_MARK_DELAY: Duration = Duration::from_secs(2);
 const AUTO_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -804,6 +807,8 @@ pub(crate) struct LiveSessionState {
     in_flight_gen: u64,
     pub(crate) body_cache: HashMap<(u32, u32), MessageDetail>,
     body_cache_order: VecDeque<(u32, u32)>,
+    body_cache_bytes: usize,
+    body_cache_byte_budget: usize,
     active_reader_target: Option<(String, u32, u32)>,
     pending_mark_thread_seen: Option<u32>,
 }
@@ -830,6 +835,8 @@ impl LiveSessionState {
             in_flight_gen: 0,
             body_cache: HashMap::new(),
             body_cache_order: VecDeque::new(),
+            body_cache_bytes: 0,
+            body_cache_byte_budget: BODY_CACHE_BYTE_BUDGET,
             active_reader_target: None,
             pending_mark_thread_seen: None,
         }
@@ -894,22 +901,48 @@ impl LiveSessionState {
 
     fn cache_detail(&mut self, detail: MessageDetail) {
         let key = (detail.account_id, detail.id);
-        if self.body_cache.contains_key(&key) {
+        let detail_bytes = detail.estimated_body_bytes();
+        if let Some(previous) = self.body_cache.get(&key) {
+            self.body_cache_bytes = self
+                .body_cache_bytes
+                .saturating_sub(previous.estimated_body_bytes());
             self.body_cache.insert(key, detail);
+            self.body_cache_bytes = self.body_cache_bytes.saturating_add(detail_bytes);
+            self.trim_body_cache_to_budget();
             return;
         }
         if self.body_cache_order.len() >= BODY_CACHE_CAPACITY {
             if let Some(evicted) = self.body_cache_order.pop_front() {
-                self.body_cache.remove(&evicted);
+                self.remove_body_cache_entry(&evicted);
             }
         }
         self.body_cache_order.push_back(key);
         self.body_cache.insert(key, detail);
+        self.body_cache_bytes = self.body_cache_bytes.saturating_add(detail_bytes);
+        self.trim_body_cache_to_budget();
+    }
+
+    fn remove_body_cache_entry(&mut self, key: &(u32, u32)) {
+        if let Some(removed) = self.body_cache.remove(key) {
+            self.body_cache_bytes = self
+                .body_cache_bytes
+                .saturating_sub(removed.estimated_body_bytes());
+        }
+    }
+
+    /// 按 FIFO 顺序淘汰，直到正文缓存不超过字节预算；单条超预算时会连同自身一起清掉。
+    fn trim_body_cache_to_budget(&mut self) {
+        while self.body_cache_bytes > self.body_cache_byte_budget {
+            let Some(evicted) = self.body_cache_order.pop_front() else {
+                break;
+            };
+            self.remove_body_cache_entry(&evicted);
+        }
     }
 
     fn remove_cached_detail(&mut self, account_id: u32, message_id: u32) {
         let key = (account_id, message_id);
-        self.body_cache.remove(&key);
+        self.remove_body_cache_entry(&key);
         self.body_cache_order.retain(|k| *k != key);
         if self
             .active_reader_target
@@ -924,6 +957,7 @@ impl LiveSessionState {
         self.in_flight_bodies.clear();
         self.body_cache.clear();
         self.body_cache_order.clear();
+        self.body_cache_bytes = 0;
         self.active_reader_target = None;
         self.pending_mark_thread_seen = None;
     }
@@ -1636,6 +1670,7 @@ impl MailSession {
             let mut live = self.live.lock().expect("live mutex poisoned");
             live.body_cache.clear();
             live.body_cache_order.clear();
+            live.body_cache_bytes = 0;
             drop(live);
             self.reset_read_cache();
         }
@@ -5976,6 +6011,35 @@ pub(crate) mod tests {
         (session, emitter, reader_sink, worker, dir)
     }
 
+    pub(crate) fn body_cache_test_detail(
+        message_id: u32,
+        body_text: &str,
+        body_html: Option<&str>,
+    ) -> MessageDetail {
+        MessageDetail {
+            id: message_id,
+            account_id: 1,
+            folder_id: 1,
+            folder_path: "INBOX".to_string(),
+            uid: message_id,
+            rfc_message_id: format!("<m{message_id}@example.com>"),
+            sender: "Alice <alice@example.com>".to_string(),
+            recipients: "tester@example.com".to_string(),
+            cc: String::new(),
+            subject: format!("正文缓存测试邮件 {message_id}"),
+            date_ts: 1_700_000_000,
+            date_display: "10:00".to_string(),
+            body_text: body_text.to_string(),
+            body_html: body_html.map(str::to_string),
+            flagged: false,
+            attachments: Vec::new(),
+            thread_messages: Vec::new(),
+            unsubscribe_url: None,
+            unsubscribe_one_click: false,
+            auth_results: None,
+        }
+    }
+
     #[test]
     fn demo_session_paginates_filters_sorts_and_searches() {
         let (session, _, dir) = make_test_session();
@@ -6255,6 +6319,111 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn body_cache_tracks_html_and_thread_body_bytes() {
+        let mut live = LiveSessionState::empty();
+        live.body_cache_byte_budget = 10_000;
+        let mut detail = body_cache_test_detail(1, &"a".repeat(10), Some(&"b".repeat(20)));
+        detail
+            .thread_messages
+            .push(kitemail_mail_core::ThreadMessage {
+                id: 2,
+                rfc_message_id: "<thread@example.com>".to_string(),
+                subject: "会话回复".to_string(),
+                sender: "Bob <bob@example.com>".to_string(),
+                recipients: "tester@example.com".to_string(),
+                cc: String::new(),
+                date_ts: 1_700_000_100,
+                date_display: "09:00".to_string(),
+                body_text: "c".repeat(30),
+                body_html: Some("d".repeat(40)),
+                body_loaded: true,
+                unread: false,
+                flagged: false,
+                attachments: Vec::new(),
+                uid: 12,
+                folder_path: "INBOX".to_string(),
+            });
+        live.cache_detail(detail);
+        assert_eq!(live.body_cache_bytes, 100);
+    }
+
+    #[test]
+    fn body_cache_tracks_byte_delta_when_overwriting_existing_key() {
+        let mut live = LiveSessionState::empty();
+        live.body_cache_byte_budget = 10_000;
+        live.cache_detail(body_cache_test_detail(1, &"a".repeat(100), None));
+        assert_eq!(live.body_cache_bytes, 100);
+
+        live.cache_detail(body_cache_test_detail(1, &"b".repeat(40), None));
+        assert_eq!(live.body_cache_bytes, 40);
+        assert_eq!(live.body_cache.len(), 1);
+        assert_eq!(live.body_cache_order.len(), 1);
+        assert_eq!(live.body_cache_order[0], (1, 1));
+    }
+
+    #[test]
+    fn body_cache_evicts_oldest_when_over_byte_budget() {
+        let mut live = LiveSessionState::empty();
+        live.body_cache_byte_budget = 100;
+        live.cache_detail(body_cache_test_detail(1, &"a".repeat(60), None));
+        live.cache_detail(body_cache_test_detail(2, &"b".repeat(60), None));
+
+        assert_eq!(live.body_cache.len(), 1);
+        assert!(!live.body_cache.contains_key(&(1, 1)));
+        assert!(live.body_cache.contains_key(&(1, 2)));
+        assert_eq!(live.body_cache_bytes, 60);
+        assert_eq!(live.body_cache_order, VecDeque::from([(1, 2)]));
+    }
+
+    #[test]
+    fn body_cache_keeps_entry_capacity_limit() {
+        let mut live = LiveSessionState::empty();
+        for message_id in 0..=BODY_CACHE_CAPACITY as u32 {
+            live.cache_detail(body_cache_test_detail(message_id, "x", None));
+        }
+
+        assert_eq!(live.body_cache.len(), BODY_CACHE_CAPACITY);
+        assert!(!live.body_cache.contains_key(&(1, 0)));
+        assert!(live
+            .body_cache
+            .contains_key(&(1, BODY_CACHE_CAPACITY as u32)));
+        assert_eq!(live.body_cache_bytes, BODY_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn body_cache_drops_entry_larger_than_byte_budget() {
+        let mut live = LiveSessionState::empty();
+        live.body_cache_byte_budget = 50;
+        live.cache_detail(body_cache_test_detail(1, &"a".repeat(51), None));
+
+        assert!(live.body_cache.is_empty());
+        assert!(live.body_cache_order.is_empty());
+        assert_eq!(live.body_cache_bytes, 0);
+    }
+
+    #[test]
+    fn body_cache_remove_and_clear_reset_byte_counter() {
+        let mut live = LiveSessionState::empty();
+        live.body_cache_byte_budget = 10_000;
+        live.cache_detail(body_cache_test_detail(1, &"a".repeat(100), None));
+        live.cache_detail(body_cache_test_detail(
+            2,
+            &"b".repeat(30),
+            Some(&"h".repeat(70)),
+        ));
+        assert_eq!(live.body_cache_bytes, 200);
+
+        live.remove_cached_detail(1, 1);
+        assert_eq!(live.body_cache_bytes, 100);
+        assert_eq!(live.body_cache_order, VecDeque::from([(1, 2)]));
+
+        live.clear_sensitive_caches();
+        assert!(live.body_cache.is_empty());
+        assert!(live.body_cache_order.is_empty());
+        assert_eq!(live.body_cache_bytes, 0);
+    }
+
+    #[test]
     fn live_open_message_deduplicates_in_flight_body_fetches_and_reuses_cache_on_quick_switch() {
         let (session, _, reader_sink, worker, dir) = make_live_test_session(true, None);
         let list = session
@@ -6448,6 +6617,278 @@ pub(crate) mod tests {
             .filter(|r| matches!(r, MailRequest::LoadMessageBody { message_id, .. } if *message_id == msg_a.id))
             .count();
         assert_eq!(count, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_body_cache_eviction_recovers_body_from_disk_without_refetch() {
+        let (session, _, _, worker, dir) = make_live_test_session(true, None);
+        let list = session
+            .list_messages(&ListMessagesInput {
+                request_id: "l-evict".to_string(),
+                view: MainViewDto::UnifiedInbox,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        let msg_b = list
+            .items
+            .iter()
+            .find(|m| m.subject.contains("邮件 B"))
+            .unwrap();
+
+        let open_first = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-evict-1".to_string(),
+                    account_id: 1,
+                    message_id: msg_b.id,
+                },
+                "rs-evict-1".to_string(),
+            )
+            .unwrap();
+        assert_eq!(open_first.body_status, BodyStatusDto::Ready);
+        assert_eq!(open_first.plain_text, "这是邮件 B 的缓存正文");
+
+        {
+            let mut live = session.live.lock().expect("live mutex poisoned");
+            assert!(live.body_cache.contains_key(&(1, msg_b.id)));
+            assert!(live.body_cache_bytes > 0);
+            // 模拟大邮件轮换把预算压到低于当前条目，触发内存淘汰。
+            live.body_cache_byte_budget = 1;
+            live.trim_body_cache_to_budget();
+            assert!(live.body_cache.is_empty());
+            assert_eq!(live.body_cache_bytes, 0);
+            // 模拟离线重开：没有 worker 时也必须能从磁盘缓存恢复正文。
+            live.worker = None;
+        }
+
+        let open_second = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-evict-2".to_string(),
+                    account_id: 1,
+                    message_id: msg_b.id,
+                },
+                "rs-evict-2".to_string(),
+            )
+            .unwrap();
+        assert_eq!(open_second.body_status, BodyStatusDto::Ready);
+        assert_eq!(open_second.plain_text, "这是邮件 B 的缓存正文");
+
+        let load_reqs = worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, MailRequest::LoadMessageBody { message_id, .. } if *message_id == msg_b.id))
+            .count();
+        assert_eq!(load_reqs, 0, "淘汰后应从磁盘缓存恢复，而不是重新抓取正文");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_clear_body_cache_recovers_body_from_disk_without_refetch() {
+        let (session, _, _, worker, dir) = make_live_test_session(true, None);
+        let list = session
+            .list_messages(&ListMessagesInput {
+                request_id: "l-clear".to_string(),
+                view: MainViewDto::UnifiedInbox,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        let msg_b = list
+            .items
+            .iter()
+            .find(|m| m.subject.contains("邮件 B"))
+            .unwrap();
+
+        session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-clear-1".to_string(),
+                    account_id: 1,
+                    message_id: msg_b.id,
+                },
+                "rs-clear-1".to_string(),
+            )
+            .unwrap();
+        session.clear_live_body_cache();
+        {
+            let live = session.live.lock().expect("live mutex poisoned");
+            assert!(live.body_cache.is_empty());
+            assert_eq!(live.body_cache_bytes, 0);
+        }
+
+        let open_again = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-clear-2".to_string(),
+                    account_id: 1,
+                    message_id: msg_b.id,
+                },
+                "rs-clear-2".to_string(),
+            )
+            .unwrap();
+        assert_eq!(open_again.body_status, BodyStatusDto::Ready);
+        assert_eq!(open_again.plain_text, "这是邮件 B 的缓存正文");
+        let load_reqs = worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, MailRequest::LoadMessageBody { message_id, .. } if *message_id == msg_b.id))
+            .count();
+        assert_eq!(load_reqs, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_lock_clears_body_cache_and_unlock_recovers_from_disk() {
+        let (session, _, _, worker, dir) = make_live_test_session(true, Some("1234"));
+        let list = session
+            .list_messages(&ListMessagesInput {
+                request_id: "l-lock".to_string(),
+                view: MainViewDto::UnifiedInbox,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        let msg_b = list
+            .items
+            .iter()
+            .find(|m| m.subject.contains("邮件 B"))
+            .unwrap();
+
+        session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-lock-1".to_string(),
+                    account_id: 1,
+                    message_id: msg_b.id,
+                },
+                "rs-lock-1".to_string(),
+            )
+            .unwrap();
+        session.lock_app(Some("manual"));
+        {
+            let live = session.live.lock().expect("live mutex poisoned");
+            assert!(live.body_cache.is_empty());
+            assert!(live.body_cache_order.is_empty());
+            assert_eq!(live.body_cache_bytes, 0);
+        }
+
+        assert!(
+            session
+                .unlock_app(&UnlockAppInput {
+                    passcode: "1234".to_string(),
+                })
+                .unlocked
+        );
+        let open_after = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-lock-2".to_string(),
+                    account_id: 1,
+                    message_id: msg_b.id,
+                },
+                "rs-lock-2".to_string(),
+            )
+            .unwrap();
+        assert_eq!(open_after.body_status, BodyStatusDto::Ready);
+        assert_eq!(open_after.plain_text, "这是邮件 B 的缓存正文");
+        let load_reqs = worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, MailRequest::LoadMessageBody { message_id, .. } if *message_id == msg_b.id))
+            .count();
+        assert_eq!(load_reqs, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_failed_body_fetch_is_not_charged_to_body_cache() {
+        let (session, _, _, worker, dir) = make_live_test_session(true, None);
+        let list = session
+            .list_messages(&ListMessagesInput {
+                request_id: "l-fail".to_string(),
+                view: MainViewDto::UnifiedInbox,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        let msg_a = list
+            .items
+            .iter()
+            .find(|m| m.subject.contains("邮件 A"))
+            .unwrap();
+
+        let open = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-fail-1".to_string(),
+                    account_id: 1,
+                    message_id: msg_a.id,
+                },
+                "rs-fail-1".to_string(),
+            )
+            .unwrap();
+        assert_eq!(open.body_status, BodyStatusDto::Loading);
+
+        session.process_worker_events(vec![WorkerEvent::MessageBodyLoadFailed {
+            account_id: 1,
+            message_id: msg_a.id,
+            message: "网络不可用".to_string(),
+        }]);
+        {
+            let live = session.live.lock().expect("live mutex poisoned");
+            assert!(!live.body_cache.contains_key(&(1, msg_a.id)));
+            assert_eq!(live.body_cache_bytes, 0);
+        }
+
+        // 失败回读不占用预算，且允许重新发起抓取。
+        let retry = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-fail-2".to_string(),
+                    account_id: 1,
+                    message_id: msg_a.id,
+                },
+                "rs-fail-2".to_string(),
+            )
+            .unwrap();
+        assert_eq!(retry.body_status, BodyStatusDto::Loading);
+        let load_reqs = worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, MailRequest::LoadMessageBody { message_id, .. } if *message_id == msg_a.id))
+            .count();
+        assert_eq!(load_reqs, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
