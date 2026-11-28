@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use kitemail_mail_core::config::normalize_sender_email;
 use kitemail_mail_core::{MessageDetail, ThreadMessage};
@@ -215,7 +216,23 @@ pub enum LayoutApplyOutcome {
     },
 }
 
+/// 布局投递结果：区分「宿主尚未创建」与「已投递到已有宿主」。
+///
+/// 控制器是否就绪由宿主异步回执 `LayoutApplied { controller_ready }` 确认：就绪前
+/// 原生层可能还没有可见画面，前端继续停留在布局等待态（stage = layoutPendingController），
+/// 只有控制器就绪且原生层显示后才切到原生正文。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutDelivery {
+    /// `load_html` 尚未创建宿主（纯文本正文、未加载原生文档或宿主已关闭），
+    /// 布局只记录在管理器里，等宿主创建后由后续布局或正文加载补发。
+    HostMissing,
+    /// 已投递给现有宿主；原生层实际显示以后续 `LayoutApplied` 回执为准。
+    Delivered,
+}
+
 /// Sink for platform-specific main-thread WebView2 operations and status event emission.
+///
+/// 只有 `load_html` 负责创建原生宿主；其余操作只访问已存在的宿主，宿主缺席时安全返回。
 pub trait ReaderPlatformSink: Send + Sync {
     fn is_native_supported(&self) -> bool;
     fn load_html(
@@ -229,16 +246,19 @@ pub trait ReaderPlatformSink: Send + Sync {
     );
     fn apply_layout(
         &self,
+        session_id: String,
         clip: PhysicalRect,
         bounds: PhysicalRect,
         visible: bool,
-    ) -> Result<(), String>;
+    ) -> Result<LayoutDelivery, String>;
     fn set_visible(&self, visible: bool);
-    fn set_zoom(&self, zoom_percent: u32);
-    fn execute_script(&self, _script: String) {}
+    fn set_zoom(&self, session_id: String, zoom_percent: u32);
+    fn execute_script(&self, _session_id: String, _script: String) {}
     fn close(&self);
     fn emit_status(&self, event: ReaderStatusEvent);
     fn set_action_handler(&self, _handler: Weak<dyn ThreadActionHandler>) {}
+    /// 主窗口持续退到后台后挂起原生宿主；无原生宿主的环境默认忽略。
+    fn suspend_after_hidden(&self, _session_id: String) {}
 }
 
 /// No-op sink used in unit tests or non-Windows/headless environments.
@@ -263,17 +283,21 @@ impl ReaderPlatformSink for NullReaderSink {
 
     fn apply_layout(
         &self,
+        _session_id: String,
         _clip: PhysicalRect,
         _bounds: PhysicalRect,
         _visible: bool,
-    ) -> Result<(), String> {
-        Ok(())
+    ) -> Result<LayoutDelivery, String> {
+        Ok(LayoutDelivery::Delivered)
     }
     fn set_visible(&self, _visible: bool) {}
-    fn set_zoom(&self, _zoom_percent: u32) {}
+    fn set_zoom(&self, _session_id: String, _zoom_percent: u32) {}
     fn close(&self) {}
     fn emit_status(&self, _event: ReaderStatusEvent) {}
 }
+
+/// 主窗口持续退到后台多久后挂起原生阅读器（实验起点，合入前按恢复体验调整）。
+pub const READER_BACKGROUND_SUSPEND_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct ReaderCoordinatorState {
@@ -283,6 +307,58 @@ struct ReaderCoordinatorState {
     last_layout: Option<AppliedReaderLayout>,
     locked: bool,
     reader_hidden_pref: bool,
+    /// 本次持续后台的起始时刻；主窗口一回到前台就清空。
+    hidden_since: Option<Instant>,
+    /// 后台挂起是否已发起，避免同一段后台期间重复调用 try_suspend。
+    background_suspended: bool,
+    /// 进入后台时的布局修订号，用来判断恢复前前端是否已下发过新的（隐藏）布局。
+    layout_revision_at_hide: Option<u64>,
+}
+
+/// 主窗口可见性变化后的动作：挂起原生宿主，或在宿主未感知隐藏时补发最后一次布局。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BackgroundAction {
+    None,
+    Suspend,
+    Restore(AppliedReaderLayout),
+}
+
+impl ReaderCoordinatorState {
+    fn note_window_visibility(
+        &mut self,
+        visible: bool,
+        now: Instant,
+        suspend_delay: Duration,
+    ) -> BackgroundAction {
+        if visible {
+            let hidden_before = self.hidden_since.take().is_some();
+            let revision_at_hide = self.layout_revision_at_hide.take();
+            let was_suspended = std::mem::take(&mut self.background_suspended);
+            if !hidden_before && !was_suspended {
+                return BackgroundAction::None;
+            }
+            // 前端若在后台期间下发过新布局（修订号已变），说明它自己会在恢复时重新同步；
+            // 只有前端仍停留在进入后台前的「可见」布局时才需要补发，避免原生层被挂起后留在隐藏态。
+            if let Some(layout) = self.last_layout.clone() {
+                if was_suspended && layout.visible && revision_at_hide == Some(layout.revision) {
+                    return BackgroundAction::Restore(layout);
+                }
+            }
+            return BackgroundAction::None;
+        }
+        if self.hidden_since.is_none() {
+            self.hidden_since = Some(now);
+            self.layout_revision_at_hide = self.last_layout.as_ref().map(|l| l.revision);
+        }
+        let due = self
+            .hidden_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= suspend_delay);
+        if due && !self.locked && !self.background_suspended {
+            self.background_suspended = true;
+            return BackgroundAction::Suspend;
+        }
+        BackgroundAction::None
+    }
 }
 
 /// Pure, testable coordinator guarding `readerSessionId` and `layoutRevision` monotonicity.
@@ -322,19 +398,25 @@ impl ReaderManager {
         }
         let trimmed = query.trim();
         if trimmed.is_empty() {
-            self.sink
-                .execute_script("window.kmFindClear && window.kmFindClear();".to_string());
+            self.sink.execute_script(
+                reader_session_id.to_string(),
+                "window.kmFindClear && window.kmFindClear();".to_string(),
+            );
             return Ok(true);
         }
         if let Some(delta) = step.filter(|&d| d != 0) {
             let dir = if delta < 0 { -1 } else { 1 };
-            self.sink
-                .execute_script(format!("window.kmFindStep && window.kmFindStep({dir});"));
+            self.sink.execute_script(
+                reader_session_id.to_string(),
+                format!("window.kmFindStep && window.kmFindStep({dir});"),
+            );
             return Ok(true);
         }
         let escaped = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
-        self.sink
-            .execute_script(format!("window.kmFind && window.kmFind({escaped});"));
+        self.sink.execute_script(
+            reader_session_id.to_string(),
+            format!("window.kmFind && window.kmFind({escaped});"),
+        );
         Ok(true)
     }
 
@@ -360,6 +442,8 @@ impl ReaderManager {
             guard.last_layout_revision = None;
             guard.last_layout = None;
             guard.active_document = Some(doc.clone());
+            // 新会话重新排队：后台期间换信后仍可在持续隐藏时再次挂起。
+            guard.background_suspended = false;
         }
 
         if !reader_enabled {
@@ -394,7 +478,8 @@ impl ReaderManager {
                 allow_remote,
                 mode,
             );
-            self.sink.set_zoom(appearance.zoom_percent);
+            self.sink
+                .set_zoom(session_id.clone(), appearance.zoom_percent);
             self.sink.emit_status(ReaderStatusEvent {
                 reader_session_id: session_id,
                 account_id,
@@ -532,31 +617,45 @@ impl ReaderManager {
                 account_id,
                 message_id,
             } => {
-                if let Err(err) = self.sink.apply_layout(clip, bounds, visible) {
-                    self.sink.emit_status(ReaderStatusEvent {
+                match self
+                    .sink
+                    .apply_layout(input.reader_session_id.clone(), clip, bounds, visible)
+                {
+                    Ok(LayoutDelivery::Delivered) => Ok(SetReaderLayoutOutput {
+                        applied: true,
                         reader_session_id: input.reader_session_id.clone(),
-                        account_id,
-                        message_id,
-                        body_status: BodyStatusDto::Unavailable,
-                        detail: Some(err.clone()),
-                        message: Some(err.clone()),
-                        retryable: Some(true),
-                        plain_text: None,
-                        has_html: None,
-                        html_body: None,
-                        layout_applied: Some(false),
-                        layout_visible: Some(false),
-                        stage: Some("applyLayout".to_string()),
-                    });
-                    return Err(IpcError::render_failed(err, None));
+                        layout_revision: input.layout_revision,
+                        visible: Some(visible),
+                        reason: None,
+                    }),
+                    // 宿主还没由 load_html 创建（纯文本正文等）：布局已记入 last_layout，
+                    // 不当作失败，前端保持等待态，待宿主就绪后的布局/回执再切到原生正文。
+                    Ok(LayoutDelivery::HostMissing) => Ok(SetReaderLayoutOutput {
+                        applied: false,
+                        reader_session_id: input.reader_session_id.clone(),
+                        layout_revision: input.layout_revision,
+                        visible: None,
+                        reason: Some("hostPending".to_string()),
+                    }),
+                    Err(err) => {
+                        self.sink.emit_status(ReaderStatusEvent {
+                            reader_session_id: input.reader_session_id.clone(),
+                            account_id,
+                            message_id,
+                            body_status: BodyStatusDto::Unavailable,
+                            detail: Some(err.clone()),
+                            message: Some(err.clone()),
+                            retryable: Some(true),
+                            plain_text: None,
+                            has_html: None,
+                            html_body: None,
+                            layout_applied: Some(false),
+                            layout_visible: Some(false),
+                            stage: Some("applyLayout".to_string()),
+                        });
+                        Err(IpcError::render_failed(err, None))
+                    }
                 }
-                Ok(SetReaderLayoutOutput {
-                    applied: true,
-                    reader_session_id: input.reader_session_id.clone(),
-                    layout_revision: input.layout_revision,
-                    visible: Some(visible),
-                    reason: None,
-                })
             }
         }
     }
@@ -588,18 +687,22 @@ impl ReaderManager {
             if should_load_native_document(&doc) && self.sink.is_native_supported() {
                 let (bytes, allow_remote, mode) = build_reader_document_bytes(&doc, appearance);
                 self.sink.load_html(
-                    doc.session_id,
+                    doc.session_id.clone(),
                     doc.account_id,
                     doc.message_id,
                     bytes,
                     allow_remote,
                     mode,
                 );
-                self.sink.set_zoom(appearance.zoom_percent);
+                self.sink
+                    .set_zoom(doc.session_id.clone(), appearance.zoom_percent);
                 if let Some(layout) = last_layout {
-                    let _ = self
-                        .sink
-                        .apply_layout(layout.clip, layout.bounds, layout.visible);
+                    let _ = self.sink.apply_layout(
+                        doc.session_id,
+                        layout.clip,
+                        layout.bounds,
+                        layout.visible,
+                    );
                 }
             }
         }
@@ -653,18 +756,22 @@ impl ReaderManager {
         if should_load_native_document(&doc) && self.sink.is_native_supported() {
             let (bytes, allow_remote, mode) = build_reader_document_bytes(&doc, appearance);
             self.sink.load_html(
-                doc.session_id,
+                doc.session_id.clone(),
                 doc.account_id,
                 doc.message_id,
                 bytes,
                 allow_remote,
                 mode,
             );
-            self.sink.set_zoom(appearance.zoom_percent);
+            self.sink
+                .set_zoom(doc.session_id.clone(), appearance.zoom_percent);
             if let Some(layout) = last_layout {
-                let _ = self
-                    .sink
-                    .apply_layout(layout.clip, layout.bounds, layout.visible);
+                let _ = self.sink.apply_layout(
+                    doc.session_id,
+                    layout.clip,
+                    layout.bounds,
+                    layout.visible,
+                );
             }
             true
         } else {
@@ -697,6 +804,9 @@ impl ReaderManager {
             guard.last_layout_revision = None;
             guard.active_document = None;
             guard.last_layout = None;
+            guard.hidden_since = None;
+            guard.background_suspended = false;
+            guard.layout_revision_at_hide = None;
             drop(guard);
             self.sink.set_visible(false);
             self.sink.close();
@@ -713,8 +823,48 @@ impl ReaderManager {
         guard.last_layout_revision = None;
         guard.active_document = None;
         guard.last_layout = None;
+        guard.hidden_since = None;
+        guard.background_suspended = false;
+        guard.layout_revision_at_hide = None;
         drop(guard);
         self.sink.close();
+    }
+
+    /// 主窗口真实可见性变化（关闭到托盘、最小化到托盘、托盘或单实例唤醒都汇到这里）。
+    ///
+    /// 持续后台超过 READER_BACKGROUND_SUSPEND_DELAY 才挂起原生宿主；期间任何一次回到前台
+    /// 都会撤销待执行的挂起。挂起异步回执由共享库按文档版本校验，晚于恢复或切信的旧回执
+    /// 会被丢弃并主动恢复控制器。
+    pub fn note_main_window_visibility(&self, visible: bool) {
+        self.note_main_window_visibility_at(visible, Instant::now());
+    }
+
+    fn note_main_window_visibility_at(&self, visible: bool, now: Instant) {
+        let (action, session_id) = {
+            let mut guard = self.state.lock().expect("reader mutex poisoned");
+            let action =
+                guard.note_window_visibility(visible, now, READER_BACKGROUND_SUSPEND_DELAY);
+            (action, guard.active_session_id.clone())
+        };
+        match action {
+            BackgroundAction::None => {}
+            BackgroundAction::Suspend => {
+                if let Some(session_id) = session_id {
+                    self.sink.suspend_after_hidden(session_id);
+                }
+            }
+            BackgroundAction::Restore(layout) => {
+                if let Some(session_id) = session_id {
+                    // 恢复走既有布局/可见性链路：控制器若被挂起，可见布局会触发 resume。
+                    let _ = self.sink.apply_layout(
+                        session_id,
+                        layout.clip,
+                        layout.bounds,
+                        layout.visible,
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -754,12 +904,24 @@ pub fn supports_document(html: &str) -> bool {
     reader_supports_document(html)
 }
 
+/// 主窗口是否处于前台可见：隐藏（关闭到托盘或托盘隐藏）与最小化都算后台。
+///
+/// 查询失败时按前台处理，宁可多保留阅读器也不误挂起。
+pub fn main_window_in_foreground(app_handle: &tauri::AppHandle) -> bool {
+    use tauri::Manager;
+    match app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
+        Some(win) => win.is_visible().unwrap_or(true) && !win.is_minimized().unwrap_or(false),
+        None => true,
+    }
+}
+
 /// Windows WebView2 child-HWND sink delegating to shared `kitemail-windows-mail-reader`.
 #[cfg(windows)]
 pub mod platform_win {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use kitemail_windows_mail_reader::{
         prepare_external_url, PixelRect, ReaderEvent, ReaderLoadStatus, WebView2Host,
@@ -1134,6 +1296,9 @@ pub mod platform_win {
         user_data_dir: PathBuf,
         action_handler: SharedActionHandler,
         active_meta: Arc<Mutex<(String, u32, u32)>>,
+        /// 是否已由 `load_html` 发起原生宿主创建；创建失败或宿主关闭后置 false。
+        /// 非创建操作据此判断宿主是否存在，绝不自行拉起 `WebView2-reader`。
+        host_expected: Arc<AtomicBool>,
     }
 
     impl TauriWindowsReaderSink {
@@ -1143,10 +1308,13 @@ pub mod platform_win {
                 user_data_dir,
                 action_handler: Arc::new(Mutex::new(None)),
                 active_meta: Arc::new(Mutex::new((String::new(), 0, 0))),
+                host_expected: Arc::new(AtomicBool::new(false)),
             }
         }
 
-        fn with_host_on_main_thread<F>(&self, f: F) -> Result<(), String>
+        /// 投递到 UI 线程执行宿主操作。`create_if_missing` 只允许 `load_html` 传 true：
+        /// 隐藏、布局、缩放、脚本调用和会话清理在宿主缺席时直接返回，不创建阅读器。
+        fn with_host_on_main_thread<F>(&self, create_if_missing: bool, f: F) -> Result<(), String>
         where
             F: FnOnce(
                     &tauri::AppHandle,
@@ -1160,18 +1328,21 @@ pub mod platform_win {
             let handle = self.app_handle.clone();
             let user_data_dir = self.user_data_dir.clone();
             let action_handler = Arc::clone(&self.action_handler);
+            let host_expected = Arc::clone(&self.host_expected);
             self.app_handle
                 .run_on_main_thread(move || {
                     MAIN_THREAD_HOST.with(|slot| {
                         let mut borrow = slot.borrow_mut();
-                        let create_err = if borrow.is_none() {
+                        let create_err = if create_if_missing && borrow.is_none() {
                             match create_host_slot(&handle, &user_data_dir, &action_handler) {
                                 Ok(new_slot) => {
                                     *borrow = Some(new_slot);
+                                    host_expected.store(true, Ordering::SeqCst);
                                     None
                                 }
                                 Err(err) => {
                                     eprintln!("[reader] {err}");
+                                    host_expected.store(false, Ordering::SeqCst);
                                     Some(err)
                                 }
                             }
@@ -1188,6 +1359,13 @@ pub mod platform_win {
                     });
                 })
                 .map_err(|e| format!("投递主线程阅读器任务失败: {e}"))
+        }
+
+        fn session_matches(&self, session_id: &str) -> bool {
+            self.active_meta
+                .lock()
+                .map(|meta| meta.0 == session_id)
+                .unwrap_or(false)
         }
     }
 
@@ -1215,8 +1393,14 @@ pub mod platform_win {
             if let Ok(mut meta) = self.active_meta.lock() {
                 *meta = (session_id.clone(), account_id, message_id);
             }
+            // 乐观占位：本次 load_html 会创建宿主。稍后到达的布局据此投递而不是误判为宿主缺席；
+            // 创建或重建失败时在 UI 线程回写 false，后续布局重新回到「宿主未就绪」。
+            self.host_expected.store(true, Ordering::SeqCst);
+            let expected_for_err = Arc::clone(&self.host_expected);
+            let expected_for_dispatch = Arc::clone(&self.host_expected);
             let session_for_err = session_id.clone();
             if let Err(err) = self.with_host_on_main_thread(
+                true,
                 move |handle, user_data_dir, action_handler, slot, create_err| {
                     if let Some(current) = slot.as_ref() {
                         if current.host.retire_for_remote_reload(allow_remote_images) {
@@ -1226,6 +1410,7 @@ pub mod platform_win {
                                 Err(err) => {
                                     eprintln!("[reader] recreate host failed: {err}");
                                     *slot = None;
+                                    expected_for_err.store(false, Ordering::SeqCst);
                                     emit_unavailable_status(
                                         handle,
                                         session_id,
@@ -1285,6 +1470,7 @@ pub mod platform_win {
                 },
             ) {
                 eprintln!("[reader] {err}");
+                expected_for_dispatch.store(false, Ordering::SeqCst);
                 emit_unavailable_status(
                     &self.app_handle,
                     session_for_err,
@@ -1298,25 +1484,27 @@ pub mod platform_win {
 
         fn apply_layout(
             &self,
+            session_id: String,
             clip: PhysicalRect,
             bounds: PhysicalRect,
             visible: bool,
-        ) -> Result<(), String> {
+        ) -> Result<LayoutDelivery, String> {
+            if !self.host_expected.load(Ordering::SeqCst) {
+                return Ok(LayoutDelivery::HostMissing);
+            }
             let active_meta = Arc::clone(&self.active_meta);
-            self.with_host_on_main_thread(move |handle, _, _, slot, create_err| {
+            self.with_host_on_main_thread(false, move |_, _, _, slot, _| {
                 let Some(current) = slot.as_ref() else {
-                    if let Ok((sid, acc, msg)) = active_meta.lock().map(|g| g.clone()) {
-                        emit_unavailable_status(
-                            handle,
-                            sid,
-                            acc,
-                            msg,
-                            "createHost",
-                            create_err.unwrap_or_else(|| "原生阅读器宿主不可用".to_string()),
-                        );
-                    }
                     return;
                 };
+                // 旧会话的布局晚到时不再作用到新会话的宿主上。
+                if !active_meta
+                    .lock()
+                    .map(|meta| meta.0 == session_id)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
                 let clip_px = PixelRect {
                     left: clip.left,
                     top: clip.top,
@@ -1332,11 +1520,12 @@ pub mod platform_win {
                 if let Err(err) = current.host.try_set_bounds(content_px, clip_px, visible) {
                     eprintln!("[reader] apply_layout failed: {err}");
                 }
-            })
+            })?;
+            Ok(LayoutDelivery::Delivered)
         }
 
         fn set_visible(&self, visible: bool) {
-            let _ = self.with_host_on_main_thread(move |_, _, _, slot, _| {
+            let _ = self.with_host_on_main_thread(false, move |_, _, _, slot, _| {
                 if let Some(current) = slot.as_ref() {
                     if let Err(err) = current.host.try_set_visible(visible) {
                         eprintln!("[reader] set_visible failed: {err}");
@@ -1345,17 +1534,23 @@ pub mod platform_win {
             });
         }
 
-        fn set_zoom(&self, zoom_percent: u32) {
+        fn set_zoom(&self, session_id: String, zoom_percent: u32) {
+            if !self.session_matches(&session_id) {
+                return;
+            }
             let factor = f64::from(zoom_percent.clamp(50, 250)) / 100.0;
-            let _ = self.with_host_on_main_thread(move |_, _, _, slot, _| {
+            let _ = self.with_host_on_main_thread(false, move |_, _, _, slot, _| {
                 if let Some(current) = slot.as_ref() {
                     current.host.set_zoom(factor);
                 }
             });
         }
 
-        fn execute_script(&self, script: String) {
-            let _ = self.with_host_on_main_thread(move |_, _, _, slot, _| {
+        fn execute_script(&self, session_id: String, script: String) {
+            if !self.session_matches(&session_id) {
+                return;
+            }
+            let _ = self.with_host_on_main_thread(false, move |_, _, _, slot, _| {
                 if let Some(current) = slot.as_ref() {
                     current.host.execute_script(&script);
                 }
@@ -1363,12 +1558,45 @@ pub mod platform_win {
         }
 
         fn close(&self) {
-            let _ = self.app_handle.run_on_main_thread(|| {
+            self.host_expected.store(false, Ordering::SeqCst);
+            let host_expected = Arc::clone(&self.host_expected);
+            let _ = self.app_handle.run_on_main_thread(move || {
                 MAIN_THREAD_HOST.with(|slot| {
                     if let Some(current) = slot.borrow_mut().take() {
                         current.host.close();
                     }
+                    host_expected.store(false, Ordering::SeqCst);
                 });
+            });
+        }
+
+        fn suspend_after_hidden(&self, session_id: String) {
+            let active_meta = Arc::clone(&self.active_meta);
+            let _ = self.with_host_on_main_thread(false, move |handle, _, _, slot, _| {
+                // 调度到 UI 线程后再确认一次：窗口已回到前台、会话已切换或宿主已关闭时放弃挂起。
+                if main_window_in_foreground(handle) {
+                    return;
+                }
+                let Some(current) = slot.as_ref() else {
+                    return;
+                };
+                if current.host.is_closed() {
+                    return;
+                }
+                if !active_meta
+                    .lock()
+                    .map(|meta| meta.0 == session_id)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                // 先把原生层收进隐藏态（try_suspend 要求控制器不可见），再交给共享库异步挂起。
+                // 挂起结果由共享库按文档版本校验，晚于恢复或切信的旧回执会被丢弃并恢复控制器。
+                if let Err(err) = current.host.try_set_visible(false) {
+                    eprintln!("[reader] suspend set_visible failed: {err}");
+                    return;
+                }
+                current.host.try_suspend();
             });
         }
 
@@ -1389,7 +1617,13 @@ mod tests {
         events: Mutex<Vec<ReaderStatusEvent>>,
         layouts: Mutex<Vec<(PhysicalRect, PhysicalRect, bool)>>,
         loads: Mutex<Vec<(Vec<u8>, bool, DocumentMode)>>,
+        visibles: Mutex<Vec<bool>>,
+        zooms: Mutex<Vec<u32>>,
+        scripts: Mutex<Vec<String>>,
+        suspends: Mutex<Vec<String>>,
         apply_layout_error: Mutex<Option<String>>,
+        /// 模拟 `load_html` 没建起原生宿主（创建失败或纯文本未加载原生文档）。
+        host_missing: std::sync::atomic::AtomicBool,
     }
 
     impl ReaderPlatformSink for RecordingSink {
@@ -1411,20 +1645,38 @@ mod tests {
 
         fn apply_layout(
             &self,
+            _: String,
             clip: PhysicalRect,
             bounds: PhysicalRect,
             visible: bool,
-        ) -> Result<(), String> {
+        ) -> Result<LayoutDelivery, String> {
             if let Some(err) = self.apply_layout_error.lock().unwrap().clone() {
                 return Err(err);
             }
+            if self.host_missing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(LayoutDelivery::HostMissing);
+            }
             self.layouts.lock().unwrap().push((clip, bounds, visible));
-            Ok(())
+            Ok(LayoutDelivery::Delivered)
         }
 
-        fn set_visible(&self, _: bool) {}
-        fn set_zoom(&self, _: u32) {}
+        fn set_visible(&self, visible: bool) {
+            self.visibles.lock().unwrap().push(visible);
+        }
+
+        fn set_zoom(&self, _: String, zoom_percent: u32) {
+            self.zooms.lock().unwrap().push(zoom_percent);
+        }
+
+        fn execute_script(&self, _: String, script: String) {
+            self.scripts.lock().unwrap().push(script);
+        }
+
         fn close(&self) {}
+
+        fn suspend_after_hidden(&self, session_id: String) {
+            self.suspends.lock().unwrap().push(session_id);
+        }
 
         fn emit_status(&self, event: ReaderStatusEvent) {
             self.events.lock().unwrap().push(event);
@@ -1438,6 +1690,253 @@ mod tests {
             width,
             height,
         }
+    }
+
+    fn test_appearance() -> ReaderAppearance {
+        ReaderAppearance {
+            theme_id: "system".to_string(),
+            dark: false,
+            zoom_percent: 100,
+            block_remote_images: true,
+        }
+    }
+
+    fn html_doc(session_id: &str, message_id: u32) -> ReaderDocumentSpec {
+        ReaderDocumentSpec {
+            session_id: session_id.to_string(),
+            account_id: 1,
+            message_id,
+            subject: "HTML".to_string(),
+            sender: "a@example.com".to_string(),
+            plain_text: "body".to_string(),
+            html_body: Some("<p>Hi</p>".to_string()),
+            has_thread: false,
+            thread: None,
+        }
+    }
+
+    fn plain_doc(session_id: &str) -> ReaderDocumentSpec {
+        ReaderDocumentSpec {
+            session_id: session_id.to_string(),
+            account_id: 1,
+            message_id: 9,
+            subject: "Plain".to_string(),
+            sender: "a@example.com".to_string(),
+            plain_text: "plain body".to_string(),
+            html_body: None,
+            has_thread: false,
+            thread: None,
+        }
+    }
+
+    fn layout_input(session_id: &str, revision: u64, visible: bool) -> SetReaderLayoutInput {
+        SetReaderLayoutInput {
+            reader_session_id: session_id.to_string(),
+            layout_revision: revision,
+            content_rect: rect(400.0, 48.0, 600.0, 600.0),
+            clip_rect: rect(400.0, 48.0, 600.0, 600.0),
+            visible,
+            device_pixel_ratio: Some(1.0),
+        }
+    }
+
+    #[test]
+    fn plain_text_session_never_creates_or_touches_native_host() {
+        let sink = Arc::new(RecordingSink::default());
+        sink.host_missing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mgr = ReaderManager::new(sink.clone());
+
+        let status = mgr.begin_session(plain_doc("sess-plain"), &test_appearance(), true);
+        assert_eq!(status, BodyStatusDto::Ready);
+        // 纯文本走 Vue 回退：不加载原生文档，只隐藏（隐藏操作在宿主缺席时安全返回）。
+        assert!(sink.loads.lock().unwrap().is_empty());
+        assert_eq!(sink.visibles.lock().unwrap().as_slice(), [false]);
+
+        let out = mgr
+            .apply_layout(&layout_input("sess-plain", 1, false), 1.0)
+            .expect("layout accepted");
+        assert!(!out.applied);
+        assert_eq!(out.reason.as_deref(), Some("hostPending"));
+        // 宿主缺席时布局只记录在管理器，不投递给原生层，也不报不可用。
+        assert!(sink.layouts.lock().unwrap().is_empty());
+        assert_eq!(
+            mgr.snapshot_test_state().2.map(|layout| layout.revision),
+            Some(1)
+        );
+        assert!(!sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.body_status == BodyStatusDto::Unavailable));
+    }
+
+    #[test]
+    fn first_native_body_loads_once_and_layout_is_delivered() {
+        let sink = Arc::new(RecordingSink::default());
+        let mgr = ReaderManager::new(sink.clone());
+
+        let status = mgr.begin_session(html_doc("sess-html", 3), &test_appearance(), true);
+        assert_eq!(status, BodyStatusDto::Loading);
+        assert_eq!(sink.loads.lock().unwrap().len(), 1);
+        assert_eq!(sink.zooms.lock().unwrap().as_slice(), [100]);
+
+        let out = mgr
+            .apply_layout(&layout_input("sess-html", 1, true), 1.0)
+            .expect("layout accepted");
+        assert!(out.applied);
+        assert_eq!(out.visible, Some(true));
+        assert_eq!(sink.layouts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_host_keeps_layout_until_host_is_available_again() {
+        let sink = Arc::new(RecordingSink::default());
+        sink.host_missing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mgr = ReaderManager::new(sink.clone());
+
+        // 首次正文创建失败：管理器接受布局请求但标记为宿主未就绪。
+        mgr.begin_session(html_doc("sess-fail", 1), &test_appearance(), true);
+        let failed = mgr
+            .apply_layout(&layout_input("sess-fail", 1, true), 1.0)
+            .expect("layout accepted");
+        assert!(!failed.applied);
+        assert_eq!(failed.reason.as_deref(), Some("hostPending"));
+        assert!(sink.layouts.lock().unwrap().is_empty());
+
+        // 重建成功后的下一次正文加载可以重试并正常投递布局。
+        sink.host_missing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        mgr.begin_session(html_doc("sess-retry", 1), &test_appearance(), true);
+        assert_eq!(sink.loads.lock().unwrap().len(), 2);
+        let retried = mgr
+            .apply_layout(&layout_input("sess-retry", 1, true), 1.0)
+            .expect("layout accepted");
+        assert!(retried.applied);
+        assert_eq!(sink.layouts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn late_layout_from_previous_session_is_dropped_after_switch() {
+        let sink = Arc::new(RecordingSink::default());
+        let mgr = ReaderManager::new(sink.clone());
+
+        mgr.begin_session(html_doc("sess-old", 1), &test_appearance(), true);
+        assert!(
+            mgr.apply_layout(&layout_input("sess-old", 5, true), 1.0)
+                .expect("old layout")
+                .applied
+        );
+
+        mgr.begin_session(html_doc("sess-new", 2), &test_appearance(), true);
+        assert!(
+            mgr.apply_layout(&layout_input("sess-new", 1, true), 1.0)
+                .expect("new layout")
+                .applied
+        );
+
+        // 旧邮件晚到的布局请求即使修订号更大也限定在原会话。
+        let late = mgr
+            .apply_layout(&layout_input("sess-old", 99, true), 1.0)
+            .expect("late layout");
+        assert!(!late.applied);
+        assert_eq!(late.reason.as_deref(), Some("staleSession"));
+        assert_eq!(sink.layouts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn background_suspend_only_after_sustained_hidden_and_never_repeats() {
+        let sink = Arc::new(RecordingSink::default());
+        let mgr = ReaderManager::new(sink.clone());
+        mgr.begin_session(html_doc("sess-bg", 1), &test_appearance(), true);
+
+        let start = Instant::now();
+        mgr.note_main_window_visibility_at(false, start);
+        mgr.note_main_window_visibility_at(false, start + Duration::from_secs(4));
+        assert!(sink.suspends.lock().unwrap().is_empty());
+
+        // 快速恢复取消待执行挂起，重新计时。
+        mgr.note_main_window_visibility_at(true, start + Duration::from_secs(4));
+        mgr.note_main_window_visibility_at(false, start + Duration::from_secs(4));
+        mgr.note_main_window_visibility_at(false, start + Duration::from_secs(8));
+        assert!(sink.suspends.lock().unwrap().is_empty());
+
+        mgr.note_main_window_visibility_at(false, start + Duration::from_secs(9));
+        assert_eq!(sink.suspends.lock().unwrap().as_slice(), ["sess-bg"]);
+
+        mgr.note_main_window_visibility_at(false, start + Duration::from_secs(30));
+        assert_eq!(sink.suspends.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn background_suspend_is_skipped_while_locked() {
+        let sink = Arc::new(RecordingSink::default());
+        let mgr = ReaderManager::new(sink.clone());
+        mgr.begin_session(html_doc("sess-lock", 1), &test_appearance(), true);
+        mgr.set_locked(true);
+
+        let start = Instant::now();
+        mgr.note_main_window_visibility_at(false, start);
+        mgr.note_main_window_visibility_at(false, start + Duration::from_secs(10));
+        assert!(sink.suspends.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_after_background_reapplies_visible_layout_when_frontend_stayed_silent() {
+        let sink = Arc::new(RecordingSink::default());
+        let mgr = ReaderManager::new(sink.clone());
+        mgr.begin_session(html_doc("sess-restore", 1), &test_appearance(), true);
+        mgr.apply_layout(&layout_input("sess-restore", 1, true), 1.0)
+            .expect("layout applied");
+
+        let start = Instant::now();
+        mgr.note_main_window_visibility_at(false, start);
+        mgr.note_main_window_visibility_at(false, start + Duration::from_secs(6));
+        assert_eq!(sink.suspends.lock().unwrap().len(), 1);
+
+        mgr.note_main_window_visibility_at(true, start + Duration::from_secs(7));
+        let layouts = sink.layouts.lock().unwrap();
+        assert_eq!(layouts.len(), 2);
+        assert!(layouts[1].2);
+    }
+
+    #[test]
+    fn restore_after_background_defers_to_frontend_after_new_layout() {
+        let sink = Arc::new(RecordingSink::default());
+        let mgr = ReaderManager::new(sink.clone());
+        mgr.begin_session(html_doc("sess-frontend", 1), &test_appearance(), true);
+        mgr.apply_layout(&layout_input("sess-frontend", 1, true), 1.0)
+            .expect("layout applied");
+
+        let start = Instant::now();
+        mgr.note_main_window_visibility_at(false, start);
+        // 前端自己感知到 document.hidden 并推送隐藏布局，恢复时由它重新同步可见布局。
+        mgr.apply_layout(&layout_input("sess-frontend", 2, false), 1.0)
+            .expect("hidden layout applied");
+        mgr.note_main_window_visibility_at(false, start + Duration::from_secs(6));
+        assert_eq!(sink.suspends.lock().unwrap().len(), 1);
+
+        mgr.note_main_window_visibility_at(true, start + Duration::from_secs(7));
+        assert_eq!(sink.layouts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn find_script_is_scoped_to_the_active_session() {
+        let sink = Arc::new(RecordingSink::default());
+        let mgr = ReaderManager::new(sink.clone());
+        mgr.begin_session(html_doc("sess-find", 1), &test_appearance(), true);
+
+        assert!(!mgr
+            .find_in_reader("sess-other", "needle", None)
+            .expect("stale find"));
+        assert!(sink.scripts.lock().unwrap().is_empty());
+
+        assert!(mgr
+            .find_in_reader("sess-find", "needle", None)
+            .expect("active find"));
+        assert_eq!(sink.scripts.lock().unwrap().len(), 1);
     }
 
     #[test]

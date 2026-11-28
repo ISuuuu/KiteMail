@@ -639,7 +639,14 @@ function flushLayoutSync(forceHide = false, sessionOverride?: string) {
         } else if (localLayoutAppliedSession.value === sessionId) {
           localLayoutAppliedSession.value = "";
         }
-      } else if (shouldBeVisible && res.reason && res.reason !== "staleSession" && res.reason !== "staleRevision") {
+      } else if (
+        shouldBeVisible &&
+        res.reason &&
+        res.reason !== "staleSession" &&
+        res.reason !== "staleRevision" &&
+        // hostPending：原生宿主还没由 load_html 建起，属于等待态，交给 layout-pending 看门狗兜底。
+        res.reason !== "hostPending"
+      ) {
         localLayoutAppliedSession.value = "";
         localLayoutError.value = `原生阅读器布局未应用（${res.reason}）`;
         console.warn("[ReaderViewport] setReaderLayout ignored:", res.reason, sessionId);
