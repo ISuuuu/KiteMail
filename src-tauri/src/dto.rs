@@ -1600,6 +1600,8 @@ pub struct FetchAttachmentPreviewOutput {
     pub mime_type: String,
     pub data_url: String,
     pub size_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_data_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2558,5 +2560,26 @@ mod tests {
         .expect("SetAppLockPasscodeInput");
         assert_eq!(passcode_in.new_passcode, None);
         assert_eq!(passcode_in.idle_minutes, Some(5));
+
+        let preview_without_thumb = serde_json::to_value(FetchAttachmentPreviewOutput {
+            attachment_id: 1,
+            filename: "note.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            data_url: "data:text/plain;base64,aGk=".to_string(),
+            size_bytes: 2,
+            thumbnail_data_url: None,
+        })
+        .expect("FetchAttachmentPreviewOutput without thumb");
+        assert!(preview_without_thumb.get("thumbnailDataUrl").is_none());
+
+        let legacy_preview: FetchAttachmentPreviewOutput = serde_json::from_value(json!({
+            "attachmentId": 1,
+            "filename": "note.txt",
+            "mimeType": "text/plain",
+            "dataUrl": "data:text/plain;base64,aGk=",
+            "sizeBytes": 2
+        }))
+        .expect("legacy FetchAttachmentPreviewOutput");
+        assert_eq!(legacy_preview.thumbnail_data_url, None);
     }
 }

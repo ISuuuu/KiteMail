@@ -485,9 +485,220 @@ html, body {{ margin: 0; padding: 0; background: #ffffff; color: #1a1d21; font: 
     )
 }
 
+fn pdf_safe_ascii_text(raw: &str, fallback: &str) -> String {
+    let mut ascii_only = String::with_capacity(raw.len());
+    let mut last_was_space = true;
+    for ch in raw.chars() {
+        if ch.is_ascii() && !ch.is_ascii_control() {
+            ascii_only.push(ch);
+            last_was_space = ch == ' ';
+        } else if !last_was_space {
+            ascii_only.push(' ');
+            last_was_space = true;
+        }
+    }
+    let trimmed = ascii_only.trim();
+    let stem = trimmed
+        .strip_suffix(".pdf")
+        .or_else(|| trimmed.strip_suffix(".PDF"))
+        .unwrap_or(trimmed)
+        .trim();
+    let source = if stem.chars().any(|c| c.is_ascii_alphanumeric()) {
+        trimmed
+    } else {
+        fallback
+    };
+    let mut escaped = String::with_capacity(source.len());
+    for ch in source.chars().take(68) {
+        match ch {
+            '\\' => escaped.push_str(r"\\"),
+            '(' => escaped.push_str(r"\("),
+            ')' => escaped.push_str(r"\)"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+/// Build a strictly valid single-page PDF 1.4 document with an accurate `xref` table
+/// for demo PDF previews and Windows WinRT thumbnail rendering.
+pub fn build_demo_pdf_bytes(title: &str, subtitle: &str) -> Vec<u8> {
+    let safe_title = pdf_safe_ascii_text(title, "KiteMail Demo PDF");
+    let safe_subtitle = pdf_safe_ascii_text(subtitle, "KiteMail Demo PDF Preview");
+    let stream_body = format!(
+        "1 1 1 rg\n\
+         0 0 612 792 re f\n\
+         0.93 0.95 0.99 rg\n\
+         36 660 540 96 re f\n\
+         0.21 0.52 0.89 rg\n\
+         36 750 540 6 re f\n\
+         0.12 0.16 0.24 rg\n\
+         BT /F1 20 Tf 56 716 Td ({safe_title}) Tj ET\n\
+         0.34 0.40 0.50 rg\n\
+         BT /F1 12 Tf 56 686 Td ({safe_subtitle}) Tj ET\n\
+         0.21 0.52 0.89 rg\n\
+         56 616 144 10 re f\n\
+         0.82 0.86 0.91 rg\n\
+         56 586 500 8 re f\n\
+         56 566 468 8 re f\n\
+         56 546 484 8 re f\n\
+         56 526 350 8 re f\n\
+         0.96 0.97 0.99 rg\n\
+         56 386 500 112 re f\n\
+         0.84 0.88 0.94 RG 1 w\n\
+         56 386 500 112 re S\n\
+         0.21 0.52 0.89 rg\n\
+         76 468 120 8 re f\n\
+         0.76 0.81 0.88 rg\n\
+         76 442 440 7 re f\n\
+         76 424 410 7 re f\n\
+         76 406 312 7 re f\n\
+         0.82 0.86 0.91 rg\n\
+         56 344 492 8 re f\n\
+         56 324 456 8 re f\n\
+         56 304 476 8 re f\n\
+         56 284 372 8 re f\n\
+         0.86 0.89 0.93 rg\n\
+         56 96 500 1.5 re f\n\
+         0.45 0.50 0.58 rg\n\
+         BT /F1 10 Tf 56 74 Td (KiteMail Demo PDF - Page 1) Tj ET"
+    );
+
+    let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec();
+    let obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec();
+    let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n".to_vec();
+    let obj4 = b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec();
+    let obj5 = format!(
+        "5 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        stream_body.len(),
+        stream_body
+    )
+    .into_bytes();
+
+    let mut pdf = Vec::with_capacity(2048);
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+
+    let mut offsets = [0usize; 6];
+    let objects: [&[u8]; 5] = [&obj1, &obj2, &obj3, &obj4, &obj5];
+    for (idx, obj_bytes) in objects.iter().enumerate() {
+        offsets[idx + 1] = pdf.len();
+        pdf.extend_from_slice(obj_bytes);
+    }
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for offset in &offsets[1..] {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+            .as_bytes(),
+    );
+    pdf
+}
+
+#[cfg(target_os = "windows")]
+fn render_pdf_first_page_png_winrt(
+    pdf_bytes: &[u8],
+    target_width: u32,
+) -> windows::core::Result<Option<Vec<u8>>> {
+    use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
+    use windows::Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream};
+
+    let input_stream = InMemoryRandomAccessStream::new()?;
+    let writer = DataWriter::CreateDataWriter(&input_stream)?;
+    writer.WriteBytes(pdf_bytes)?;
+    writer.StoreAsync()?.get()?;
+    writer.FlushAsync()?.get()?;
+    let _ = writer.DetachStream()?;
+    input_stream.Seek(0)?;
+
+    let doc = PdfDocument::LoadFromStreamAsync(&input_stream)?.get()?;
+    if doc.PageCount()? == 0 {
+        return Ok(None);
+    }
+    let page = doc.GetPage(0)?;
+    let options = PdfPageRenderOptions::new()?;
+    options.SetDestinationWidth(target_width.max(64))?;
+
+    let out_stream = InMemoryRandomAccessStream::new()?;
+    page.RenderWithOptionsToStreamAsync(&out_stream, &options)?
+        .get()?;
+    let _ = page.Close();
+    out_stream.FlushAsync()?.get()?;
+
+    let raw_size = out_stream.Size()?;
+    if raw_size == 0 || raw_size > MAX_ATTACHMENT_PREVIEW_BYTES as u64 {
+        return Ok(None);
+    }
+    let size = raw_size as u32;
+    out_stream.Seek(0)?;
+
+    let reader = DataReader::CreateDataReader(&out_stream)?;
+    let loaded = reader.LoadAsync(size)?.get()?;
+    if loaded == 0 || loaded > MAX_ATTACHMENT_PREVIEW_BYTES as u32 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; loaded as usize];
+    reader.ReadBytes(&mut buf)?;
+    let _ = reader.DetachStream();
+
+    if !buf.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok(None);
+    }
+    Ok(Some(buf))
+}
+
+#[cfg(target_os = "windows")]
+fn render_pdf_first_page_png_worker(pdf_bytes: &[u8], target_width: u32) -> Option<Vec<u8>> {
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+    struct ComApartmentGuard(bool);
+    impl Drop for ComApartmentGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+        return None;
+    }
+    let _com_guard = ComApartmentGuard(hr.is_ok());
+
+    render_pdf_first_page_png_winrt(pdf_bytes, target_width)
+        .ok()
+        .flatten()
+}
+
+/// Render the first page of `pdf_bytes` to PNG using Windows WinRT `Windows.Data.Pdf`.
+/// Runs on a dedicated MTA worker thread to avoid interfering with caller thread COM state.
+#[cfg(target_os = "windows")]
+pub fn render_pdf_first_page_png(pdf_bytes: &[u8], target_width: u32) -> Option<Vec<u8>> {
+    if pdf_bytes.is_empty() || pdf_bytes.len() > MAX_ATTACHMENT_PREVIEW_BYTES {
+        return None;
+    }
+    let width = target_width.max(64);
+    let owned = pdf_bytes.to_vec();
+    std::thread::spawn(move || render_pdf_first_page_png_worker(&owned, width))
+        .join()
+        .ok()
+        .flatten()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn render_pdf_first_page_png(_pdf_bytes: &[u8], _target_width: u32) -> Option<Vec<u8>> {
+    None
+}
+
 fn demo_attachment_payload(attachment_id: u32, filename: &str, mime_type: &str) -> Vec<u8> {
     if is_image_attachment(mime_type, filename) {
         DEMO_SAFE_SVG.as_bytes().to_vec()
+    } else if is_pdf_attachment(mime_type, filename) {
+        build_demo_pdf_bytes(filename, "KiteMail Demo PDF Preview")
     } else {
         format!("{DEMO_SAMPLE_TEXT}\nAttachment ID: {attachment_id}\nFilename: {filename}\n")
             .into_bytes()
@@ -608,6 +819,12 @@ impl MailSession {
                         demo_attachment_payload(att.id, &att.filename, &att.mime_type),
                     )
                 };
+                let thumbnail_data_url = if is_pdf_attachment(&att.mime_type, &att.filename) {
+                    render_pdf_first_page_png(&bytes, 240)
+                        .map(|png| format!("data:image/png;base64,{}", encode_base64(&png)))
+                } else {
+                    None
+                };
                 let b64 = encode_base64(&bytes);
                 let data_url = format!("data:{preview_mime};base64,{b64}");
                 Ok(FetchAttachmentPreviewOutput {
@@ -616,6 +833,7 @@ impl MailSession {
                     mime_type: preview_mime,
                     data_url,
                     size_bytes: bytes.len(),
+                    thumbnail_data_url,
                 })
             }
             AppMode::Live => {
@@ -704,12 +922,19 @@ impl MailSession {
                 let safe_mime = sanitize_mime_for_data_url(&mime_type, &filename);
                 let data_url = format!("data:{safe_mime};base64,{}", encode_base64(&bytes));
                 let size_bytes = bytes.len();
+                let thumbnail_data_url = if is_pdf_attachment(&mime_type, &filename) {
+                    render_pdf_first_page_png(&bytes, 240)
+                        .map(|png| format!("data:image/png;base64,{}", encode_base64(&png)))
+                } else {
+                    None
+                };
                 Ok(FetchAttachmentPreviewOutput {
                     attachment_id: input.attachment_id,
                     filename,
                     mime_type: safe_mime,
                     data_url,
                     size_bytes,
+                    thumbnail_data_url,
                 })
             }
         }
@@ -1691,6 +1916,95 @@ mod tests {
             .expect("save all local");
         assert_eq!(batch.saved_count, 1);
         assert!(Path::new(&batch.saved_paths[0]).is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn decode_base64_for_test(input: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len() * 3 / 4);
+        let mut buf: u32 = 0;
+        let mut bits: u8 = 0;
+        for b in input.bytes() {
+            if b == b'=' {
+                break;
+            }
+            let val = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b' ' | b'\r' | b'\n' | b'\t' => continue,
+                _ => panic!("unexpected base64 byte: {b}"),
+            };
+            buf = (buf << 6) | (val as u32);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(((buf >> bits) & 0xFF) as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn demo_pdf_builder_produces_valid_pdf_1_4_with_escaped_text() {
+        let pdf_bytes = build_demo_pdf_bytes(r"Q3-(roadmap)\v1.pdf", "Demo (Subtitle)");
+        assert!(pdf_bytes.starts_with(b"%PDF-1.4\n"));
+        assert!(pdf_bytes.ends_with(b"%%EOF\n"));
+
+        let text = String::from_utf8_lossy(&pdf_bytes);
+        assert!(text.contains("/Type /Catalog"));
+        assert!(text.contains("/Type /Pages"));
+        assert!(text.contains("/Type /Page"));
+        assert!(text.contains("/BaseFont /Helvetica"));
+        assert!(text.contains(r"(Q3-\(roadmap\)\\v1.pdf)"));
+        assert!(text.contains(r"(Demo \(Subtitle\))"));
+
+        let xref_pos = text.find("xref\n0 6\n").expect("xref table");
+        assert!(text.contains(&format!("startxref\n{xref_pos}\n%%EOF\n")));
+
+        let cjk_pdf = build_demo_pdf_bytes("测试报告.pdf", "摘要");
+        let cjk_text = String::from_utf8_lossy(&cjk_pdf);
+        assert!(cjk_pdf.starts_with(b"%PDF-1.4\n"));
+        assert!(cjk_text.contains("(KiteMail Demo PDF) Tj"));
+    }
+
+    #[test]
+    fn render_pdf_first_page_png_rejects_invalid_bytes_safely() {
+        assert_eq!(render_pdf_first_page_png(b"not a pdf", 180), None);
+        assert_eq!(render_pdf_first_page_png(b"", 180), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn demo_pdf_attachment_801_renders_png_thumbnail() {
+        let (session, _, dir) = make_test_session();
+
+        let preview = session
+            .fetch_attachment_preview(&FetchAttachmentPreviewInput { attachment_id: 801 })
+            .expect("preview Q3-roadmap-draft.pdf");
+        assert_eq!(preview.filename, "Q3-roadmap-draft.pdf");
+        assert_eq!(preview.mime_type, "application/pdf");
+        assert!(preview.data_url.starts_with("data:application/pdf;base64,"));
+
+        let thumb_url = preview
+            .thumbnail_data_url
+            .expect("Windows PDF thumbnail_data_url should be Some");
+        let b64 = thumb_url
+            .strip_prefix("data:image/png;base64,")
+            .expect("thumbnail_data_url must be PNG data URL");
+        let png_bytes = decode_base64_for_test(b64);
+        assert!(
+            png_bytes.len() > 8 && &png_bytes[..8] == b"\x89PNG\r\n\x1a\n",
+            "expected valid PNG magic header, got len={}",
+            png_bytes.len()
+        );
+
+        let text_preview = session
+            .fetch_attachment_preview(&FetchAttachmentPreviewInput { attachment_id: 803 })
+            .expect("preview notes.txt");
+        assert_eq!(text_preview.thumbnail_data_url, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

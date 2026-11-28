@@ -146,6 +146,35 @@ export function decodeTextPreviewDataUrl(dataUrl: string): string | null {
   }
 }
 
+/** 提取附件抽屉网格缩略图 URL（图片用 dataUrl，PDF 用后端渲染的 thumbnailDataUrl） */
+export function resolveDrawerThumbUrl(
+  item: Pick<DrawerAttachmentItem, "id" | "isImage" | "isPdf">,
+  previewCache: Readonly<Record<number, FetchAttachmentPreviewOutput | undefined>>
+): string | null {
+  const preview = previewCache[item.id];
+  if (!preview) return null;
+  if (item.isImage) return preview.dataUrl || null;
+  if (item.isPdf) return preview.thumbnailDataUrl || null;
+  return null;
+}
+
+/** 对附件抽屉中尚未缓存缩略图的图片与 PDF 项发起静默预取 */
+export async function prefetchDrawerThumbnails(
+  items: readonly Pick<DrawerAttachmentItem, "id" | "isImage" | "isPdf">[],
+  previewCache: Readonly<Record<number, FetchAttachmentPreviewOutput | undefined>>,
+  fetchFn: (attachmentId: number, opts?: { force?: boolean; silent?: boolean }) => Promise<unknown>
+): Promise<void> {
+  const tasks: Promise<unknown>[] = [];
+  for (const item of items) {
+    if (!item.isImage && !item.isPdf) continue;
+    if (previewCache[item.id]) continue;
+    tasks.push(fetchFn(item.id, { silent: true }));
+  }
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
 export interface UseAttachmentsOptions {
   pageSize?: number;
 }
@@ -278,15 +307,19 @@ export function useAttachments(options: UseAttachmentsOptions = {}) {
 
   async function fetchPreview(
     attachmentId: number,
-    opts?: { force?: boolean }
+    opts?: { force?: boolean; silent?: boolean }
   ): Promise<FetchAttachmentPreviewOutput | null> {
     if (!opts?.force && previewCache.value[attachmentId]) {
-      previewError.value = null;
+      if (!opts?.silent) {
+        previewError.value = null;
+      }
       return previewCache.value[attachmentId];
     }
 
     previewLoadingId.value = attachmentId;
-    previewError.value = null;
+    if (!opts?.silent) {
+      previewError.value = null;
+    }
     try {
       const preview = await fetchAttachmentPreview({ attachmentId });
       locked.value = false;
@@ -296,7 +329,9 @@ export function useAttachments(options: UseAttachmentsOptions = {}) {
       };
       return preview;
     } catch (err) {
-      handleIpcFailure(err, "preview");
+      if (!opts?.silent) {
+        handleIpcFailure(err, "preview");
+      }
       return null;
     } finally {
       if (previewLoadingId.value === attachmentId) {

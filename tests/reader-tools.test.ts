@@ -97,11 +97,11 @@ test("图片与文档预览缓存命中，避免重复拉取 IPC", async () => {
 
   // 重置并校验文档文本 preview 解码
   __resetReaderToolsMock();
-  const docPreview = await state.fetchPreview(1, { force: true });
+  const docPreview = await state.fetchPreview(9, { force: true });
   assert.ok(docPreview);
   assert.ok(docPreview.dataUrl.startsWith("data:text/plain"));
   const decoded = decodeTextPreviewDataUrl(docPreview.dataUrl);
-  assert.ok(decoded?.includes("KiteMail-三栏布局规范.pdf"));
+  assert.ok(decoded?.includes("CHANGELOG-v0.4.txt"));
 
   state.closePreview();
   assert.equal(state.activePreview.value, null);
