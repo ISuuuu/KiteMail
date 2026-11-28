@@ -1,8 +1,9 @@
 //! Frozen IPC DTOs and event payloads for the KiteMail Tauri main window.
 
+use kitemail_mail_core::cache::TagItem;
 use kitemail_mail_core::{
-    AccountSummary, AttachmentMeta, FolderSummary, LocalDraft, MessageSort, MessageSummary,
-    OutboxItem, OutboxStatus, SearchScope, ThreadMessage,
+    AccountSummary, AttachmentMeta, FolderSummary, LocalDraft, MailTemplate, MessageSort,
+    MessageSummary, OutboxItem, OutboxStatus, SearchScope, ThreadMessage,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -96,6 +97,12 @@ pub struct AccountSummaryDto {
     pub id: u32,
     pub display_name: String,
     pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
 }
 
 impl From<&AccountSummary> for AccountSummaryDto {
@@ -104,6 +111,9 @@ impl From<&AccountSummary> for AccountSummaryDto {
             id: value.id,
             display_name: value.display_name.clone(),
             email: value.email.clone(),
+            label: None,
+            color: None,
+            emoji: None,
         }
     }
 }
@@ -111,7 +121,67 @@ impl From<&AccountSummary> for AccountSummaryDto {
 impl From<&kitemail_mail_core::config::AccountConfig> for AccountSummaryDto {
     fn from(cfg: &kitemail_mail_core::config::AccountConfig) -> Self {
         let summary = AccountSummary::from(cfg);
-        Self::from(&summary)
+        Self {
+            id: summary.id,
+            display_name: summary.display_name,
+            email: summary.email,
+            label: cfg.label.clone(),
+            color: cfg.color.clone(),
+            emoji: cfg.emoji.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagItemDto {
+    pub id: u32,
+    pub name: String,
+    pub color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortcut: Option<u8>,
+}
+
+impl From<&TagItem> for TagItemDto {
+    fn from(value: &TagItem) -> Self {
+        Self {
+            id: value.id,
+            name: value.name.clone(),
+            color: value.color.clone(),
+            shortcut: value.shortcut,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailTemplateDto {
+    pub id: u32,
+    pub name: String,
+    pub to_addr: String,
+    pub cc_addr: String,
+    pub bcc_addr: String,
+    pub subject: String,
+    pub body_text: String,
+    pub body_format: String,
+    pub attachment_paths: Vec<String>,
+    pub created_at: i64,
+}
+
+impl From<&MailTemplate> for MailTemplateDto {
+    fn from(value: &MailTemplate) -> Self {
+        Self {
+            id: value.id,
+            name: value.name.clone(),
+            to_addr: value.to_addr.clone(),
+            cc_addr: value.cc_addr.clone(),
+            bcc_addr: value.bcc_addr.clone(),
+            subject: value.subject.clone(),
+            body_text: value.body_text.clone(),
+            body_format: value.body_format.clone(),
+            attachment_paths: value.attachment_paths.clone(),
+            created_at: value.created_at,
+        }
     }
 }
 
@@ -157,6 +227,8 @@ pub enum MainViewDto {
     Junk,
     Trash,
     Snoozed,
+    Filters,
+    Tags,
     AccountFolder { account_id: u32, folder_id: u32 },
 }
 
@@ -250,6 +322,10 @@ pub struct MainBootstrapDto {
     pub current_view: MainViewDto,
     pub preferences: MainPreferencesDto,
     pub sync_status: SyncStatusDto,
+    #[serde(default)]
+    pub tags: Vec<TagItemDto>,
+    #[serde(default)]
+    pub templates: Vec<MailTemplateDto>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +385,30 @@ pub struct MessageFilterDto {
     pub starred: Option<bool>,
     pub has_attachment: Option<bool>,
     pub today: Option<bool>,
+    pub to_me: Option<bool>,
+    pub from_contacts: Option<bool>,
+    pub high_importance: Option<bool>,
+    pub tagged: Option<bool>,
+    pub date_from_ts: Option<i64>,
+    pub date_to_ts: Option<i64>,
+    pub account_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListThreadSummariesInput {
+    pub account_id: u32,
+    pub message_id: u32,
+    #[serde(default)]
+    pub subject: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListThreadSummariesOutput {
+    pub account_id: u32,
+    pub message_id: u32,
+    pub items: Vec<MessageSummaryDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1891,6 +1991,9 @@ mod tests {
                 id: 1,
                 display_name: "测试工作邮箱".to_string(),
                 email: "demo@hylki.example".to_string(),
+                label: None,
+                color: None,
+                emoji: None,
             }],
             folders: vec![FolderSummaryDto {
                 id: 1,
@@ -1923,6 +2026,8 @@ mod tests {
                 message: None,
                 last_sync_at: Some(1_700_000_000),
             },
+            tags: Vec::new(),
+            templates: Vec::new(),
         };
 
         let val = serde_json::to_value(&dto).expect("serialize bootstrap");

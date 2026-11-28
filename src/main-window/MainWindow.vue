@@ -8,7 +8,11 @@
     <FolderSidebar
       :accounts="state.accounts.value"
       :folders="state.folders.value"
+      :tags="state.tags.value"
+      :templates="state.templates.value"
       :currentView="state.currentView.value"
+      :searchQuery="state.searchQuery.value"
+      :filterSet="state.filterSet.value"
       :isRail="state.layout.isRail.value"
       :width="state.layout.sidebarVisualWidth.value"
       :syncing="state.syncStatus.value.syncing"
@@ -16,17 +20,26 @@
       :hasPasscode="state.hasPasscode.value"
       :darkMode="state.layout.prefs.value.darkMode"
       :effectiveDark="state.layout.effectiveDark.value"
-      @selectView="state.selectView"
+      :readerPosition="state.layout.prefs.value.readerPosition"
+      :activeWorkspaceView="activeWorkspaceView"
+      @selectView="onSidebarSelectView"
+      @applyFilter="onSidebarApplyFilter"
       @toggleCollapse="state.layout.toggleSidebarCollapsed"
       @refresh="state.refresh"
       @lock="state.lock"
+      @quit="state.quit"
       @toggleDarkMode="state.layout.toggleDarkMode"
+      @setDarkMode="state.layout.setDarkMode"
+      @setReaderPosition="state.layout.setReaderPosition"
       @compose="openNewCompose()"
+      @composeFromTemplate="openComposeFromTemplate"
       @openAccounts="openAccountManager()"
-      @openAttachments="attachmentGalleryOpen = true"
-      @openContacts="contactsModalOpen = true"
+      @openAttachments="openAttachmentsView()"
+      @openContacts="openContactsView()"
       @openCommandPalette="commandPaletteOpen = true"
       @openPreferences="openPreferencesModal('appearance')"
+      @openShortcutsHelp="shortcutsHelpOpen = true"
+      @overlayChange="state.layout.setOverlayOpen"
     />
 
     <!-- 侧栏分隔把手 -->
@@ -64,12 +77,21 @@
           :readerPosition="state.layout.prefs.value.readerPosition"
           :compactList="state.layout.prefs.value.compactList"
           :showAvatars="state.layout.prefs.value.showAvatars"
+          :isRail="state.layout.isRail.value"
+          :effectiveDark="state.layout.effectiveDark.value"
+          :tagsMeta="state.tags.value"
+          :collapsedDayGroups="state.collapsedDayGroups.value"
+          :expandedThreadKeys="state.expandedThreadKeys.value"
+          :threadChildren="state.threadChildren.value"
           :scrollResetToken="state.scrollResetToken.value"
           :syncStatus="state.syncStatus.value"
           :cacheReady="state.cacheReady.value"
           @selectMessage="state.selectMessage"
           @toggleSeen="state.toggleMessageSeen"
           @toggleFlagged="state.toggleMessageFlagged"
+          @toggleThread="state.toggleThreadExpand"
+          @toggleDayGroup="state.toggleDayGroup"
+          @toggleSidebar="state.layout.toggleSidebarCollapsed"
           @setSearch="state.setSearch"
           @setScope="state.setScope"
           @setSort="state.setSort"
@@ -273,8 +295,8 @@
 
     <AttachmentGalleryModal
       :open="attachmentGalleryOpen"
-      @update:open="(v) => (attachmentGalleryOpen = v)"
-      @close="attachmentGalleryOpen = false"
+      @update:open="(v) => { attachmentGalleryOpen = v; if (!v && activeWorkspaceView === 'attachments') activeWorkspaceView = 'mail'; }"
+      @close="closeAttachmentsView()"
       @openMessage="onGalleryOpenMessage"
       @overlayChange="state.layout.setOverlayOpen"
     />
@@ -293,8 +315,8 @@
 
     <ContactsModal
       :open="contactsModalOpen"
-      @update:open="(v) => (contactsModalOpen = v)"
-      @close="contactsModalOpen = false"
+      @update:open="(v) => { contactsModalOpen = v; if (!v && activeWorkspaceView === 'contacts') activeWorkspaceView = 'mail'; }"
+      @close="closeContactsView()"
       @composeTo="onComposeToContact"
       @overlayChange="state.layout.setOverlayOpen"
     />
@@ -337,7 +359,7 @@ import PaneSplitter from "./PaneSplitter.vue";
 import ComposePane from "../compose/ComposePane.vue";
 import OutboxUndoToast from "../compose/OutboxUndoToast.vue";
 import { useCompose } from "../compose/useCompose";
-import type { ComposeAccountOption, ComposeMode } from "../compose/types";
+import type { BodyFormat, ComposeAccountOption, ComposeMode } from "../compose/types";
 import AccountsModal from "../accounts/AccountsModal.vue";
 import WelcomeOverlay from "../accounts/WelcomeOverlay.vue";
 import AttachmentDrawer from "../reader-tools/AttachmentDrawer.vue";
@@ -359,7 +381,13 @@ import CommandPaletteModal from "../command-palette/CommandPaletteModal.vue";
 import ShortcutsHelpModal from "../command-palette/ShortcutsHelpModal.vue";
 import type { CommandPaletteItem } from "../command-palette/types";
 import { matchSingleKeyShortcut } from "../command-palette/useCommandPalette";
-import type { OpenMessageOutput } from "../ipc/types";
+import type {
+  MailTemplateDto,
+  MessageFilterDto,
+  OpenMessageOutput,
+  SearchScope,
+  ViewDto,
+} from "../ipc/types";
 import { openSettingsWindow } from "../ipc/windows";
 import { injectMainWindow } from "./useMainWindow";
 import {
@@ -409,6 +437,27 @@ function openNewCompose() {
   compose.openCompose({
     mode: "new",
     accountId: defaultAccountId,
+  });
+}
+
+function openComposeFromTemplate(tpl: MailTemplateDto) {
+  const defaultAccountId =
+    state.currentView.value.kind === "accountFolder"
+      ? String(state.currentView.value.accountId)
+      : composeAccounts.value[0]?.id ?? null;
+  const rawFmt = tpl.bodyFormat?.trim().toLowerCase();
+  const bodyFormat: BodyFormat =
+    rawFmt === "plain" || rawFmt === "markdown" || rawFmt === "html" ? rawFmt : "plain";
+  compose.openCompose({
+    mode: "new",
+    accountId: defaultAccountId,
+    to: tpl.toAddr,
+    cc: tpl.ccAddr,
+    bcc: tpl.bccAddr,
+    subject: tpl.subject,
+    bodyText: tpl.bodyText,
+    bodyFormat,
+    attachmentPaths: [...tpl.attachmentPaths],
   });
 }
 
@@ -471,6 +520,52 @@ const preferencesInitialTab = ref<PreferenceTabId>("appearance");
 const commandPaletteOpen = ref(false);
 const shortcutsHelpOpen = ref(false);
 const singleKeyShortcuts = ref(true);
+const activeWorkspaceView = ref<"mail" | "contacts" | "attachments">("mail");
+
+function onSidebarSelectView(view: ViewDto) {
+  activeWorkspaceView.value = "mail";
+  contactsModalOpen.value = false;
+  attachmentGalleryOpen.value = false;
+  state.selectView(view);
+}
+
+function onSidebarApplyFilter(options: {
+  view?: ViewDto;
+  query?: string;
+  scope?: SearchScope;
+  filter?: MessageFilterDto;
+}) {
+  activeWorkspaceView.value = "mail";
+  contactsModalOpen.value = false;
+  attachmentGalleryOpen.value = false;
+  state.applySidebarFilter(options);
+}
+
+function openContactsView() {
+  activeWorkspaceView.value = "contacts";
+  attachmentGalleryOpen.value = false;
+  contactsModalOpen.value = true;
+}
+
+function closeContactsView() {
+  contactsModalOpen.value = false;
+  if (activeWorkspaceView.value === "contacts") {
+    activeWorkspaceView.value = "mail";
+  }
+}
+
+function openAttachmentsView() {
+  activeWorkspaceView.value = "attachments";
+  contactsModalOpen.value = false;
+  attachmentGalleryOpen.value = true;
+}
+
+function closeAttachmentsView() {
+  attachmentGalleryOpen.value = false;
+  if (activeWorkspaceView.value === "attachments") {
+    activeWorkspaceView.value = "mail";
+  }
+}
 
 const hasAnyOpenModal = computed(
   () =>

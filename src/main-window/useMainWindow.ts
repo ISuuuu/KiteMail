@@ -21,7 +21,9 @@ import type {
   MessageFilterDto,
   ReaderStatusEvent,
   MailChangedEvent,
+  MailTemplateDto,
   SyncStatusDto,
+  TagItemDto,
   MessageRef,
   ReaderPosition,
   MessageMoveOutput,
@@ -30,6 +32,7 @@ import {
   isTauri,
   mainBootstrap,
   listMessages,
+  listThreadSummaries,
   openMessage,
   setReaderLayout,
   updateMainPreferences,
@@ -89,6 +92,154 @@ export interface UndoToastState {
 export interface MessageGroup {
   label: string;
   items: MessageSummaryDto[];
+}
+
+export type VirtualListItem =
+  | {
+      type: "header";
+      key: string;
+      label: string;
+      count: number;
+      collapsed: boolean;
+      top: number;
+      height: number;
+    }
+  | {
+      type: "row";
+      key: string;
+      message: MessageSummaryDto;
+      groupLabel: string;
+      isThreadChild: boolean;
+      isLastThreadChild: boolean;
+      top: number;
+      height: number;
+    };
+
+export const LIST_DATE_HEADER_HEIGHT = 28;
+
+/** 计算虚拟列表布局（支持日期分组折叠、会话子行内联展开与精确行键索引） */
+export function buildMessageListVirtualLayout(
+  groupedMessages: readonly MessageGroup[],
+  options: {
+    rowHeight: number;
+    headerHeight?: number;
+    collapsedDayGroups?: ReadonlySet<string>;
+    expandedThreadKeys?: ReadonlySet<string>;
+    threadChildren?: Readonly<Record<string, readonly MessageSummaryDto[]>>;
+  }
+): {
+  items: VirtualListItem[];
+  totalHeight: number;
+  rowIndexByKey: Map<string, number>;
+} {
+  const items: VirtualListItem[] = [];
+  const rowIndexByKey = new Map<string, number>();
+  const rh = options.rowHeight;
+  const hh = options.headerHeight ?? LIST_DATE_HEADER_HEIGHT;
+  const collapsed = options.collapsedDayGroups ?? new Set<string>();
+  const expandedThreads = options.expandedThreadKeys ?? new Set<string>();
+  const threadChildren = options.threadChildren ?? {};
+  let top = 0;
+
+  for (const group of groupedMessages) {
+    const isGroupCollapsed = Boolean(group.label) && collapsed.has(group.label);
+    if (group.label) {
+      items.push({
+        type: "header",
+        key: `hdr:${group.label}`,
+        label: group.label,
+        count: group.items.length,
+        collapsed: isGroupCollapsed,
+        top,
+        height: hh,
+      });
+      top += hh;
+    }
+    if (isGroupCollapsed) {
+      continue;
+    }
+    for (const msg of group.items) {
+      const key = `${msg.accountId}:${msg.id}`;
+      rowIndexByKey.set(key, items.length);
+      items.push({
+        type: "row",
+        key,
+        message: msg,
+        groupLabel: group.label,
+        isThreadChild: false,
+        isLastThreadChild: false,
+        top,
+        height: rh,
+      });
+      top += rh;
+
+      if (msg.threadCount > 1 && expandedThreads.has(key)) {
+        const children = threadChildren[key] ?? [];
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i];
+          const childKey = `${child.accountId}:${child.id}`;
+          if (!rowIndexByKey.has(childKey)) {
+            rowIndexByKey.set(childKey, items.length);
+          }
+          items.push({
+            type: "row",
+            key: `child:${key}:${childKey}`,
+            message: child,
+            groupLabel: group.label,
+            isThreadChild: true,
+            isLastThreadChild: i === children.length - 1,
+            top,
+            height: rh,
+          });
+          top += rh;
+        }
+      }
+    }
+  }
+
+  return { items, totalHeight: top, rowIndexByKey };
+}
+
+/** 查找包含选中邮件但当前处于折叠状态的日期分组名 */
+export function resolveSelectedGroupToUnfold(
+  selectedId: MessageRef | null,
+  groupedMessages: readonly MessageGroup[],
+  collapsedDayGroups: ReadonlySet<string>
+): string | null {
+  if (!selectedId || collapsedDayGroups.size === 0) return null;
+  for (const group of groupedMessages) {
+    if (!group.label || !collapsedDayGroups.has(group.label)) continue;
+    if (
+      group.items.some(
+        (m) => m.accountId === selectedId.accountId && m.id === selectedId.messageId
+      )
+    ) {
+      return group.label;
+    }
+  }
+  return null;
+}
+
+/** 将 YYYY-MM-DD 起止日期字符串转为闭开区间 Unix 秒时间戳 [from, to) */
+export function dateInputToUnixRange(
+  fromStr: string,
+  toStr: string
+): { dateFromTs: number | null; dateToTs: number | null } {
+  const parseLocalDayStart = (raw: string): number | null => {
+    const trimmed = raw.trim();
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+    if (!m) return null;
+    const year = Number(m[1]);
+    const month = Number(m[2]) - 1;
+    const day = Number(m[3]);
+    const dt = new Date(year, month, day, 0, 0, 0, 0);
+    if (Number.isNaN(dt.getTime())) return null;
+    return Math.floor(dt.getTime() / 1000);
+  };
+  const dateFromTs = parseLocalDayStart(fromStr);
+  const endDayStart = parseLocalDayStart(toStr);
+  const dateToTs = endDayStart !== null ? endDayStart + 86400 : null;
+  return { dateFromTs, dateToTs };
 }
 
 export interface AnchorLayoutItem {
@@ -216,6 +367,8 @@ export function useMainWindow() {
   const stateVersion = ref(0);
   const accounts = ref<AccountSummaryDto[]>([]);
   const folders = ref<FolderSummaryDto[]>([]);
+  const tags = ref<TagItemDto[]>([]);
+  const templates = ref<MailTemplateDto[]>([]);
   const currentView = ref<ViewDto>({ kind: "unifiedInbox" });
   const syncStatus = ref<SyncStatusDto>({
     syncing: false,
@@ -234,11 +387,14 @@ export function useMainWindow() {
   const hasMore = ref(false);
   const scrollResetToken = ref(0);
 
-  // 查询状态
+  // 查询状态与展开/折叠状态
   const searchQuery = ref("");
   const searchScope = ref<SearchScope>("thisFolder");
   const sortMode = ref<MessageSort>("dateNewest");
   const filterSet = ref<MessageFilterDto>({});
+  const expandedThreadKeys = ref<Set<string>>(new Set());
+  const threadChildren = ref<Record<string, MessageSummaryDto[]>>({});
+  const collapsedDayGroups = ref<Set<string>>(new Set());
 
   // 请求代次防乱序
   let queryEpoch = 0;
@@ -391,6 +547,8 @@ export function useMainWindow() {
     activeOpenRequestId = "";
     accounts.value = [];
     folders.value = [];
+    tags.value = [];
+    templates.value = [];
     messages.value = [];
     listTotal.value = 0;
     hasMore.value = false;
@@ -402,6 +560,9 @@ export function useMainWindow() {
     readerError.value = null;
     searchQuery.value = "";
     filterSet.value = {};
+    expandedThreadKeys.value = new Set();
+    threadChildren.value = {};
+    collapsedDayGroups.value = new Set();
     layout.clearOverlays();
   }
 
@@ -549,8 +710,90 @@ export function useMainWindow() {
     openEpoch += 1;
     activeOpenRequestId = "";
     searchQuery.value = "";
+    searchScope.value = "thisFolder";
     filterSet.value = {};
+    expandedThreadKeys.value = new Set();
     loadMessages(true);
+  }
+
+  /** 侧栏规则文件夹 / 标签 / 账号子项快捷筛选（单次刷新，避免重复请求） */
+  function applySidebarFilter(options: {
+    view?: ViewDto;
+    query?: string;
+    scope?: SearchScope;
+    filter?: MessageFilterDto;
+  }) {
+    if (options.view) {
+      currentView.value = options.view;
+    }
+    selectedId.value = null;
+    openedMessage.value = null;
+    readerError.value = null;
+    readerLoading.value = false;
+    openEpoch += 1;
+    activeOpenRequestId = "";
+    searchQuery.value = options.query ?? "";
+    searchScope.value = options.scope ?? "thisFolder";
+    filterSet.value = options.filter ? { ...options.filter } : {};
+    expandedThreadKeys.value = new Set();
+    loadMessages(true);
+  }
+
+  // --- 日期分组折叠 & 会话子行展开 ---
+  function toggleDayGroup(label: string) {
+    if (!label) return;
+    const next = new Set(collapsedDayGroups.value);
+    if (next.has(label)) {
+      next.delete(label);
+    } else {
+      next.add(label);
+    }
+    collapsedDayGroups.value = next;
+  }
+
+  function collapseAllDayGroups() {
+    const next = new Set<string>();
+    for (const g of groupedMessages.value) {
+      if (g.label) next.add(g.label);
+    }
+    collapsedDayGroups.value = next;
+  }
+
+  function expandAllDayGroups() {
+    if (collapsedDayGroups.value.size > 0) {
+      collapsedDayGroups.value = new Set();
+    }
+  }
+
+  async function toggleThreadExpand(msg: MessageSummaryDto) {
+    if (locked.value || msg.threadCount <= 1) return;
+    const key = `${msg.accountId}:${msg.id}`;
+    const next = new Set(expandedThreadKeys.value);
+    if (next.has(key)) {
+      next.delete(key);
+      expandedThreadKeys.value = next;
+      return;
+    }
+    next.add(key);
+    expandedThreadKeys.value = next;
+
+    if (!threadChildren.value[key]) {
+      try {
+        const res = await listThreadSummaries({
+          accountId: msg.accountId,
+          messageId: msg.id,
+          subject: msg.subject,
+        });
+        if (!locked.value) {
+          threadChildren.value = {
+            ...threadChildren.value,
+            [key]: res.items,
+          };
+        }
+      } catch (e) {
+        if (handleIpcError(e)) return;
+      }
+    }
   }
 
   // --- 搜索/筛选/排序 ---
@@ -1066,19 +1309,33 @@ export function useMainWindow() {
     }
   );
 
-  // 键盘上下选邮件
+  // 键盘上下选邮件（自动展开所在折叠日期分组）
+  function selectMessageAndUnfold(target: MessageRef) {
+    const groupToUnfold = resolveSelectedGroupToUnfold(
+      target,
+      groupedMessages.value,
+      collapsedDayGroups.value
+    );
+    if (groupToUnfold) {
+      const next = new Set(collapsedDayGroups.value);
+      next.delete(groupToUnfold);
+      collapsedDayGroups.value = next;
+    }
+    selectMessage(target);
+  }
+
   function selectPrev() {
     const flat = messages.value;
     if (!flat.length) return;
     if (!selectedId.value) {
-      selectMessage({ accountId: flat[0].accountId, messageId: flat[0].id });
+      selectMessageAndUnfold({ accountId: flat[0].accountId, messageId: flat[0].id });
       return;
     }
     const idx = flat.findIndex(
       (m) => m.id === selectedId.value!.messageId && m.accountId === selectedId.value!.accountId
     );
     if (idx > 0) {
-      selectMessage({ accountId: flat[idx - 1].accountId, messageId: flat[idx - 1].id });
+      selectMessageAndUnfold({ accountId: flat[idx - 1].accountId, messageId: flat[idx - 1].id });
     }
   }
 
@@ -1086,14 +1343,14 @@ export function useMainWindow() {
     const flat = messages.value;
     if (!flat.length) return;
     if (!selectedId.value) {
-      selectMessage({ accountId: flat[0].accountId, messageId: flat[0].id });
+      selectMessageAndUnfold({ accountId: flat[0].accountId, messageId: flat[0].id });
       return;
     }
     const idx = flat.findIndex(
       (m) => m.id === selectedId.value!.messageId && m.accountId === selectedId.value!.accountId
     );
     if (idx >= 0 && idx < flat.length - 1) {
-      selectMessage({ accountId: flat[idx + 1].accountId, messageId: flat[idx + 1].id });
+      selectMessageAndUnfold({ accountId: flat[idx + 1].accountId, messageId: flat[idx + 1].id });
     } else if (idx === flat.length - 1) {
       loadMore();
     }
@@ -1110,6 +1367,8 @@ export function useMainWindow() {
       }
       accounts.value = bootstrap.accounts;
       folders.value = bootstrap.folders;
+      tags.value = bootstrap.tags ?? [];
+      templates.value = bootstrap.templates ?? [];
       hasPasscode.value = Boolean(bootstrap.hasPasscode);
       cacheReady.value = bootstrap.cacheReady ?? true;
     } catch (e) {
@@ -1207,6 +1466,8 @@ export function useMainWindow() {
         lockedReason.value = null;
         accounts.value = bootstrap.accounts;
         folders.value = bootstrap.folders;
+        tags.value = bootstrap.tags ?? [];
+        templates.value = bootstrap.templates ?? [];
         currentView.value = bootstrap.currentView;
         await loadMessages(true);
       }
@@ -1246,6 +1507,8 @@ export function useMainWindow() {
     stateVersion,
     accounts,
     folders,
+    tags,
+    templates,
     currentView,
     syncStatus,
     layout,
@@ -1262,6 +1525,9 @@ export function useMainWindow() {
     searchScope,
     sortMode,
     filterSet,
+    expandedThreadKeys,
+    threadChildren,
+    collapsedDayGroups,
     selectedId,
     selectedMessage,
     selectedUnread,
@@ -1275,6 +1541,11 @@ export function useMainWindow() {
     init,
     dispose,
     selectView,
+    applySidebarFilter,
+    toggleDayGroup,
+    collapseAllDayGroups,
+    expandAllDayGroups,
+    toggleThreadExpand,
     setSearch,
     setFilter,
     setSort,

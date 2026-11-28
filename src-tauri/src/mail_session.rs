@@ -35,13 +35,14 @@ use tauri::Emitter;
 use crate::dto::{
     AccountEvent, AccountEventKindDto, AccountSummaryDto, AllowRemoteImagesInput,
     AllowRemoteImagesOutput, AppMode, AttachmentMetaDto, BodyStatusDto, DraftSavedEvent,
-    FolderSummaryDto, IpcError, ListMessagesInput, ListMessagesOutput, LoadOlderMessagesInput,
-    LoadOlderMessagesOutput, LockAppOutput, LockStateEvent, MailChangedEvent, MainBootstrapDto,
-    MainViewDto, MessageActionInput, MessageFilterDto, MessageMoveOutput, MessageSummaryDto,
-    MoveMessageInput, OpenMessageInput, OpenMessageOutput, OutboxEventKindDto, OutboxItemDto,
-    OutboxUpdatedEvent, ReaderPositionDto, ReaderStatusEvent, RefreshMailInput, RefreshMailOutput,
-    SearchScopeDto, SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput,
-    SetMessageSeenOutput, SyncStatusDto, SyncStatusEvent, ThreadMessageDto, UndoMessageMoveInput,
+    FolderSummaryDto, IpcError, ListMessagesInput, ListMessagesOutput, ListThreadSummariesInput,
+    ListThreadSummariesOutput, LoadOlderMessagesInput, LoadOlderMessagesOutput, LockAppOutput,
+    LockStateEvent, MailChangedEvent, MailTemplateDto, MainBootstrapDto, MainViewDto,
+    MessageActionInput, MessageFilterDto, MessageMoveOutput, MessageSummaryDto, MoveMessageInput,
+    OpenMessageInput, OpenMessageOutput, OutboxEventKindDto, OutboxItemDto, OutboxUpdatedEvent,
+    ReaderPositionDto, ReaderStatusEvent, RefreshMailInput, RefreshMailOutput, SearchScopeDto,
+    SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput, SetMessageSeenOutput,
+    SyncStatusDto, SyncStatusEvent, TagItemDto, ThreadMessageDto, UndoMessageMoveInput,
     UndoMessageMoveOutput, UnlockAppInput, UnlockAppOutput, VerifyAccountOutput,
     EVENT_ACCOUNT_EVENT, EVENT_DRAFT_SAVED, EVENT_LOCK_STATE, EVENT_MAIL_CHANGED,
     EVENT_OUTBOX_UPDATED, EVENT_SYNC_STATUS, MAIN_WINDOW_LABEL,
@@ -197,17 +198,27 @@ impl DemoSessionState {
         let account_configs: Vec<AccountConfig> = store
             .accounts
             .iter()
-            .map(|a| AccountConfig {
-                id: a.id,
-                display_name: a.display_name.clone(),
-                email: a.email.clone(),
-                imap_host: "imap.hylki.example".to_string(),
-                imap_port: 993,
-                imap_username: a.email.clone(),
-                smtp_host: "smtp.hylki.example".to_string(),
-                smtp_port: 465,
-                smtp_username: a.email.clone(),
-                ..AccountConfig::default()
+            .map(|a| {
+                let (label, color) = match a.id {
+                    1 => (Some("Work".to_string()), Some("#3584e4".to_string())),
+                    2 => (Some("Hyprlab".to_string()), Some("#9141ac".to_string())),
+                    3 => (Some("Personal".to_string()), Some("#26a269".to_string())),
+                    _ => (None, None),
+                };
+                AccountConfig {
+                    id: a.id,
+                    display_name: a.display_name.clone(),
+                    email: a.email.clone(),
+                    label,
+                    color,
+                    imap_host: "imap.hylki.example".to_string(),
+                    imap_port: 993,
+                    imap_username: a.email.clone(),
+                    smtp_host: "smtp.hylki.example".to_string(),
+                    smtp_port: 465,
+                    smtp_username: a.email.clone(),
+                    ..AccountConfig::default()
+                }
             })
             .collect();
         let account_has_password = account_configs.iter().map(|a| (a.id, true)).collect();
@@ -217,7 +228,7 @@ impl DemoSessionState {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        let accounts = store.accounts.iter().map(AccountSummaryDto::from).collect();
+        let accounts = account_configs.iter().map(AccountSummaryDto::from).collect();
         let base_folders: Vec<FolderSummaryDto> =
             store.folders.iter().map(FolderSummaryDto::from).collect();
         let inbox = store.all_inbox_messages().to_vec();
@@ -415,6 +426,41 @@ impl DemoSessionState {
                 MainViewDto::Junk => self.filter_slice(&self.junk, &parsed, quick, today_start),
                 MainViewDto::Trash => self.filter_slice(&self.trash, &parsed, quick, today_start),
                 MainViewDto::Snoozed => Vec::new(),
+                MainViewDto::Filters => self
+                    .inbox
+                    .iter()
+                    .chain(self.sent.iter())
+                    .chain(self.archive.iter())
+                    .filter(|m| {
+                        (m.unread || m.flagged || m.has_attachment)
+                            && matches_quick_filters(m, quick, today_start)
+                    })
+                    .filter(|m| {
+                        parsed.is_empty()
+                            || parsed.matches_summary(
+                                m,
+                                self.folder_name_for(m.folder_id),
+                                "demo@hylki.example",
+                                None,
+                            )
+                    })
+                    .collect(),
+                MainViewDto::Tags => self
+                    .inbox
+                    .iter()
+                    .chain(self.sent.iter())
+                    .chain(self.archive.iter())
+                    .filter(|m| !m.tags.is_empty() && matches_quick_filters(m, quick, today_start))
+                    .filter(|m| {
+                        parsed.is_empty()
+                            || parsed.matches_summary(
+                                m,
+                                self.folder_name_for(m.folder_id),
+                                "demo@hylki.example",
+                                None,
+                            )
+                    })
+                    .collect(),
                 MainViewDto::AccountFolder {
                     account_id,
                     folder_id,
@@ -433,6 +479,10 @@ impl DemoSessionState {
                 }
             }
         };
+
+        if let Some(account_id) = input.filter.account_id {
+            matched.retain(|m| m.account_id == account_id);
+        }
 
         sort_summary_refs(&mut matched, sort);
 
@@ -885,7 +935,12 @@ fn to_quick_filters(filter: MessageFilterDto) -> QuickFilterSet {
         starred: filter.starred.unwrap_or(false),
         has_attachment: filter.has_attachment.unwrap_or(false),
         today: filter.today.unwrap_or(false),
-        ..QuickFilterSet::default()
+        to_me: filter.to_me.unwrap_or(false),
+        from_contacts: filter.from_contacts.unwrap_or(false),
+        high_importance: filter.high_importance.unwrap_or(false),
+        tagged: filter.tagged.unwrap_or(false),
+        date_from_ts: filter.date_from_ts,
+        date_to_ts: filter.date_to_ts,
     }
 }
 
@@ -894,6 +949,11 @@ fn matches_quick_filters(m: &MessageSummary, filters: QuickFilterSet, today_star
         && (!filters.starred || m.flagged)
         && (!filters.has_attachment || m.has_attachment)
         && (!filters.today || m.date_ts >= today_start_ts)
+        && (!filters.to_me || !m.recipients.trim().is_empty())
+        && (!filters.high_importance || m.importance > 0)
+        && (!filters.tagged || !m.tags.is_empty())
+        && filters.date_from_ts.is_none_or(|from| m.date_ts >= from)
+        && filters.date_to_ts.is_none_or(|to| m.date_ts < to)
 }
 
 fn sort_summary_refs(items: &mut [&MessageSummary], sort: MessageSort) {
@@ -1591,6 +1651,8 @@ impl MailSession {
                 current_view,
                 preferences,
                 sync_status,
+                tags: Vec::new(),
+                templates: Vec::new(),
             };
         }
 
@@ -1608,10 +1670,70 @@ impl MailSession {
                     current_view,
                     preferences,
                     sync_status,
+                    tags: vec![
+                        TagItemDto {
+                            id: 1,
+                            name: "Work".to_string(),
+                            color: "#3584e4".to_string(),
+                            shortcut: Some(1),
+                        },
+                        TagItemDto {
+                            id: 2,
+                            name: "Personal".to_string(),
+                            color: "#26a269".to_string(),
+                            shortcut: Some(2),
+                        },
+                        TagItemDto {
+                            id: 3,
+                            name: "重要".to_string(),
+                            color: "#e01b24".to_string(),
+                            shortcut: Some(3),
+                        },
+                        TagItemDto {
+                            id: 4,
+                            name: "工作".to_string(),
+                            color: "#3584e4".to_string(),
+                            shortcut: Some(4),
+                        },
+                        TagItemDto {
+                            id: 5,
+                            name: "待办".to_string(),
+                            color: "#e66100".to_string(),
+                            shortcut: Some(5),
+                        },
+                        TagItemDto {
+                            id: 6,
+                            name: "财务".to_string(),
+                            color: "#10b981".to_string(),
+                            shortcut: Some(6),
+                        },
+                    ],
+                    templates: Vec::new(),
                 }
             }
             AppMode::Live => {
                 let live = self.live.lock().expect("live mutex poisoned");
+                let (tags, templates) = if config::global_db_in(&live.data_dir).exists() {
+                    if let Ok(cache) = CacheStore::open_for_data_dir_read_only(&live.data_dir) {
+                        let tags = cache
+                            .list_tags()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(TagItemDto::from)
+                            .collect();
+                        let templates = cache
+                            .list_templates()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(MailTemplateDto::from)
+                            .collect();
+                        (tags, templates)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    }
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 MainBootstrapDto {
                     mode: self.mode,
                     locked: false,
@@ -1623,6 +1745,8 @@ impl MailSession {
                     current_view,
                     preferences,
                     sync_status,
+                    tags,
+                    templates,
                 }
             }
         }
@@ -1710,10 +1834,22 @@ impl MailSession {
         let quick = to_quick_filters(input.filter);
         let sort: MessageSort = input.sort.into();
         let limit = input.limit.min(MAX_PAGE_LIMIT);
-        let cross_folder =
-            !input.query.trim().is_empty() && input.scope == SearchScopeDto::AllFolders;
+        let cross_folder = input.scope == SearchScopeDto::AllFolders
+            && (!input.query.trim().is_empty() || !quick.is_empty());
+        let scoped_unified_ids = if let Some(acc_id) = input.filter.account_id {
+            vec![acc_id]
+        } else {
+            unified_ids.clone()
+        };
+        let scoped_enabled_ids = if let Some(acc_id) = input.filter.account_id {
+            vec![acc_id]
+        } else {
+            enabled_ids.clone()
+        };
 
-        let worker_query = if cross_folder {
+        let worker_query = if input.filter.account_id.is_some() {
+            None
+        } else if cross_folder {
             Some(PageQueryRequest::SearchAllFolders {
                 query: input.query.clone(),
                 quick_filters: quick,
@@ -1794,6 +1930,23 @@ impl MailSession {
                     offset: input.offset,
                     limit,
                 }),
+                MainViewDto::Filters => Some(PageQueryRequest::SearchAllFolders {
+                    query: input.query.clone(),
+                    quick_filters: quick,
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
+                MainViewDto::Tags => Some(PageQueryRequest::SearchAllFolders {
+                    query: input.query.clone(),
+                    quick_filters: QuickFilterSet {
+                        tagged: true,
+                        ..quick
+                    },
+                    sort,
+                    offset: input.offset,
+                    limit,
+                }),
                 MainViewDto::AccountFolder { folder_id, .. } => {
                     Some(PageQueryRequest::MessagesPage {
                         folder_id,
@@ -1830,11 +1983,18 @@ impl MailSession {
         })?;
 
         let res = if cross_folder {
-            cache.search_all_folders(&enabled_ids, &input.query, quick, sort, input.offset, limit)
+            cache.search_all_folders(
+                &scoped_enabled_ids,
+                &input.query,
+                quick,
+                sort,
+                input.offset,
+                limit,
+            )
         } else {
             match input.view {
                 MainViewDto::UnifiedInbox => cache.list_unified_inbox_for_accounts(
-                    &unified_ids,
+                    &scoped_unified_ids,
                     &input.query,
                     quick,
                     sort,
@@ -1842,7 +2002,7 @@ impl MailSession {
                     limit,
                 ),
                 MainViewDto::Unread => cache.list_unread_messages_for_accounts(
-                    &unified_ids,
+                    &scoped_unified_ids,
                     &input.query,
                     quick,
                     sort,
@@ -1850,7 +2010,7 @@ impl MailSession {
                     limit,
                 ),
                 MainViewDto::Starred => cache.list_starred_messages_for_accounts(
-                    &unified_ids,
+                    &scoped_unified_ids,
                     &input.query,
                     quick,
                     sort,
@@ -1858,7 +2018,7 @@ impl MailSession {
                     limit,
                 ),
                 MainViewDto::Sent => cache.list_sent_messages_for_accounts(
-                    &unified_ids,
+                    &scoped_unified_ids,
                     &input.query,
                     quick,
                     sort,
@@ -1866,7 +2026,7 @@ impl MailSession {
                     limit,
                 ),
                 MainViewDto::Archive => cache.list_archived_messages_for_accounts(
-                    &unified_ids,
+                    &scoped_unified_ids,
                     &input.query,
                     quick,
                     sort,
@@ -1874,7 +2034,7 @@ impl MailSession {
                     limit,
                 ),
                 MainViewDto::Junk => cache.list_junk_messages_for_accounts(
-                    &unified_ids,
+                    &scoped_unified_ids,
                     &input.query,
                     quick,
                     sort,
@@ -1882,7 +2042,7 @@ impl MailSession {
                     limit,
                 ),
                 MainViewDto::Trash => cache.list_trash_messages_for_accounts(
-                    &unified_ids,
+                    &scoped_unified_ids,
                     &input.query,
                     quick,
                     sort,
@@ -1890,9 +2050,28 @@ impl MailSession {
                     limit,
                 ),
                 MainViewDto::Snoozed => cache.list_snoozed_messages_for_accounts(
-                    &unified_ids,
+                    &scoped_unified_ids,
                     &input.query,
                     quick,
+                    sort,
+                    input.offset,
+                    limit,
+                ),
+                MainViewDto::Filters => cache.search_all_folders(
+                    &scoped_enabled_ids,
+                    &input.query,
+                    quick,
+                    sort,
+                    input.offset,
+                    limit,
+                ),
+                MainViewDto::Tags => cache.search_all_folders(
+                    &scoped_enabled_ids,
+                    &input.query,
+                    QuickFilterSet {
+                        tagged: true,
+                        ..quick
+                    },
                     sort,
                     input.offset,
                     limit,
@@ -2003,6 +2182,55 @@ impl MailSession {
             thread,
         };
         (spec, effective_appearance, remote_blocked)
+    }
+
+    pub fn list_thread_summaries(
+        &self,
+        input: &ListThreadSummariesInput,
+    ) -> Result<ListThreadSummariesOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if input.account_id == 0 || input.message_id == 0 {
+            return Err(IpcError::invalid_input(
+                "accountId 与 messageId 必须为正整数",
+                None,
+            ));
+        }
+        let items: Vec<MessageSummaryDto> = match self.mode {
+            AppMode::Demo => {
+                let demo = self.demo.lock().expect("demo mutex poisoned");
+                demo.store
+                    .list_thread_summaries(input.message_id)
+                    .iter()
+                    .map(MessageSummaryDto::from)
+                    .collect()
+            }
+            AppMode::Live => {
+                let data_dir = {
+                    let live = self.live.lock().expect("live mutex poisoned");
+                    live.data_dir.clone()
+                };
+                if !config::global_db_in(&data_dir).exists() {
+                    Vec::new()
+                } else {
+                    let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
+                        IpcError::internal(format!("打开本地只读缓存失败: {e}"), None)
+                    })?;
+                    cache
+                        .list_thread_summaries(input.account_id, input.message_id, &input.subject)
+                        .map_err(|e| IpcError::internal(format!("加载会话子邮件失败: {e}"), None))?
+                        .iter()
+                        .map(MessageSummaryDto::from)
+                        .collect()
+                }
+            }
+        };
+        Ok(ListThreadSummariesOutput {
+            account_id: input.account_id,
+            message_id: input.message_id,
+            items,
+        })
     }
 
     pub fn open_message(

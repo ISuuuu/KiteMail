@@ -314,6 +314,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::main_bootstrap,
             commands::list_messages,
+            commands::list_thread_summaries,
             commands::open_message,
             commands::set_reader_layout,
             commands::update_main_preferences,

@@ -694,6 +694,7 @@ impl PreferencesStore {
             MainViewDto::Junk => (Some("junk".to_string()), None),
             MainViewDto::Trash => (Some("trash".to_string()), None),
             MainViewDto::Snoozed => (Some("snoozed".to_string()), None),
+            MainViewDto::Filters | MainViewDto::Tags => (Some("unified".to_string()), None),
             MainViewDto::AccountFolder {
                 account_id,
                 folder_id,

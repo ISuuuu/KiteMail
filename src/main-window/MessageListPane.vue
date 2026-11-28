@@ -1,9 +1,235 @@
 <template>
   <section class="km-list-pane" aria-label="邮件列表">
-    <!-- 顶部栏 48px -->
-    <header class="km-list-header">
+    <!-- 顶部栏 48px：左（侧栏切换 + 搜索图标） / 中（拖拽区） / 右（总数 + 排序筛选图标） -->
+    <header class="km-list-header" data-tauri-drag-region>
+      <div class="km-header-left">
+        <button
+          type="button"
+          class="km-icon-btn"
+          :title="isRail ? '展开侧栏' : '折叠侧栏'"
+          :aria-label="isRail ? '展开侧栏' : '折叠侧栏'"
+          @click="emit('toggleSidebar')"
+        >
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <rect
+              x="2"
+              y="2.5"
+              width="12"
+              height="11"
+              rx="1.8"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.35"
+            />
+            <path fill="none" stroke="currentColor" stroke-width="1.35" d="M6 2.5v11" />
+          </svg>
+        </button>
+
+        <button
+          type="button"
+          class="km-icon-btn"
+          :class="{ active: searchBarVisible }"
+          title="搜索邮件 (Ctrl+F)"
+          aria-label="搜索邮件"
+          :aria-expanded="searchBarVisible"
+          @click="toggleSearchBar"
+        >
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.45" />
+            <path
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.45"
+              stroke-linecap="round"
+              d="m10.4 10.4 3.2 3.2"
+            />
+          </svg>
+        </button>
+      </div>
+
+      <div class="km-header-spacer" data-tauri-drag-region>
+        <span v-if="syncStatus?.syncing" class="km-sync-pill" role="status" :title="syncStatus.message || '正在同步邮件…'">
+          <span class="km-sync-spinner" aria-hidden="true" />
+        </span>
+      </div>
+
+      <div class="km-header-right">
+        <span class="km-total-count" :title="`共 ${total.toLocaleString()} 封邮件`">
+          {{ total.toLocaleString() }}
+        </span>
+
+        <!-- 排序与筛选菜单 -->
+        <div ref="filterWrapRef" class="km-popover-wrap">
+          <button
+            type="button"
+            class="km-icon-btn km-filter-btn"
+            :class="{ active: hasActiveFilter }"
+            :title="filterTooltip"
+            aria-label="排序与筛选"
+            aria-haspopup="menu"
+            :aria-expanded="filterMenuOpen"
+            @click="toggleFilterMenu"
+          >
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+              <path
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                d="M2.5 4.2h11M4.5 8h7M6.5 11.8h3"
+              />
+            </svg>
+            <span v-if="hasActiveFilter" class="km-filter-active-dot" aria-hidden="true" />
+          </button>
+
+          <div v-if="filterMenuOpen" class="km-popover-menu" role="menu" aria-label="排序与筛选">
+            <div class="km-menu-title">快速筛选</div>
+            <label class="km-menu-check">
+              <input
+                type="checkbox"
+                :checked="Boolean(filterSet.unread)"
+                @change="toggleFilterFlag('unread')"
+              />
+              <span>仅未读</span>
+            </label>
+            <label class="km-menu-check">
+              <input
+                type="checkbox"
+                :checked="Boolean(filterSet.starred)"
+                @change="toggleFilterFlag('starred')"
+              />
+              <span>仅星标</span>
+            </label>
+            <label class="km-menu-check">
+              <input
+                type="checkbox"
+                :checked="Boolean(filterSet.hasAttachment)"
+                @change="toggleFilterFlag('hasAttachment')"
+              />
+              <span>含附件</span>
+            </label>
+            <label class="km-menu-check">
+              <input
+                type="checkbox"
+                :checked="Boolean(filterSet.toMe)"
+                @change="toggleFilterFlag('toMe')"
+              />
+              <span>直接发给我</span>
+            </label>
+            <label class="km-menu-check">
+              <input
+                type="checkbox"
+                :checked="Boolean(filterSet.highImportance)"
+                @change="toggleFilterFlag('highImportance')"
+              />
+              <span>高优先级</span>
+            </label>
+            <label class="km-menu-check">
+              <input
+                type="checkbox"
+                :checked="Boolean(filterSet.tagged)"
+                @change="toggleFilterFlag('tagged')"
+              />
+              <span>含标签</span>
+            </label>
+            <label class="km-menu-check">
+              <input
+                type="checkbox"
+                :checked="Boolean(filterSet.today)"
+                @change="toggleFilterFlag('today')"
+              />
+              <span>今天</span>
+            </label>
+
+            <div class="km-menu-divider" />
+            <div class="km-menu-title">日期范围</div>
+            <div class="km-date-presets">
+              <button type="button" class="km-date-preset-btn" @click="applyDatePresetDays(7)">7 天</button>
+              <button type="button" class="km-date-preset-btn" @click="applyDatePresetDays(30)">30 天</button>
+              <button type="button" class="km-date-preset-btn" @click="applyDatePresetDays(90)">90 天</button>
+            </div>
+            <div class="km-date-inputs">
+              <label class="km-date-field">
+                <span>起</span>
+                <input
+                  v-model="dateFromDraft"
+                  type="date"
+                  class="km-date-input"
+                  aria-label="开始日期"
+                  @change="applyCustomDateRange"
+                />
+              </label>
+              <label class="km-date-field">
+                <span>止</span>
+                <input
+                  v-model="dateToDraft"
+                  type="date"
+                  class="km-date-input"
+                  aria-label="结束日期"
+                  @change="applyCustomDateRange"
+                />
+              </label>
+            </div>
+            <button
+              v-if="hasDateRangeFilter"
+              type="button"
+              class="km-menu-subaction"
+              @click="clearDateRange"
+            >
+              清除日期范围
+            </button>
+
+            <button
+              v-if="hasActiveFilter"
+              type="button"
+              class="km-menu-reset"
+              @click="clearAllFilters"
+            >
+              重置全部筛选 ({{ activeFilterCount }})
+            </button>
+
+            <div class="km-menu-divider" />
+            <div class="km-menu-title">排序方式</div>
+            <button
+              v-for="opt in SORT_OPTIONS"
+              :key="opt.value"
+              type="button"
+              class="km-menu-item"
+              :class="{ active: sortMode === opt.value }"
+              @click="selectSort(opt.value)"
+            >
+              <span>{{ opt.label }}</span>
+              <svg v-if="sortMode === opt.value" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                <path
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="m3.5 8.5 3 3 6-6.5"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- 可展开第二行搜索框（仅点击搜索图标 / Ctrl+F / 有查询词时展示） -->
+    <div v-if="searchBarVisible" class="km-search-row">
       <div class="km-search-box">
-        <span class="km-search-icon" aria-hidden="true">🔍</span>
+        <span class="km-search-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="13" height="13">
+            <circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+            <path
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              d="m10.4 10.4 3.2 3.2"
+            />
+          </svg>
+        </span>
         <input
           ref="searchInputRef"
           v-model="draftQuery"
@@ -18,122 +244,42 @@
           @keydown.esc.stop="clearSearch"
         />
         <button
-          v-if="draftQuery"
           type="button"
           class="km-clear-btn"
-          title="清空搜索"
-          aria-label="清空搜索"
+          :title="draftQuery ? '清空搜索' : '收起搜索'"
+          :aria-label="draftQuery ? '清空搜索' : '收起搜索'"
           @click="clearSearch"
         >
-          ✕
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              d="m4 4 8 8m0-8-8 8"
+            />
+          </svg>
         </button>
       </div>
 
-      <!-- 搜索范围 -->
       <button
         type="button"
-        class="km-toolbar-btn"
+        class="km-scope-btn"
         :class="{ active: searchScope === 'allFolders' }"
         :title="searchScope === 'allFolders' ? '当前：跨文件夹搜索' : '当前：仅搜本文件夹'"
         @click="toggleScope"
       >
         {{ searchScope === "allFolders" ? "全部" : "本夹" }}
       </button>
+    </div>
 
-      <!-- 筛选弹出菜单 -->
-      <div ref="filterWrapRef" class="km-popover-wrap">
-        <button
-          type="button"
-          class="km-toolbar-btn"
-          :class="{ active: hasActiveFilter }"
-          aria-haspopup="menu"
-          :aria-expanded="filterMenuOpen"
-          @click="toggleFilterMenu"
-        >
-          筛选{{ activeFilterCount > 0 ? `(${activeFilterCount})` : "" }}
-        </button>
-
-        <div v-if="filterMenuOpen" class="km-popover-menu" role="menu">
-          <div class="km-menu-title">快速筛选</div>
-          <label class="km-menu-check">
-            <input
-              type="checkbox"
-              :checked="Boolean(filterSet.unread)"
-              @change="toggleFilterFlag('unread')"
-            />
-            <span>仅未读</span>
-          </label>
-          <label class="km-menu-check">
-            <input
-              type="checkbox"
-              :checked="Boolean(filterSet.starred)"
-              @change="toggleFilterFlag('starred')"
-            />
-            <span>仅星标</span>
-          </label>
-          <label class="km-menu-check">
-            <input
-              type="checkbox"
-              :checked="Boolean(filterSet.hasAttachment)"
-              @change="toggleFilterFlag('hasAttachment')"
-            />
-            <span>含附件</span>
-          </label>
-          <label class="km-menu-check">
-            <input
-              type="checkbox"
-              :checked="Boolean(filterSet.today)"
-              @change="toggleFilterFlag('today')"
-            />
-            <span>今天</span>
-          </label>
-          <button
-            v-if="hasActiveFilter"
-            type="button"
-            class="km-menu-reset"
-            @click="clearAllFilters"
-          >
-            重置筛选
-          </button>
-
-          <div class="km-menu-divider" />
-          <div class="km-menu-title">排序方式</div>
-          <button
-            v-for="opt in SORT_OPTIONS"
-            :key="opt.value"
-            type="button"
-            class="km-menu-item"
-            :class="{ active: sortMode === opt.value }"
-            @click="selectSort(opt.value)"
-          >
-            <span>{{ opt.label }}</span>
-            <span v-if="sortMode === opt.value">✓</span>
-          </button>
-        </div>
-      </div>
-
-      <button
-        type="button"
-        class="km-toolbar-btn"
-        title="刷新当前列表 (F5)"
-        aria-label="刷新"
-        @click="emit('refresh')"
-      >
-        ↻
-      </button>
-    </header>
-
-    <!-- 列表摘要栏 -->
-    <div class="km-list-subbar">
-      <span class="km-total-text">共 {{ total.toLocaleString() }} 封</span>
-      <span v-if="syncStatus?.syncing" class="km-sync-text" role="status">
-        <span class="km-sync-spinner" aria-hidden="true" />
-        <span>{{ syncStatus.message || "正在同步邮件…" }}</span>
+    <!-- 启用筛选状态反馈条（仅在开启了快捷筛选或日期筛选时显示，常态隐藏） -->
+    <div v-if="hasActiveFilter" class="km-active-filter-bar">
+      <span class="km-filter-summary">
+        已启用 {{ activeFilterCount }} 项筛选
+        <span v-if="hasDateRangeFilter">（含日期范围）</span>
       </span>
-      <span v-else-if="hasActiveFilter" class="km-filter-summary">
-        已启用筛选
-        <button type="button" class="km-link-btn" @click="clearAllFilters">清除</button>
-      </span>
+      <button type="button" class="km-link-btn" @click="clearAllFilters">清除</button>
     </div>
 
     <!-- 错误提示条 -->
@@ -186,9 +332,37 @@
             transform: `translateY(${item.top}px)`,
           }"
         >
-          <div v-if="item.type === 'header'" class="km-date-group-header">
-            {{ item.label }}
-          </div>
+          <button
+            v-if="item.type === 'header'"
+            type="button"
+            class="km-date-group-header"
+            :aria-expanded="!item.collapsed"
+            :title="item.collapsed ? `展开 ${item.label}` : `折叠 ${item.label}`"
+            @click="emit('toggleDayGroup', item.label)"
+          >
+            <span class="km-date-group-left">
+              <span class="km-date-group-label">{{ item.label }}</span>
+              <svg
+                class="km-date-chevron"
+                :class="{ collapsed: item.collapsed }"
+                viewBox="0 0 12 12"
+                width="10"
+                height="10"
+                aria-hidden="true"
+              >
+                <path
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="m3 4.5 3 3 3-3"
+                />
+              </svg>
+            </span>
+            <span v-if="item.collapsed" class="km-date-group-count">{{ item.count }}</span>
+          </button>
+
           <MessageRow
             v-else
             :message="item.message"
@@ -196,9 +370,15 @@
             :wide="listWide"
             :compact="compactList"
             :showAvatar="showAvatars"
+            :effectiveDark="effectiveDark"
+            :tagsMeta="tagsMeta"
+            :threadExpanded="isThreadExpanded(item.message)"
+            :isThreadChild="item.isThreadChild"
+            :isLastThreadChild="item.isLastThreadChild"
             @select="emit('selectMessage', $event)"
             @toggleSeen="(ref, seen) => emit('toggleSeen', ref, seen)"
             @toggleFlagged="(ref, flagged) => emit('toggleFlagged', ref, flagged)"
+            @toggleThread="emit('toggleThread', $event)"
           />
         </div>
       </div>
@@ -231,8 +411,15 @@ import type {
   ReaderPosition,
   SearchScope,
   SyncStatusDto,
+  TagItemDto,
 } from "../ipc/types";
-import { computeAnchorScrollTop, type MessageGroup } from "./useMainWindow";
+import {
+  buildMessageListVirtualLayout,
+  computeAnchorScrollTop,
+  dateInputToUnixRange,
+  type MessageGroup,
+  type VirtualListItem,
+} from "./useMainWindow";
 import MessageRow from "./MessageRow.vue";
 
 const SORT_OPTIONS: ReadonlyArray<{ value: MessageSort; label: string }> = [
@@ -248,33 +435,52 @@ const SORT_OPTIONS: ReadonlyArray<{ value: MessageSort; label: string }> = [
   { value: "subjectDesc", label: "主题 Z → A" },
 ];
 
-const props = defineProps<{
-  messages: MessageSummaryDto[];
-  groupedMessages: MessageGroup[];
-  total: number;
-  loading: boolean;
-  error: string | null;
-  hasMore: boolean;
-  hasMoreRemote?: boolean;
-  loadingOlder?: boolean;
-  searchQuery: string;
-  searchScope: SearchScope;
-  sortMode: MessageSort;
-  filterSet: MessageFilterDto;
-  selectedId: MessageRef | null;
-  listWide: boolean;
-  readerPosition: ReaderPosition;
-  compactList: boolean;
-  showAvatars: boolean;
-  scrollResetToken?: number;
-  syncStatus?: SyncStatusDto;
-  cacheReady?: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    messages: MessageSummaryDto[];
+    groupedMessages: MessageGroup[];
+    total: number;
+    loading: boolean;
+    error: string | null;
+    hasMore: boolean;
+    hasMoreRemote?: boolean;
+    loadingOlder?: boolean;
+    searchQuery: string;
+    searchScope: SearchScope;
+    sortMode: MessageSort;
+    filterSet: MessageFilterDto;
+    selectedId: MessageRef | null;
+    listWide: boolean;
+    readerPosition: ReaderPosition;
+    compactList: boolean;
+    showAvatars: boolean;
+    isRail?: boolean;
+    effectiveDark?: boolean;
+    tagsMeta?: TagItemDto[];
+    collapsedDayGroups?: ReadonlySet<string>;
+    expandedThreadKeys?: ReadonlySet<string>;
+    threadChildren?: Readonly<Record<string, readonly MessageSummaryDto[]>>;
+    scrollResetToken?: number;
+    syncStatus?: SyncStatusDto;
+    cacheReady?: boolean;
+  }>(),
+  {
+    isRail: false,
+    effectiveDark: false,
+    tagsMeta: () => [],
+    collapsedDayGroups: () => new Set<string>(),
+    expandedThreadKeys: () => new Set<string>(),
+    threadChildren: () => ({}),
+  }
+);
 
 const emit = defineEmits<{
   selectMessage: [ref: MessageRef];
   toggleSeen: [ref: MessageRef, seen: boolean];
   toggleFlagged: [ref: MessageRef, flagged: boolean];
+  toggleThread: [message: MessageSummaryDto];
+  toggleDayGroup: [label: string];
+  toggleSidebar: [];
   setSearch: [query: string];
   setScope: [scope: SearchScope];
   setSort: [sort: MessageSort];
@@ -289,10 +495,15 @@ const searchInputRef = ref<HTMLInputElement | null>(null);
 const filterWrapRef = ref<HTMLElement | null>(null);
 const viewportRef = ref<HTMLElement | null>(null);
 
-// 搜索与 IME 组合状态
+// 可展开搜索栏状态：常态收起，点击搜索图标或 Ctrl+F 展开；有查询时保持展开
+const searchOpen = ref(Boolean(props.searchQuery));
 const draftQuery = ref(props.searchQuery);
 const isComposing = ref(false);
 let searchTimer: ReturnType<typeof setTimeout> | null = null;
+
+const searchBarVisible = computed(
+  () => searchOpen.value || draftQuery.value.length > 0 || props.searchQuery.length > 0
+);
 
 watch(
   () => props.searchQuery,
@@ -300,8 +511,27 @@ watch(
     if (draftQuery.value !== val) {
       draftQuery.value = val;
     }
+    if (!val && !searchOpen.value) {
+      searchOpen.value = false;
+    }
   }
 );
+
+function toggleSearchBar() {
+  if (searchBarVisible.value && !draftQuery.value && !props.searchQuery) {
+    searchOpen.value = false;
+    return;
+  }
+  searchOpen.value = !searchOpen.value;
+  if (searchOpen.value) {
+    nextTick(() => {
+      searchInputRef.value?.focus();
+      searchInputRef.value?.select();
+    });
+  } else if (!draftQuery.value && !props.searchQuery) {
+    searchOpen.value = false;
+  }
+}
 
 function onSearchInput() {
   if (isComposing.value) return;
@@ -336,6 +566,7 @@ function clearSearch() {
     searchTimer = null;
   }
   draftQuery.value = "";
+  searchOpen.value = false;
   emit("setSearch", "");
 }
 
@@ -345,6 +576,26 @@ function toggleScope() {
 
 // 筛选/排序弹出层
 const filterMenuOpen = ref(false);
+const dateFromDraft = ref("");
+const dateToDraft = ref("");
+
+function formatUnixToDateInput(ts?: number | null): string {
+  if (ts == null || !Number.isFinite(ts)) return "";
+  const d = new Date(ts * 1000);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+watch(
+  () => [props.filterSet.dateFromTs, props.filterSet.dateToTs] as const,
+  ([fromTs, toTs]) => {
+    dateFromDraft.value = formatUnixToDateInput(fromTs);
+    dateToDraft.value = toTs != null ? formatUnixToDateInput(toTs - 86400) : "";
+  },
+  { immediate: true }
+);
 
 function setFilterMenu(open: boolean) {
   if (filterMenuOpen.value === open) return;
@@ -356,14 +607,38 @@ function toggleFilterMenu() {
   setFilterMenu(!filterMenuOpen.value);
 }
 
+const hasDateRangeFilter = computed(
+  () => props.filterSet.dateFromTs != null || props.filterSet.dateToTs != null
+);
+
 const activeFilterCount = computed(() => {
   const f = props.filterSet;
-  return Number(Boolean(f.unread)) + Number(Boolean(f.starred)) + Number(Boolean(f.hasAttachment)) + Number(Boolean(f.today));
+  return (
+    Number(Boolean(f.unread)) +
+    Number(Boolean(f.starred)) +
+    Number(Boolean(f.hasAttachment)) +
+    Number(Boolean(f.toMe)) +
+    Number(Boolean(f.fromContacts)) +
+    Number(Boolean(f.highImportance)) +
+    Number(Boolean(f.tagged)) +
+    Number(Boolean(f.today)) +
+    Number(hasDateRangeFilter.value)
+  );
 });
 
 const hasActiveFilter = computed(() => activeFilterCount.value > 0);
 
-function toggleFilterFlag(key: keyof MessageFilterDto) {
+const filterTooltip = computed(() => {
+  const sortLabel = SORT_OPTIONS.find((o) => o.value === props.sortMode)?.label ?? "排序";
+  if (!hasActiveFilter.value) {
+    return `排序与筛选（${sortLabel}）`;
+  }
+  return `排序：${sortLabel}｜已启用 ${activeFilterCount.value} 项筛选`;
+});
+
+function toggleFilterFlag(
+  key: "unread" | "starred" | "hasAttachment" | "today" | "toMe" | "fromContacts" | "highImportance" | "tagged"
+) {
   const next: MessageFilterDto = {
     ...props.filterSet,
     [key]: !props.filterSet[key],
@@ -371,14 +646,45 @@ function toggleFilterFlag(key: keyof MessageFilterDto) {
   emit("setFilter", next);
 }
 
+function applyDatePresetDays(days: number) {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const start = Math.floor(now.getTime() / 1000) - (days - 1) * 86400;
+  emit("setFilter", {
+    ...props.filterSet,
+    dateFromTs: start,
+    dateToTs: null,
+  });
+}
+
+function applyCustomDateRange() {
+  const { dateFromTs, dateToTs } = dateInputToUnixRange(dateFromDraft.value, dateToDraft.value);
+  emit("setFilter", {
+    ...props.filterSet,
+    dateFromTs,
+    dateToTs,
+  });
+}
+
+function clearDateRange() {
+  dateFromDraft.value = "";
+  dateToDraft.value = "";
+  const next = { ...props.filterSet };
+  delete next.dateFromTs;
+  delete next.dateToTs;
+  emit("setFilter", next);
+}
+
 function clearAllFilters() {
-  emit("setFilter", {});
+  dateFromDraft.value = "";
+  dateToDraft.value = "";
+  emit("setFilter", props.filterSet.accountId != null ? { accountId: props.filterSet.accountId } : {});
   setFilterMenu(false);
 }
 
 function resetQueryAndFilters() {
   clearSearch();
-  emit("setFilter", {});
+  clearAllFilters();
 }
 
 function selectSort(sort: MessageSort) {
@@ -387,48 +693,19 @@ function selectSort(sort: MessageSort) {
 }
 
 // ---------- 虚拟列表布局计算 ----------
-type VirtualItem =
-  | { type: "header"; key: string; label: string; top: number; height: number }
-  | { type: "row"; key: string; message: MessageSummaryDto; top: number; height: number };
-
 const rowHeight = computed(() => {
   if (props.listWide) return 38;
-  return props.compactList ? 66 : 90;
+  return props.compactList ? 68 : 86;
 });
 
-const virtualLayout = computed(() => {
-  const items: VirtualItem[] = [];
-  const rowIndexByKey = new Map<string, number>();
-  let top = 0;
-  const rh = rowHeight.value;
-
-  for (const group of props.groupedMessages) {
-    if (group.label) {
-      items.push({
-        type: "header",
-        key: `hdr:${group.label}`,
-        label: group.label,
-        top,
-        height: 28,
-      });
-      top += 28;
-    }
-    for (const msg of group.items) {
-      const key = `${msg.accountId}:${msg.id}`;
-      rowIndexByKey.set(key, items.length);
-      items.push({
-        type: "row",
-        key,
-        message: msg,
-        top,
-        height: rh,
-      });
-      top += rh;
-    }
-  }
-
-  return { items, totalHeight: top, rowIndexByKey };
-});
+const virtualLayout = computed(() =>
+  buildMessageListVirtualLayout(props.groupedMessages, {
+    rowHeight: rowHeight.value,
+    collapsedDayGroups: props.collapsedDayGroups,
+    expandedThreadKeys: props.expandedThreadKeys,
+    threadChildren: props.threadChildren,
+  })
+);
 
 const totalHeight = computed(() => virtualLayout.value.totalHeight);
 
@@ -436,7 +713,7 @@ const scrollTop = ref(0);
 const viewportHeight = ref(600);
 const OVERSCAN_PX = 360;
 
-function findStartIndex(items: VirtualItem[], targetTop: number): number {
+function findStartIndex(items: VirtualListItem[], targetTop: number): number {
   let lo = 0;
   let hi = items.length - 1;
   let ans = items.length;
@@ -531,25 +808,38 @@ watch(
   { flush: "pre" }
 );
 
-// 键盘上下选信时确保选中行在视口内可见
+function scrollSelectedIntoView(sel: MessageRef | null) {
+  if (!sel || !viewportRef.value) return;
+  const key = `${sel.accountId}:${sel.messageId}`;
+  const idx = virtualLayout.value.rowIndexByKey.get(key);
+  if (idx === undefined) return;
+  const item = virtualLayout.value.items[idx];
+  const el = viewportRef.value;
+  const viewTop = el.scrollTop;
+  const viewBottom = viewTop + el.clientHeight;
+  if (item.top < viewTop) {
+    el.scrollTop = item.top;
+    scrollTop.value = item.top;
+  } else if (item.top + item.height > viewBottom) {
+    const nextTop = Math.max(0, item.top + item.height - el.clientHeight);
+    el.scrollTop = nextTop;
+    scrollTop.value = nextTop;
+  }
+}
+
+// 键盘上下选信及折叠展开后确保选中行在视口内可见
 watch(
   () => props.selectedId,
   (sel) => {
-    if (!sel || !viewportRef.value) return;
-    const key = `${sel.accountId}:${sel.messageId}`;
-    const idx = virtualLayout.value.rowIndexByKey.get(key);
-    if (idx === undefined) return;
-    const item = virtualLayout.value.items[idx];
-    const el = viewportRef.value;
-    const viewTop = el.scrollTop;
-    const viewBottom = viewTop + el.clientHeight;
-    if (item.top < viewTop) {
-      el.scrollTop = item.top;
-      scrollTop.value = item.top;
-    } else if (item.top + item.height > viewBottom) {
-      const nextTop = Math.max(0, item.top + item.height - el.clientHeight);
-      el.scrollTop = nextTop;
-      scrollTop.value = nextTop;
+    nextTick(() => scrollSelectedIntoView(sel));
+  }
+);
+
+watch(
+  () => props.collapsedDayGroups,
+  () => {
+    if (props.selectedId) {
+      nextTick(() => scrollSelectedIntoView(props.selectedId));
     }
   }
 );
@@ -561,10 +851,17 @@ function isMessageSelected(msg: MessageSummaryDto): boolean {
   );
 }
 
-// 全局 Ctrl+F 聚焦 & 点击外部关闭菜单
+function isThreadExpanded(msg: MessageSummaryDto): boolean {
+  return props.expandedThreadKeys.has(`${msg.accountId}:${msg.id}`);
+}
+
+// 全局 Ctrl+F 展开并聚焦搜索框 & 点击外部关闭菜单
 function onFocusSearchEvent() {
-  searchInputRef.value?.focus();
-  searchInputRef.value?.select();
+  searchOpen.value = true;
+  nextTick(() => {
+    searchInputRef.value?.focus();
+    searchInputRef.value?.select();
+  });
 }
 
 function onDocumentPointerDown(e: PointerEvent) {
@@ -603,15 +900,97 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--km-surface);
+  background: var(--km-surface, #fafafb);
   color: var(--km-text);
   overflow: hidden;
+}
+
+:global(:root[data-theme="system"][data-color-mode="light"]) .km-list-pane {
+  background: #fafafb;
+}
+
+:global(:root[data-theme="system"][data-color-mode="dark"]) .km-list-pane {
+  background: #222226;
 }
 
 .km-list-header {
   height: 48px;
   min-height: 48px;
   padding: 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.km-header-left,
+.km-header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.km-header-spacer {
+  flex: 1 1 auto;
+  height: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.km-icon-btn {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: var(--km-radius-sm);
+  background: transparent;
+  color: var(--km-text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.km-icon-btn:hover {
+  background: var(--km-hover-bg);
+  color: var(--km-text);
+}
+
+.km-icon-btn.active {
+  background: var(--km-accent-soft);
+  color: var(--km-accent);
+}
+
+.km-filter-active-dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--km-accent);
+}
+
+.km-total-count {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--km-text-muted);
+  padding: 0 4px;
+  user-select: none;
+}
+
+.km-sync-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 展开的第二行搜索框 */
+.km-search-row {
+  padding: 4px 10px 8px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -636,7 +1015,8 @@ onUnmounted(() => {
 }
 
 .km-search-icon {
-  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
   color: var(--km-text-muted);
   flex-shrink: 0;
 }
@@ -655,28 +1035,35 @@ onUnmounted(() => {
   background: transparent;
   color: var(--km-text-muted);
   cursor: pointer;
-  padding: 0 2px;
-  font-size: 11px;
+  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.km-toolbar-btn {
+.km-clear-btn:hover {
+  color: var(--km-text);
+}
+
+.km-scope-btn {
   height: 30px;
   padding: 0 8px;
   border: 1px solid var(--km-border);
   border-radius: var(--km-radius-sm);
-  background: var(--km-surface-raised);
-  color: var(--km-text);
+  background: transparent;
+  color: var(--km-text-muted);
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
   flex-shrink: 0;
 }
 
-.km-toolbar-btn:hover {
+.km-scope-btn:hover {
   background: var(--km-hover-bg);
+  color: var(--km-text);
 }
 
-.km-toolbar-btn.active {
+.km-scope-btn.active {
   background: var(--km-accent-soft);
   border-color: var(--km-accent);
   color: var(--km-accent);
@@ -691,8 +1078,8 @@ onUnmounted(() => {
   position: absolute;
   top: 34px;
   right: 0;
-  width: 200px;
-  max-height: 360px;
+  width: 224px;
+  max-height: 440px;
   overflow-y: auto;
   padding: 6px;
   border-radius: var(--km-radius-md);
@@ -745,14 +1132,73 @@ onUnmounted(() => {
   font-weight: 600;
 }
 
+.km-date-presets {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 2px 6px 4px;
+}
+
+.km-date-preset-btn {
+  border: 1px solid var(--km-border);
+  background: transparent;
+  color: var(--km-text);
+  border-radius: var(--km-radius-sm);
+  padding: 3px 0;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.km-date-preset-btn:hover {
+  background: var(--km-hover-bg);
+  border-color: var(--km-accent);
+}
+
+.km-date-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 6px 4px;
+}
+
+.km-date-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--km-text-muted);
+}
+
+.km-date-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--km-border);
+  border-radius: 4px;
+  background: var(--km-canvas);
+  font-size: 11px;
+}
+
+.km-menu-subaction {
+  border: none;
+  background: transparent;
+  color: var(--km-accent);
+  text-align: left;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
 .km-menu-reset {
   margin-top: 2px;
   border: none;
   background: var(--km-accent-soft);
   color: var(--km-accent);
-  padding: 4px 8px;
+  padding: 5px 8px;
   border-radius: var(--km-radius-sm);
   font-size: 12px;
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -762,24 +1208,16 @@ onUnmounted(() => {
   margin: 4px 0;
 }
 
-.km-list-subbar {
-  height: 28px;
-  min-height: 28px;
+.km-active-filter-bar {
+  height: 26px;
   padding: 0 12px;
   border-bottom: 1px solid var(--km-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
   font-size: 11px;
-  color: var(--km-text-muted);
-}
-
-.km-sync-text {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
   color: var(--km-accent);
-  font-weight: 500;
+  background: var(--km-accent-soft);
 }
 
 .km-sync-spinner,
@@ -829,6 +1267,7 @@ onUnmounted(() => {
   cursor: pointer;
   padding: 0;
   font-size: 11px;
+  font-weight: 600;
 }
 
 .km-list-error {
@@ -864,14 +1303,43 @@ onUnmounted(() => {
 }
 
 .km-date-group-header {
+  width: 100%;
   height: 28px;
   padding: 0 14px;
+  border: none;
   display: flex;
   align-items: center;
-  font-size: 11px;
-  font-weight: 700;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--km-text-muted);
-  background: var(--km-surface);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.km-date-group-header:hover {
+  color: var(--km-text);
+}
+
+.km-date-group-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.km-date-chevron {
+  opacity: 0.65;
+  transition: transform 120ms ease;
+}
+
+.km-date-chevron.collapsed {
+  transform: rotate(-90deg);
+}
+
+.km-date-group-count {
+  font-size: 11px;
+  color: var(--km-text-muted);
 }
 
 .km-list-empty {

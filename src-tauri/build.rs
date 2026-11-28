@@ -7,6 +7,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "main_bootstrap",
             "list_messages",
+            "list_thread_summaries",
             "open_message",
             "set_reader_layout",
             "update_main_preferences",
