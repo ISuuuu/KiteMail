@@ -18,6 +18,7 @@
       :syncing="state.syncStatus.value.syncing"
       :mode="state.mode.value"
       :hasPasscode="state.hasPasscode.value"
+      :themeId="state.layout.prefs.value.themeId"
       :darkMode="state.layout.prefs.value.darkMode"
       :effectiveDark="state.layout.effectiveDark.value"
       :readerPosition="state.layout.prefs.value.readerPosition"
@@ -30,6 +31,7 @@
       @quit="state.quit"
       @toggleDarkMode="state.layout.toggleDarkMode"
       @setDarkMode="state.layout.setDarkMode"
+      @setTheme="state.layout.setTheme"
       @setReaderPosition="state.layout.setReaderPosition"
       @compose="openNewCompose()"
       @composeFromTemplate="openComposeFromTemplate"
@@ -86,6 +88,7 @@
           :scrollResetToken="state.scrollResetToken.value"
           :syncStatus="state.syncStatus.value"
           :cacheReady="state.cacheReady.value"
+          :showWindowClose="state.layout.prefs.value.readerPosition !== 'right'"
           @selectMessage="state.selectMessage"
           @toggleSeen="state.toggleMessageSeen"
           @toggleFlagged="state.toggleMessageFlagged"
@@ -99,6 +102,7 @@
           @refresh="state.refresh"
           @loadMore="state.loadMore"
           @loadOlder="state.loadOlderMessages()"
+          @closeWindow="state.closeWindow()"
           @overlayChange="state.layout.setOverlayOpen"
         />
       </div>
@@ -118,6 +122,7 @@
         <ReaderPane
           ref="belowReaderPaneRef"
           :isBelow="true"
+          :showWindowClose="false"
           :message="state.openedMessage.value"
           :loading="state.readerLoading.value"
           :error="state.readerError.value"
@@ -194,6 +199,7 @@
       <ReaderPane
         ref="rightReaderPaneRef"
         class="km-reader-column"
+        :showWindowClose="true"
         :message="state.openedMessage.value"
         :loading="state.readerLoading.value"
         :error="state.readerError.value"

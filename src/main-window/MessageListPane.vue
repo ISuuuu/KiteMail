@@ -212,6 +212,22 @@
             </button>
           </div>
         </div>
+
+        <button
+          v-if="showWindowClose"
+          type="button"
+          class="km-icon-btn km-window-close-btn"
+          title="关闭主窗口"
+          aria-label="关闭窗口"
+          @click="emit('closeWindow')"
+        >
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="m3.7 2.8 4.3 4.3 4.3-4.3.9.9L8.9 8l4.3 4.3-.9.9L8 8.9l-4.3 4.3-.9-.9L7.1 8 2.8 3.7l.9-.9Z"
+            />
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -463,10 +479,12 @@ const props = withDefaults(
     scrollResetToken?: number;
     syncStatus?: SyncStatusDto;
     cacheReady?: boolean;
+    showWindowClose?: boolean;
   }>(),
   {
     isRail: false,
     effectiveDark: false,
+    showWindowClose: false,
     tagsMeta: () => [],
     collapsedDayGroups: () => new Set<string>(),
     expandedThreadKeys: () => new Set<string>(),
@@ -488,6 +506,7 @@ const emit = defineEmits<{
   refresh: [];
   loadMore: [];
   loadOlder: [];
+  closeWindow: [];
   overlayChange: [id: string, open: boolean];
 }>();
 
@@ -962,6 +981,11 @@ onUnmounted(() => {
 .km-icon-btn.active {
   background: var(--km-accent-soft);
   color: var(--km-accent);
+}
+
+.km-window-close-btn:hover {
+  background: var(--km-danger-soft);
+  color: var(--km-danger);
 }
 
 .km-filter-active-dot {
