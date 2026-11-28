@@ -31,7 +31,7 @@
 - **Native GPUI Interface**: Responsive three-pane layout (collapsible sidebar, message list, and reader) with configurable reader placement (right, bottom, or hidden), Focus Mode, adaptive narrow rail on half-screen windows, Light/Dark/System themes, single-instance activation, and system tray minimization.
 - **Secure WebView2 Reader**: Renders HTML messages inside WebView2 with remote images blocked by default (loadable on demand), external request headers and `Referrer` stripped, and sanitized links opened in your default browser. Supports RFC-header conversation threading, quote folding, inline images, standalone reader windows, print preview, and `Authentication-Results` verification badges.
 - **Rich Composing & Productivity**: Four editing modes (including rich HTML, Markdown, and plain text), HTML signature sanitization and import, inline reply, standalone compose windows, auto-saved drafts, scheduled send, and restart-safe Undo Send. Includes full-text search, multi-criteria filtering, an attachment gallery, contacts management (VCF/CSV import & export), Command Palette (`Ctrl+Shift+K`), and optional single-key shortcuts.
-- **Per-Account Storage & Portable Mode**: Separates global metadata (`global.db`) from per-account storage (`mail.db` index, lazy-loaded `content.db` bodies, and bucketed attachments). Supports custom mail storage directories with migration/reuse and full portable isolation via `portable.flag`.
+- **Per-Account Storage & Portable Mode**: Separates global metadata (`global.db`) from per-account storage (`mail.db` index, lazy-loaded `content.db` bodies, and bucketed attachments). Supports a custom mail storage directory via `mail_data_dir` in `storage.toml` (migrate manually with the app closed) and full portable isolation via `portable.flag`.
 - **Security & In-App Updates**: Stores passwords and OAuth tokens in Windows Credential Manager. Built-in updater verifies SHA-256 checksums, honors Windows system proxy settings (WinHTTP / PAC / env) and system root certificates, supports resumable downloads, and separates Beta prereleases from the stable channel.
 
 ## Installation
@@ -39,7 +39,7 @@
 Download the latest Windows x64 release from [GitHub Releases](https://github.com/ISuuuu/KiteMail/releases):
 
 - **Installer (`KiteMail_<version>_x64-setup.exe`)**: NSIS installer targeting `%LOCALAPPDATA%\KiteMail` by default. Configuration and local data are stored in `%LOCALAPPDATA%\KiteMail\`, with silent in-app updates.
-- **Portable (`KiteMail_v<version>_portable.zip`)**: Extract and run. Includes `portable.flag` so configuration and global state stay inside a sibling `data\` directory, with in-place updates and optional custom mail storage paths.
+- **Portable (`KiteMail_v<version>_portable.zip`)**: Extract and run. Includes `portable.flag` so configuration and global state stay inside a sibling `data\` directory, with in-place updates, and a shared custom mail storage path configurable in `storage.toml`.
 
 To preview the UI without adding a real email account, pass `--demo` (e.g., `pnpm dev:wt -- --demo` from source or `kitemail.exe --demo`).
 

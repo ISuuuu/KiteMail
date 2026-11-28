@@ -31,7 +31,7 @@
 - **原生 GPUI 界面与高响应交互**：基于 GPUI 构建的三栏布局（可折叠侧边栏、邮件列表、阅读器），支持阅读窗格位置切换（右侧 / 下方 / 关闭）、专注模式、半屏自适应窄轨、浅色/深色/跟随系统主题、单实例窗口唤醒与系统托盘驻留。
 - **WebView2 安全阅读**：使用 WebView2 渲染 HTML 邮件正文，默认拦截远程图片并支持按需加载，剥离外部请求头与 Referrer，净化外链后通过系统浏览器打开；支持基于 RFC 头的会话聚合、引用折叠、内联图片、独立阅读窗口、打印预览以及 `Authentication-Results` 发件验证展示。
 - **高效写信与日常管理**：支持富文本 HTML、Markdown 与纯文本等四种编辑模式，支持 HTML 签名清洗与导入、内联回复、独立写信窗口、草稿自动保存、定时发送与重启可恢复的撤销发送；内置全文搜索、多条件筛选、附件总览、通讯录（VCF/CSV 导入导出）、命令面板（`Ctrl+Shift+K`）及单键快捷键模式。
-- **分账号分库存储与便携隔离**：采用全局元数据库（`global.db`）与分账号独立目录（轻量索引 `mail.db`、懒加载正文库 `content.db` 及分桶附件目录），支持自定义邮件目录与迁移/复用，并通过 `portable.flag` 提供便携版完整隔离。
+- **分账号分库存储与便携隔离**：采用全局元数据库（`global.db`）与分账号独立目录（轻量索引 `mail.db`、懒加载正文库 `content.db` 及分桶附件目录），支持在 `storage.toml` 中通过 `mail_data_dir` 指定自定义邮件目录（需退出应用后手动迁移），并通过 `portable.flag` 提供便携版完整隔离。
 - **凭据安全与自动更新**：密码与 OAuth 令牌加密保存于 Windows 凭据管理器；内置应用内检查更新，支持 SHA-256 校验、系统代理（WinHTTP / PAC / 环境变量）与系统根证书、断点续传及 Beta 预发布渠道隔离。
 
 ## 下载与安装
@@ -39,7 +39,7 @@
 前往 [GitHub Releases](https://github.com/ISuuuu/KiteMail/releases) 下载最新 Windows x64 构建产物：
 
 - **安装版（`KiteMail_<version>_x64-setup.exe`）**：NSIS 安装包，默认安装至 `%LOCALAPPDATA%\KiteMail`，配置与本地数据存放于 `%LOCALAPPDATA%\KiteMail\`，支持应用内静默更新。
-- **便携版（`KiteMail_v<version>_portable.zip`）**：解压即用，内置 `portable.flag` 标记，配置与全局索引写入程序同级 `data\` 目录，支持应用内就地更新与自定义共享邮件目录。
+- **便携版（`KiteMail_v<version>_portable.zip`）**：解压即用，内置 `portable.flag` 标记，配置与全局索引写入程序同级 `data\` 目录，支持应用内就地更新，并可在 `storage.toml` 中配置共享的自定义邮件目录。
 
 如需在未配置真实账号时快速体验界面，可通过 `--demo` 参数启动演示模式（例如源码下运行 `pnpm dev:wt -- --demo`，或执行 `kitemail.exe --demo`）。
 
