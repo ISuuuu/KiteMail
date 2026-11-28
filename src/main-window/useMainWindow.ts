@@ -27,7 +27,6 @@ import type {
   MessageRef,
   ReaderPosition,
   MessageMoveOutput,
-  TagItemDto,
   ThreadCardActionEvent,
   ReaderFindResultEvent,
 } from "../ipc/types";

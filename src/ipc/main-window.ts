@@ -67,7 +67,6 @@ import type {
   ViewDto,
   MessageSort,
   IpcError,
-  TagItemDto,
   SetMessageTagsInput,
   SetMessageTagsOutput,
   GetReaderViewOptionsInput,
