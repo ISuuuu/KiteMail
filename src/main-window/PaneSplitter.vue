@@ -102,21 +102,44 @@ function onKeyDown(e: KeyboardEvent) {
   touch-action: none;
 }
 
+/* 将分隔线视觉/布局占宽保持为 1 px，并通过伪元素在边界两侧保留 7 px 指针命中区 */
+.km-splitter::before {
+  content: "";
+  position: absolute;
+  z-index: 5;
+}
+
 .km-splitter-vertical {
-  width: 5px;
+  width: 1px;
   height: 100%;
   cursor: col-resize;
 }
 
+.km-splitter-vertical::before {
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+
 .km-splitter-horizontal {
-  height: 5px;
+  height: 1px;
   width: 100%;
   cursor: row-resize;
 }
 
+.km-splitter-horizontal::before {
+  left: 0;
+  right: 0;
+  top: -3px;
+  bottom: -3px;
+}
+
 .km-splitter-line {
+  position: relative;
   background: var(--km-border);
   transition: background-color 120ms ease;
+  pointer-events: none;
 }
 
 .km-splitter-vertical .km-splitter-line {
@@ -135,13 +158,28 @@ function onKeyDown(e: KeyboardEvent) {
   background: var(--km-accent);
 }
 
-.km-splitter-vertical:hover .km-splitter-line,
-.km-splitter-vertical.dragging .km-splitter-line {
-  width: 2px;
+/* 悬停/拖拽高亮加粗浮于边界之上，不挤占相邻栏布局宽度 */
+.km-splitter-vertical:hover .km-splitter-line::after,
+.km-splitter-vertical.dragging .km-splitter-line::after,
+.km-splitter-vertical:focus-visible .km-splitter-line::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -1px;
+  width: 3px;
+  background: var(--km-accent);
 }
 
-.km-splitter-horizontal:hover .km-splitter-line,
-.km-splitter-horizontal.dragging .km-splitter-line {
-  height: 2px;
+.km-splitter-horizontal:hover .km-splitter-line::after,
+.km-splitter-horizontal.dragging .km-splitter-line::after,
+.km-splitter-horizontal:focus-visible .km-splitter-line::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -1px;
+  height: 3px;
+  background: var(--km-accent);
 }
 </style>

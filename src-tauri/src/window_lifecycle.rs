@@ -6,7 +6,7 @@ use crate::dto::RectDto;
 use crate::preferences::PreferencesStore;
 
 pub const DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
-pub const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
+pub const DEFAULT_WINDOW_HEIGHT: f32 = 840.0;
 pub const MIN_WINDOW_WIDTH: f32 = 900.0;
 pub const MIN_WINDOW_HEIGHT: f32 = 600.0;
 pub const MAX_WINDOW_WIDTH: f32 = 7680.0;
@@ -157,6 +157,73 @@ pub fn save_main_window_geometry(window: &tauri::WebviewWindow, prefs_store: &Pr
     let _ = prefs_store.mutate_and_save(|prefs| {
         capture_window_geometry(prefs, logical_w, logical_h, maximized, false)
     });
+}
+
+#[cfg(windows)]
+fn show_win32_system_menu_at_cursor(window: &tauri::WebviewWindow) -> Result<(), crate::dto::IpcError> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnableMenuItem, GetCursorPos, GetSystemMenu, IsZoomed, PostMessageW, SetForegroundWindow,
+        TrackPopupMenu, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
+        SC_MOVE, SC_RESTORE, SC_SIZE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
+        WM_SYSCOMMAND,
+    };
+
+    let raw = HasWindowHandle::window_handle(window)
+        .map_err(|e| crate::dto::IpcError::unavailable(format!("无法获取窗口句柄: {e}"), None))?;
+    let hwnd = match raw.as_raw() {
+        RawWindowHandle::Win32(h) => HWND(h.hwnd.get() as *mut core::ffi::c_void),
+        _ => return Ok(()),
+    };
+
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        if menu.is_invalid() {
+            return Ok(());
+        }
+        let zoomed = IsZoomed(hwnd).as_bool();
+        let enable = |cmd: u32, ok: bool| {
+            let flags = MF_BYCOMMAND | if ok { MF_ENABLED } else { MF_GRAYED };
+            let _ = EnableMenuItem(menu, cmd, flags);
+        };
+        enable(SC_RESTORE, zoomed);
+        enable(SC_MOVE, !zoomed);
+        enable(SC_SIZE, !zoomed);
+        enable(SC_MINIMIZE, true);
+        enable(SC_MAXIMIZE, !zoomed);
+        enable(SC_CLOSE, true);
+
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return Ok(());
+        }
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            Some(0),
+            hwnd,
+            None,
+        );
+        if cmd.0 > 0 {
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(cmd.0 as usize), LPARAM(0));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn show_win32_system_menu_at_cursor(_window: &tauri::WebviewWindow) -> Result<(), crate::dto::IpcError> {
+    Ok(())
+}
+
+/// Show the native Windows system menu (Restore/Move/Size/Minimize/Maximize/Close) at the cursor.
+#[tauri::command]
+pub fn show_window_system_menu(window: tauri::WebviewWindow) -> Result<(), crate::dto::IpcError> {
+    show_win32_system_menu_at_cursor(&window)
 }
 
 #[cfg(test)]
