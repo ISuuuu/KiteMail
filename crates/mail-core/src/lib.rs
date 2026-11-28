@@ -213,6 +213,26 @@ pub struct MessageDetail {
     pub auth_results: Option<String>,
 }
 
+impl MessageDetail {
+    /// 估算正文在内存中的体积（字节），用于正文缓存的字节预算。
+    ///
+    /// 口径：只累计会随邮件变大而增长的正文内容——主邮件与会话卡片的
+    /// `body_text` / `body_html` 的 UTF-8 字节长度。主题、收发件人等元数据
+    /// 由缓存条数上限约束，结构体与分配器开销忽略；结果用于相对约束，
+    /// 不等同于精确堆占用。
+    pub fn estimated_body_bytes(&self) -> usize {
+        let own = self.body_text.len() + self.body_html.as_deref().map_or(0, str::len);
+        let thread = self
+            .thread_messages
+            .iter()
+            .map(|message| {
+                message.body_text.len() + message.body_html.as_deref().map_or(0, str::len)
+            })
+            .sum::<usize>();
+        own + thread
+    }
+}
+
 /// 一次完整正文抓取（IMAP `RFC822` / Graph 消息）解析出的载荷；
 /// 退订头在抓取时一并读出并随正文落库（对齐原版「正文抓取时读句柄」）。
 #[derive(Clone, Debug, Default)]
