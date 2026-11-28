@@ -5,7 +5,7 @@
 <h1 align="center">KiteMail</h1>
 
 <p align="center">
-  A native Windows desktop email client built with Rust, GPUI, and WebView2.
+  A fast, privacy-focused native Windows desktop email client built with Rust, Tauri 2, Vue 3, and WebView2.
 </p>
 
 <p align="center">
@@ -20,10 +20,10 @@
 
 ---
 
-**KiteMail** is a fast, privacy-focused native email client for Windows, built with Rust, GPUI (`gpui-kit`), and Microsoft Edge WebView2. It sends no telemetry or analytics.
+**KiteMail** is a fast, privacy-focused native email client for Windows built with **Rust**, **Tauri 2**, **Vue 3**, and **Microsoft Edge WebView2** (while preserving the earlier GPUI desktop implementation in [`crates/app`](crates/app)). It sends no telemetry or analytics.
 
 > [!NOTE]
-> **Project Independence**: **KiteMail** (originally forked from the Linux GNOME email client [hyprlab/hylki](https://github.com/hyprlab/hylki)) is developed and maintained as an independent native Windows email client. It lives in [`crates/`](crates/) with its own architecture and `0.x` release cycle, independent from the upstream Linux `1.x` series.
+> **Project Independence**: **KiteMail** (originally forked from the Linux GNOME email client [hyprlab/hylki](https://github.com/hyprlab/hylki)) is developed and maintained as an independent native Windows email client. It maintains its own architecture and `0.x` release cycle across [`src/`](src/), [`src-tauri/`](src-tauri/), and [`crates/`](crates/), independent from the upstream Linux `1.x` series.
 
 ## Features
 
@@ -41,7 +41,7 @@ Download the latest Windows x64 release from [GitHub Releases](https://github.co
 - **Installer (`KiteMail_<version>_x64-setup.exe`)**: NSIS installer targeting `%LOCALAPPDATA%\KiteMail` by default. Configuration and local data are stored in `%LOCALAPPDATA%\KiteMail\`, with silent in-app updates.
 - **Portable (`KiteMail_v<version>_portable.zip`)**: Extract and run. Includes `portable.flag` so configuration and global state stay inside a sibling `data\` directory, with in-place updates and optional custom mail storage paths.
 
-To preview the UI without adding a real email account, launch `kitemail.exe` with `--demo`.
+To preview the UI without adding a real email account, pass `--demo` (e.g., `pnpm dev:wt -- --demo` from source or `kitemail.exe --demo`).
 
 ## Building from Source
 
@@ -49,6 +49,7 @@ To preview the UI without adding a real email account, launch `kitemail.exe` wit
 
 - Windows x64
 - [Rust toolchain](https://rustup.rs/) (`x86_64-pc-windows-msvc`)
+- [Node.js 24+](https://nodejs.org/) and [pnpm 10+](https://pnpm.io/)
 - Microsoft Edge WebView2 Runtime (preinstalled on modern Windows 10/11)
 
 ### Commands
@@ -57,26 +58,38 @@ To preview the UI without adding a real email account, launch `kitemail.exe` wit
 git clone https://github.com/ISuuuu/KiteMail.git
 cd KiteMail
 
-# Format, check, and run unit tests
-cargo fmt --all -- --check
+# Install frontend dependencies
+pnpm install --frozen-lockfile
+
+# Run frontend unit tests and typecheck/build
+pnpm test
+pnpm build
+
+# Run Rust tests (core crates and Tauri desktop backend)
+cargo test -p kitemail-mail-core
+cargo test -p kitemail-windows-mail-reader
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+# Launch Tauri desktop app in development mode (auto-picks free loopback Vite port; add `-- --demo` for demo mode)
+pnpm dev:wt
+pnpm dev:wt -- --demo
+
+# Build Tauri executable (no-bundle)
+pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
+
+# Legacy GPUI workspace checks (root Cargo workspace)
 cargo check --workspace --locked
 cargo test --workspace --locked
-
-# Optional: enable pre-commit auto-formatting hook
-git config core.hooksPath .githooks
-
-# Run in development mode
-cargo run -p kitemail --bin kitemail
-
-# Build release binary
-cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc --locked
 ```
 
 ## Repository Layout
 
-- [`crates/`](crates/): Rust workspace crates ([`crates/app`](crates/app) `kitemail` desktop UI and [`crates/mail-core`](crates/mail-core) `kitemail-mail-core` library)
-- [`.github/`](.github/): Windows x64 CI/CD workflow and NSIS installer script
-- [`data/`](data/): App icons, welcome wordmarks, brand/SVG assets, and contributor lists
+- [`src/`](src/): Vue 3 + TypeScript frontend for the main window, embedded workspace views, reader drawer, compose editor, and standalone settings window
+- [`src-tauri/`](src-tauri/): Tauri 2 Rust backend, window lifecycle, IPC commands/DTOs, demo/live mail session, and Windows WinRT PDF thumbnail rendering
+- [`crates/`](crates/): Shared Rust workspace crates ([`crates/mail-core`](crates/mail-core) mail engine/cache/sync, [`crates/windows-mail-reader`](crates/windows-mail-reader) isolated WebView2 thread reader, and [`crates/app`](crates/app) legacy GPUI desktop UI)
+- [`tests/`](tests/) & [`scripts/`](scripts/): Frontend unit/integration test runner (`tests/run.mjs`) and worktree-safe dev launcher (`scripts/dev-tauri.mjs`)
+- [`.github/`](.github/): Windows x64 CI/CD workflows (`tauri-windows.yml`, `windows.yml`) and NSIS installer script
+- [`data/`](data/): App icons, welcome wordmarks, brand/SVG assets, reference screenshots, and contributor lists
 - [`tools/release-notes.sh`](tools/release-notes.sh): Release notes generator for GitHub Releases
 - [`docs/`](docs/): Licensing notices, upstream credits, and security policy
 - [`CHANGELOG.md`](CHANGELOG.md): Windows client release history and earlier upstream changelog

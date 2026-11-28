@@ -5,7 +5,7 @@
 <h1 align="center">KiteMail</h1>
 
 <p align="center">
-  基于 Rust、GPUI 与 WebView2 构建的原生 Windows 桌面邮件客户端。
+  基于 Rust、Tauri 2、Vue 3 与 WebView2 构建的原生 Windows 桌面邮件客户端。
 </p>
 
 <p align="center">
@@ -20,10 +20,10 @@
 
 ---
 
-**KiteMail** 是一个注重性能、隐私与桌面体验的原生 Windows 电子邮件客户端，不收集任何遥测或统计数据。
+**KiteMail** 是一个注重性能、隐私与桌面体验的原生 Windows 电子邮件客户端，基于 **Rust**、**Tauri 2**、**Vue 3** 与 **Microsoft Edge WebView2** 构建（同时在 [`crates/app`](crates/app) 保留了早期 GPUI 桌面端实现），不收集任何遥测或统计数据。
 
 > [!NOTE]
-> **项目独立说明**：**KiteMail** 最初派生自 Linux GNOME 邮件客户端 [hyprlab/hylki](https://github.com/hyprlab/hylki)，现已作为独立原生 Windows 邮件客户端持续演进与维护。源码位于 [`crates/`](crates/) 工作区，采用独立的软件架构与 `0.x` 版本体系，与上游 Linux `1.x` 版本相互独立。
+> **项目独立说明**：**KiteMail** 最初派生自 Linux GNOME 邮件客户端 [hyprlab/hylki](https://github.com/hyprlab/hylki)，现已作为独立原生 Windows 邮件客户端持续演进与维护。源码分布在 [`src/`](src/)、[`src-tauri/`](src-tauri/) 与 [`crates/`](crates/)，采用独立的软件架构与 `0.x` 版本体系，与上游 Linux `1.x` 版本相互独立。
 
 ## 核心特性
 
@@ -41,7 +41,7 @@
 - **安装版（`KiteMail_<version>_x64-setup.exe`）**：NSIS 安装包，默认安装至 `%LOCALAPPDATA%\KiteMail`，配置与本地数据存放于 `%LOCALAPPDATA%\KiteMail\`，支持应用内静默更新。
 - **便携版（`KiteMail_v<version>_portable.zip`）**：解压即用，内置 `portable.flag` 标记，配置与全局索引写入程序同级 `data\` 目录，支持应用内就地更新与自定义共享邮件目录。
 
-如需在未配置真实账号时快速体验界面，可通过 `--demo` 参数启动演示模式。
+如需在未配置真实账号时快速体验界面，可通过 `--demo` 参数启动演示模式（例如源码下运行 `pnpm dev:wt -- --demo`，或执行 `kitemail.exe --demo`）。
 
 ## 从源码构建
 
@@ -49,6 +49,7 @@
 
 - Windows x64
 - [Rust 工具链](https://rustup.rs/)（`x86_64-pc-windows-msvc`）
+- [Node.js 24+](https://nodejs.org/) 与 [pnpm 10+](https://pnpm.io/)
 - Microsoft Edge WebView2 运行时（Windows 10/11 通常已内置）
 
 ### 编译与测试
@@ -57,26 +58,38 @@
 git clone https://github.com/ISuuuu/KiteMail.git
 cd KiteMail
 
-# 格式检查、编译检查与单元测试
-cargo fmt --all -- --check
+# 安装前端依赖
+pnpm install --frozen-lockfile
+
+# 运行前端单元测试、类型检查与 Vite 构建
+pnpm test
+pnpm build
+
+# 运行 Rust 核心库与 Tauri 桌面后端测试
+cargo test -p kitemail-mail-core
+cargo test -p kitemail-windows-mail-reader
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+# 开发模式启动桌面端（自动探测空闲回环 Vite 端口；附加 `-- --demo` 进入演示模式）
+pnpm dev:wt
+pnpm dev:wt -- --demo
+
+# 构建 Tauri 桌面可执行文件（no-bundle）
+pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
+
+# 传统 GPUI 工作区检查与测试
 cargo check --workspace --locked
 cargo test --workspace --locked
-
-# 可选：启用提交前自动格式化钩子
-git config core.hooksPath .githooks
-
-# 启动开发版
-cargo run -p kitemail --bin kitemail
-
-# 构建 Release 可执行文件
-cargo build -p kitemail --bin kitemail --release --target x86_64-pc-windows-msvc --locked
 ```
 
 ## 仓库结构
 
-- [`crates/`](crates/)：Rust 工作区源码（[`crates/app`](crates/app) `kitemail` 桌面端主程序与 [`crates/mail-core`](crates/mail-core) `kitemail-mail-core` 邮件核心库）
-- [`.github/`](.github/)：Windows x64 CI/CD 工作流与 NSIS 安装包脚本
-- [`data/`](data/)：应用图标、欢迎页字标、品牌/SVG 图标资源与贡献者名单
+- [`src/`](src/)：Vue 3 + TypeScript 前端源码（主窗口、内嵌通讯录与附件图库、阅读器抽屉、写信编辑器与独立设置窗口）
+- [`src-tauri/`](src-tauri/)：Tauri 2 Rust 后端宿主（窗口生命周期、IPC 命令与 DTO、Demo/Live 会话、Windows WinRT PDF 首页缩略图渲染）
+- [`crates/`](crates/)：共享 Rust 工作区 crate（[`crates/mail-core`](crates/mail-core) 邮件引擎/缓存/同步、[`crates/windows-mail-reader`](crates/windows-mail-reader) 独立 WebView2 阅读器，以及 [`crates/app`](crates/app) 早期 GPUI 桌面端）
+- [`tests/`](tests/) 与 [`scripts/`](scripts/)：前端单测与集成校验入口（`tests/run.mjs`）及多 worktree 开发启动脚本（`scripts/dev-tauri.mjs`）
+- [`.github/`](.github/)：Windows x64 CI/CD 工作流（`tauri-windows.yml`、`windows.yml`）与 NSIS 安装包脚本
+- [`data/`](data/)：应用图标、欢迎页字标、品牌/SVG 图标资源、视觉参考图与贡献者名单
 - [`tools/release-notes.sh`](tools/release-notes.sh)：GitHub Release 说明生成脚本
 - [`docs/`](docs/)：第三方许可声明、上游致谢名单与安全策略
 - [`CHANGELOG.md`](CHANGELOG.md)：Windows 客户端更新日志与早期历史记录
