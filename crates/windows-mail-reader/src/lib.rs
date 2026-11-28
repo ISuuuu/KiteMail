@@ -21,9 +21,9 @@ pub use policy::{
     WebViewAction, DOCUMENT_URL,
 };
 pub use thread_document::{
-    avatar_badge_spec, build_thread_document, first_snippet_line, format_raw_source,
-    recipient_list, split_sender, ThreadCardRenderInput, ThreadDocContext, ThreadPalette,
-    STAR_GOLD,
+    avatar_badge_spec, build_thread_document, build_thread_document_with_extra, first_snippet_line,
+    format_raw_source, recipient_list, split_sender, ThreadCardRenderInput, ThreadDocContext,
+    ThreadPalette, ThreadRenderExtra, STAR_GOLD,
 };
 #[cfg(windows)]
 pub use webview2::{

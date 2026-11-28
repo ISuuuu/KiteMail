@@ -100,4 +100,30 @@ export interface StandaloneMessageTarget {
   messageId: number;
 }
 
+export interface OpenAttachmentInput {
+  attachmentId: number;
+}
+
+export interface OpenAttachmentOutput {
+  opened: boolean;
+  path: string;
+  message: string;
+}
+
+export interface PickDirectoryOutput {
+  cancelled: boolean;
+  path: string | null;
+}
+
+export interface DrawerAttachmentItem {
+  id: number;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  downloaded: boolean;
+  isImage: boolean;
+  isPdf: boolean;
+  messageId?: number;
+}
+
 export type { AttachmentDto, OpenMessageOutput };

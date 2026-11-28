@@ -10,15 +10,16 @@ use kitemail_mail_core::config;
 use kitemail_mail_core::imap_client::{plain_text_to_html, sanitize_html_for_display_with_options};
 use kitemail_mail_core::{MailRequest, MessageDetail};
 use kitemail_windows_mail_reader::escape_html;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::commands::AppState;
 use crate::dto::{
     AppMode, BodyStatusDto, CachedAttachmentDto, FetchAttachmentPreviewInput,
     FetchAttachmentPreviewOutput, GetMessagePrintHtmlInput, GetMessagePrintHtmlOutput, IpcError,
-    ListCachedAttachmentsInput, ListCachedAttachmentsOutput, OpenMessageWindowInput,
-    OpenMessageWindowOutput, SaveAllAttachmentsInput, SaveAllAttachmentsOutput,
-    SaveAttachmentInput, SaveAttachmentOutput,
+    ListCachedAttachmentsInput, ListCachedAttachmentsOutput, OpenAttachmentInput,
+    OpenAttachmentOutput, OpenMessageWindowInput, OpenMessageWindowOutput, PickDirectoryOutput,
+    SaveAllAttachmentsInput, SaveAllAttachmentsOutput, SaveAttachmentInput, SaveAttachmentOutput,
+    MAIN_WINDOW_LABEL,
 };
 use crate::mail_session::{
     build_open_message_output, is_message_remote_images_blocked, MailSession, MAX_PAGE_LIMIT,
@@ -94,6 +95,13 @@ fn is_text_attachment(mime_type: &str, filename: &str) -> bool {
     false
 }
 
+pub fn is_pdf_attachment(mime_type: &str, filename: &str) -> bool {
+    let lower_mime = mime_type.trim().to_ascii_lowercase();
+    lower_mime == "application/pdf"
+        || ((lower_mime.is_empty() || lower_mime == "application/octet-stream")
+            && file_ext_lower(filename) == "pdf")
+}
+
 fn sanitize_mime_for_data_url(mime_type: &str, filename: &str) -> String {
     let base = mime_type
         .split(';')
@@ -118,6 +126,7 @@ fn sanitize_mime_for_data_url(mime_type: &str, filename: &str) -> String {
         "txt" | "log" | "md" => "text/plain",
         "csv" => "text/csv",
         "json" => "application/json",
+        "pdf" => "application/pdf",
         _ => "application/octet-stream",
     }
     .to_string()
@@ -685,8 +694,12 @@ impl MailSession {
                 }
                 if !is_image_attachment(&mime_type, &filename)
                     && !is_text_attachment(&mime_type, &filename)
+                    && !is_pdf_attachment(&mime_type, &filename)
                 {
-                    return Err(IpcError::invalid_input("仅支持预览图片或文本类附件", None));
+                    return Err(IpcError::invalid_input(
+                        "仅支持预览图片、PDF 或文本类附件",
+                        None,
+                    ));
                 }
                 let safe_mime = sanitize_mime_for_data_url(&mime_type, &filename);
                 let data_url = format!("data:{safe_mime};base64,{}", encode_base64(&bytes));
@@ -1080,6 +1093,229 @@ impl MailSession {
             message,
         })
     }
+
+    pub fn open_attachment(
+        &self,
+        input: &OpenAttachmentInput,
+    ) -> Result<OpenAttachmentOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if input.attachment_id == 0 {
+            return Err(IpcError::invalid_input("attachmentId 必须为正整数", None));
+        }
+
+        let (data_dir, raw_filename) = match self.mode {
+            AppMode::Demo => {
+                let att = {
+                    let demo = self.demo.lock().expect("demo mutex poisoned");
+                    demo.store
+                        .list_cached_attachments("", 0, 10_000)
+                        .into_iter()
+                        .find(|a| a.id == input.attachment_id)
+                }
+                .ok_or_else(|| {
+                    IpcError::invalid_input(format!("未找到附件 #{}", input.attachment_id), None)
+                })?;
+                (self.prefs.data_dir().to_path_buf(), att.filename)
+            }
+            AppMode::Live => {
+                let data_dir = self
+                    .live
+                    .lock()
+                    .expect("live mutex poisoned")
+                    .data_dir
+                    .clone();
+                let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
+                    IpcError::unavailable(format!("本地邮件缓存暂不可用: {e}"), None)
+                })?;
+                let record = cache
+                    .get_attachment_record(input.attachment_id)
+                    .map_err(|e| IpcError::internal(format!("读取附件记录失败: {e}"), None))?
+                    .ok_or_else(|| {
+                        IpcError::invalid_input(
+                            format!("未找到附件 #{}", input.attachment_id),
+                            None,
+                        )
+                    })?;
+                let filename = match record {
+                    AttachmentRecord::Local { filename, .. }
+                    | AttachmentRecord::PendingRemote { filename, .. } => filename,
+                };
+                (data_dir, filename)
+            }
+        };
+
+        let safe_name = Path::new(&raw_filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && !is_windows_reserved_filename(n))
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let stage_dir = data_dir
+            .join("opened-attachments")
+            .join(input.attachment_id.to_string());
+        let target_path = stage_dir.join(&safe_name);
+        let saved = self.save_attachment(&SaveAttachmentInput {
+            attachment_id: input.attachment_id,
+            dest_path: Some(target_path.to_string_lossy().into_owned()),
+        })?;
+        let opened = launch_path_with_default_app(&saved.saved_path)?;
+        Ok(OpenAttachmentOutput {
+            opened,
+            path: saved.saved_path.clone(),
+            message: format!("已打开附件 {}", safe_name),
+        })
+    }
+}
+
+fn launch_path_with_default_app(path: &str) -> Result<bool, IpcError> {
+    #[cfg(all(windows, not(test)))]
+    {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let res = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        if (res.0 as isize) <= 32 {
+            return Err(IpcError::internal("调用系统默认应用打开附件失败", None));
+        }
+        return Ok(true);
+    }
+    #[cfg(not(all(windows, not(test))))]
+    {
+        let _ = path;
+        Ok(true)
+    }
+}
+
+pub fn pick_directory_blocking(parent_hwnd: Option<isize>) -> Result<PickDirectoryOutput, IpcError> {
+    #[cfg(all(windows, not(test)))]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        };
+        use windows::Win32::UI::Shell::{
+            FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
+            FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+        };
+
+        const ERROR_CANCELLED_HRESULT: i32 = 0x8007_04C7u32 as i32;
+        let co_hr =
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        let needs_uninit = co_hr.is_ok();
+        let result = (|| -> Result<PickDirectoryOutput, IpcError> {
+            let dialog: IFileOpenDialog =
+                unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL) }.map_err(|e| {
+                    IpcError::internal(format!("初始化文件夹选择器失败: {e}"), None)
+                })?;
+            let opts = unsafe { dialog.GetOptions() }.map_err(|e| {
+                IpcError::internal(format!("读取文件夹选择器选项失败: {e}"), None)
+            })?;
+            unsafe {
+                dialog
+                    .SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)
+                    .map_err(|e| {
+                        IpcError::internal(format!("配置文件夹选择器失败: {e}"), None)
+                    })?;
+            }
+            let owner = parent_hwnd.map(|h| HWND(h as *mut core::ffi::c_void));
+            if let Err(err) = unsafe { dialog.Show(owner) } {
+                if err.code().0 == ERROR_CANCELLED_HRESULT {
+                    return Ok(PickDirectoryOutput {
+                        cancelled: true,
+                        path: None,
+                    });
+                }
+                return Err(IpcError::internal(
+                    format!("打开文件夹选择器失败: {err}"),
+                    None,
+                ));
+            }
+            let item = unsafe { dialog.GetResult() }
+                .map_err(|e| IpcError::internal(format!("获取所选目录失败: {e}"), None))?;
+            let pwstr = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
+                .map_err(|e| IpcError::internal(format!("读取目录路径失败: {e}"), None))?;
+            let path = unsafe { pwstr.to_string() }.unwrap_or_default();
+            unsafe {
+                CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void));
+            }
+            if path.trim().is_empty() {
+                Ok(PickDirectoryOutput {
+                    cancelled: true,
+                    path: None,
+                })
+            } else {
+                Ok(PickDirectoryOutput {
+                    cancelled: false,
+                    path: Some(path),
+                })
+            }
+        })();
+        if needs_uninit {
+            unsafe { CoUninitialize() };
+        }
+        return result;
+    }
+    #[cfg(not(all(windows, not(test))))]
+    {
+        let _ = parent_hwnd;
+        Ok(PickDirectoryOutput {
+            cancelled: true,
+            path: None,
+        })
+    }
+}
+
+#[tauri::command]
+pub fn open_attachment(
+    state: State<'_, AppState>,
+    input: OpenAttachmentInput,
+) -> Result<OpenAttachmentOutput, IpcError> {
+    state.session.open_attachment(&input)
+}
+
+#[tauri::command]
+pub async fn pick_directory(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PickDirectoryOutput, IpcError> {
+    if state.session.is_locked() {
+        return Err(IpcError::locked(None));
+    }
+    #[cfg(windows)]
+    let parent_hwnd: Option<isize> = {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        app.get_webview_window(MAIN_WINDOW_LABEL).and_then(|win| {
+            let handle = win.window_handle().ok()?;
+            match handle.as_raw() {
+                RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                _ => None,
+            }
+        })
+    };
+    #[cfg(not(windows))]
+    let parent_hwnd: Option<isize> = {
+        let _ = app;
+        None
+    };
+
+    tauri::async_runtime::spawn_blocking(move || pick_directory_blocking(parent_hwnd))
+        .await
+        .map_err(|e| IpcError::internal(format!("目录选择任务异常: {e}"), None))?
 }
 
 #[tauri::command]

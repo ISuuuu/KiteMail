@@ -34,16 +34,20 @@ use tauri::Emitter;
 use crate::dto::{
     AccountEvent, AccountEventKindDto, AccountSummaryDto, AllowRemoteImagesInput,
     AllowRemoteImagesOutput, AppMode, AttachmentMetaDto, BodyStatusDto, DraftSavedEvent,
-    FolderSummaryDto, IpcError, ListMessagesInput, ListMessagesOutput, LoadOlderMessagesInput,
-    LoadOlderMessagesOutput, LockAppOutput, LockStateEvent, MailChangedEvent, MainBootstrapDto,
-    MainViewDto, MessageActionInput, MessageFilterDto, MessageMoveOutput, MessageSummaryDto,
-    MoveMessageInput, OpenMessageInput, OpenMessageOutput, OutboxEventKindDto, OutboxItemDto,
-    OutboxUpdatedEvent, ReaderPositionDto, ReaderStatusEvent, RefreshMailInput, RefreshMailOutput,
+    FolderSummaryDto, GetReaderViewOptionsInput, IpcError, ListMessagesInput, ListMessagesOutput,
+    LoadOlderMessagesInput, LoadOlderMessagesOutput, LockAppOutput, LockStateEvent,
+    MailChangedEvent, MainBootstrapDto, MainViewDto, MessageActionInput, MessageFilterDto,
+    MessageMoveOutput, MessageSummaryDto, MoveMessageInput, OpenMessageInput, OpenMessageOutput,
+    OutboxEventKindDto, OutboxItemDto, OutboxUpdatedEvent, ReaderFindInput, ReaderFindOutput,
+    ReaderFindResultEvent, ReaderPositionDto, ReaderStatusEvent, ReaderViewOptionsOutput,
+    RefreshMailInput, RefreshMailOutput, SaveAllAttachmentsInput, SaveAttachmentInput,
     SearchScopeDto, SetMessageFlaggedInput, SetMessageFlaggedOutput, SetMessageSeenInput,
-    SetMessageSeenOutput, SyncStatusDto, SyncStatusEvent, ThreadMessageDto, UndoMessageMoveInput,
-    UndoMessageMoveOutput, UnlockAppInput, UnlockAppOutput, VerifyAccountOutput,
-    EVENT_ACCOUNT_EVENT, EVENT_DRAFT_SAVED, EVENT_LOCK_STATE, EVENT_MAIL_CHANGED,
-    EVENT_OUTBOX_UPDATED, EVENT_SYNC_STATUS, MAIN_WINDOW_LABEL,
+    SetMessageSeenOutput, SetMessageTagsInput, SetMessageTagsOutput, SetReaderViewOptionsInput,
+    SyncStatusDto, SyncStatusEvent, TagItemDto, ThreadCardActionEvent, ThreadCardActionKindDto,
+    ThreadMessageDto, UndoMessageMoveInput, UndoMessageMoveOutput, UnlockAppInput,
+    UnlockAppOutput, VerifyAccountOutput, EVENT_ACCOUNT_EVENT, EVENT_DRAFT_SAVED,
+    EVENT_LOCK_STATE, EVENT_MAIL_CHANGED, EVENT_OUTBOX_UPDATED, EVENT_READER_FIND_RESULT,
+    EVENT_SYNC_STATUS, EVENT_THREAD_CARD_ACTION, MAIN_WINDOW_LABEL,
 };
 use crate::preferences::{view_from_last_str, PreferencesStore};
 use crate::reader::{
@@ -67,6 +71,8 @@ pub trait MainEventEmitter: Send + Sync {
     fn emit_outbox_updated(&self, event: OutboxUpdatedEvent);
     fn emit_draft_saved(&self, event: DraftSavedEvent);
     fn emit_account_event(&self, event: AccountEvent);
+    fn emit_thread_card_action(&self, _event: ThreadCardActionEvent) {}
+    fn emit_reader_find_result(&self, _event: ReaderFindResultEvent) {}
 }
 
 pub struct TauriMainEventEmitter {
@@ -114,6 +120,18 @@ impl MainEventEmitter for TauriMainEventEmitter {
         let _ = self
             .app_handle
             .emit_to(MAIN_WINDOW_LABEL, EVENT_ACCOUNT_EVENT, event);
+    }
+
+    fn emit_thread_card_action(&self, event: ThreadCardActionEvent) {
+        let _ = self
+            .app_handle
+            .emit_to(MAIN_WINDOW_LABEL, EVENT_THREAD_CARD_ACTION, event);
+    }
+
+    fn emit_reader_find_result(&self, event: ReaderFindResultEvent) {
+        let _ = self
+            .app_handle
+            .emit_to(MAIN_WINDOW_LABEL, EVENT_READER_FIND_RESULT, event);
     }
 }
 
@@ -1144,7 +1162,10 @@ pub struct MailSession {
     state_version: AtomicU64,
     read_mark_gen: AtomicU64,
     pub(crate) active_selected_msg: Mutex<Option<(u32, u32)>>,
+    pub(crate) active_reader_session_id: Mutex<Option<String>>,
     pub(crate) allowed_remote_messages: Mutex<HashSet<(u32, u32)>>,
+    pub(crate) per_message_dark: Mutex<HashMap<(u32, u32), bool>>,
+    pub(crate) reading_view: AtomicBool,
     thread_collapsed_cards: Mutex<(Option<(u32, u32)>, HashSet<u32>)>,
     thread_raw_cards: Mutex<(Option<(u32, u32)>, HashSet<u32>)>,
     current_view: Mutex<MainViewDto>,
@@ -1189,7 +1210,10 @@ impl MailSession {
             state_version: AtomicU64::new(1),
             read_mark_gen: AtomicU64::new(0),
             active_selected_msg: Mutex::new(None),
+            active_reader_session_id: Mutex::new(None),
             allowed_remote_messages: Mutex::new(HashSet::new()),
+            per_message_dark: Mutex::new(HashMap::new()),
+            reading_view: AtomicBool::new(false),
             thread_collapsed_cards: Mutex::new((None, HashSet::new())),
             thread_raw_cards: Mutex::new((None, HashSet::new())),
             current_view: Mutex::new(MainViewDto::UnifiedInbox),
@@ -1302,7 +1326,10 @@ impl MailSession {
             state_version: AtomicU64::new(1),
             read_mark_gen: AtomicU64::new(0),
             active_selected_msg: Mutex::new(None),
+            active_reader_session_id: Mutex::new(None),
             allowed_remote_messages: Mutex::new(HashSet::new()),
+            per_message_dark: Mutex::new(HashMap::new()),
+            reading_view: AtomicBool::new(false),
             thread_collapsed_cards: Mutex::new((None, HashSet::new())),
             thread_raw_cards: Mutex::new((None, HashSet::new())),
             current_view: Mutex::new(initial_view),
@@ -1912,66 +1939,85 @@ impl MailSession {
         let remote_blocked = is_message_remote_images_blocked(detail, raw_prefs, &allowed_msgs);
         let has_thread = detail.thread_messages.len() > 1;
         let mut effective_appearance = base_appearance.clone();
+        effective_appearance.block_remote_images = raw_prefs.block_remote_images;
 
-        let thread = if has_thread {
-            let key = (detail.account_id, detail.id);
-            let collapsed_cards = {
-                let mut guard = self
-                    .thread_collapsed_cards
-                    .lock()
-                    .expect("thread_collapsed_cards mutex poisoned");
-                if guard.0 != Some(key) {
-                    guard.0 = Some(key);
-                    guard.1 = compute_default_collapsed_cards(
-                        detail,
-                        raw_prefs.thread_newest_first,
-                        raw_prefs.effective_fold_messages_mode(),
-                    );
-                }
-                guard.1.clone()
-            };
-            let raw_cards = {
-                let mut guard = self
-                    .thread_raw_cards
-                    .lock()
-                    .expect("thread_raw_cards mutex poisoned");
-                if guard.0 != Some(key) {
-                    guard.0 = Some(key);
-                    guard.1.clear();
-                }
-                guard.1.clone()
-            };
-            let allowed_remote_cards: HashSet<u32> = detail
-                .thread_messages
-                .iter()
-                .filter(|tm| {
-                    allowed_msgs.contains(&(detail.account_id, tm.id))
-                        || allowed_msgs.contains(&(detail.account_id, detail.id))
-                })
-                .map(|tm| tm.id)
-                .collect();
-            effective_appearance.block_remote_images = raw_prefs.block_remote_images;
-            Some(ThreadRenderOptions {
-                detail: detail.clone(),
-                collapsed_cards,
-                raw_cards,
-                allowed_remote_cards,
-                allowed_remote_senders: raw_prefs.allowed_remote_senders.clone(),
-                ui_text_scale_percent: raw_prefs.ui_text_scale_percent,
-                date_style: raw_prefs.date_style.clone(),
-                clock_style: raw_prefs.clock_style.clone(),
-                always_show_recipients: raw_prefs.always_show_recipients,
-                demo_mode: self.mode == AppMode::Demo,
-                read_receipt_policy: raw_prefs.read_receipt_policy.clone(),
-                initial_anchor: None,
-            })
+        let key = (detail.account_id, detail.id);
+        let collapsed_cards = if has_thread {
+            let mut guard = self
+                .thread_collapsed_cards
+                .lock()
+                .expect("thread_collapsed_cards mutex poisoned");
+            if guard.0 != Some(key) {
+                guard.0 = Some(key);
+                guard.1 = compute_default_collapsed_cards(
+                    detail,
+                    raw_prefs.thread_newest_first,
+                    raw_prefs.effective_fold_messages_mode(),
+                );
+            }
+            guard.1.clone()
         } else {
-            let msg_allowed = raw_prefs.is_remote_sender_allowed(&detail.sender)
-                || allowed_msgs.contains(&(detail.account_id, detail.id));
-            effective_appearance.block_remote_images =
-                raw_prefs.block_remote_images && !msg_allowed;
-            None
+            HashSet::new()
         };
+        let raw_cards = if has_thread {
+            let mut guard = self
+                .thread_raw_cards
+                .lock()
+                .expect("thread_raw_cards mutex poisoned");
+            if guard.0 != Some(key) {
+                guard.0 = Some(key);
+                guard.1.clear();
+            }
+            guard.1.clone()
+        } else {
+            HashSet::new()
+        };
+        let mut allowed_remote_cards: HashSet<u32> = detail
+            .thread_messages
+            .iter()
+            .filter(|tm| {
+                allowed_msgs.contains(&(detail.account_id, tm.id))
+                    || allowed_msgs.contains(&(detail.account_id, detail.id))
+            })
+            .map(|tm| tm.id)
+            .collect();
+        if allowed_msgs.contains(&(detail.account_id, detail.id)) {
+            allowed_remote_cards.insert(detail.id);
+        }
+        let per_message_dark = {
+            let guard = self
+                .per_message_dark
+                .lock()
+                .expect("per_message_dark mutex poisoned");
+            let mut map = HashMap::new();
+            if let Some(&dark) = guard.get(&(detail.account_id, detail.id)) {
+                map.insert(detail.id, dark);
+            }
+            for tm in &detail.thread_messages {
+                if let Some(&dark) = guard.get(&(detail.account_id, tm.id)) {
+                    map.insert(tm.id, dark);
+                }
+            }
+            map
+        };
+        let card_tags = self.resolve_card_tags_map(detail);
+        let thread = Some(ThreadRenderOptions {
+            detail: detail.clone(),
+            collapsed_cards,
+            raw_cards,
+            allowed_remote_cards,
+            allowed_remote_senders: raw_prefs.allowed_remote_senders.clone(),
+            ui_text_scale_percent: raw_prefs.ui_text_scale_percent,
+            date_style: raw_prefs.date_style.clone(),
+            clock_style: raw_prefs.clock_style.clone(),
+            always_show_recipients: raw_prefs.always_show_recipients,
+            demo_mode: self.mode == AppMode::Demo,
+            read_receipt_policy: raw_prefs.read_receipt_policy.clone(),
+            initial_anchor: None,
+            reading_view: self.reading_view.load(Ordering::SeqCst),
+            per_message_dark,
+            card_tags,
+        });
 
         let spec = ReaderDocumentSpec {
             session_id: reader_session_id,
@@ -2003,6 +2049,10 @@ impl MailSession {
             .lock()
             .expect("active_selected_msg mutex poisoned") =
             Some((input.account_id, input.message_id));
+        *self
+            .active_reader_session_id
+            .lock()
+            .expect("active_reader_session_id mutex poisoned") = Some(reader_session_id.clone());
 
         let raw_prefs = self.prefs.snapshot_raw();
         let pref_dto = self.prefs.snapshot_dto();
@@ -3056,6 +3106,29 @@ impl MailSession {
                         "messageMarkedSpam",
                     );
                 }
+                WorkerEvent::MessageTagsUpdated {
+                    account_id,
+                    message_id,
+                    tags,
+                } => {
+                    let ver = self.bump_state_version();
+                    self.emitter.emit_mail_changed(MailChangedEvent {
+                        state_version: ver,
+                        reason: "tagsUpdated".to_string(),
+                        account_id: Some(account_id),
+                        folder_id: None,
+                        message_id: Some(message_id),
+                    });
+                    let tag_pairs = self.decorate_tag_pairs(&tags);
+                    let raw_prefs = self.prefs.snapshot_raw();
+                    let appearance = self.current_reader_appearance(raw_prefs.block_remote_images);
+                    self.reader
+                        .rerender_matching_document(account_id, message_id, &appearance, |spec| {
+                            if let Some(ref mut thread) = spec.thread {
+                                thread.card_tags.insert(message_id, tag_pairs);
+                            }
+                        });
+                }
                 WorkerEvent::AttachmentBytesFetched {
                     attachment_id,
                     filename,
@@ -4028,6 +4101,386 @@ impl MailSession {
         )
     }
 
+    pub fn unmark_message_spam(
+        &self,
+        input: &MessageActionInput,
+    ) -> Result<MessageMoveOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if input.account_id == 0 || input.message_id == 0 {
+            return Err(IpcError::invalid_input(
+                "accountId 与 messageId 必须为正整数",
+                None,
+            ));
+        }
+        let detail = self.load_detail_for_action(input.account_id, input.message_id)?;
+        let is_in_spam = {
+            let p = detail.folder_path.trim().to_ascii_lowercase();
+            p == "junk" || p == "spam" || p == "junkemail" || p.contains("spam") || p.contains("junk")
+        };
+        if !is_in_spam {
+            return Err(IpcError::invalid_input(
+                "仅垃圾邮件文件夹中的邮件可执行恢复操作",
+                None,
+            ));
+        }
+        let target_inbox = match self.mode {
+            AppMode::Demo => "INBOX".to_string(),
+            AppMode::Live => {
+                let data_dir = self
+                    .live
+                    .lock()
+                    .expect("live mutex poisoned")
+                    .data_dir
+                    .clone();
+                let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
+                    IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None)
+                })?;
+                cache
+                    .find_inbox_folder(input.account_id)
+                    .map_err(|e| IpcError::internal(format!("查询收件箱失败: {e}"), None))?
+                    .map(|(_, path)| path)
+                    .unwrap_or_else(|| "INBOX".to_string())
+            }
+        };
+        self.execute_message_move(
+            input.account_id,
+            input.message_id,
+            LiveMoveKind::Folder(target_inbox),
+        )
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<TagItemDto>, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        match self.mode {
+            AppMode::Demo => Ok(Self::demo_tag_catalog()),
+            AppMode::Live => {
+                let data_dir = self
+                    .live
+                    .lock()
+                    .expect("live mutex poisoned")
+                    .data_dir
+                    .clone();
+                if !config::global_db_in(&data_dir).exists() {
+                    return Ok(Vec::new());
+                }
+                let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
+                    IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None)
+                })?;
+                let items = cache
+                    .list_tags()
+                    .map_err(|e| IpcError::internal(format!("读取标签列表失败: {e}"), None))?;
+                Ok(items
+                    .into_iter()
+                    .map(|t| TagItemDto {
+                        id: t.id,
+                        name: t.name,
+                        color: t.color,
+                        shortcut: t.shortcut,
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    fn demo_tag_catalog() -> Vec<TagItemDto> {
+        vec![
+            TagItemDto {
+                id: 1,
+                name: "重要".to_string(),
+                color: "#ef4444".to_string(),
+                shortcut: Some(1),
+            },
+            TagItemDto {
+                id: 2,
+                name: "工作".to_string(),
+                color: "#3b82f6".to_string(),
+                shortcut: Some(2),
+            },
+            TagItemDto {
+                id: 3,
+                name: "待办".to_string(),
+                color: "#f59e0b".to_string(),
+                shortcut: Some(3),
+            },
+            TagItemDto {
+                id: 4,
+                name: "财务".to_string(),
+                color: "#10b981".to_string(),
+                shortcut: Some(4),
+            },
+        ]
+    }
+
+    fn decorate_tag_pairs(&self, tags: &[String]) -> Vec<(String, String)> {
+        let catalog = self.list_tags().unwrap_or_default();
+        tags.iter()
+            .map(|name| {
+                let color = catalog
+                    .iter()
+                    .find(|t| t.name == *name)
+                    .map(|t| t.color.clone())
+                    .unwrap_or_else(|| "#6366f1".to_string());
+                (name.clone(), color)
+            })
+            .collect()
+    }
+
+    fn resolve_card_tags_map(&self, detail: &MessageDetail) -> HashMap<u32, Vec<(String, String)>> {
+        let mut out = HashMap::new();
+        let catalog = self.list_tags().unwrap_or_default();
+        let to_pairs = |names: &[String]| -> Vec<(String, String)> {
+            names
+                .iter()
+                .map(|name| {
+                    let color = catalog
+                        .iter()
+                        .find(|t| t.name == *name)
+                        .map(|t| t.color.clone())
+                        .unwrap_or_else(|| "#6366f1".to_string());
+                    (name.clone(), color)
+                })
+                .collect()
+        };
+        match self.mode {
+            AppMode::Demo => {
+                let demo = self.demo.lock().expect("demo mutex poisoned");
+                if let Some(s) = demo.find_summary(detail.account_id, detail.id) {
+                    if !s.tags.is_empty() {
+                        out.insert(detail.id, to_pairs(&s.tags));
+                    }
+                }
+                for tm in &detail.thread_messages {
+                    if let Some(s) = demo.find_summary(detail.account_id, tm.id) {
+                        if !s.tags.is_empty() {
+                            out.insert(tm.id, to_pairs(&s.tags));
+                        }
+                    }
+                }
+            }
+            AppMode::Live => {
+                let data_dir = self
+                    .live
+                    .lock()
+                    .expect("live mutex poisoned")
+                    .data_dir
+                    .clone();
+                if config::global_db_in(&data_dir).exists() {
+                    if let Ok(cache) = CacheStore::open_for_data_dir_read_only(&data_dir) {
+                        let mut uids = vec![detail.uid];
+                        for tm in &detail.thread_messages {
+                            if tm.uid != 0 && tm.folder_path == detail.folder_path {
+                                uids.push(tm.uid);
+                            }
+                        }
+                        if let Ok(summaries) =
+                            cache.list_summaries_by_uids(detail.folder_id, &uids)
+                        {
+                            for s in summaries {
+                                if !s.tags.is_empty() {
+                                    out.insert(s.id, to_pairs(&s.tags));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn set_message_tags(
+        &self,
+        input: &SetMessageTagsInput,
+    ) -> Result<SetMessageTagsOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if input.account_id == 0 || input.message_id == 0 {
+            return Err(IpcError::invalid_input(
+                "accountId 与 messageId 必须为正整数",
+                None,
+            ));
+        }
+        let mut normalized = Vec::new();
+        for raw in &input.tags {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !normalized.iter().any(|existing| existing == trimmed) {
+                normalized.push(trimmed.to_string());
+            }
+        }
+
+        let folder_id = match self.mode {
+            AppMode::Demo => {
+                let mut demo = self.demo.lock().expect("demo mutex poisoned");
+                demo.store
+                    .set_message_tags(input.message_id, normalized.clone());
+                let summary = demo
+                    .find_summary_mut(input.account_id, input.message_id)
+                    .ok_or_else(|| IpcError::message_not_found(input.message_id, None))?;
+                summary.tags = normalized.clone();
+                Some(summary.folder_id)
+            }
+            AppMode::Live => {
+                let (data_dir, worker) = {
+                    let live = self.live.lock().expect("live mutex poisoned");
+                    (live.data_dir.clone(), live.worker.clone())
+                };
+                let mut cache = CacheStore::open_for_data_dir(&data_dir).map_err(|e| {
+                    IpcError::unavailable(format!("本地缓存暂不可用: {e}"), None)
+                })?;
+                cache
+                    .set_message_tags(input.message_id, &normalized)
+                    .map_err(|e| IpcError::internal(format!("更新标签失败: {e}"), None))?;
+                if let Some(w) = worker {
+                    w.send(MailRequest::SetMessageTags {
+                        account_id: input.account_id,
+                        message_id: input.message_id,
+                        tags: normalized.clone(),
+                    });
+                }
+                None
+            }
+        };
+
+        let tag_pairs = self.decorate_tag_pairs(&normalized);
+        let raw_prefs = self.prefs.snapshot_raw();
+        let appearance = self.current_reader_appearance(raw_prefs.block_remote_images);
+        self.reader.rerender_matching_document(
+            input.account_id,
+            input.message_id,
+            &appearance,
+            |spec| {
+                if let Some(ref mut thread) = spec.thread {
+                    thread.card_tags.insert(input.message_id, tag_pairs);
+                }
+            },
+        );
+
+        let ver = self.bump_state_version();
+        self.emitter.emit_mail_changed(MailChangedEvent {
+            state_version: ver,
+            reason: "tagsUpdated".to_string(),
+            account_id: Some(input.account_id),
+            folder_id,
+            message_id: Some(input.message_id),
+        });
+        Ok(SetMessageTagsOutput {
+            account_id: input.account_id,
+            message_id: input.message_id,
+            tags: normalized,
+            state_version: ver,
+        })
+    }
+
+    pub fn get_reader_view_options(
+        &self,
+        input: &GetReaderViewOptionsInput,
+    ) -> Result<ReaderViewOptionsOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        let per_message_dark = self
+            .per_message_dark
+            .lock()
+            .expect("per_message_dark mutex poisoned")
+            .get(&(input.account_id, input.message_id))
+            .copied();
+        Ok(ReaderViewOptionsOutput {
+            account_id: input.account_id,
+            message_id: input.message_id,
+            per_message_dark,
+            reading_view: self.reading_view.load(Ordering::SeqCst),
+        })
+    }
+
+    pub fn set_reader_view_options(
+        &self,
+        input: &SetReaderViewOptionsInput,
+    ) -> Result<ReaderViewOptionsOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        if input.account_id == 0 || input.message_id == 0 {
+            return Err(IpcError::invalid_input(
+                "accountId 与 messageId 必须为正整数",
+                None,
+            ));
+        }
+        let next_dark = {
+            let mut guard = self
+                .per_message_dark
+                .lock()
+                .expect("per_message_dark mutex poisoned");
+            if let Some(dark_opt) = input.per_message_dark {
+                match dark_opt {
+                    Some(v) => {
+                        guard.insert((input.account_id, input.message_id), v);
+                    }
+                    None => {
+                        guard.remove(&(input.account_id, input.message_id));
+                    }
+                }
+            }
+            guard.get(&(input.account_id, input.message_id)).copied()
+        };
+        let next_reading = if let Some(rv) = input.reading_view {
+            self.reading_view.store(rv, Ordering::SeqCst);
+            rv
+        } else {
+            self.reading_view.load(Ordering::SeqCst)
+        };
+
+        let raw_prefs = self.prefs.snapshot_raw();
+        let appearance = self.current_reader_appearance(raw_prefs.block_remote_images);
+        self.reader.rerender_matching_document(
+            input.account_id,
+            input.message_id,
+            &appearance,
+            |spec| {
+                if let Some(ref mut thread) = spec.thread {
+                    thread.reading_view = next_reading;
+                    if let Some(dark_opt) = input.per_message_dark {
+                        match dark_opt {
+                            Some(v) => {
+                                thread.per_message_dark.insert(input.message_id, v);
+                                for tm in &thread.detail.thread_messages {
+                                    thread.per_message_dark.insert(tm.id, v);
+                                }
+                            }
+                            None => {
+                                thread.per_message_dark.remove(&input.message_id);
+                                for tm in &thread.detail.thread_messages {
+                                    thread.per_message_dark.remove(&tm.id);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        );
+
+        Ok(ReaderViewOptionsOutput {
+            account_id: input.account_id,
+            message_id: input.message_id,
+            per_message_dark: next_dark,
+            reading_view: next_reading,
+        })
+    }
+
+    pub fn find_in_reader(&self, input: &ReaderFindInput) -> Result<ReaderFindOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        let dispatched =
+            self.reader
+                .find_in_reader(&input.reader_session_id, &input.query, input.step)?;
+        Ok(ReaderFindOutput { dispatched })
+    }
+
     fn execute_message_move(
         &self,
         account_id: u32,
@@ -4492,14 +4945,148 @@ impl ThreadActionHandler for MailSession {
                     }
                 }
             }
-            WebViewAction::CardReply(_)
-            | WebViewAction::CardReplyAll(_)
-            | WebViewAction::CardForward(_)
-            | WebViewAction::CardExportEml(_)
-            | WebViewAction::CardCopyBody(_)
-            | WebViewAction::CardSaveAttachment(_)
-            | WebViewAction::CardSaveAllAttachments(_)
-            | WebViewAction::CardMdn { .. } => {}
+            WebViewAction::CardReply(msg_id) => {
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::Reply,
+                    account_id,
+                    message_id,
+                    target_id: Some(msg_id),
+                    text: None,
+                });
+            }
+            WebViewAction::CardReplyAll(msg_id) => {
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::ReplyAll,
+                    account_id,
+                    message_id,
+                    target_id: Some(msg_id),
+                    text: None,
+                });
+            }
+            WebViewAction::CardForward(msg_id) => {
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::Forward,
+                    account_id,
+                    message_id,
+                    target_id: Some(msg_id),
+                    text: None,
+                });
+            }
+            WebViewAction::CardOpenAttachment(att_id) => {
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::OpenAttachment,
+                    account_id,
+                    message_id,
+                    target_id: Some(att_id),
+                    text: None,
+                });
+            }
+            WebViewAction::CardSaveAttachment(att_id) => {
+                let text = match self.save_attachment(&SaveAttachmentInput {
+                    attachment_id: att_id,
+                    dest_path: None,
+                }) {
+                    Ok(out) => Some(out.message),
+                    Err(err) => Some(err.message),
+                };
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::SaveAttachment,
+                    account_id,
+                    message_id,
+                    target_id: Some(att_id),
+                    text,
+                });
+            }
+            WebViewAction::CardSaveAllAttachments(msg_id) => {
+                let att_ids: Vec<u32> = self
+                    .load_detail_for_action(account_id, message_id)
+                    .ok()
+                    .map(|detail| {
+                        detail
+                            .thread_messages
+                            .iter()
+                            .find(|tm| tm.id == msg_id)
+                            .map(|tm| tm.attachments.iter().map(|a| a.id).collect())
+                            .unwrap_or_else(|| {
+                                if detail.id == msg_id {
+                                    detail.attachments.iter().map(|a| a.id).collect()
+                                } else {
+                                    Vec::new()
+                                }
+                            })
+                    })
+                    .unwrap_or_default();
+                let text = if att_ids.is_empty() {
+                    Some("当前卡片没有可保存的附件".to_string())
+                } else {
+                    match self.save_all_attachments(&SaveAllAttachmentsInput {
+                        attachment_ids: att_ids,
+                        dest_dir: None,
+                    }) {
+                        Ok(out) => Some(out.message),
+                        Err(err) => Some(err.message),
+                    }
+                };
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::SaveAllAttachments,
+                    account_id,
+                    message_id,
+                    target_id: Some(msg_id),
+                    text,
+                });
+            }
+            WebViewAction::CardCopyBody(msg_id) => {
+                let body = self
+                    .load_detail_for_action(account_id, message_id)
+                    .ok()
+                    .and_then(|detail| {
+                        detail
+                            .thread_messages
+                            .iter()
+                            .find(|tm| tm.id == msg_id)
+                            .map(|tm| tm.body_text.clone())
+                            .or_else(|| (detail.id == msg_id).then_some(detail.body_text))
+                    });
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::CopyBody,
+                    account_id,
+                    message_id,
+                    target_id: Some(msg_id),
+                    text: body,
+                });
+            }
+            WebViewAction::CardExportEml(msg_id) => {
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::ExportEml,
+                    account_id,
+                    message_id,
+                    target_id: Some(msg_id),
+                    text: None,
+                });
+            }
+            WebViewAction::CardMdn { msg_id, send } => {
+                self.emitter.emit_thread_card_action(ThreadCardActionEvent {
+                    kind: ThreadCardActionKindDto::Mdn,
+                    account_id,
+                    message_id,
+                    target_id: Some(msg_id),
+                    text: Some(if send { "accept" } else { "ignore" }.to_string()),
+                });
+            }
+            WebViewAction::FindCount { current, total } => {
+                let reader_session_id = self
+                    .active_reader_session_id
+                    .lock()
+                    .expect("active_reader_session_id mutex poisoned")
+                    .clone()
+                    .unwrap_or_default();
+                self.emitter
+                    .emit_reader_find_result(ReaderFindResultEvent {
+                        reader_session_id,
+                        current,
+                        total,
+                    });
+            }
         }
     }
 }
@@ -4600,6 +5187,8 @@ pub(crate) mod tests {
         pub(crate) outbox_updated: Mutex<Vec<OutboxUpdatedEvent>>,
         pub(crate) draft_saved: Mutex<Vec<DraftSavedEvent>>,
         pub(crate) account_events: Mutex<Vec<AccountEvent>>,
+        pub(crate) thread_card_actions: Mutex<Vec<ThreadCardActionEvent>>,
+        pub(crate) reader_find_results: Mutex<Vec<ReaderFindResultEvent>>,
     }
 
     impl MainEventEmitter for TestEmitter {
@@ -4625,6 +5214,14 @@ pub(crate) mod tests {
 
         fn emit_account_event(&self, event: AccountEvent) {
             self.account_events.lock().unwrap().push(event);
+        }
+
+        fn emit_thread_card_action(&self, event: ThreadCardActionEvent) {
+            self.thread_card_actions.lock().unwrap().push(event);
+        }
+
+        fn emit_reader_find_result(&self, event: ReaderFindResultEvent) {
+            self.reader_find_results.lock().unwrap().push(event);
         }
     }
 
@@ -4819,7 +5416,10 @@ pub(crate) mod tests {
             state_version: AtomicU64::new(1),
             read_mark_gen: AtomicU64::new(0),
             active_selected_msg: Mutex::new(None),
+            active_reader_session_id: Mutex::new(None),
             allowed_remote_messages: Mutex::new(HashSet::new()),
+            per_message_dark: Mutex::new(HashMap::new()),
+            reading_view: AtomicBool::new(false),
             thread_collapsed_cards: Mutex::new((None, HashSet::new())),
             thread_raw_cards: Mutex::new((None, HashSet::new())),
             current_view: Mutex::new(MainViewDto::UnifiedInbox),

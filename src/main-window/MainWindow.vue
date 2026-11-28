@@ -89,6 +89,7 @@
           @step="(delta) => state.layout.onBelowResize(state.layout.prefs.value.listBelowHeight + delta)"
         />
         <ReaderPane
+          ref="belowReaderPaneRef"
           :isBelow="true"
           :message="state.openedMessage.value"
           :loading="state.readerLoading.value"
@@ -104,6 +105,17 @@
           :folders="state.folders.value"
           :allowingRemoteImages="state.allowingRemoteImages.value"
           :movingMessage="state.movingMessage.value"
+          :accountEmail="state.openedAccountEmail.value"
+          :availableTags="state.availableTags.value"
+          :selectedTags="state.selectedTags.value"
+          :perMessageDark="state.perMessageDark.value"
+          :readingView="state.readingView.value"
+          :findOpen="state.readerFindOpen.value"
+          :findQuery="state.readerFindQuery.value"
+          :findCurrent="state.readerFindCurrent.value"
+          :findTotal="state.readerFindTotal.value"
+          :findStepToken="state.readerFindStepToken.value"
+          :findStepDelta="state.readerFindStepDelta.value"
           @retry="state.retryOpen"
           @reply="openReplyCompose('reply')"
           @replyAll="openReplyCompose('replyAll')"
@@ -118,11 +130,22 @@
           @allowRemoteImages="state.allowOpenedRemoteImages"
           @archive="state.archiveSelectedMessage()"
           @markSpam="state.markSelectedSpam()"
+          @unmarkSpam="state.unmarkSelectedSpam()"
           @delete="state.deleteSelectedMessage()"
           @moveToFolder="state.moveSelectedMessage"
           @openStandalone="openStandaloneReader('read')"
           @print="openStandaloneReader('print')"
-          @openAttachments="attachmentDrawerOpen = true"
+          @openAttachments="activeReaderPane()?.expandAttachments()"
+          @setTags="state.setOpenedMessageTags"
+          @togglePerMessageDark="state.togglePerMessageDark()"
+          @toggleReadingView="state.toggleReadingView()"
+          @toggleFind="state.toggleReaderFind()"
+          @closeFind="state.closeReaderFind()"
+          @findQuery="(q) => state.runReaderFind(q)"
+          @findStep="(delta) => state.runReaderFind(state.readerFindQuery.value, delta)"
+          @fallbackFindResult="(res) => state.updateFallbackFindResult(res.current, res.total)"
+          @cardAction="handleCardAction"
+          @closeWindow="state.closeWindow()"
           @overlayChange="state.layout.setOverlayOpen"
         />
       </template>
@@ -141,6 +164,7 @@
         @step="(delta) => state.layout.onListResize(state.layout.prefs.value.listWidth + delta)"
       />
       <ReaderPane
+        ref="rightReaderPaneRef"
         class="km-reader-column"
         :message="state.openedMessage.value"
         :loading="state.readerLoading.value"
@@ -156,6 +180,17 @@
         :folders="state.folders.value"
         :allowingRemoteImages="state.allowingRemoteImages.value"
         :movingMessage="state.movingMessage.value"
+        :accountEmail="state.openedAccountEmail.value"
+        :availableTags="state.availableTags.value"
+        :selectedTags="state.selectedTags.value"
+        :perMessageDark="state.perMessageDark.value"
+        :readingView="state.readingView.value"
+        :findOpen="state.readerFindOpen.value"
+        :findQuery="state.readerFindQuery.value"
+        :findCurrent="state.readerFindCurrent.value"
+        :findTotal="state.readerFindTotal.value"
+        :findStepToken="state.readerFindStepToken.value"
+        :findStepDelta="state.readerFindStepDelta.value"
         @retry="state.retryOpen"
         @reply="openReplyCompose('reply')"
         @replyAll="openReplyCompose('replyAll')"
@@ -170,11 +205,22 @@
         @allowRemoteImages="state.allowOpenedRemoteImages"
         @archive="state.archiveSelectedMessage()"
         @markSpam="state.markSelectedSpam()"
+        @unmarkSpam="state.unmarkSelectedSpam()"
         @delete="state.deleteSelectedMessage()"
         @moveToFolder="state.moveSelectedMessage"
         @openStandalone="openStandaloneReader('read')"
         @print="openStandaloneReader('print')"
-        @openAttachments="attachmentDrawerOpen = true"
+        @openAttachments="activeReaderPane()?.expandAttachments()"
+        @setTags="state.setOpenedMessageTags"
+        @togglePerMessageDark="state.togglePerMessageDark()"
+        @toggleReadingView="state.toggleReadingView()"
+        @toggleFind="state.toggleReaderFind()"
+        @closeFind="state.closeReaderFind()"
+        @findQuery="(q) => state.runReaderFind(q)"
+        @findStep="(delta) => state.runReaderFind(state.readerFindQuery.value, delta)"
+        @fallbackFindResult="(res) => state.updateFallbackFindResult(res.current, res.total)"
+        @cardAction="handleCardAction"
+        @closeWindow="state.closeWindow()"
         @overlayChange="state.layout.setOverlayOpen"
       />
     </template>
@@ -255,16 +301,7 @@
       @overlayChange="state.layout.setOverlayOpen"
     />
 
-    <!-- Wave 3：附件抽屉 / 全局附件图库 / 独立读信打印 / 通讯录 / 设置 / 命令面板与快捷键 -->
-    <AttachmentDrawer
-      :open="attachmentDrawerOpen"
-      :attachments="state.openedMessage.value?.attachments ?? []"
-      :subject="state.openedMessage.value?.subject"
-      @update:open="(v) => (attachmentDrawerOpen = v)"
-      @close="attachmentDrawerOpen = false"
-      @overlayChange="state.layout.setOverlayOpen"
-    />
-
+    <!-- Wave 3：全局附件图库 / 独立读信打印 / 通讯录 / 设置 / 命令面板与快捷键 -->
     <AttachmentGalleryModal
       :open="attachmentGalleryOpen"
       @update:open="(v) => (attachmentGalleryOpen = v)"
@@ -334,7 +371,6 @@ import { useCompose } from "../compose/useCompose";
 import type { ComposeAccountOption, ComposeMode } from "../compose/types";
 import AccountsModal from "../accounts/AccountsModal.vue";
 import WelcomeOverlay from "../accounts/WelcomeOverlay.vue";
-import AttachmentDrawer from "../reader-tools/AttachmentDrawer.vue";
 import AttachmentGalleryModal from "../reader-tools/AttachmentGalleryModal.vue";
 import StandaloneMessageModal from "../reader-tools/StandaloneMessageModal.vue";
 import type {
@@ -353,7 +389,7 @@ import CommandPaletteModal from "../command-palette/CommandPaletteModal.vue";
 import ShortcutsHelpModal from "../command-palette/ShortcutsHelpModal.vue";
 import type { CommandPaletteItem } from "../command-palette/types";
 import { matchSingleKeyShortcut } from "../command-palette/useCommandPalette";
-import type { OpenMessageOutput } from "../ipc/types";
+import type { OpenMessageOutput, ThreadCardActionEvent } from "../ipc/types";
 import { injectMainWindow } from "./useMainWindow";
 import {
   BELOW_LIST_MIN_HEIGHT,
@@ -404,28 +440,51 @@ function openNewCompose() {
   });
 }
 
-function openReplyCompose(mode: ComposeMode) {
+function openReplyCompose(mode: ComposeMode, targetCardId?: number | null) {
   const msg = state.openedMessage.value;
   if (!msg) return;
+  const targetCard =
+    targetCardId !== undefined && targetCardId !== null
+      ? msg.threadMessages.find((tm) => tm.id === targetCardId) ?? null
+      : null;
   const rfcMessageId =
+    targetCard?.rfcMessageId ??
     msg.rfcMessageId ??
     msg.threadMessages?.[msg.threadMessages.length - 1]?.rfcMessageId ??
     null;
   compose.openCompose({
     mode,
-    accountId: String(msg.accountId),
+    accountId: String(targetCard?.accountId ?? msg.accountId),
     originalMessage: {
-      accountId: String(msg.accountId),
-      sender: msg.sender,
-      recipients: msg.recipients,
-      cc: msg.cc,
-      subject: msg.subject,
-      dateDisplay: msg.dateDisplay,
-      plainText: msg.plainText,
-      htmlBody: msg.htmlBody,
+      accountId: String(targetCard?.accountId ?? msg.accountId),
+      sender: targetCard?.sender ?? msg.sender,
+      recipients: targetCard?.recipients ?? msg.recipients,
+      cc: targetCard?.cc ?? msg.cc,
+      subject: targetCard?.subject || msg.subject,
+      dateDisplay: targetCard?.dateDisplay ?? msg.dateDisplay,
+      plainText: targetCard?.plainText ?? msg.plainText,
+      htmlBody: targetCard?.htmlBody ?? msg.htmlBody,
       rfcMessageId,
     },
   });
+}
+
+function handleCardAction(e: ThreadCardActionEvent) {
+  if (e.kind === "reply" || e.kind === "replyAll" || e.kind === "forward") {
+    openReplyCompose(e.kind, e.targetId ?? e.messageId);
+    return;
+  }
+  if (
+    e.kind === "openAttachment" ||
+    e.kind === "saveAttachment" ||
+    e.kind === "saveAllAttachments"
+  ) {
+    activeReaderPane()?.openAttachmentFromNative(e.kind, e.targetId);
+    return;
+  }
+  if (e.kind === "copyBody" && e.text && typeof navigator !== "undefined" && navigator.clipboard) {
+    void navigator.clipboard.writeText(e.text).catch(() => {});
+  }
 }
 
 function openAccountsModal() {
@@ -441,7 +500,14 @@ async function onWelcomeCompleted() {
   await state.init();
 }
 
-const attachmentDrawerOpen = ref(false);
+const belowReaderPaneRef = ref<InstanceType<typeof ReaderPane> | null>(null);
+const rightReaderPaneRef = ref<InstanceType<typeof ReaderPane> | null>(null);
+function activeReaderPane() {
+  return state.layout.prefs.value.readerPosition === "below"
+    ? belowReaderPaneRef.value
+    : rightReaderPaneRef.value;
+}
+
 const attachmentGalleryOpen = ref(false);
 const standaloneOpen = ref(false);
 const standaloneTarget = ref<StandaloneMessageTarget | null>(null);
@@ -458,7 +524,6 @@ const hasAnyOpenModal = computed(
     compose.open.value ||
     accountsModalOpen.value ||
     showWelcome.value ||
-    attachmentDrawerOpen.value ||
     attachmentGalleryOpen.value ||
     standaloneOpen.value ||
     contactsModalOpen.value ||
@@ -471,7 +536,11 @@ const commandPaletteItems = computed<CommandPaletteItem[]>(() => {
   const hasSelection = Boolean(state.selectedId.value);
   const hasMessage = Boolean(state.openedMessage.value);
   const hasAttachments = Boolean(
-    state.openedMessage.value && state.openedMessage.value.attachments.length > 0
+    state.openedMessage.value &&
+      (state.openedMessage.value.attachments.length > 0 ||
+        state.openedMessage.value.threadMessages.some(
+          (tm) => (tm.attachments?.length ?? 0) > 0
+        ))
   );
   return [
     {
@@ -750,9 +819,7 @@ function executePaletteCommand(commandId: string) {
       openStandaloneReader("print");
       break;
     case "reader.attachments":
-      if (state.openedMessage.value?.attachments.length) {
-        attachmentDrawerOpen.value = true;
-      }
+      activeReaderPane()?.expandAttachments();
       break;
     case "tools.attachments":
       attachmentGalleryOpen.value = true;
@@ -811,6 +878,7 @@ onMounted(() => {
     });
     ro.observe(rootRef.value);
   }
+  state.registerThreadCardActionHandler(handleCardAction);
   window.addEventListener("keydown", onKeyDown);
   void getFullPreferences()
     .then((res) => {
@@ -822,6 +890,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  state.registerThreadCardActionHandler(null);
   ro?.disconnect();
   window.removeEventListener("keydown", onKeyDown);
   state.layout.flushSave();

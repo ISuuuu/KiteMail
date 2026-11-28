@@ -212,12 +212,14 @@ export interface AttachmentDto {
   filename: string;
   mimeType: string;
   sizeBytes: number;
+  downloaded?: boolean;
 }
 
 export interface ThreadMessageDto {
   id: number;
   accountId: number;
   rfcMessageId?: string;
+  subject?: string;
   sender: string;
   recipients: string;
   cc: string;
@@ -228,6 +230,8 @@ export interface ThreadMessageDto {
   htmlBody: string | null;
   unread: boolean;
   flagged: boolean;
+  attachments?: AttachmentDto[];
+  folderPath?: string;
 }
 
 export interface OpenMessageOutput {
@@ -383,4 +387,78 @@ export interface LockStateEvent {
 export interface MessageRef {
   accountId: number;
   messageId: number;
+}
+
+export interface TagItemDto {
+  id: number;
+  name: string;
+  color: string;
+  shortcut?: number | null;
+}
+
+export interface SetMessageTagsInput {
+  accountId: number;
+  messageId: number;
+  tags: string[];
+}
+
+export interface SetMessageTagsOutput {
+  accountId: number;
+  messageId: number;
+  tags: string[];
+  stateVersion: number;
+}
+
+export interface GetReaderViewOptionsInput {
+  accountId: number;
+  messageId: number;
+}
+
+export interface SetReaderViewOptionsInput {
+  accountId: number;
+  messageId: number;
+  perMessageDark?: boolean | null;
+  readingView?: boolean;
+}
+
+export interface ReaderViewOptionsOutput {
+  accountId: number;
+  messageId: number;
+  perMessageDark: boolean | null;
+  readingView: boolean;
+}
+
+export interface ReaderFindInput {
+  readerSessionId: string;
+  query: string;
+  step?: number;
+}
+
+export interface ReaderFindOutput {
+  dispatched: boolean;
+}
+
+export interface ReaderFindResultEvent {
+  readerSessionId: string;
+  current: number;
+  total: number;
+}
+
+export type ThreadCardActionKind =
+  | "reply"
+  | "replyAll"
+  | "forward"
+  | "openAttachment"
+  | "saveAttachment"
+  | "saveAllAttachments"
+  | "copyBody"
+  | "exportEml"
+  | "mdn";
+
+export interface ThreadCardActionEvent {
+  kind: ThreadCardActionKind;
+  accountId: number;
+  messageId: number;
+  targetId?: number | null;
+  text?: string | null;
 }

@@ -5,16 +5,22 @@
 
 import { computed, ref } from "vue";
 import { extractErrorMessage, isLockedError } from "../ipc/main-window";
+import type { AttachmentDto, ThreadMessageDto } from "../ipc/types";
 import {
   fetchAttachmentPreview,
   listCachedAttachments,
+  openAttachment,
+  pickDirectory,
   saveAllAttachments,
   saveAttachment,
 } from "./ipc";
 import type {
   AttachmentFilterKind,
   CachedAttachmentDto,
+  DrawerAttachmentItem,
   FetchAttachmentPreviewOutput,
+  OpenAttachmentOutput,
+  PickDirectoryOutput,
   SaveAllAttachmentsOutput,
   SaveAttachmentOutput,
 } from "./types";
@@ -47,6 +53,65 @@ export function isImageAttachment(att: {
     return IMAGE_EXTENSIONS.has(ext);
   }
   return false;
+}
+
+/** 判断附件是否为 PDF 文档 */
+export function isPdfAttachment(att: {
+  mimeType?: string;
+  filename?: string;
+}): boolean {
+  const mime = (att.mimeType ?? "").trim().toLowerCase();
+  if (mime === "application/pdf") return true;
+  const name = (att.filename ?? "").trim().toLowerCase();
+  return name.endsWith(".pdf");
+}
+
+/** 聚合并按 id 去重整组会话附件 */
+export function aggregateThreadAttachments(
+  attachments: readonly AttachmentDto[] = [],
+  threadMessages: readonly ThreadMessageDto[] = []
+): DrawerAttachmentItem[] {
+  const seen = new Set<number>();
+  const result: DrawerAttachmentItem[] = [];
+  const pushItem = (att: AttachmentDto, messageId?: number) => {
+    const numId = resolveNumericAttachmentId(att.id);
+    if (numId === null || seen.has(numId)) return;
+    seen.add(numId);
+    result.push({
+      id: numId,
+      filename: att.filename,
+      mimeType: att.mimeType,
+      sizeBytes: att.sizeBytes,
+      downloaded: Boolean(att.downloaded),
+      isImage: isImageAttachment({ mimeType: att.mimeType, filename: att.filename }),
+      isPdf: isPdfAttachment({ mimeType: att.mimeType, filename: att.filename }),
+      ...(messageId !== undefined ? { messageId } : {}),
+    });
+  };
+  for (const att of attachments) {
+    pushItem(att);
+  }
+  for (const tm of threadMessages) {
+    for (const att of tm.attachments ?? []) {
+      pushItem(att, tm.id);
+    }
+  }
+  return result;
+}
+
+/** 按文件名正序或倒序排序抽屉附件 */
+export function sortDrawerAttachments<T extends { filename: string }>(
+  list: readonly T[],
+  order: "asc" | "desc"
+): T[] {
+  const factor = order === "asc" ? 1 : -1;
+  return [...list].sort(
+    (a, b) =>
+      a.filename.localeCompare(b.filename, "zh-CN", {
+        numeric: true,
+        sensitivity: "base",
+      }) * factor
+  );
 }
 
 /** 格式化文件大小显示 */
@@ -311,6 +376,44 @@ export function useAttachments(options: UseAttachmentsOptions = {}) {
     }
   }
 
+  async function openWithDefaultApp(attachmentId: number): Promise<OpenAttachmentOutput | null> {
+    error.value = null;
+    statusMessage.value = null;
+    try {
+      const res = await openAttachment({ attachmentId });
+      locked.value = false;
+      markItemsDownloaded([attachmentId]);
+      statusMessage.value = res.message;
+      return res;
+    } catch (err) {
+      handleIpcFailure(err, "main");
+      return null;
+    }
+  }
+
+  async function pickSaveDirectory(): Promise<PickDirectoryOutput | null> {
+    error.value = null;
+    try {
+      const res = await pickDirectory();
+      locked.value = false;
+      return res;
+    } catch (err) {
+      handleIpcFailure(err, "main");
+      return null;
+    }
+  }
+
+  async function saveManyWithPicker(
+    attachmentIds: number[]
+  ): Promise<SaveAllAttachmentsOutput | null> {
+    if (attachmentIds.length === 0) return null;
+    const picked = await pickSaveDirectory();
+    if (!picked || picked.cancelled || !picked.path) {
+      return null;
+    }
+    return saveMany(attachmentIds, picked.path);
+  }
+
   function clearStatus(): void {
     error.value = null;
     previewError.value = null;
@@ -371,6 +474,9 @@ export function useAttachments(options: UseAttachmentsOptions = {}) {
     closePreview,
     saveSingle,
     saveMany,
+    openWithDefaultApp,
+    pickSaveDirectory,
+    saveManyWithPicker,
     clearStatus,
     reset,
   };

@@ -1,16 +1,16 @@
 //! Tauri main-thread native reader lifecycle, layout/visibility coordinator,
 //! and shared `kitemail-windows-mail-reader` WebView2 host adapter.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
 use kitemail_mail_core::config::normalize_sender_email;
-use kitemail_mail_core::MessageDetail;
+use kitemail_mail_core::{MessageDetail, ThreadMessage};
 use kitemail_windows_mail_reader::{
-    build_body_document, build_thread_document, supports_document as reader_supports_document,
-    DocumentAppearance, DocumentMode, ThreadCardRenderInput, ThreadDocContext, ThreadPalette,
-    WebViewAction,
+    build_body_document, build_thread_document_with_extra,
+    supports_document as reader_supports_document, DocumentAppearance, DocumentMode,
+    ThreadCardRenderInput, ThreadDocContext, ThreadPalette, ThreadRenderExtra, WebViewAction,
 };
 
 use crate::dto::{
@@ -49,6 +49,9 @@ pub struct ThreadRenderOptions {
     pub demo_mode: bool,
     pub read_receipt_policy: String,
     pub initial_anchor: Option<(u32, i32)>,
+    pub reading_view: bool,
+    pub per_message_dark: HashMap<u32, bool>,
+    pub card_tags: HashMap<u32, Vec<(String, String)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,11 +83,7 @@ fn sender_in_allowlist(sender: &str, allowed_senders: &[String]) -> bool {
 }
 
 fn should_load_native_document(doc: &ReaderDocumentSpec) -> bool {
-    if doc
-        .thread
-        .as_ref()
-        .is_some_and(|t| t.detail.thread_messages.len() > 1)
-    {
+    if doc.thread.is_some() {
         return true;
     }
     doc.html_body.as_deref().is_some_and(supports_document)
@@ -97,58 +96,92 @@ pub fn build_reader_document_bytes(
 ) -> (Vec<u8>, bool, DocumentMode) {
     let doc_appearance = appearance.to_document_appearance();
     if let Some(ref thread) = doc.thread {
-        if thread.detail.thread_messages.len() > 1 {
-            let palette = ThreadPalette::from_appearance(&doc_appearance);
-            let cards: Vec<ThreadCardRenderInput<'_>> = thread
-                .detail
-                .thread_messages
-                .iter()
-                .map(|tm| {
-                    let is_current = tm.id == thread.detail.id;
-                    let is_collapsed = thread.collapsed_cards.contains(&tm.id);
-                    let show_raw_source = thread.raw_cards.contains(&tm.id);
-                    let sender_allowed =
-                        sender_in_allowlist(&tm.sender, &thread.allowed_remote_senders);
-                    let block_remote = appearance.block_remote_images
-                        && !sender_allowed
-                        && !thread.allowed_remote_cards.contains(&tm.id);
-                    ThreadCardRenderInput {
-                        message: tm,
-                        is_current,
-                        is_collapsed,
-                        show_raw_source,
-                        block_remote,
-                        card_dark: appearance.dark,
-                        card_pending: false,
-                        eml_exporting: false,
-                        auth_results: is_current
-                            .then_some(thread.detail.auth_results.as_deref())
-                            .flatten(),
-                        unsubscribe_url: is_current
-                            .then_some(thread.detail.unsubscribe_url.as_deref())
-                            .flatten(),
-                    }
-                })
-                .collect();
-            let ctx = ThreadDocContext {
-                detail: &thread.detail,
-                cards: &cards,
-                palette: &palette,
-                app_dark_mode: appearance.dark,
-                zoom_percent: appearance.zoom_percent,
-                ui_text_scale_percent: thread.ui_text_scale_percent,
-                date_style: &thread.date_style,
-                clock_style: &thread.clock_style,
-                show_remote_banner: true,
-                always_show_recipients: thread.always_show_recipients,
-                card_attachments: true,
-                demo_mode: thread.demo_mode,
-                read_receipt_policy: &thread.read_receipt_policy,
-                initial_anchor: thread.initial_anchor,
-            };
-            let (bytes, any_remote_allowed) = build_thread_document(&ctx);
-            return (bytes, any_remote_allowed, DocumentMode::ThreadContainer);
-        }
+        let palette = ThreadPalette::from_appearance(&doc_appearance);
+        let fallback_single: Vec<ThreadMessage>;
+        let thread_msgs: &[ThreadMessage] = if thread.detail.thread_messages.is_empty() {
+            fallback_single = vec![ThreadMessage {
+                id: thread.detail.id,
+                rfc_message_id: thread.detail.rfc_message_id.clone(),
+                subject: thread.detail.subject.clone(),
+                sender: thread.detail.sender.clone(),
+                recipients: thread.detail.recipients.clone(),
+                cc: thread.detail.cc.clone(),
+                date_ts: thread.detail.date_ts,
+                date_display: thread.detail.date_display.clone(),
+                body_text: thread.detail.body_text.clone(),
+                body_html: thread.detail.body_html.clone(),
+                body_loaded: true,
+                unread: false,
+                flagged: thread.detail.flagged,
+                attachments: thread.detail.attachments.clone(),
+                uid: thread.detail.uid,
+                folder_path: thread.detail.folder_path.clone(),
+            }];
+            &fallback_single
+        } else {
+            &thread.detail.thread_messages
+        };
+        let cards: Vec<ThreadCardRenderInput<'_>> = thread_msgs
+            .iter()
+            .map(|tm| {
+                let is_current = tm.id == thread.detail.id;
+                let is_collapsed = thread.collapsed_cards.contains(&tm.id);
+                let show_raw_source = thread.raw_cards.contains(&tm.id);
+                let sender_allowed =
+                    sender_in_allowlist(&tm.sender, &thread.allowed_remote_senders);
+                let block_remote = appearance.block_remote_images
+                    && !sender_allowed
+                    && !thread.allowed_remote_cards.contains(&tm.id);
+                let card_dark = thread
+                    .per_message_dark
+                    .get(&tm.id)
+                    .copied()
+                    .unwrap_or(appearance.dark);
+                ThreadCardRenderInput {
+                    message: tm,
+                    is_current,
+                    is_collapsed,
+                    show_raw_source,
+                    block_remote,
+                    card_dark,
+                    card_pending: false,
+                    eml_exporting: false,
+                    auth_results: is_current
+                        .then_some(thread.detail.auth_results.as_deref())
+                        .flatten(),
+                    unsubscribe_url: is_current
+                        .then_some(thread.detail.unsubscribe_url.as_deref())
+                        .flatten(),
+                }
+            })
+            .collect();
+        let ctx = ThreadDocContext {
+            detail: &thread.detail,
+            cards: &cards,
+            palette: &palette,
+            app_dark_mode: appearance.dark,
+            zoom_percent: appearance.zoom_percent,
+            ui_text_scale_percent: thread.ui_text_scale_percent,
+            date_style: &thread.date_style,
+            clock_style: &thread.clock_style,
+            show_remote_banner: true,
+            always_show_recipients: thread.always_show_recipients,
+            card_attachments: true,
+            demo_mode: thread.demo_mode,
+            read_receipt_policy: &thread.read_receipt_policy,
+            initial_anchor: thread.initial_anchor,
+        };
+        let card_tags_vec: Vec<(u32, Vec<(String, String)>)> = thread
+            .card_tags
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let extra = ThreadRenderExtra {
+            reading_view: thread.reading_view,
+            card_tags: &card_tags_vec,
+        };
+        let (bytes, any_remote_allowed) = build_thread_document_with_extra(&ctx, &extra);
+        return (bytes, any_remote_allowed, DocumentMode::ThreadContainer);
     }
 
     let html = doc.html_body.as_deref().unwrap_or("");
@@ -193,6 +226,7 @@ pub trait ReaderPlatformSink: Send + Sync {
     fn apply_layout(&self, clip: PhysicalRect, bounds: PhysicalRect, visible: bool);
     fn set_visible(&self, visible: bool);
     fn set_zoom(&self, zoom_percent: u32);
+    fn execute_script(&self, _script: String) {}
     fn close(&self);
     fn emit_status(&self, event: ReaderStatusEvent);
     fn set_action_handler(&self, _handler: Weak<dyn ThreadActionHandler>) {}
@@ -251,6 +285,41 @@ impl ReaderManager {
 
     pub fn set_action_handler(&self, handler: Weak<dyn ThreadActionHandler>) {
         self.sink.set_action_handler(handler);
+    }
+
+    pub fn find_in_reader(
+        &self,
+        reader_session_id: &str,
+        query: &str,
+        step: Option<i32>,
+    ) -> Result<bool, IpcError> {
+        let (matches_active, enabled, locked) = {
+            let guard = self.state.lock().expect("reader mutex poisoned");
+            (
+                guard.active_session_id.as_deref() == Some(reader_session_id),
+                !guard.reader_hidden_pref,
+                guard.locked,
+            )
+        };
+        if locked || !enabled || !matches_active || !self.sink.is_native_supported() {
+            return Ok(false);
+        }
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            self.sink
+                .execute_script("window.kmFindClear && window.kmFindClear();".to_string());
+            return Ok(true);
+        }
+        if let Some(delta) = step.filter(|&d| d != 0) {
+            let dir = if delta < 0 { -1 } else { 1 };
+            self.sink
+                .execute_script(format!("window.kmFindStep && window.kmFindStep({dir});"));
+            return Ok(true);
+        }
+        let escaped = serde_json::to_string(trimmed).unwrap_or_else(|_| "\"\"".to_string());
+        self.sink
+            .execute_script(format!("window.kmFind && window.kmFind({escaped});"));
+        Ok(true)
     }
 
     /// Start a new reader session for a selected message, resetting the layout revision guard.
@@ -923,6 +992,14 @@ pub mod platform_win {
             });
         }
 
+        fn execute_script(&self, script: String) {
+            self.with_host_on_main_thread(move |_, _, _, slot| {
+                if let Some(current) = slot.as_ref() {
+                    current.host.execute_script(&script);
+                }
+            });
+        }
+
         fn close(&self) {
             let _ = self.app_handle.run_on_main_thread(|| {
                 MAIN_THREAD_HOST.with(|slot| {
@@ -1256,6 +1333,9 @@ mod tests {
                     demo_mode: true,
                     read_receipt_policy: "ask".to_string(),
                     initial_anchor: None,
+                    reading_view: false,
+                    per_message_dark: HashMap::new(),
+                    card_tags: HashMap::new(),
                 }),
             },
             &appearance,
