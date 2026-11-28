@@ -47,6 +47,19 @@ export function resolveReaderViewportMode(input: ReaderViewportModeInput): Reade
   return "native-ready";
 }
 
+/** 导航就绪后等待 LayoutApplied 回执的上限：超时即视为布局失败，不再永久停在 layout-pending。 */
+export const LAYOUT_PENDING_TIMEOUT_MS = 4000;
+
+export const LAYOUT_PENDING_TIMEOUT_MESSAGE = "原生阅读器布局超时（未收到布局就绪回执）";
+
+/** 等待布局回执是否已超出容忍窗口（elapsed 为毫秒）。 */
+export function isLayoutPendingTimedOut(
+  elapsedMs: number,
+  timeoutMs: number = LAYOUT_PENDING_TIMEOUT_MS
+): boolean {
+  return Number.isFinite(elapsedMs) && elapsedMs >= timeoutMs;
+}
+
 export interface EarlyRevealOptions {
   source: string;
   reveal: (source: string, stageMs: number) => Promise<void>;

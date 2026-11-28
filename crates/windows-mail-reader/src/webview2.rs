@@ -28,9 +28,10 @@ use windows::{
             Input::KeyboardAndMouse::{GetFocus, SetFocus},
             Shell::SHCreateMemStream,
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetParent, IsChild, SetWindowPos, ShowWindow,
-                HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-                SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
+                CreateWindowExW, DestroyWindow, GetParent, GetWindowLongPtrW, IsChild,
+                SetWindowPos, ShowWindow, GWL_STYLE, HWND_TOP, SET_WINDOW_POS_FLAGS,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+                WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN, WS_VISIBLE,
             },
         },
     },
@@ -354,8 +355,42 @@ unsafe fn apply_clip_window_pos_and_show(
             clip_window,
             if visible { SW_SHOWNOACTIVATE } else { SW_HIDE },
         );
+        // ShowWindow 的返回值只表示「此前是否可见」，无法据此判断成败，
+        // 因此回读窗口自身的 WS_VISIBLE 样式位确认显隐是否真的生效。
+        let style = GetWindowLongPtrW(clip_window, GWL_STYLE) as u32;
+        let now_visible = (style & WS_VISIBLE.0) != 0;
+        if now_visible != visible {
+            return Err((
+                "show_window",
+                format!(
+                    "ShowWindow 未生效: 期望{}，实际{}",
+                    if visible { "显示" } else { "隐藏" },
+                    if now_visible { "显示" } else { "隐藏" }
+                ),
+            ));
+        }
     }
     Ok(())
+}
+
+/// 导航就绪后重申一次 Z 序（SetWindowPos(HWND_TOP, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)）。
+///
+/// 阅读器只在裁剪矩形变化或可见性翻转时抬到 HWND_TOP；WebView2 完成导航时，
+/// Wry 的同级子窗口可能被重新创建或重新抬升，把已显示的正文重新压到下面。
+/// 导航就绪时重申一次是零成本兜底：不移动、不缩放、不抢焦点，且仅在窗口当前可见时执行。
+fn reassert_clip_z_order(state: &Rc<RefCell<State>>) {
+    let (clip_window, shown) = {
+        let inner = state.borrow();
+        (inner.clip_window, inner.window_shown)
+    };
+    if !shown || clip_window.is_invalid() {
+        return;
+    }
+    let res =
+        unsafe { apply_clip_window_pos_and_show(clip_window, RECT::default(), false, true, false) };
+    if let Err((stage, detail)) = res {
+        record_stage_error(state, stage, detail);
+    }
 }
 
 fn flush_events(state: &Rc<RefCell<State>>) {
@@ -1547,6 +1582,7 @@ unsafe fn configure(
                 if matched {
                     flush_events(&state);
                     maybe_install_bridge_script(&state, view.as_ref());
+                    reassert_clip_z_order(&state);
                 }
             }
             Ok(())
@@ -1567,6 +1603,8 @@ unsafe fn configure(
             flush_events(&state);
             if matched {
                 maybe_install_bridge_script(&state, view.as_ref());
+                // 导航完成是子窗口层级最容易被重置的时刻，重申一帧 Z 序。
+                reassert_clip_z_order(&state);
                 let should_suspend = {
                     let mut inner = state.borrow_mut();
                     let flag = inner.suspend_after_load

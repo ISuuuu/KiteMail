@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import {
+  LAYOUT_PENDING_TIMEOUT_MS,
+  isLayoutPendingTimedOut,
   resolveReaderViewportMode,
   triggerEarlyWindowReveal,
 } from "../src/main-window/startupHelpers";
@@ -167,6 +169,24 @@ test("triggerEarlyWindowReveal 立即携带来源与耗时显窗，且失败时�
   });
   assert.equal(failOk, false);
   assert.equal(reportedError, "show window denied");
+});
+
+test("layout-pending 超时兜底：有限等待后转不可用而不是永久等待回执", () => {
+  assert.ok(
+    LAYOUT_PENDING_TIMEOUT_MS >= 3000 && LAYOUT_PENDING_TIMEOUT_MS <= 5000,
+    "等待回执的窗口应落在 3-5s"
+  );
+  assert.equal(isLayoutPendingTimedOut(LAYOUT_PENDING_TIMEOUT_MS - 1), false);
+  assert.equal(isLayoutPendingTimedOut(LAYOUT_PENDING_TIMEOUT_MS), true);
+  assert.equal(isLayoutPendingTimedOut(Number.NaN), false);
+
+  const viewportVue = fs.readFileSync(
+    path.resolve("src/main-window/ReaderViewport.vue"),
+    "utf8"
+  );
+  // 超时写入 localLayoutError 后由 resolveReaderViewportMode 转 unavailable，并保留重试入口
+  assert.match(viewportVue, /armLayoutPendingWatchdog\(\);/);
+  assert.match(viewportVue, /localLayoutError\.value = LAYOUT_PENDING_TIMEOUT_MESSAGE;/);
 });
 
 test("启动加载壳与阅读器回执源码守卫", () => {

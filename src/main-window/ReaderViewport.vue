@@ -211,7 +211,12 @@ import type {
   ThreadMessageDto,
 } from "../ipc/types";
 import { isTauri, extractErrorMessage, nextReaderLayoutRevision, setReaderLayout } from "../ipc/main-window";
-import { resolveReaderViewportMode } from "./startupHelpers";
+import {
+  LAYOUT_PENDING_TIMEOUT_MESSAGE,
+  LAYOUT_PENDING_TIMEOUT_MS,
+  isLayoutPendingTimedOut,
+  resolveReaderViewportMode,
+} from "./startupHelpers";
 import { formatAttachmentSize, resolveNumericAttachmentId } from "../reader-tools/useAttachments";
 import {
   avatarToneColor,
@@ -274,6 +279,8 @@ const zoomFactor = computed(() => {
 
 const localLayoutAppliedSession = ref("");
 const localLayoutError = ref<string | null>(null);
+let layoutPendingTimer: ReturnType<typeof setTimeout> | null = null;
+let layoutPendingSince = 0;
 
 const nativeHostActive = computed(
   () =>
@@ -299,6 +306,48 @@ const viewportMode = computed(() =>
 
 const displayedErrorMessage = computed(
   () => localLayoutError.value || props.errorMessage || "正文阅读器暂不可用，请重试"
+);
+
+function nowMs(): number {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+function clearLayoutPendingWatchdog() {
+  if (layoutPendingTimer !== null) {
+    clearTimeout(layoutPendingTimer);
+    layoutPendingTimer = null;
+  }
+}
+
+/**
+ * layout-pending 超时兜底：导航已就绪但 LayoutApplied 回执始终不来时，
+ * 有限等待后转入不可用态（带重试），避免永久停在「正在准备正文视图」。
+ */
+function armLayoutPendingWatchdog() {
+  clearLayoutPendingWatchdog();
+  layoutPendingSince = nowMs();
+  layoutPendingTimer = setTimeout(() => {
+    layoutPendingTimer = null;
+    if (viewportMode.value !== "layout-pending") return;
+    if (!isLayoutPendingTimedOut(nowMs() - layoutPendingSince)) return;
+    console.warn(
+      "[ReaderViewport] layout-pending timeout, falling back to unavailable:",
+      props.readerSessionId
+    );
+    localLayoutError.value = LAYOUT_PENDING_TIMEOUT_MESSAGE;
+  }, LAYOUT_PENDING_TIMEOUT_MS);
+}
+
+watch(
+  viewportMode,
+  (mode) => {
+    if (mode === "layout-pending") {
+      armLayoutPendingWatchdog();
+    } else {
+      clearLayoutPendingWatchdog();
+    }
+  },
+  { immediate: true }
 );
 
 function retryReader() {
@@ -664,6 +713,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  clearLayoutPendingWatchdog();
   if (rafId !== null) {
     cancelAnimationFrame(rafId);
     rafId = null;

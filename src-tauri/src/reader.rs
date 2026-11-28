@@ -777,6 +777,8 @@ pub mod platform_win {
         layout_applied: bool,
         layout_visible: bool,
         last_error: Option<String>,
+        /// 本版本失败（Error / ProcessFailed）已上报过，避免随后的状态变更再推一条重复的不可用事件。
+        fail_reported: bool,
     }
 
     struct HostSlot {
@@ -869,6 +871,7 @@ pub mod platform_win {
                     layout_applied,
                     layout_visible,
                     last_error,
+                    fail_reported,
                 ) = {
                     let mut active = cb_meta.borrow_mut();
                     if version != active.expected_version || active.session_id.is_empty() {
@@ -880,10 +883,12 @@ pub mod platform_win {
                             active.layout_applied = false;
                             active.layout_visible = false;
                             active.last_error = None;
+                            active.fail_reported = false;
                         }
                         ReaderLoadStatus::Ready => {
                             active.navigation_ready = true;
                             active.last_error = None;
+                            active.fail_reported = false;
                         }
                         ReaderLoadStatus::Unavailable | ReaderLoadStatus::ProcessFailed => {
                             active.navigation_ready = false;
@@ -898,8 +903,18 @@ pub mod platform_win {
                         active.layout_applied,
                         active.layout_visible,
                         active.last_error.clone(),
+                        active.fail_reported,
                     )
                 };
+                // Error / ProcessFailed 事件已就同一版本上报过不可用，合并事件只推一次。
+                if fail_reported
+                    && matches!(
+                        status,
+                        ReaderLoadStatus::Unavailable | ReaderLoadStatus::ProcessFailed
+                    )
+                {
+                    return;
+                }
                 let (body_status, detail, retryable, stage) = match status {
                     ReaderLoadStatus::Loading => (
                         BodyStatusDto::Loading,
@@ -1004,6 +1019,7 @@ pub mod platform_win {
                         active.last_error = Some(msg.clone());
                         active.layout_applied = false;
                         active.layout_visible = false;
+                        active.fail_reported = true;
                         Some((active.session_id.clone(), active.account_id, active.message_id, msg))
                     }
                 };
@@ -1019,17 +1035,29 @@ pub mod platform_win {
                 }
             }
             ReaderEvent::ProcessFailed { version } => {
-                let active = cb_meta.borrow();
-                if version != active.expected_version || active.session_id.is_empty() {
+                let target = {
+                    let mut active = cb_meta.borrow_mut();
+                    if version != active.expected_version || active.session_id.is_empty() {
+                        None
+                    } else {
+                        active.fail_reported = true;
+                        Some((
+                            active.session_id.clone(),
+                            active.account_id,
+                            active.message_id,
+                        ))
+                    }
+                };
+                let Some((session_id, account_id, message_id)) = target else {
                     return;
-                }
+                };
                 let detail = Some("WebView2 阅读进程异常退出".to_string());
                 emit_reader_status(
                     &cb_handle,
                     ReaderStatusEvent {
-                        reader_session_id: active.session_id.clone(),
-                        account_id: active.account_id,
-                        message_id: active.message_id,
+                        reader_session_id: session_id,
+                        account_id,
+                        message_id,
                         body_status: BodyStatusDto::Unavailable,
                         detail: detail.clone(),
                         message: detail,
@@ -1222,6 +1250,7 @@ pub mod platform_win {
                         meta.layout_applied = false;
                         meta.layout_visible = false;
                         meta.last_error = None;
+                        meta.fail_reported = false;
                     }
                     match current
                         .host
