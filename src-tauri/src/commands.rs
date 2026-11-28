@@ -51,10 +51,20 @@ where
 
 #[tauri::command]
 pub async fn main_bootstrap(state: State<'_, AppState>) -> Result<MainBootstrapDto, IpcError> {
+    let started = std::time::Instant::now();
     let session = Arc::clone(&state.session);
-    tauri::async_runtime::spawn_blocking(move || session.bootstrap())
+    let dto = tauri::async_runtime::spawn_blocking(move || session.bootstrap())
         .await
-        .map_err(|e| IpcError::internal(format!("初始化主窗口失败: {e}"), None))
+        .map_err(|e| IpcError::internal(format!("初始化主窗口失败: {e}"), None))?;
+    eprintln!(
+        "[startup] ipc main_bootstrap completed: locked={}, cache_ready={}, folders={}, elapsed_ms={:.2}, since_process_ms={:.2}",
+        dto.locked,
+        dto.cache_ready,
+        dto.folders.len(),
+        started.elapsed().as_secs_f64() * 1000.0,
+        window_lifecycle::elapsed_since_process_start_ms()
+    );
+    Ok(dto)
 }
 
 #[tauri::command]

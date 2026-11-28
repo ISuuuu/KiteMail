@@ -475,6 +475,39 @@ fn parse_graph_messages_json(
     (items, next_link)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedGraphBody<'a> {
+    content_type: &'a str,
+    raw_content: &'a str,
+    is_html: bool,
+}
+
+fn parse_graph_body(json: &serde_json::Value) -> ParsedGraphBody<'_> {
+    let content_type = json["body"]["contentType"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("text");
+    let raw_content = json["body"]["content"].as_str().unwrap_or("");
+    let is_html =
+        content_type.eq_ignore_ascii_case("html") || content_type.eq_ignore_ascii_case("text/html");
+    ParsedGraphBody {
+        content_type,
+        raw_content,
+        is_html,
+    }
+}
+
+fn format_body_diag(content_type: &str, body_html: Option<&str>, body_text_len: usize) -> String {
+    format!(
+        "[graph_client] body: contentType={}, has_html={}, body_html_len={}, body_text_len={}",
+        content_type,
+        body_html.is_some(),
+        body_html.map_or(0, str::len),
+        body_text_len
+    )
+}
+
 /// Fetch message body, inline `cid:` images, and auto-cached small attachments via Microsoft Graph.
 /// Attachments larger than `AUTO_CACHE_ATTACHMENT_MAX_BYTES` store metadata only (`content: None`).
 pub fn fetch_message_body(
@@ -496,10 +529,10 @@ pub fn fetch_message_body(
         .into_json()
         .map_err(|e| format!("解析 Graph 邮件正文失败: {e}"))?;
 
-    let content_type = json["body"]["contentType"].as_str().unwrap_or("text");
-    let raw_content = json["body"]["content"].as_str().unwrap_or("");
-    let is_html = content_type.eq_ignore_ascii_case("html");
-    let mut body_html = if is_html {
+    let parsed_body = parse_graph_body(&json);
+    let content_type = parsed_body.content_type;
+    let raw_content = parsed_body.raw_content;
+    let mut body_html = if parsed_body.is_html {
         Some(raw_content.to_string())
     } else {
         None
@@ -612,6 +645,10 @@ pub fn fetch_message_body(
     } else {
         raw_content.to_string()
     };
+    eprintln!(
+        "{}",
+        format_body_diag(content_type, body_html.as_deref(), body_text.len())
+    );
 
     // F-7 一键退订：internetMessageHeaders 中查找退订相关头（名称大小写不敏感）。
     let (unsubscribe_url, unsubscribe_one_click, auth_results) =
@@ -703,11 +740,9 @@ pub fn fetch_index_text(
     }
     let json: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("解析 Graph 索引正文失败: {e}"))?;
-    let content = json["body"]["content"].as_str().unwrap_or("");
-    let is_html = json["body"]["contentType"]
-        .as_str()
-        .unwrap_or("text")
-        .eq_ignore_ascii_case("html");
+    let parsed_body = parse_graph_body(&json);
+    let content = parsed_body.raw_content;
+    let is_html = parsed_body.is_html;
     let text = if is_html {
         html_to_readable_text(content)
     } else {
@@ -1176,5 +1211,47 @@ mod graph_url_security_tests {
         assert_eq!(urlencoding_segment("."), "%2E");
         assert_eq!(urlencoding_segment(".."), "%2E%2E");
         assert!(fetch_folder_headers_next("secret", "https://evil.test/").is_err());
+    }
+
+    #[test]
+    fn parse_graph_body_preserves_html_for_case_and_mime_variants() {
+        let html_upper = serde_json::json!({
+            "body": { "contentType": "HTML", "content": "<p>Hello</p>" }
+        });
+        let parsed = parse_graph_body(&html_upper);
+        assert!(parsed.is_html);
+        assert_eq!(parsed.content_type, "HTML");
+        assert_eq!(parsed.raw_content, "<p>Hello</p>");
+
+        let html_mime = serde_json::json!({
+            "body": { "contentType": " text/html ", "content": "<div>Card</div>" }
+        });
+        let parsed_mime = parse_graph_body(&html_mime);
+        assert!(parsed_mime.is_html);
+        assert_eq!(parsed_mime.content_type, "text/html");
+
+        let plain = serde_json::json!({
+            "body": { "contentType": "text", "content": "Secret plain body" }
+        });
+        let parsed_plain = parse_graph_body(&plain);
+        assert!(!parsed_plain.is_html);
+        assert_eq!(parsed_plain.content_type, "text");
+
+        let missing = serde_json::json!({});
+        let parsed_missing = parse_graph_body(&missing);
+        assert!(!parsed_missing.is_html);
+        assert_eq!(parsed_missing.content_type, "text");
+        assert_eq!(parsed_missing.raw_content, "");
+    }
+
+    #[test]
+    fn body_diag_log_is_sanitized() {
+        let diag = format_body_diag("html", Some("<p>top secret body</p>"), 15);
+        assert!(diag.contains("contentType=html"));
+        assert!(diag.contains("has_html=true"));
+        assert!(diag.contains("body_html_len=22"));
+        assert!(diag.contains("body_text_len=15"));
+        assert!(!diag.contains("top secret"));
+        assert!(!diag.contains("Bearer"));
     }
 }

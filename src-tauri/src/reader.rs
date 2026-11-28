@@ -203,11 +203,15 @@ pub struct AppliedReaderLayout {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutApplyOutcome {
-    Ignored,
+    Ignored {
+        reason: String,
+    },
     Applied {
         clip: PhysicalRect,
         bounds: PhysicalRect,
         visible: bool,
+        account_id: u32,
+        message_id: u32,
     },
 }
 
@@ -223,7 +227,8 @@ pub trait ReaderPlatformSink: Send + Sync {
         allow_remote_images: bool,
         mode: DocumentMode,
     );
-    fn apply_layout(&self, clip: PhysicalRect, bounds: PhysicalRect, visible: bool);
+    fn apply_layout(&self, clip: PhysicalRect, bounds: PhysicalRect, visible: bool)
+        -> Result<(), String>;
     fn set_visible(&self, visible: bool);
     fn set_zoom(&self, zoom_percent: u32);
     fn execute_script(&self, _script: String) {}
@@ -252,7 +257,14 @@ impl ReaderPlatformSink for NullReaderSink {
     ) {
     }
 
-    fn apply_layout(&self, _clip: PhysicalRect, _bounds: PhysicalRect, _visible: bool) {}
+    fn apply_layout(
+        &self,
+        _clip: PhysicalRect,
+        _bounds: PhysicalRect,
+        _visible: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     fn set_visible(&self, _visible: bool) {}
     fn set_zoom(&self, _zoom_percent: u32) {}
     fn close(&self) {}
@@ -360,6 +372,9 @@ impl ReaderManager {
                 plain_text: Some(doc.plain_text.clone()),
                 has_html: Some(doc.html_body.is_some() || should_load_native),
                 html_body: doc.html_body.clone(),
+                layout_applied: None,
+                layout_visible: None,
+                stage: Some("readerDisabled".to_string()),
             });
             return status;
         }
@@ -387,6 +402,9 @@ impl ReaderManager {
                 plain_text: Some(doc.plain_text.clone()),
                 has_html: Some(true),
                 html_body: doc.html_body.clone(),
+                layout_applied: Some(false),
+                layout_visible: Some(false),
+                stage: Some("loading".to_string()),
             });
             BodyStatusDto::Loading
         } else {
@@ -402,6 +420,9 @@ impl ReaderManager {
                 plain_text: Some(doc.plain_text.clone()),
                 has_html: Some(doc.html_body.is_some()),
                 html_body: doc.html_body.clone(),
+                layout_applied: None,
+                layout_visible: None,
+                stage: Some("plainTextReady".to_string()),
             });
             BodyStatusDto::Ready
         }
@@ -429,15 +450,25 @@ impl ReaderManager {
 
         let decision = {
             let mut guard = self.state.lock().expect("reader mutex poisoned");
-            if guard.locked || guard.reader_hidden_pref {
-                LayoutApplyOutcome::Ignored
+            if guard.locked {
+                LayoutApplyOutcome::Ignored {
+                    reason: "locked".to_string(),
+                }
+            } else if guard.reader_hidden_pref {
+                LayoutApplyOutcome::Ignored {
+                    reason: "readerDisabled".to_string(),
+                }
             } else if guard.active_session_id.as_deref() != Some(input.reader_session_id.as_str()) {
-                LayoutApplyOutcome::Ignored
+                LayoutApplyOutcome::Ignored {
+                    reason: "staleSession".to_string(),
+                }
             } else if guard
                 .last_layout_revision
                 .is_some_and(|prev| input.layout_revision <= prev)
             {
-                LayoutApplyOutcome::Ignored
+                LayoutApplyOutcome::Ignored {
+                    reason: "staleRevision".to_string(),
+                }
             } else {
                 guard.last_layout_revision = Some(input.layout_revision);
                 let dpr = resolve_effective_dpr(input.device_pixel_ratio, window_dpr);
@@ -468,30 +499,59 @@ impl ReaderManager {
                     bounds,
                     visible,
                 });
+                let (account_id, message_id) = guard
+                    .active_document
+                    .as_ref()
+                    .map_or((0, 0), |d| (d.account_id, d.message_id));
                 LayoutApplyOutcome::Applied {
                     clip,
                     bounds,
                     visible,
+                    account_id,
+                    message_id,
                 }
             }
         };
 
         match decision {
-            LayoutApplyOutcome::Ignored => Ok(SetReaderLayoutOutput {
+            LayoutApplyOutcome::Ignored { reason } => Ok(SetReaderLayoutOutput {
                 applied: false,
                 reader_session_id: input.reader_session_id.clone(),
                 layout_revision: input.layout_revision,
+                visible: None,
+                reason: Some(reason),
             }),
             LayoutApplyOutcome::Applied {
                 clip,
                 bounds,
                 visible,
+                account_id,
+                message_id,
             } => {
-                self.sink.apply_layout(clip, bounds, visible);
+                if let Err(err) = self.sink.apply_layout(clip, bounds, visible) {
+                    self.sink.emit_status(ReaderStatusEvent {
+                        reader_session_id: input.reader_session_id.clone(),
+                        account_id,
+                        message_id,
+                        body_status: BodyStatusDto::Unavailable,
+                        detail: Some(err.clone()),
+                        message: Some(err.clone()),
+                        retryable: Some(true),
+                        plain_text: None,
+                        has_html: None,
+                        html_body: None,
+                        layout_applied: Some(false),
+                        layout_visible: Some(false),
+                        stage: Some("applyLayout".to_string()),
+                    });
+                    return Err(IpcError::render_failed(err, None));
+                }
                 Ok(SetReaderLayoutOutput {
                     applied: true,
                     reader_session_id: input.reader_session_id.clone(),
                     layout_revision: input.layout_revision,
+                    visible: Some(visible),
+                    reason: None,
                 })
             }
         }
@@ -533,7 +593,8 @@ impl ReaderManager {
                 );
                 self.sink.set_zoom(appearance.zoom_percent);
                 if let Some(layout) = last_layout {
-                    self.sink
+                    let _ = self
+                        .sink
                         .apply_layout(layout.clip, layout.bounds, layout.visible);
                 }
             }
@@ -597,7 +658,8 @@ impl ReaderManager {
             );
             self.sink.set_zoom(appearance.zoom_percent);
             if let Some(layout) = last_layout {
-                self.sink
+                let _ = self
+                    .sink
                     .apply_layout(layout.clip, layout.bounds, layout.visible);
             }
             true
@@ -711,6 +773,10 @@ pub mod platform_win {
         session_id: String,
         account_id: u32,
         message_id: u32,
+        navigation_ready: bool,
+        layout_applied: bool,
+        layout_visible: bool,
+        last_error: Option<String>,
     }
 
     struct HostSlot {
@@ -720,6 +786,41 @@ pub mod platform_win {
 
     thread_local! {
         static MAIN_THREAD_HOST: RefCell<Option<HostSlot>> = const { RefCell::new(None) };
+    }
+
+    fn emit_reader_status(app_handle: &tauri::AppHandle, event: ReaderStatusEvent) {
+        let _ = app_handle.emit_to(MAIN_WINDOW_LABEL, EVENT_READER_STATUS, event);
+    }
+
+    fn emit_unavailable_status(
+        app_handle: &tauri::AppHandle,
+        session_id: String,
+        account_id: u32,
+        message_id: u32,
+        stage: &str,
+        detail: String,
+    ) {
+        if session_id.is_empty() {
+            return;
+        }
+        emit_reader_status(
+            app_handle,
+            ReaderStatusEvent {
+                reader_session_id: session_id,
+                account_id,
+                message_id,
+                body_status: BodyStatusDto::Unavailable,
+                detail: Some(detail.clone()),
+                message: Some(detail),
+                retryable: Some(true),
+                plain_text: None,
+                has_html: None,
+                html_body: None,
+                layout_applied: Some(false),
+                layout_visible: Some(false),
+                stage: Some(stage.to_string()),
+            },
+        );
     }
 
     fn open_external_url(raw: &str) {
@@ -745,44 +846,92 @@ pub mod platform_win {
         app_handle: &tauri::AppHandle,
         user_data_dir: &PathBuf,
         action_handler: &SharedActionHandler,
-    ) -> Option<HostSlot> {
-        let win = tauri::Manager::get_webview_window(app_handle, MAIN_WINDOW_LABEL)?;
-        let raw = HasWindowHandle::window_handle(&win).ok()?;
+    ) -> Result<HostSlot, String> {
+        let win = tauri::Manager::get_webview_window(app_handle, MAIN_WINDOW_LABEL)
+            .ok_or_else(|| "未找到主窗口，无法创建原生阅读器宿主".to_string())?;
+        let raw = HasWindowHandle::window_handle(&win)
+            .map_err(|e| format!("获取主窗口原生句柄失败: {e}"))?;
         let RawWindowHandle::Win32(win32) = raw.as_raw() else {
-            return None;
+            return Err("主窗口不是有效的 Win32 HWND".to_string());
         };
-        let host = WebView2Host::from_raw_hwnd(win32.hwnd.get(), user_data_dir.clone()).ok()?;
+        let host = WebView2Host::from_raw_hwnd(win32.hwnd.get(), user_data_dir.clone())
+            .map_err(|e| format!("创建 WebView2 阅读器宿主失败: {e}"))?;
         let meta = Rc::new(RefCell::new(ActiveSessionMeta::default()));
         let cb_meta = meta.clone();
         let cb_handle = app_handle.clone();
         let cb_action_handler = Arc::clone(action_handler);
         host.set_event_callback(move |event| match event {
             ReaderEvent::StatusChanged { version, status } => {
-                let active = cb_meta.borrow();
-                if version != active.expected_version || active.session_id.is_empty() {
-                    return;
-                }
-                let (body_status, detail, retryable) = match status {
-                    ReaderLoadStatus::Loading => (BodyStatusDto::Loading, None, None),
-                    ReaderLoadStatus::Ready => (BodyStatusDto::Ready, None, None),
+                let (
+                    session_id,
+                    account_id,
+                    message_id,
+                    layout_applied,
+                    layout_visible,
+                    last_error,
+                ) = {
+                    let mut active = cb_meta.borrow_mut();
+                    if version != active.expected_version || active.session_id.is_empty() {
+                        return;
+                    }
+                    match status {
+                        ReaderLoadStatus::Loading => {
+                            active.navigation_ready = false;
+                            active.layout_applied = false;
+                            active.layout_visible = false;
+                            active.last_error = None;
+                        }
+                        ReaderLoadStatus::Ready => {
+                            active.navigation_ready = true;
+                            active.last_error = None;
+                        }
+                        ReaderLoadStatus::Unavailable | ReaderLoadStatus::ProcessFailed => {
+                            active.navigation_ready = false;
+                            active.layout_applied = false;
+                            active.layout_visible = false;
+                        }
+                    }
+                    (
+                        active.session_id.clone(),
+                        active.account_id,
+                        active.message_id,
+                        active.layout_applied,
+                        active.layout_visible,
+                        active.last_error.clone(),
+                    )
+                };
+                let (body_status, detail, retryable, stage) = match status {
+                    ReaderLoadStatus::Loading => (
+                        BodyStatusDto::Loading,
+                        None,
+                        None,
+                        Some("navigationLoading".to_string()),
+                    ),
+                    ReaderLoadStatus::Ready => (
+                        BodyStatusDto::Ready,
+                        None,
+                        None,
+                        Some("navigationReady".to_string()),
+                    ),
                     ReaderLoadStatus::Unavailable => (
                         BodyStatusDto::Unavailable,
-                        Some("邮件正文加载失败".to_string()),
+                        Some(last_error.unwrap_or_else(|| "邮件正文加载失败".to_string())),
                         Some(true),
+                        Some("navigationUnavailable".to_string()),
                     ),
                     ReaderLoadStatus::ProcessFailed => (
                         BodyStatusDto::Unavailable,
                         Some("WebView2 阅读进程异常退出".to_string()),
                         Some(true),
+                        Some("processFailed".to_string()),
                     ),
                 };
-                let _ = cb_handle.emit_to(
-                    MAIN_WINDOW_LABEL,
-                    EVENT_READER_STATUS,
+                emit_reader_status(
+                    &cb_handle,
                     ReaderStatusEvent {
-                        reader_session_id: active.session_id.clone(),
-                        account_id: active.account_id,
-                        message_id: active.message_id,
+                        reader_session_id: session_id,
+                        account_id,
+                        message_id,
                         body_status,
                         detail: detail.clone(),
                         message: detail,
@@ -790,8 +939,84 @@ pub mod platform_win {
                         plain_text: None,
                         has_html: None,
                         html_body: None,
+                        layout_applied: Some(layout_applied),
+                        layout_visible: Some(layout_visible),
+                        stage,
                     },
                 );
+            }
+            ReaderEvent::LayoutApplied {
+                version,
+                visible,
+                controller_ready,
+            } => {
+                let payload = {
+                    let mut active = cb_meta.borrow_mut();
+                    if version != active.expected_version || active.session_id.is_empty() {
+                        None
+                    } else {
+                        active.layout_applied = controller_ready;
+                        active.layout_visible = visible;
+                        let body_status = if active.navigation_ready {
+                            BodyStatusDto::Ready
+                        } else {
+                            BodyStatusDto::Loading
+                        };
+                        let stage = if controller_ready && visible {
+                            "layoutVisible"
+                        } else if controller_ready {
+                            "layoutHidden"
+                        } else {
+                            "layoutPendingController"
+                        };
+                        Some(ReaderStatusEvent {
+                            reader_session_id: active.session_id.clone(),
+                            account_id: active.account_id,
+                            message_id: active.message_id,
+                            body_status,
+                            detail: None,
+                            message: None,
+                            retryable: None,
+                            plain_text: None,
+                            has_html: None,
+                            html_body: None,
+                            layout_applied: Some(controller_ready),
+                            layout_visible: Some(visible),
+                            stage: Some(stage.to_string()),
+                        })
+                    }
+                };
+                if let Some(ev) = payload {
+                    emit_reader_status(&cb_handle, ev);
+                }
+            }
+            ReaderEvent::Error {
+                version,
+                stage,
+                detail,
+            } => {
+                let target = {
+                    let mut active = cb_meta.borrow_mut();
+                    if version != active.expected_version || active.session_id.is_empty() {
+                        None
+                    } else {
+                        let msg = format!("{stage}: {detail}");
+                        active.last_error = Some(msg.clone());
+                        active.layout_applied = false;
+                        active.layout_visible = false;
+                        Some((active.session_id.clone(), active.account_id, active.message_id, msg))
+                    }
+                };
+                if let Some((session_id, account_id, message_id, msg)) = target {
+                    emit_unavailable_status(
+                        &cb_handle,
+                        session_id,
+                        account_id,
+                        message_id,
+                        stage,
+                        msg,
+                    );
+                }
             }
             ReaderEvent::ProcessFailed { version } => {
                 let active = cb_meta.borrow();
@@ -799,9 +1024,8 @@ pub mod platform_win {
                     return;
                 }
                 let detail = Some("WebView2 阅读进程异常退出".to_string());
-                let _ = cb_handle.emit_to(
-                    MAIN_WINDOW_LABEL,
-                    EVENT_READER_STATUS,
+                emit_reader_status(
+                    &cb_handle,
                     ReaderStatusEvent {
                         reader_session_id: active.session_id.clone(),
                         account_id: active.account_id,
@@ -813,6 +1037,9 @@ pub mod platform_win {
                         plain_text: None,
                         has_html: None,
                         html_body: None,
+                        layout_applied: Some(false),
+                        layout_visible: Some(false),
+                        stage: Some("processFailed".to_string()),
                     },
                 );
             }
@@ -867,13 +1094,14 @@ pub mod platform_win {
             }
             ReaderEvent::StateChanged => {}
         });
-        Some(HostSlot { host, meta })
+        Ok(HostSlot { host, meta })
     }
 
     pub struct TauriWindowsReaderSink {
         app_handle: tauri::AppHandle,
         user_data_dir: PathBuf,
         action_handler: SharedActionHandler,
+        active_meta: Arc<Mutex<(String, u32, u32)>>,
     }
 
     impl TauriWindowsReaderSink {
@@ -882,27 +1110,46 @@ pub mod platform_win {
                 app_handle,
                 user_data_dir,
                 action_handler: Arc::new(Mutex::new(None)),
+                active_meta: Arc::new(Mutex::new((String::new(), 0, 0))),
             }
         }
 
-        fn with_host_on_main_thread<F>(&self, f: F)
+        fn with_host_on_main_thread<F>(&self, f: F) -> Result<(), String>
         where
-            F: FnOnce(&tauri::AppHandle, &PathBuf, &SharedActionHandler, &mut Option<HostSlot>)
-                + Send
+            F: FnOnce(
+                    &tauri::AppHandle,
+                    &PathBuf,
+                    &SharedActionHandler,
+                    &mut Option<HostSlot>,
+                    Option<String>,
+                ) + Send
                 + 'static,
         {
             let handle = self.app_handle.clone();
             let user_data_dir = self.user_data_dir.clone();
             let action_handler = Arc::clone(&self.action_handler);
-            let _ = self.app_handle.run_on_main_thread(move || {
-                MAIN_THREAD_HOST.with(|slot| {
-                    let mut borrow = slot.borrow_mut();
-                    if borrow.is_none() {
-                        *borrow = create_host_slot(&handle, &user_data_dir, &action_handler);
-                    }
-                    f(&handle, &user_data_dir, &action_handler, &mut borrow);
-                });
-            });
+            self.app_handle
+                .run_on_main_thread(move || {
+                    MAIN_THREAD_HOST.with(|slot| {
+                        let mut borrow = slot.borrow_mut();
+                        let create_err = if borrow.is_none() {
+                            match create_host_slot(&handle, &user_data_dir, &action_handler) {
+                                Ok(new_slot) => {
+                                    *borrow = Some(new_slot);
+                                    None
+                                }
+                                Err(err) => {
+                                    eprintln!("[reader] {err}");
+                                    Some(err)
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        f(&handle, &user_data_dir, &action_handler, &mut borrow, create_err);
+                    });
+                })
+                .map_err(|e| format!("投递主线程阅读器任务失败: {e}"))
         }
     }
 
@@ -927,36 +1174,108 @@ pub mod platform_win {
             allow_remote_images: bool,
             mode: DocumentMode,
         ) {
-            self.with_host_on_main_thread(move |handle, user_data_dir, action_handler, slot| {
-                if let Some(current) = slot.as_ref() {
-                    if current.host.retire_for_remote_reload(allow_remote_images) {
-                        current.host.close();
-                        *slot = create_host_slot(handle, user_data_dir, action_handler);
+            if let Ok(mut meta) = self.active_meta.lock() {
+                *meta = (session_id.clone(), account_id, message_id);
+            }
+            let session_for_err = session_id.clone();
+            if let Err(err) = self.with_host_on_main_thread(
+                move |handle, user_data_dir, action_handler, slot, create_err| {
+                    if let Some(current) = slot.as_ref() {
+                        if current.host.retire_for_remote_reload(allow_remote_images) {
+                            current.host.close();
+                            match create_host_slot(handle, user_data_dir, action_handler) {
+                                Ok(new_slot) => *slot = Some(new_slot),
+                                Err(err) => {
+                                    eprintln!("[reader] recreate host failed: {err}");
+                                    *slot = None;
+                                    emit_unavailable_status(
+                                        handle,
+                                        session_id,
+                                        account_id,
+                                        message_id,
+                                        "recreateHost",
+                                        err,
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                     }
-                }
-                let Some(current) = slot.as_ref() else {
-                    return;
-                };
-                {
-                    let mut meta = current.meta.borrow_mut();
-                    meta.expected_version = current.host.version().wrapping_add(1);
-                    meta.session_id = session_id;
-                    meta.account_id = account_id;
-                    meta.message_id = message_id;
-                }
-                if let Ok(version) =
-                    current
+                    let Some(current) = slot.as_ref() else {
+                        emit_unavailable_status(
+                            handle,
+                            session_id,
+                            account_id,
+                            message_id,
+                            "createHost",
+                            create_err.unwrap_or_else(|| "原生阅读器宿主不可用".to_string()),
+                        );
+                        return;
+                    };
+                    {
+                        let mut meta = current.meta.borrow_mut();
+                        meta.expected_version = current.host.version().wrapping_add(1);
+                        meta.session_id = session_id.clone();
+                        meta.account_id = account_id;
+                        meta.message_id = message_id;
+                        meta.navigation_ready = false;
+                        meta.layout_applied = false;
+                        meta.layout_visible = false;
+                        meta.last_error = None;
+                    }
+                    match current
                         .host
                         .load_document(html_bytes, allow_remote_images, mode)
-                {
-                    current.meta.borrow_mut().expected_version = version;
-                }
-            });
+                    {
+                        Ok(version) => {
+                            current.meta.borrow_mut().expected_version = version;
+                        }
+                        Err(err) => {
+                            let detail = format!("加载邮件文档到 WebView2 失败: {err}");
+                            eprintln!("[reader] {detail}");
+                            emit_unavailable_status(
+                                handle,
+                                session_id,
+                                account_id,
+                                message_id,
+                                "loadDocument",
+                                detail,
+                            );
+                        }
+                    }
+                },
+            ) {
+                eprintln!("[reader] {err}");
+                emit_unavailable_status(
+                    &self.app_handle,
+                    session_for_err,
+                    account_id,
+                    message_id,
+                    "dispatchLoadHtml",
+                    err,
+                );
+            }
         }
 
-        fn apply_layout(&self, clip: PhysicalRect, bounds: PhysicalRect, visible: bool) {
-            self.with_host_on_main_thread(move |_, _, _, slot| {
+        fn apply_layout(
+            &self,
+            clip: PhysicalRect,
+            bounds: PhysicalRect,
+            visible: bool,
+        ) -> Result<(), String> {
+            let active_meta = Arc::clone(&self.active_meta);
+            self.with_host_on_main_thread(move |handle, _, _, slot, create_err| {
                 let Some(current) = slot.as_ref() else {
+                    if let Ok((sid, acc, msg)) = active_meta.lock().map(|g| g.clone()) {
+                        emit_unavailable_status(
+                            handle,
+                            sid,
+                            acc,
+                            msg,
+                            "createHost",
+                            create_err.unwrap_or_else(|| "原生阅读器宿主不可用".to_string()),
+                        );
+                    }
                     return;
                 };
                 let clip_px = PixelRect {
@@ -971,21 +1290,25 @@ pub mod platform_win {
                     right: clip.left + bounds.right,
                     bottom: clip.top + bounds.bottom,
                 };
-                current.host.set_bounds(content_px, clip_px, visible);
-            });
+                if let Err(err) = current.host.try_set_bounds(content_px, clip_px, visible) {
+                    eprintln!("[reader] apply_layout failed: {err}");
+                }
+            })
         }
 
         fn set_visible(&self, visible: bool) {
-            self.with_host_on_main_thread(move |_, _, _, slot| {
+            let _ = self.with_host_on_main_thread(move |_, _, _, slot, _| {
                 if let Some(current) = slot.as_ref() {
-                    current.host.set_visible(visible);
+                    if let Err(err) = current.host.try_set_visible(visible) {
+                        eprintln!("[reader] set_visible failed: {err}");
+                    }
                 }
             });
         }
 
         fn set_zoom(&self, zoom_percent: u32) {
             let factor = f64::from(zoom_percent.clamp(50, 250)) / 100.0;
-            self.with_host_on_main_thread(move |_, _, _, slot| {
+            let _ = self.with_host_on_main_thread(move |_, _, _, slot, _| {
                 if let Some(current) = slot.as_ref() {
                     current.host.set_zoom(factor);
                 }
@@ -993,7 +1316,7 @@ pub mod platform_win {
         }
 
         fn execute_script(&self, script: String) {
-            self.with_host_on_main_thread(move |_, _, _, slot| {
+            let _ = self.with_host_on_main_thread(move |_, _, _, slot, _| {
                 if let Some(current) = slot.as_ref() {
                     current.host.execute_script(&script);
                 }
@@ -1027,6 +1350,7 @@ mod tests {
         events: Mutex<Vec<ReaderStatusEvent>>,
         layouts: Mutex<Vec<(PhysicalRect, PhysicalRect, bool)>>,
         loads: Mutex<Vec<(Vec<u8>, bool, DocumentMode)>>,
+        apply_layout_error: Mutex<Option<String>>,
     }
 
     impl ReaderPlatformSink for RecordingSink {
@@ -1046,8 +1370,17 @@ mod tests {
             self.loads.lock().unwrap().push((bytes, allow_remote, mode));
         }
 
-        fn apply_layout(&self, clip: PhysicalRect, bounds: PhysicalRect, visible: bool) {
+        fn apply_layout(
+            &self,
+            clip: PhysicalRect,
+            bounds: PhysicalRect,
+            visible: bool,
+        ) -> Result<(), String> {
+            if let Some(err) = self.apply_layout_error.lock().unwrap().clone() {
+                return Err(err);
+            }
             self.layouts.lock().unwrap().push((clip, bounds, visible));
+            Ok(())
         }
 
         fn set_visible(&self, _: bool) {}
@@ -1386,5 +1719,57 @@ mod tests {
         assert!(html2.contains("https://tracker.example/p.png"));
         // Re-render also re-applied last layout so a recreated host stays visible.
         assert_eq!(sink.layouts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn apply_layout_failure_emits_unavailable_status_and_returns_error() {
+        let sink = Arc::new(RecordingSink::default());
+        *sink.apply_layout_error.lock().unwrap() = Some("SetWindowPos 失败".to_string());
+        let mgr = ReaderManager::new(sink.clone());
+        let appearance = ReaderAppearance {
+            theme_id: "system".to_string(),
+            dark: false,
+            zoom_percent: 100,
+            block_remote_images: true,
+        };
+        mgr.begin_session(
+            ReaderDocumentSpec {
+                session_id: "sess-err".to_string(),
+                account_id: 7,
+                message_id: 42,
+                subject: "HTML".to_string(),
+                sender: "a@example.com".to_string(),
+                plain_text: "body".to_string(),
+                html_body: Some("<p>Hi</p>".to_string()),
+                has_thread: false,
+                thread: None,
+            },
+            &appearance,
+            true,
+        );
+
+        let err = mgr
+            .apply_layout(
+                &SetReaderLayoutInput {
+                    reader_session_id: "sess-err".to_string(),
+                    layout_revision: 1,
+                    content_rect: rect(400.0, 48.0, 600.0, 600.0),
+                    clip_rect: rect(400.0, 48.0, 600.0, 600.0),
+                    visible: true,
+                    device_pixel_ratio: Some(1.0),
+                },
+                1.0,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "RENDER_FAILED");
+        assert!(err.message.contains("SetWindowPos"));
+
+        let events = sink.events.lock().unwrap();
+        let last = events.last().expect("unavailable event emitted");
+        assert_eq!(last.body_status, BodyStatusDto::Unavailable);
+        assert_eq!(last.account_id, 7);
+        assert_eq!(last.message_id, 42);
+        assert_eq!(last.layout_applied, Some(false));
+        assert_eq!(last.stage.as_deref(), Some("applyLayout"));
     }
 }

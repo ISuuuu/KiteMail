@@ -378,6 +378,8 @@ export interface SetReaderLayoutOutput {
   applied: boolean;
   readerSessionId: string;
   layoutRevision: number;
+  visible?: boolean;
+  reason?: string | null;
 }
 
 export interface RefreshMailInput {
@@ -420,6 +422,9 @@ export interface ReaderStatusEvent {
   plainText?: string | null;
   hasHtml?: boolean;
   htmlBody?: string | null;
+  layoutApplied?: boolean;
+  layoutVisible?: boolean;
+  stage?: string | null;
 }
 
 export interface LockStateEvent {

@@ -82,9 +82,15 @@ fn should_export_data_dir_env(
 }
 
 fn main() {
+    window_lifecycle::record_process_start();
     let mode = parse_launch_mode(
         std::env::args(),
         std::env::var("KITEMAIL_DEMO").ok().as_deref(),
+    );
+    eprintln!(
+        "[startup] process_start mode={:?} since_process_ms={:.2}",
+        mode,
+        window_lifecycle::elapsed_since_process_start_ms()
     );
 
     let Some(_single_instance_guard) = single_instance::acquire_or_activate() else {
@@ -127,13 +133,30 @@ fn main() {
     let prefs_store = Arc::new(PreferencesStore::open_in(data_dir.clone()));
     let tray = TrayHandle::start(TRAY_ICON_PNG).map(Arc::new);
     let quitting = Arc::new(AtomicBool::new(false));
+    eprintln!(
+        "[startup] pre_tauri_builder_ready since_process_ms={:.2}",
+        window_lifecycle::elapsed_since_process_start_ms()
+    );
 
     let tray_for_setup = tray.clone();
     let quitting_for_setup = Arc::clone(&quitting);
     let data_dir_for_setup = data_dir.clone();
 
     tauri::Builder::default()
+        .on_page_load(|webview, payload| {
+            if webview.label() == MAIN_WINDOW_LABEL {
+                let stage = match payload.event() {
+                    tauri::webview::PageLoadEvent::Started => "page_load_started",
+                    tauri::webview::PageLoadEvent::Finished => "page_load_finished",
+                };
+                eprintln!(
+                    "[startup] {stage} since_process_ms={:.2}",
+                    window_lifecycle::elapsed_since_process_start_ms()
+                );
+            }
+        })
         .setup(move |app| {
+            let setup_start = std::time::Instant::now();
             let handle = app.handle().clone();
 
             #[cfg(windows)]
@@ -276,14 +299,22 @@ fn main() {
                         if let Some(win) = handle_for_fallback.get_webview_window(MAIN_WINDOW_LABEL)
                         {
                             let raw_prefs = prefs_for_fallback.snapshot_raw();
-                            window_lifecycle::reveal_main_window_with_geometry(
+                            if let Err(err) = window_lifecycle::reveal_main_window_with_geometry(
                                 &win,
                                 &raw_prefs,
                                 &revealed_for_fallback,
-                            );
+                                "fallback:2000ms",
+                            ) {
+                                eprintln!("[startup] fallback reveal failed: {err}");
+                            }
                         }
                     }
                 });
+            eprintln!(
+                "[startup] setup_done elapsed_ms={:.2} since_process_ms={:.2}",
+                setup_start.elapsed().as_secs_f64() * 1000.0,
+                window_lifecycle::elapsed_since_process_start_ms()
+            );
 
             // Spawn background 1s monitor for tray actions, minimize_to_tray, and auto-lock.
             let handle_for_tick = handle.clone();

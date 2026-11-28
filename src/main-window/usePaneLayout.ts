@@ -230,6 +230,7 @@ export function usePaneLayout() {
   }
 
   if (typeof window !== "undefined") {
+    syncDocumentTheme();
     window.addEventListener("beforeunload", flushSave);
     if (window.matchMedia) {
       mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");

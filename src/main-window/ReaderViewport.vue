@@ -4,11 +4,16 @@
     class="km-reader-viewport"
     :class="viewportToneClass"
   >
-    <!-- 加载骨架 -->
-    <div v-if="bodyStatus === 'loading'" class="km-body-skeleton" aria-busy="true" aria-label="正在加载邮件正文">
+    <!-- 加载骨架（正文加载中，或导航就绪但原生阅读器布局尚未实际生效） -->
+    <div
+      v-if="viewportMode === 'loading' || viewportMode === 'layout-pending'"
+      class="km-body-skeleton"
+      aria-busy="true"
+      :aria-label="viewportMode === 'layout-pending' ? '正在应用原生阅读器布局' : '正在加载邮件正文'"
+    >
       <div class="km-body-sk-head">
         <span class="km-body-spinner" aria-hidden="true" />
-        <span>正在加载邮件正文…</span>
+        <span>{{ viewportMode === "layout-pending" ? "正在准备正文视图…" : "正在加载邮件正文…" }}</span>
       </div>
       <div class="km-body-sk-line w-85" />
       <div class="km-body-sk-line w-92" />
@@ -17,24 +22,23 @@
     </div>
 
     <!-- 不可用 / 错误回退状态 -->
-    <div v-else-if="bodyStatus === 'unavailable'" class="km-body-unavailable">
+    <div v-else-if="viewportMode === 'unavailable'" class="km-body-unavailable">
       <div class="km-unavailable-banner" role="alert">
-        <span>{{ errorMessage || "正文阅读器暂不可用，请重试" }}</span>
-        <button type="button" class="km-retry-btn" @click="emit('retry')">重试正文</button>
+        <span>{{ displayedErrorMessage }}</span>
+        <button type="button" class="km-retry-btn" @click="retryReader">重试正文</button>
       </div>
       <pre v-if="plainText" class="km-plain-body">{{ plainText }}</pre>
     </div>
 
-    <!-- 原生 WebView2 宿主占位（Tauri + HTML/多封会话正文且未被浮层遮挡） -->
+    <!-- 原生 WebView2 宿主占位（仅在原生布局已确认生效或浮层暂隐期间启用） -->
     <div
-      v-else-if="nativeHostActive"
+      v-else-if="viewportMode === 'occluded' || viewportMode === 'native-ready'"
       class="km-native-placeholder"
       :style="{ fontSize: `${zoomFactor * 13}px` }"
     >
-      <span v-if="overlayOccluded" class="km-occluded-hint">
+      <span v-if="viewportMode === 'occluded'" class="km-occluded-hint">
         菜单打开期间已暂隐原生阅读器控件
       </span>
-      <pre v-else-if="plainText" class="km-plain-body km-plain-backdrop">{{ plainText }}</pre>
     </div>
 
     <!-- 浏览器预览或纯文本正文渲染（严格转义，不使用 v-html） -->
@@ -206,7 +210,8 @@ import type {
   ThreadCardActionEvent,
   ThreadMessageDto,
 } from "../ipc/types";
-import { isTauri, nextReaderLayoutRevision, setReaderLayout } from "../ipc/main-window";
+import { isTauri, extractErrorMessage, nextReaderLayoutRevision, setReaderLayout } from "../ipc/main-window";
+import { resolveReaderViewportMode } from "./startupHelpers";
 import { formatAttachmentSize, resolveNumericAttachmentId } from "../reader-tools/useAttachments";
 import {
   avatarToneColor,
@@ -226,6 +231,8 @@ const props = defineProps<{
   htmlBody: string | null;
   threadMessages?: ThreadMessageDto[];
   overlayOccluded: boolean;
+  nativeLayoutApplied?: boolean;
+  nativeLayoutVisible?: boolean;
   errorMessage?: string | null;
   zoomPercent?: number;
   accountId?: number;
@@ -265,12 +272,40 @@ const zoomFactor = computed(() => {
   return Math.min(2.5, Math.max(0.5, z / 100));
 });
 
+const localLayoutAppliedSession = ref("");
+const localLayoutError = ref<string | null>(null);
+
 const nativeHostActive = computed(
   () =>
     tauriMode &&
     props.bodyStatus === "ready" &&
     (props.hasHtml || (props.threadMessages?.length ?? 0) > 1)
 );
+
+const viewportMode = computed(() =>
+  resolveReaderViewportMode({
+    tauriMode,
+    bodyStatus: props.bodyStatus,
+    hasHtml: props.hasHtml,
+    threadCount: props.threadMessages?.length ?? 0,
+    overlayOccluded: props.overlayOccluded,
+    layoutError: localLayoutError.value,
+    localLayoutApplied:
+      localLayoutAppliedSession.value === props.readerSessionId &&
+      props.nativeLayoutVisible !== false,
+    backendLayoutApplied: props.nativeLayoutApplied,
+  })
+);
+
+const displayedErrorMessage = computed(
+  () => localLayoutError.value || props.errorMessage || "正文阅读器暂不可用，请重试"
+);
+
+function retryReader() {
+  localLayoutError.value = null;
+  localLayoutAppliedSession.value = "";
+  emit("retry");
+}
 
 const viewportToneClass = computed(() => {
   if (props.perMessageDark === true) return "km-body-force-dark";
@@ -545,9 +580,29 @@ function flushLayoutSync(forceHide = false, sessionOverride?: string) {
     clipRect,
     visible: shouldBeVisible,
     devicePixelRatio: typeof window !== "undefined" ? window.devicePixelRatio : 1,
-  }).catch(() => {
-    /* 忽略非 Tauri 或过期会话拒绝 */
-  });
+  })
+    .then((res) => {
+      if (sessionId !== props.readerSessionId) return;
+      if (res.applied) {
+        if (shouldBeVisible) {
+          localLayoutAppliedSession.value = sessionId;
+          localLayoutError.value = null;
+        } else if (localLayoutAppliedSession.value === sessionId) {
+          localLayoutAppliedSession.value = "";
+        }
+      } else if (shouldBeVisible && res.reason && res.reason !== "staleSession" && res.reason !== "staleRevision") {
+        localLayoutAppliedSession.value = "";
+        localLayoutError.value = `原生阅读器布局未应用（${res.reason}）`;
+        console.warn("[ReaderViewport] setReaderLayout ignored:", res.reason, sessionId);
+      }
+    })
+    .catch((err) => {
+      if (sessionId !== props.readerSessionId) return;
+      const msg = extractErrorMessage(err);
+      localLayoutAppliedSession.value = "";
+      localLayoutError.value = `原生阅读器布局失败：${msg}`;
+      console.error("[ReaderViewport] setReaderLayout failed:", err);
+    });
 }
 
 function scheduleLayoutSync() {
@@ -573,8 +628,19 @@ function onDocumentPointerDown() {
 }
 
 watch(
-  () => [props.readerSessionId, props.bodyStatus, props.hasHtml, props.overlayOccluded] as const,
-  ([nextSession, , , occluded], [prevSession]) => {
+  () =>
+    [
+      props.readerSessionId,
+      props.bodyStatus,
+      props.hasHtml,
+      props.threadMessages?.length ?? 0,
+      props.overlayOccluded,
+    ] as const,
+  ([nextSession, , , , occluded], [prevSession]) => {
+    if (prevSession !== nextSession) {
+      localLayoutAppliedSession.value = "";
+      localLayoutError.value = null;
+    }
     if (prevSession && prevSession !== nextSession && lastSentVisible) {
       flushLayoutSync(true, prevSession);
     }
@@ -725,10 +791,6 @@ onUnmounted(() => {
   margin: auto;
   font-size: 12px;
   color: var(--km-text-muted);
-}
-
-.km-plain-backdrop {
-  opacity: 0.72;
 }
 
 .km-body-unavailable {
