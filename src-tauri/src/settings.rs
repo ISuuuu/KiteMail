@@ -9,16 +9,24 @@ use kitemail_mail_core::app_lock::{
     hash_passcode, set_lock_persisted_in, validate_new_passcode, verify_passcode,
 };
 use kitemail_mail_core::cache::CacheStore;
-use kitemail_mail_core::config::{normalize_app_lock_idle_minutes, resolve_mail_data_dir_in};
+use kitemail_mail_core::config::{
+    export_settings_bundle_in, import_settings_bundle_in, normalize_app_lock_idle_minutes,
+    parse_settings_bundle, resolve_mail_data_dir_in, save_preferences_in,
+    serialize_settings_bundle, SettingsBackupBundle, SETTINGS_BACKUP_VERSION,
+};
 use kitemail_mail_core::{secrets, update, MailRequest};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::commands::AppState;
 use crate::dto::{
-    AppMode, CheckAppUpdateOutput, ClearBodyCachesInput, ClearBodyCachesOutput,
-    FullPreferencesPatchDto, GetFullPreferencesOutput, IpcError, LockStateEvent, MailChangedEvent,
-    ManageTrustedSendersInput, ManageTrustedSendersOutput, SetAppLockPasscodeInput,
+    AccountSummaryDto, AppMode, BackupPathInput, CheckAppUpdateOutput, ClearBodyCachesInput,
+    ClearBodyCachesOutput, DataDirectoryKindDto, ExportSettingsBackupOutput,
+    FullPreferencesPatchDto, GetFullPreferencesOutput, ImportSettingsBackupInput,
+    ImportSettingsBackupOutput, InstallAppUpdateOutput, IpcError, LockStateEvent, MailChangedEvent,
+    ManageTrustedSendersInput, ManageTrustedSendersOutput, OpenDataDirectoryInput,
+    OpenDataDirectoryOutput, PreviewSettingsBackupOutput, SetAppLockPasscodeInput,
     SetAppLockPasscodeOutput, StorageStatsDto, TrustedSenderActionDto, UpdateFullPreferencesOutput,
+    MAIN_WINDOW_LABEL,
 };
 use crate::mail_session::MailSession;
 use crate::preferences::{to_full_preferences_dto, VALID_APP_LOCK_IDLE_MINUTES};
@@ -514,6 +522,475 @@ impl MailSession {
             }),
         }
     }
+
+    pub fn install_app_update(
+        &self,
+        app: Option<&AppHandle>,
+    ) -> Result<InstallAppUpdateOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        let target = update::current_target().to_string();
+        if self.mode == AppMode::Demo {
+            return Err(IpcError::invalid_input(
+                "演示模式不支持下载或安装应用更新",
+                None,
+            ));
+        }
+        let current_version = app_version().to_string();
+        let Some(info) = update::check(&current_version)
+            .map_err(|e| IpcError::unavailable(format!("检查更新失败: {e}"), None))?
+        else {
+            return Ok(InstallAppUpdateOutput {
+                started: false,
+                target,
+                version: None,
+                message: "当前已是最新版本".to_string(),
+            });
+        };
+        let bytes = update::download(&info)
+            .map_err(|e| IpcError::unavailable(format!("下载更新包失败: {e}"), None))?;
+        update::install(&info, &bytes)
+            .map_err(|e| IpcError::internal(format!("启动更新安装失败: {e}"), None))?;
+        self.prepare_quit();
+        if let Some(app_handle) = app.cloned() {
+            let _ = std::thread::Builder::new()
+                .name("kitemail-update-exit".to_string())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    app_handle.exit(0);
+                });
+        }
+        Ok(InstallAppUpdateOutput {
+            started: true,
+            target: info.target,
+            version: Some(info.version.clone()),
+            message: format!("已启动 v{} 更新安装，应用即将自动重启", info.version),
+        })
+    }
+
+    pub fn export_settings_backup(
+        &self,
+        parent_hwnd: Option<isize>,
+        path_override: Option<&str>,
+    ) -> Result<ExportSettingsBackupOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        let toml_text = match self.mode {
+            AppMode::Demo => {
+                let accounts = self
+                    .demo
+                    .lock()
+                    .expect("demo mutex poisoned")
+                    .account_configs
+                    .clone();
+                let bundle = SettingsBackupBundle {
+                    version: SETTINGS_BACKUP_VERSION,
+                    preferences: self.prefs.snapshot_raw(),
+                    accounts,
+                };
+                serialize_settings_bundle(&bundle).map_err(|e| IpcError::internal(e, None))?
+            }
+            AppMode::Live => {
+                let data_dir = self
+                    .live
+                    .lock()
+                    .expect("live mutex poisoned")
+                    .data_dir
+                    .clone();
+                export_settings_bundle_in(&data_dir).map_err(|e| IpcError::internal(e, None))?
+            }
+        };
+
+        let dest_path = match path_override.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => std::path::PathBuf::from(p),
+            None => match pick_toml_save_path_blocking(parent_hwnd)? {
+                Some(p) => p,
+                None => {
+                    return Ok(ExportSettingsBackupOutput {
+                        saved: false,
+                        cancelled: true,
+                        path: None,
+                        message: "已取消导出备份".to_string(),
+                    });
+                }
+            },
+        };
+        if let Some(parent) = dest_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        std::fs::write(&dest_path, toml_text)
+            .map_err(|e| IpcError::internal(format!("写入备份文件失败: {e}"), None))?;
+        let display = dest_path.to_string_lossy().into_owned();
+        Ok(ExportSettingsBackupOutput {
+            saved: true,
+            cancelled: false,
+            path: Some(display.clone()),
+            message: format!("已导出设置备份至 {display}"),
+        })
+    }
+
+    pub fn preview_settings_backup(
+        &self,
+        parent_hwnd: Option<isize>,
+        path_override: Option<&str>,
+    ) -> Result<PreviewSettingsBackupOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        let src_path = match path_override.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => std::path::PathBuf::from(p),
+            None => match pick_toml_open_path_blocking(parent_hwnd)? {
+                Some(p) => p,
+                None => {
+                    return Ok(PreviewSettingsBackupOutput {
+                        cancelled: true,
+                        path: None,
+                        account_count: 0,
+                        theme_id: None,
+                        message: "已取消选择备份文件".to_string(),
+                    });
+                }
+            },
+        };
+        let meta = std::fs::metadata(&src_path)
+            .map_err(|e| IpcError::invalid_input(format!("读取备份文件失败: {e}"), None))?;
+        if meta.len() > 5 * 1024 * 1024 {
+            return Err(IpcError::invalid_input("备份文件超过 5 MiB 限制", None));
+        }
+        let text = std::fs::read_to_string(&src_path)
+            .map_err(|e| IpcError::invalid_input(format!("读取备份文件失败: {e}"), None))?;
+        let bundle = parse_settings_bundle(&text).map_err(|e| IpcError::invalid_input(e, None))?;
+        let display = src_path.to_string_lossy().into_owned();
+        Ok(PreviewSettingsBackupOutput {
+            cancelled: false,
+            path: Some(display),
+            account_count: bundle.accounts.len(),
+            theme_id: Some(bundle.preferences.theme_id),
+            message: "已解析备份文件，请核对后确认导入".to_string(),
+        })
+    }
+
+    pub fn import_settings_backup(
+        &self,
+        input: &ImportSettingsBackupInput,
+    ) -> Result<ImportSettingsBackupOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        let src_path = std::path::Path::new(input.path.trim());
+        if input.path.trim().is_empty() || !src_path.is_file() {
+            return Err(IpcError::invalid_input("备份文件不存在", None));
+        }
+        let meta = std::fs::metadata(src_path)
+            .map_err(|e| IpcError::invalid_input(format!("读取备份文件失败: {e}"), None))?;
+        if meta.len() > 5 * 1024 * 1024 {
+            return Err(IpcError::invalid_input("备份文件超过 5 MiB 限制", None));
+        }
+        let text = std::fs::read_to_string(src_path)
+            .map_err(|e| IpcError::invalid_input(format!("读取备份文件失败: {e}"), None))?;
+        let bundle = parse_settings_bundle(&text).map_err(|e| IpcError::invalid_input(e, None))?;
+
+        let count = match self.mode {
+            AppMode::Demo => {
+                save_preferences_in(self.prefs.data_dir(), &bundle.preferences)
+                    .map_err(|e| IpcError::internal(e, None))?;
+                self.prefs.reload_from_disk();
+                let mut demo = self.demo.lock().expect("demo mutex poisoned");
+                demo.account_configs = bundle.accounts.clone();
+                demo.sync_account_summaries();
+                bundle.accounts.len()
+            }
+            AppMode::Live => {
+                let data_dir = self
+                    .live
+                    .lock()
+                    .expect("live mutex poisoned")
+                    .data_dir
+                    .clone();
+                let count = import_settings_bundle_in(&data_dir, &bundle)
+                    .map_err(|e| IpcError::invalid_input(e, None))?;
+                let reloaded = self.prefs.reload_from_disk();
+                let worker = {
+                    let mut live = self.live.lock().expect("live mutex poisoned");
+                    live.account_configs = bundle.accounts.clone();
+                    live.accounts = live
+                        .account_configs
+                        .iter()
+                        .map(AccountSummaryDto::from)
+                        .collect();
+                    live.worker.clone()
+                };
+                self.reset_read_cache();
+                if let Some(w) = worker {
+                    w.send(MailRequest::SetPushEnabled {
+                        enabled: reloaded.push_enabled,
+                    });
+                    w.send(MailRequest::LoadAllCached);
+                }
+                count
+            }
+        };
+
+        self.on_preferences_updated();
+        let ver = self.bump_state_version();
+        self.emitter.emit_mail_changed(MailChangedEvent {
+            state_version: ver,
+            reason: "preferencesUpdated".to_string(),
+            account_id: None,
+            folder_id: None,
+            message_id: None,
+        });
+        self.emitter.emit_mail_changed(MailChangedEvent {
+            state_version: ver,
+            reason: "accountsUpdated".to_string(),
+            account_id: None,
+            folder_id: None,
+            message_id: None,
+        });
+        Ok(ImportSettingsBackupOutput {
+            imported: true,
+            account_count: count,
+            message: format!("已恢复配置备份（包含 {count} 个账号配置）"),
+            state_version: ver,
+        })
+    }
+
+    pub fn open_data_directory(
+        &self,
+        input: &OpenDataDirectoryInput,
+    ) -> Result<OpenDataDirectoryOutput, IpcError> {
+        if self.is_locked() {
+            return Err(IpcError::locked(None));
+        }
+        let base_dir = match self.mode {
+            AppMode::Demo => self.prefs.data_dir().to_path_buf(),
+            AppMode::Live => self
+                .live
+                .lock()
+                .expect("live mutex poisoned")
+                .data_dir
+                .clone(),
+        };
+        let target_dir = match input.kind {
+            DataDirectoryKindDto::Data => base_dir,
+            DataDirectoryKindDto::Mail => resolve_mail_data_dir_in(&base_dir),
+        };
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|e| IpcError::internal(format!("创建或访问目录失败: {e}"), None))?;
+        let display = target_dir.to_string_lossy().into_owned();
+        let opened = open_folder_in_explorer(&display)?;
+        Ok(OpenDataDirectoryOutput {
+            opened,
+            path: display.clone(),
+            message: format!("已打开目录 {display}"),
+        })
+    }
+}
+
+fn open_folder_in_explorer(path: &str) -> Result<bool, IpcError> {
+    #[cfg(all(windows, not(test)))]
+    {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let res = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        if (res.0 as isize) <= 32 {
+            return Err(IpcError::internal("打开系统文件管理器失败", None));
+        }
+        return Ok(true);
+    }
+    #[cfg(not(all(windows, not(test))))]
+    {
+        let _ = path;
+        Ok(true)
+    }
+}
+
+fn pick_toml_save_path_blocking(
+    parent_hwnd: Option<isize>,
+) -> Result<Option<std::path::PathBuf>, IpcError> {
+    #[cfg(all(windows, not(test)))]
+    {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        };
+        use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+        use windows::Win32::UI::Shell::{
+            FileSaveDialog, IFileSaveDialog, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT,
+            SIGDN_FILESYSPATH,
+        };
+
+        const ERROR_CANCELLED_HRESULT: i32 = 0x8007_04C7u32 as i32;
+        let co_hr =
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        let needs_uninit = co_hr.is_ok();
+        let result = (|| -> Result<Option<std::path::PathBuf>, IpcError> {
+            let dialog: IFileSaveDialog = unsafe {
+                CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)
+            }
+            .map_err(|e| IpcError::internal(format!("初始化备份保存对话框失败: {e}"), None))?;
+            let opts = unsafe { dialog.GetOptions() }
+                .map_err(|e| IpcError::internal(format!("读取对话框选项失败: {e}"), None))?;
+            let filter = [COMDLG_FILTERSPEC {
+                pszName: w!("TOML 备份文件"),
+                pszSpec: w!("*.toml"),
+            }];
+            unsafe {
+                dialog
+                    .SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT)
+                    .map_err(|e| IpcError::internal(format!("配置保存对话框失败: {e}"), None))?;
+                dialog
+                    .SetFileTypes(&filter)
+                    .map_err(|e| IpcError::internal(format!("设置文件类型过滤失败: {e}"), None))?;
+                dialog
+                    .SetDefaultExtension(w!("toml"))
+                    .map_err(|e| IpcError::internal(format!("设置默认扩展名失败: {e}"), None))?;
+                dialog
+                    .SetFileName(w!("kitemail-settings-backup.toml"))
+                    .map_err(|e| IpcError::internal(format!("设置默认文件名失败: {e}"), None))?;
+            }
+            let owner = parent_hwnd.map(|h| HWND(h as *mut core::ffi::c_void));
+            if let Err(err) = unsafe { dialog.Show(owner) } {
+                if err.code().0 == ERROR_CANCELLED_HRESULT {
+                    return Ok(None);
+                }
+                return Err(IpcError::internal(
+                    format!("打开保存对话框失败: {err}"),
+                    None,
+                ));
+            }
+            let item = unsafe { dialog.GetResult() }
+                .map_err(|e| IpcError::internal(format!("获取保存路径失败: {e}"), None))?;
+            let pwstr = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
+                .map_err(|e| IpcError::internal(format!("读取保存路径失败: {e}"), None))?;
+            let path = unsafe { pwstr.to_string() }.unwrap_or_default();
+            unsafe {
+                CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void));
+            }
+            let trimmed = path.trim();
+            Ok((!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed)))
+        })();
+        if needs_uninit {
+            unsafe { CoUninitialize() };
+        }
+        return result;
+    }
+    #[cfg(not(all(windows, not(test))))]
+    {
+        let _ = parent_hwnd;
+        Ok(None)
+    }
+}
+
+fn pick_toml_open_path_blocking(
+    parent_hwnd: Option<isize>,
+) -> Result<Option<std::path::PathBuf>, IpcError> {
+    #[cfg(all(windows, not(test)))]
+    {
+        use windows::core::w;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        };
+        use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+        use windows::Win32::UI::Shell::{
+            FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
+            SIGDN_FILESYSPATH,
+        };
+
+        const ERROR_CANCELLED_HRESULT: i32 = 0x8007_04C7u32 as i32;
+        let co_hr =
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        let needs_uninit = co_hr.is_ok();
+        let result = (|| -> Result<Option<std::path::PathBuf>, IpcError> {
+            let dialog: IFileOpenDialog = unsafe {
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL)
+            }
+            .map_err(|e| IpcError::internal(format!("初始化备份选择对话框失败: {e}"), None))?;
+            let opts = unsafe { dialog.GetOptions() }
+                .map_err(|e| IpcError::internal(format!("读取对话框选项失败: {e}"), None))?;
+            let filter = [COMDLG_FILTERSPEC {
+                pszName: w!("TOML 备份文件"),
+                pszSpec: w!("*.toml"),
+            }];
+            unsafe {
+                dialog
+                    .SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST)
+                    .map_err(|e| IpcError::internal(format!("配置打开对话框失败: {e}"), None))?;
+                dialog
+                    .SetFileTypes(&filter)
+                    .map_err(|e| IpcError::internal(format!("设置文件类型过滤失败: {e}"), None))?;
+            }
+            let owner = parent_hwnd.map(|h| HWND(h as *mut core::ffi::c_void));
+            if let Err(err) = unsafe { dialog.Show(owner) } {
+                if err.code().0 == ERROR_CANCELLED_HRESULT {
+                    return Ok(None);
+                }
+                return Err(IpcError::internal(
+                    format!("打开选择对话框失败: {err}"),
+                    None,
+                ));
+            }
+            let item = unsafe { dialog.GetResult() }
+                .map_err(|e| IpcError::internal(format!("获取备份路径失败: {e}"), None))?;
+            let pwstr = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
+                .map_err(|e| IpcError::internal(format!("读取备份路径失败: {e}"), None))?;
+            let path = unsafe { pwstr.to_string() }.unwrap_or_default();
+            unsafe {
+                CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void));
+            }
+            let trimmed = path.trim();
+            Ok((!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed)))
+        })();
+        if needs_uninit {
+            unsafe { CoUninitialize() };
+        }
+        return result;
+    }
+    #[cfg(not(all(windows, not(test))))]
+    {
+        let _ = parent_hwnd;
+        Ok(None)
+    }
+}
+
+fn active_settings_hwnd(app: &AppHandle) -> Option<isize> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let win = app
+            .get_webview_window(crate::settings_window::SETTINGS_WINDOW_LABEL)
+            .or_else(|| app.get_webview_window(MAIN_WINDOW_LABEL))?;
+        let handle = win.window_handle().ok()?;
+        match handle.as_raw() {
+            RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+            _ => None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        None
+    }
 }
 
 async fn run_settings_blocking<T, F>(f: F) -> Result<T, IpcError>
@@ -568,9 +1045,64 @@ pub async fn clear_body_caches(
 }
 
 #[tauri::command]
-pub async fn check_app_update(state: State<'_, AppState>) -> Result<CheckAppUpdateOutput, IpcError> {
+pub async fn check_app_update(
+    state: State<'_, AppState>,
+) -> Result<CheckAppUpdateOutput, IpcError> {
     let session = Arc::clone(&state.session);
     run_settings_blocking(move || session.check_app_update()).await
+}
+
+#[tauri::command]
+pub async fn install_app_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<InstallAppUpdateOutput, IpcError> {
+    let session = Arc::clone(&state.session);
+    run_settings_blocking(move || session.install_app_update(Some(&app))).await
+}
+
+#[tauri::command]
+pub async fn export_settings_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: Option<BackupPathInput>,
+) -> Result<ExportSettingsBackupOutput, IpcError> {
+    let session = Arc::clone(&state.session);
+    let hwnd = active_settings_hwnd(&app);
+    let path_override = input.and_then(|v| v.path);
+    run_settings_blocking(move || session.export_settings_backup(hwnd, path_override.as_deref()))
+        .await
+}
+
+#[tauri::command]
+pub async fn preview_settings_backup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: Option<BackupPathInput>,
+) -> Result<PreviewSettingsBackupOutput, IpcError> {
+    let session = Arc::clone(&state.session);
+    let hwnd = active_settings_hwnd(&app);
+    let path_override = input.and_then(|v| v.path);
+    run_settings_blocking(move || session.preview_settings_backup(hwnd, path_override.as_deref()))
+        .await
+}
+
+#[tauri::command]
+pub async fn import_settings_backup(
+    state: State<'_, AppState>,
+    input: ImportSettingsBackupInput,
+) -> Result<ImportSettingsBackupOutput, IpcError> {
+    let session = Arc::clone(&state.session);
+    run_settings_blocking(move || session.import_settings_backup(&input)).await
+}
+
+#[tauri::command]
+pub async fn open_data_directory(
+    state: State<'_, AppState>,
+    input: OpenDataDirectoryInput,
+) -> Result<OpenDataDirectoryOutput, IpcError> {
+    let session = Arc::clone(&state.session);
+    run_settings_blocking(move || session.open_data_directory(&input)).await
 }
 
 #[cfg(test)]
@@ -949,5 +1481,79 @@ mod tests {
         assert_eq!(stats.file_count, 2);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn backup_export_preview_import_and_open_dir_work_and_respect_lock() {
+        let (session, _, _, _, dir) = make_live_test_session(true, Some("1234"));
+        let backup_file = dir.join("backup-test.toml");
+        let backup_path_str = backup_file.to_string_lossy().into_owned();
+
+        let exported = session
+            .export_settings_backup(None, Some(&backup_path_str))
+            .expect("export settings backup");
+        assert!(exported.saved);
+        assert!(!exported.cancelled);
+        assert!(backup_file.is_file());
+
+        let preview = session
+            .preview_settings_backup(None, Some(&backup_path_str))
+            .expect("preview settings backup");
+        assert!(!preview.cancelled);
+        assert_eq!(preview.account_count, 1);
+
+        let imported = session
+            .import_settings_backup(&ImportSettingsBackupInput {
+                path: backup_path_str.clone(),
+            })
+            .expect("import settings backup");
+        assert!(imported.imported);
+        assert_eq!(imported.account_count, 1);
+
+        let opened = session
+            .open_data_directory(&OpenDataDirectoryInput {
+                kind: DataDirectoryKindDto::Mail,
+            })
+            .expect("open mail data dir");
+        assert!(opened.opened);
+        assert!(std::path::Path::new(&opened.path).is_dir());
+
+        // Lock rejects update install, backup, and open directory commands.
+        session.lock_app(Some("manual"));
+        assert_eq!(session.install_app_update(None).unwrap_err().code, "LOCKED");
+        assert_eq!(
+            session
+                .export_settings_backup(None, Some(&backup_path_str))
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .preview_settings_backup(None, Some(&backup_path_str))
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .import_settings_backup(&ImportSettingsBackupInput {
+                    path: backup_path_str
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+        assert_eq!(
+            session
+                .open_data_directory(&OpenDataDirectoryInput {
+                    kind: DataDirectoryKindDto::Data
+                })
+                .unwrap_err()
+                .code,
+            "LOCKED"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

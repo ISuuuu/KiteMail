@@ -123,6 +123,43 @@ export interface CheckAppUpdateOutput {
   message: string;
 }
 
+export interface InstallAppUpdateOutput {
+  started: boolean;
+  target: string;
+  version?: string | null;
+  message: string;
+}
+
+export interface ExportSettingsBackupOutput {
+  saved: boolean;
+  cancelled: boolean;
+  path?: string | null;
+  message: string;
+}
+
+export interface PreviewSettingsBackupOutput {
+  cancelled: boolean;
+  path?: string | null;
+  accountCount: number;
+  themeId?: string | null;
+  message: string;
+}
+
+export interface ImportSettingsBackupOutput {
+  imported: boolean;
+  accountCount: number;
+  message: string;
+  stateVersion: number;
+}
+
+export type DataDirectoryKind = "data" | "mail";
+
+export interface OpenDataDirectoryOutput {
+  opened: boolean;
+  path: string;
+  message: string;
+}
+
 export interface PasscodeStatus {
   hasPasscode: boolean;
   appLockEnabled: boolean;

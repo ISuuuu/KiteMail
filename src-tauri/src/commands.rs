@@ -277,10 +277,7 @@ pub fn find_in_reader(
 #[tauri::command]
 pub fn close_main_window(window: WebviewWindow) -> Result<(), IpcError> {
     if window.label() != MAIN_WINDOW_LABEL {
-        return Err(IpcError::invalid_input(
-            "仅允许主窗口调用关窗接口",
-            None,
-        ));
+        return Err(IpcError::invalid_input("仅允许主窗口调用关窗接口", None));
     }
     window
         .close()

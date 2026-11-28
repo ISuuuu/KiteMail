@@ -4,6 +4,7 @@ import { isLockedError } from "../src/ipc/main-window.ts";
 import {
   deleteDraft,
   flushMockOutboxDelivery,
+  getMockSendRequests,
   listDrafts,
   listOutbox,
   resetMockComposeState,
@@ -318,6 +319,46 @@ test("定时发送、发件失败重试/删除与 LOCKED 错误拦截", async ()
     isLockedError
   );
   await assert.rejects(() => listOutbox(), isLockedError);
+
+  compose.dispose();
+  resetMockComposeState();
+});
+
+test("发件幂等键在回执超时重试时复用、编辑内容后重新生成", async () => {
+  resetMockComposeState({
+    sendError: { code: "SEND_TIMEOUT", message: "等待发件回执超时", retryable: true },
+  });
+  const compose = useCompose({ accounts: ACCOUNTS });
+  await compose.init();
+
+  compose.openCompose({ mode: "new", accountId: "1" });
+  compose.updateField("toAddr", "idem@example.com");
+  compose.updateField("subject", "幂等键");
+  compose.updateField("bodyText", "正文");
+
+  // 首次提交因回执超时失败，但请求已带幂等键
+  const firstRes = await compose.send({ undoDelaySecs: 0 });
+  assert.equal(firstRes.sent, false);
+  const firstReq = getMockSendRequests().at(-1);
+  assert.ok(firstReq?.clientRequestId);
+
+  // 排除故障后重试：内容未变，复用同一个幂等键
+  resetMockComposeState();
+  const retryRes = await compose.send({ undoDelaySecs: 0 });
+  assert.equal(retryRes.sent, true);
+  const retryReq = getMockSendRequests().at(-1);
+  assert.equal(retryReq?.clientRequestId, firstReq?.clientRequestId);
+
+  // 编辑内容后再发：重新生成幂等键
+  compose.openCompose({ mode: "new", accountId: "1" });
+  compose.updateField("toAddr", "idem@example.com");
+  compose.updateField("subject", "幂等键");
+  compose.updateField("bodyText", "正文已修改");
+  const editedRes = await compose.send({ undoDelaySecs: 0 });
+  assert.equal(editedRes.sent, true);
+  const editedReq = getMockSendRequests().at(-1);
+  assert.ok(editedReq?.clientRequestId);
+  assert.notEqual(editedReq?.clientRequestId, firstReq?.clientRequestId);
 
   compose.dispose();
   resetMockComposeState();

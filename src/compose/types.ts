@@ -78,6 +78,7 @@ export interface SendMailInput {
   localDraftId?: string | null;
   undoDelaySecs?: number | null;
   scheduledAt?: number | null;
+  clientRequestId?: string | null;
 }
 
 export interface SendMailOutput {

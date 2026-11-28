@@ -73,6 +73,14 @@ pub struct OAuthSignInResult {
     pub expires_in_secs: u64,
 }
 
+/// Explicit outcome for interactive OAuth2 login (distinguishes success, user cancellation, and failure).
+#[derive(Clone, Debug)]
+pub enum OAuthLoginOutcome {
+    Success(OAuthSignInResult),
+    Cancelled(String),
+    Failed(String),
+}
+
 /// Result of refreshing an access token.
 #[derive(Clone, Debug)]
 pub struct RefreshedTokens {
@@ -114,26 +122,54 @@ pub fn run_microsoft_oauth_login(
     custom_client_id: &str,
     login_hint: Option<&str>,
 ) -> Result<OAuthSignInResult, String> {
+    match run_microsoft_oauth_login_cancellable(custom_client_id, login_hint, None) {
+        OAuthLoginOutcome::Success(res) => Ok(res),
+        OAuthLoginOutcome::Cancelled(msg) | OAuthLoginOutcome::Failed(msg) => Err(msg),
+    }
+}
+
+/// Run interactive Microsoft OAuth2 PKCE login with cancellation support and explicit status.
+pub fn run_microsoft_oauth_login_cancellable(
+    custom_client_id: &str,
+    login_hint: Option<&str>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> OAuthLoginOutcome {
+    use std::sync::atomic::Ordering;
+
+    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+        return OAuthLoginOutcome::Cancelled("已取消 Outlook 授权".to_string());
+    }
+
     let client_id = if custom_client_id.trim().is_empty() {
         DEFAULT_MICROSOFT_CLIENT_ID.to_string()
     } else {
         custom_client_id.trim().to_string()
     };
 
-    let verifier = random_base64url(32)?;
+    let verifier = match random_base64url(32) {
+        Ok(v) => v,
+        Err(e) => return OAuthLoginOutcome::Failed(e),
+    };
     let challenge = pkce_challenge(&verifier);
-    let state = random_base64url(16)?;
+    let state = match random_base64url(16) {
+        Ok(s) => s,
+        Err(e) => return OAuthLoginOutcome::Failed(e),
+    };
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("启动本地 OAuth 回调端口失败: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("读取回调端口失败: {e}"))?
-        .port();
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => return OAuthLoginOutcome::Failed(format!("启动本地 OAuth 回调端口失败: {e}")),
+    };
+    let port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => return OAuthLoginOutcome::Failed(format!("读取回调端口失败: {e}")),
+    };
     let redirect_uri = format!("http://localhost:{port}/");
 
-    let mut auth_url =
-        url::Url::parse(MICROSOFT_AUTH_URL).map_err(|e| format!("构造授权地址失败: {e}"))?;
+    let mut auth_url = match url::Url::parse(MICROSOFT_AUTH_URL) {
+        Ok(u) => u,
+        Err(e) => return OAuthLoginOutcome::Failed(format!("构造授权地址失败: {e}")),
+    };
     {
         let mut pairs = auth_url.query_pairs_mut();
         pairs
@@ -151,16 +187,23 @@ pub fn run_microsoft_oauth_login(
         }
     }
 
-    open_system_browser(auth_url.as_str())?;
+    if let Err(e) = open_system_browser(auth_url.as_str()) {
+        return OAuthLoginOutcome::Failed(e);
+    }
 
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("设置回调监听器失败: {e}"))?;
+    if let Err(e) = listener.set_nonblocking(true) {
+        return OAuthLoginOutcome::Failed(format!("设置回调监听器失败: {e}"));
+    }
 
     let deadline = Instant::now() + Duration::from_secs(180);
     let code = loop {
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            return OAuthLoginOutcome::Cancelled("已取消 Outlook 授权".to_string());
+        }
         if Instant::now() > deadline {
-            return Err("等待浏览器 OAuth2 授权超时（180 秒），请重试".to_string());
+            return OAuthLoginOutcome::Failed(
+                "等待浏览器 OAuth2 授权超时（180 秒），请重试".to_string(),
+            );
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -173,7 +216,7 @@ pub fn run_microsoft_oauth_login(
                 if !target.starts_with('/') {
                     let _ =
                         stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-                    return Err("无效的 OAuth 回调请求路径".to_string());
+                    return OAuthLoginOutcome::Failed("无效的 OAuth 回调请求路径".to_string());
                 }
                 if target.starts_with("/favicon.ico") {
                     let _ =
@@ -182,8 +225,12 @@ pub fn run_microsoft_oauth_login(
                 }
 
                 let full_url = format!("http://localhost{target}");
-                let parsed =
-                    url::Url::parse(&full_url).map_err(|e| format!("解析回调参数失败: {e}"))?;
+                let parsed = match url::Url::parse(&full_url) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return OAuthLoginOutcome::Failed(format!("解析回调参数失败: {e}"));
+                    }
+                };
 
                 let mut got_code = None;
                 let mut got_state = None;
@@ -207,7 +254,13 @@ pub fn run_microsoft_oauth_login(
                         body
                     );
                     let _ = stream.write_all(resp.as_bytes());
-                    return Err(format!(
+                    if err == "access_denied" || err == "user_cancelled" {
+                        return OAuthLoginOutcome::Cancelled(format!(
+                            "用户取消了 Outlook 授权: {}",
+                            got_err_desc.unwrap_or(err)
+                        ));
+                    }
+                    return OAuthLoginOutcome::Failed(format!(
                         "Outlook 授权被拒绝或失败: {}",
                         got_err_desc.unwrap_or(err)
                     ));
@@ -216,7 +269,7 @@ pub fn run_microsoft_oauth_login(
                 if got_state.as_deref() != Some(state.as_str()) {
                     let _ =
                         stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-                    return Err("OAuth2 state 校验失败，请重试".to_string());
+                    return OAuthLoginOutcome::Failed("OAuth2 state 校验失败，请重试".to_string());
                 }
 
                 if let Some(c) = got_code {
@@ -232,11 +285,15 @@ pub fn run_microsoft_oauth_login(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(120));
             }
-            Err(e) => return Err(format!("接收 OAuth 回调失败: {e}")),
+            Err(e) => return OAuthLoginOutcome::Failed(format!("接收 OAuth 回调失败: {e}")),
         }
     };
 
-    let token_resp = oauth_agent()
+    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+        return OAuthLoginOutcome::Cancelled("已取消 Outlook 授权".to_string());
+    }
+
+    let token_resp = match oauth_agent()
         .post(MICROSOFT_TOKEN_URL)
         .send_form(&[
             ("client_id", client_id.as_str()),
@@ -247,25 +304,33 @@ pub fn run_microsoft_oauth_login(
             ("scope", MICROSOFT_SCOPES),
         ])
         .map_err(format_ureq_error)
-        .and_then(require_oauth_success)?;
+        .and_then(require_oauth_success)
+    {
+        Ok(resp) => resp,
+        Err(e) => return OAuthLoginOutcome::Failed(e),
+    };
 
-    let json: serde_json::Value = token_resp
-        .into_json()
-        .map_err(|e| format!("解析 Token 响应失败: {e}"))?;
+    let json: serde_json::Value = match token_resp.into_json() {
+        Ok(v) => v,
+        Err(e) => return OAuthLoginOutcome::Failed(format!("解析 Token 响应失败: {e}")),
+    };
 
-    let access_token = json["access_token"]
-        .as_str()
-        .ok_or_else(|| "微软未返回 access_token".to_string())?
-        .to_string();
-    let refresh_token = json["refresh_token"]
-        .as_str()
-        .ok_or_else(|| "微软未返回 refresh_token（请确认包含 offline_access 权限）".to_string())?
-        .to_string();
+    let Some(access_token) = json["access_token"].as_str().map(str::to_string) else {
+        return OAuthLoginOutcome::Failed("微软未返回 access_token".to_string());
+    };
+    let Some(refresh_token) = json["refresh_token"].as_str().map(str::to_string) else {
+        return OAuthLoginOutcome::Failed(
+            "微软未返回 refresh_token（请确认包含 offline_access 权限）".to_string(),
+        );
+    };
     let expires_in_secs = json["expires_in"].as_u64().unwrap_or(3600);
 
-    let (email, display_name) = fetch_me(&access_token)?;
+    let (email, display_name) = match fetch_me(&access_token) {
+        Ok(info) => info,
+        Err(e) => return OAuthLoginOutcome::Failed(e),
+    };
 
-    Ok(OAuthSignInResult {
+    OAuthLoginOutcome::Success(OAuthSignInResult {
         client_id,
         email,
         display_name,
@@ -499,5 +564,12 @@ mod tests {
 
         assert!(require_oauth_success(ureq::Response::new(302, "Found", "").unwrap()).is_err());
         assert!(require_oauth_success(ureq::Response::new(200, "OK", "").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn cancellable_oauth_returns_cancelled_immediately_when_signalled() {
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let outcome = run_microsoft_oauth_login_cancellable("", None, Some(&cancel));
+        assert!(matches!(outcome, OAuthLoginOutcome::Cancelled(_)));
     }
 }

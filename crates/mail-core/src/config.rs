@@ -2654,6 +2654,11 @@ pub struct SettingsBackupBundle {
     pub accounts: Vec<AccountConfig>,
 }
 
+/// Serialize a [`SettingsBackupBundle`] as pretty TOML.
+pub fn serialize_settings_bundle(bundle: &SettingsBackupBundle) -> Result<String, String> {
+    toml::to_string_pretty(bundle).map_err(|e| format!("序列化设置备份失败: {e}"))
+}
+
 /// Export current `preferences.toml` and `accounts.toml` in `dir` as a TOML backup string.
 pub fn export_settings_bundle_in(dir: &Path) -> Result<String, String> {
     let preferences = load_preferences_in(dir)?;
@@ -2663,7 +2668,7 @@ pub fn export_settings_bundle_in(dir: &Path) -> Result<String, String> {
         preferences,
         accounts,
     };
-    toml::to_string_pretty(&bundle).map_err(|e| format!("序列化设置备份失败: {e}"))
+    serialize_settings_bundle(&bundle)
 }
 
 /// Parse and validate a settings backup TOML bundle (`version == 1`).

@@ -206,7 +206,9 @@ pub fn save_main_window_geometry(window: &tauri::WebviewWindow, prefs_store: &Pr
 }
 
 #[cfg(windows)]
-fn show_win32_system_menu_at_cursor(window: &tauri::WebviewWindow) -> Result<(), crate::dto::IpcError> {
+fn show_win32_system_menu_at_cursor(
+    window: &tauri::WebviewWindow,
+) -> Result<(), crate::dto::IpcError> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -262,7 +264,9 @@ fn show_win32_system_menu_at_cursor(window: &tauri::WebviewWindow) -> Result<(),
 }
 
 #[cfg(not(windows))]
-fn show_win32_system_menu_at_cursor(_window: &tauri::WebviewWindow) -> Result<(), crate::dto::IpcError> {
+fn show_win32_system_menu_at_cursor(
+    _window: &tauri::WebviewWindow,
+) -> Result<(), crate::dto::IpcError> {
     Ok(())
 }
 

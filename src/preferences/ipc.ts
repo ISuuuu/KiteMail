@@ -15,11 +15,17 @@ import type {
   CheckAppUpdateOutput,
   ClearBodyCachesInput,
   ClearBodyCachesOutput,
+  DataDirectoryKind,
+  ExportSettingsBackupOutput,
   FullPreferencesDto,
   FullPreferencesPatch,
   GetFullPreferencesOutput,
+  ImportSettingsBackupOutput,
+  InstallAppUpdateOutput,
   ManageTrustedSendersInput,
   ManageTrustedSendersOutput,
+  OpenDataDirectoryOutput,
+  PreviewSettingsBackupOutput,
   SetAppLockPasscodeInput,
   SetAppLockPasscodeOutput,
   StorageStatsDto,
@@ -376,5 +382,91 @@ export async function checkAppUpdate(): Promise<CheckAppUpdateOutput> {
     pubDate: null,
     downloadUrl: null,
     message: `当前版本 v${mockAppVersion} 已是最新版本`,
+  };
+}
+
+export async function installAppUpdate(): Promise<InstallAppUpdateOutput> {
+  if (isTauri()) return tauriInvoke<InstallAppUpdateOutput>("install_app_update");
+  if (mockLocked) return Promise.reject(makeLockedError());
+
+  return {
+    started: false,
+    target: mockIsPortable ? "windows-x86_64-portable" : "windows-x86_64",
+    version: null,
+    message: "浏览器预览环境不支持安装应用更新，请在 Windows 客户端中操作",
+  };
+}
+
+export async function exportSettingsBackup(
+  path?: string | null
+): Promise<ExportSettingsBackupOutput> {
+  if (isTauri()) {
+    return tauriInvoke<ExportSettingsBackupOutput>("export_settings_backup", {
+      input: path ? { path } : null,
+    });
+  }
+  if (mockLocked) return Promise.reject(makeLockedError());
+
+  return {
+    saved: true,
+    cancelled: false,
+    path: path || "kitemail-settings-backup.toml",
+    message: `已导出设置备份（包含偏好与账号服务器配置，不含凭据）`,
+  };
+}
+
+export async function previewSettingsBackup(
+  path?: string | null
+): Promise<PreviewSettingsBackupOutput> {
+  if (isTauri()) {
+    return tauriInvoke<PreviewSettingsBackupOutput>("preview_settings_backup", {
+      input: path ? { path } : null,
+    });
+  }
+  if (mockLocked) return Promise.reject(makeLockedError());
+
+  return {
+    cancelled: false,
+    path: path || "kitemail-settings-backup.toml",
+    accountCount: 1,
+    themeId: mockPrefs.themeId,
+    message: "已解析备份文件，请核对后确认导入",
+  };
+}
+
+export async function importSettingsBackup(
+  path: string
+): Promise<ImportSettingsBackupOutput> {
+  if (isTauri()) {
+    return tauriInvoke<ImportSettingsBackupOutput>("import_settings_backup", {
+      input: { path },
+    });
+  }
+  if (mockLocked) return Promise.reject(makeLockedError());
+
+  mockStateVersion += 1;
+  return {
+    imported: true,
+    accountCount: 1,
+    message: "已恢复配置备份（1 个账号配置）",
+    stateVersion: mockStateVersion,
+  };
+}
+
+export async function openDataDirectory(
+  kind: DataDirectoryKind
+): Promise<OpenDataDirectoryOutput> {
+  if (isTauri()) {
+    return tauriInvoke<OpenDataDirectoryOutput>("open_data_directory", {
+      input: { kind },
+    });
+  }
+  if (mockLocked) return Promise.reject(makeLockedError());
+
+  const target = kind === "mail" ? mockMailDataDir : mockDataDir;
+  return {
+    opened: true,
+    path: target,
+    message: `已打开目录 ${target}`,
   };
 }

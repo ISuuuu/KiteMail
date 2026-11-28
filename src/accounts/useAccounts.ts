@@ -17,6 +17,7 @@ import {
   verifyAccount,
   type UnlistenFn,
 } from "./ipc";
+import { onLockState } from "../ipc/main-window";
 import type {
   AccountConfigDto,
   AccountEvent,
@@ -309,6 +310,7 @@ export function useAccounts(options: UseAccountsOptions = {}) {
   const statusBanner = ref<StatusBanner | null>(null);
 
   let unlistenAccountEvent: UnlistenFn | null = null;
+  let unlistenLockState: UnlistenFn | null = null;
   let initialized = false;
 
   const selectedAccount = computed(
@@ -499,6 +501,47 @@ export function useAccounts(options: UseAccountsOptions = {}) {
       };
       return;
     }
+
+    if (oauthStatus.value === "pending") {
+      if (event.kind === "saved" && event.ok) {
+        oauthStatus.value = "authorized";
+        oauthMessage.value = event.message;
+        statusBanner.value = { kind: "success", text: event.message };
+        void loadAccounts({
+          preserveSelection: false,
+          preferAccountId: event.accountId ?? undefined,
+          preserveFeedback: true,
+        }).then(() => {
+          const acc = event.accountId
+            ? accounts.value.find((a) => a.id === event.accountId) ?? null
+            : null;
+          options.onChanged?.();
+          options.onOAuthAuthorized?.(acc, event);
+        });
+        return;
+      }
+      if (event.kind === "verified" && !event.ok) {
+        const isCancelled = event.message.includes("取消");
+        oauthStatus.value = isCancelled ? "idle" : "error";
+        oauthMessage.value = event.message;
+        statusBanner.value = {
+          kind: isCancelled ? "info" : "error",
+          text: event.message,
+        };
+      }
+    }
+  }
+
+  function clearSensitiveState(): void {
+    accounts.value = [];
+    selectedAccountId.value = null;
+    isCreating.value = true;
+    confirmDeleteId.value = null;
+    lockedFields.value = new Set();
+    form.value = createEmptyAccountForm();
+    oauthStatus.value = "idle";
+    oauthMessage.value = null;
+    clearTransientFeedback();
   }
 
   async function loadAccounts(opts?: {
@@ -550,6 +593,12 @@ export function useAccounts(options: UseAccountsOptions = {}) {
     if (!initialized) {
       initialized = true;
       unlistenAccountEvent = await onAccountEvent(handleAccountEvent);
+      // 锁定时立即清空内存中的账号与凭据输入，避免设置窗尚未销毁时残留敏感信息。
+      unlistenLockState = await onLockState((e) => {
+        if (e.locked) {
+          clearSensitiveState();
+        }
+      });
     }
     await loadAccounts({
       preserveSelection: false,
@@ -562,6 +611,10 @@ export function useAccounts(options: UseAccountsOptions = {}) {
     if (unlistenAccountEvent) {
       unlistenAccountEvent();
       unlistenAccountEvent = null;
+    }
+    if (unlistenLockState) {
+      unlistenLockState();
+      unlistenLockState = null;
     }
     initialized = false;
   }
@@ -810,5 +863,6 @@ export function useAccounts(options: UseAccountsOptions = {}) {
     cancelDelete,
     confirmDelete,
     startMicrosoftOAuthFlow,
+    clearSensitiveState,
   };
 }

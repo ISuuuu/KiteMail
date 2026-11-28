@@ -26,6 +26,24 @@ fn activate_existing(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     Some(window)
 }
 
+/// 关闭独立设置窗口（例如应用锁定时立即清除并销毁敏感账号/凭据表单）。
+pub(crate) fn close_settings_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
+        let _ = window.close();
+    }
+}
+
+fn ensure_settings_window_unlocked(app: &AppHandle) -> Result<(), IpcError> {
+    let is_locked = app
+        .try_state::<crate::commands::AppState>()
+        .is_some_and(|state| state.session.is_locked());
+    if is_locked {
+        close_settings_window(app);
+        return Err(IpcError::locked(None));
+    }
+    Ok(())
+}
+
 /// 页签 id 白名单：仅允许字母数字与下划线，避免 URL 拼注异常
 pub(crate) fn sanitize_tab_param(tab: Option<&str>) -> Option<&str> {
     tab.map(str::trim).filter(|t| {
@@ -40,6 +58,7 @@ pub(crate) fn sanitize_tab_param(tab: Option<&str>) -> Option<&str> {
 /// 待设置页首帧完成绘制后 show，并配 1.5s 后台兜底显窗。
 #[tauri::command]
 pub async fn open_settings_window(app: AppHandle, tab: Option<String>) -> Result<(), IpcError> {
+    ensure_settings_window_unlocked(&app)?;
     let clean_tab = sanitize_tab_param(tab.as_deref()).map(str::to_string);
     if activate_existing(&app).is_some() {
         if let Some(tab_id) = clean_tab {
@@ -83,6 +102,13 @@ pub async fn open_settings_window(app: AppHandle, tab: Option<String>) -> Result
         .name("kitemail-settings-reveal-fallback".to_string())
         .spawn(move || {
             std::thread::sleep(Duration::from_millis(1500));
+            if app_for_fallback
+                .try_state::<crate::commands::AppState>()
+                .is_some_and(|state| state.session.is_locked())
+            {
+                close_settings_window(&app_for_fallback);
+                return;
+            }
             if let Some(win) = app_for_fallback.get_webview_window(SETTINGS_WINDOW_LABEL) {
                 if !win.is_visible().unwrap_or(true) {
                     let _ = win.show();
@@ -110,7 +136,10 @@ mod tests {
 
     #[test]
     fn sanitize_tab_param_allows_valid_ids_only() {
-        assert_eq!(sanitize_tab_param(Some(" mailAccounts ")), Some("mailAccounts"));
+        assert_eq!(
+            sanitize_tab_param(Some(" mailAccounts ")),
+            Some("mailAccounts")
+        );
         assert_eq!(sanitize_tab_param(Some("openPgp_2")), Some("openPgp_2"));
         assert_eq!(sanitize_tab_param(Some("")), None);
         assert_eq!(sanitize_tab_param(Some("../etc")), None);
