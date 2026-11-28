@@ -55,6 +55,7 @@ fn main() {
             "clear_body_caches",
             "check_app_update",
             "open_settings_window",
+            "show_window_system_menu",
         ]),
     ))
     .expect("failed to run tauri build");

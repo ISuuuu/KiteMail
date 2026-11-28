@@ -2,24 +2,46 @@
   --km-star-gold: #e5a50a;
   --km-font-sans: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, -apple-system, sans-serif;
   --km-font-mono: "Cascadia Code", "Consolas", "Courier New", monospace;
-  --km-sidebar-width: 240px;
-  --km-list-width: 360px;
+  --km-sidebar-width: 255px;
+  --km-list-width: 350px;
   --km-list-below-height: 360px;
   --km-radius-sm: 6px;
   --km-radius-md: 8px;
   --km-radius-lg: 12px;
 
-  /* 默认回落为 system light */
-  --km-canvas: #fafafa;
+  /* 默认回落为 system light（对齐浅色原图取色） */
+  --km-canvas: #f1f1f1;
   --km-sidebar: #ebebed;
-  --km-surface: #ffffff;
+  --km-surface: #fafafb;
   --km-surface-raised: #ffffff;
   --km-accent: #3584e4;
   --km-accent-fg: #ffffff;
   --km-text: #2e2e32;
   --km-text-muted: #707074;
-  --km-border: #d9d9d9;
+  --km-border: #dcdce0;
   --km-danger: #e01b24;
+
+  /* 主窗口分区与状态语义色 */
+  --km-list-bg: var(--km-surface);
+  --km-reader-header-bg: var(--km-surface);
+  --km-reader-canvas: var(--km-canvas);
+  --km-card-bg: var(--km-surface-raised);
+  --km-drawer-bg: #f4f4f5;
+  --km-sidebar-active-bg: #d8d8db;
+  --km-row-selected-bg: var(--km-accent);
+  --km-row-selected-fg: var(--km-accent-fg);
+  --km-row-selected-muted: rgba(255, 255, 255, 0.84);
+  --km-tag-work-bg: #d2e1f5;
+  --km-tag-work-fg: #1d5fb8;
+  --km-tag-work-badge-bg: #3584e4;
+  --km-tag-work-badge-fg: #ffffff;
+  --km-tag-personal-bg: #d5f0e5;
+  --km-tag-personal-fg: #19784e;
+  --km-tag-personal-badge-bg: #26a269;
+  --km-tag-personal-badge-fg: #ffffff;
+  --km-pill-bg: rgba(0, 0, 0, 0.06);
+  --km-pill-fg: var(--km-text);
+
   --km-accent-soft: color-mix(in srgb, var(--km-accent) 12%, transparent);
   --km-accent-soft-hover: color-mix(in srgb, var(--km-accent) 18%, transparent);
   --km-hover-bg: rgba(0, 0, 0, 0.045);
@@ -30,38 +52,87 @@
 }
 
 :root[data-color-mode="dark"] {
+  --km-drawer-bg: color-mix(in srgb, var(--km-surface) 65%, var(--km-sidebar));
+  --km-sidebar-active-bg: color-mix(in srgb, var(--km-text) 12%, transparent);
+  --km-tag-work-bg: color-mix(in srgb, #3584e4 20%, var(--km-surface));
+  --km-tag-work-fg: #8ec0ff;
+  --km-tag-work-badge-bg: #2e67b2;
+  --km-tag-work-badge-fg: #ffffff;
+  --km-tag-personal-bg: color-mix(in srgb, #26a269 22%, var(--km-surface));
+  --km-tag-personal-fg: #7de0b5;
+  --km-tag-personal-badge-bg: #26865b;
+  --km-tag-personal-badge-fg: #ffffff;
+  --km-pill-bg: rgba(255, 255, 255, 0.09);
   --km-hover-bg: rgba(255, 255, 255, 0.06);
   --km-shadow-card: 0 1px 4px rgba(0, 0, 0, 0.28);
   --km-shadow-popover: 0 10px 28px rgba(0, 0, 0, 0.45);
   color-scheme: dark;
 }
 
-/* 1. system（系统） */
+/* 1. system（系统，精确对齐原图取色） */
 :root[data-theme="system"][data-color-mode="light"],
 [data-theme="system"][data-color-mode="light"] {
-  --km-canvas: #fafafa;
+  --km-canvas: #f1f1f1;
   --km-sidebar: #ebebed;
-  --km-surface: #ffffff;
+  --km-surface: #fafafb;
   --km-surface-raised: #ffffff;
+  --km-list-bg: #fafafb;
+  --km-reader-header-bg: #fafafb;
+  --km-reader-canvas: #f1f1f1;
+  --km-card-bg: #ffffff;
+  --km-drawer-bg: #f4f4f5;
+  --km-sidebar-active-bg: #d8d8db;
+  --km-row-selected-bg: #3584e4;
+  --km-row-selected-fg: #ffffff;
+  --km-row-selected-muted: rgba(255, 255, 255, 0.84);
+  --km-tag-work-bg: #d2e1f5;
+  --km-tag-work-fg: #1d5fb8;
+  --km-tag-work-badge-bg: #3584e4;
+  --km-tag-work-badge-fg: #ffffff;
+  --km-tag-personal-bg: #d5f0e5;
+  --km-tag-personal-fg: #19784e;
+  --km-tag-personal-badge-bg: #26a269;
+  --km-tag-personal-badge-fg: #ffffff;
+  --km-pill-bg: rgba(0, 0, 0, 0.06);
+  --km-pill-fg: #2e2e32;
   --km-accent: #3584e4;
   --km-accent-fg: #ffffff;
   --km-text: #2e2e32;
   --km-text-muted: #707074;
-  --km-border: #d9d9d9;
+  --km-border: #dcdce0;
   --km-danger: #e01b24;
 }
 
 :root[data-theme="system"][data-color-mode="dark"],
 [data-theme="system"][data-color-mode="dark"] {
-  --km-canvas: #242424;
-  --km-sidebar: #303030;
-  --km-surface: #303030;
-  --km-surface-raised: #363636;
+  --km-canvas: #131315;
+  --km-sidebar: #2e2e32;
+  --km-surface: #222226;
+  --km-surface-raised: #1d1d20;
+  --km-list-bg: #222226;
+  --km-reader-header-bg: #222226;
+  --km-reader-canvas: #131315;
+  --km-card-bg: #1d1d20;
+  --km-drawer-bg: #29292d;
+  --km-sidebar-active-bg: #434347;
+  --km-row-selected-bg: #3584e4;
+  --km-row-selected-fg: #ffffff;
+  --km-row-selected-muted: rgba(255, 255, 255, 0.84);
+  --km-tag-work-bg: #213046;
+  --km-tag-work-fg: #8ec0ff;
+  --km-tag-work-badge-bg: #2e67b2;
+  --km-tag-work-badge-fg: #ffffff;
+  --km-tag-personal-bg: #243f36;
+  --km-tag-personal-fg: #7de0b5;
+  --km-tag-personal-badge-bg: #26865b;
+  --km-tag-personal-badge-fg: #ffffff;
+  --km-pill-bg: rgba(255, 255, 255, 0.09);
+  --km-pill-fg: #f3f3f6;
   --km-accent: #3584e4;
   --km-accent-fg: #ffffff;
-  --km-text: #ffffff;
-  --km-text-muted: #a7a7a9;
-  --km-border: #454545;
+  --km-text: #f3f3f6;
+  --km-text-muted: #a3a3aa;
+  --km-border: #38383d;
   --km-danger: #f66151;
 }
 

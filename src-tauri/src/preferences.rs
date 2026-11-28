@@ -19,11 +19,11 @@ pub const VALID_THEME_IDS: &[&str] = &[
 ];
 
 pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
-pub const SIDEBAR_DEFAULT_WIDTH: f32 = 240.0;
+pub const SIDEBAR_DEFAULT_WIDTH: f32 = 255.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 280.0;
 
 pub const LIST_MIN_WIDTH: f32 = 280.0;
-pub const LIST_DEFAULT_WIDTH: f32 = 360.0;
+pub const LIST_DEFAULT_WIDTH: f32 = 350.0;
 pub const LIST_MAX_WIDTH: f32 = 7680.0;
 
 pub const LIST_BELOW_MIN_HEIGHT: f32 = 240.0;

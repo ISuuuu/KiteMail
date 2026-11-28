@@ -18,7 +18,8 @@ use kitemail_mail_core::app_lock::{
 use kitemail_mail_core::cache::CacheStore;
 use kitemail_mail_core::config::{self, AccountConfig, AppPreferences, AuthBackend};
 use kitemail_mail_core::demo::{
-    DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_INBOX_TOTAL, DEMO_SENT_ID,
+    DemoStore, DEMO_ARCHIVE_ID, DEMO_DRAFTS_ID, DEMO_INBOX_ID, DEMO_JUNK_ID, DEMO_SENT_ID,
+    DEMO_TRASH_ID,
 };
 use kitemail_mail_core::imap_client::strip_remote_images_for_webview;
 use kitemail_mail_core::search_query::SearchQuery;
@@ -56,8 +57,6 @@ const BODY_CACHE_CAPACITY: usize = 64;
 const DEFAULT_BODY_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_READ_MARK_DELAY: Duration = Duration::from_secs(2);
 const AUTO_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-const DEMO_JUNK_ID: u32 = 5;
-const DEMO_TRASH_ID: u32 = 6;
 
 /// Abstraction for emitting main-window scoped events (`main://*`).
 pub trait MainEventEmitter: Send + Sync {
@@ -219,34 +218,13 @@ impl DemoSessionState {
             .unwrap_or(0)
             .saturating_add(1);
         let accounts = store.accounts.iter().map(AccountSummaryDto::from).collect();
-        let mut base_folders: Vec<FolderSummaryDto> =
+        let base_folders: Vec<FolderSummaryDto> =
             store.folders.iter().map(FolderSummaryDto::from).collect();
-        base_folders.push(FolderSummaryDto {
-            id: DEMO_JUNK_ID,
-            account_id: 1,
-            name: "垃圾邮件".to_string(),
-            path: "Junk".to_string(),
-            unread_count: 0,
-            total_count: 0,
-            has_more_remote: false,
-        });
-        base_folders.push(FolderSummaryDto {
-            id: DEMO_TRASH_ID,
-            account_id: 1,
-            name: "已删除".to_string(),
-            path: "Trash".to_string(),
-            unread_count: 0,
-            total_count: 0,
-            has_more_remote: false,
-        });
-        let inbox = store
-            .list_messages_page(DEMO_INBOX_ID, "", 0, DEMO_INBOX_TOTAL)
-            .items;
-        let sent = store.list_messages_page(DEMO_SENT_ID, "", 0, 1_000).items;
-        let drafts = store.list_messages_page(DEMO_DRAFTS_ID, "", 0, 1_000).items;
-        let archive = store
-            .list_messages_page(DEMO_ARCHIVE_ID, "", 0, 1_000)
-            .items;
+        let inbox = store.all_inbox_messages().to_vec();
+        let sent = store.all_sent_messages().to_vec();
+        let drafts = store.all_draft_messages().to_vec();
+        let archive = store.all_archive_messages().to_vec();
+        let junk = store.all_junk_messages().to_vec();
         Self {
             store,
             account_configs,
@@ -258,7 +236,7 @@ impl DemoSessionState {
             sent,
             drafts,
             archive,
-            junk: Vec::new(),
+            junk,
             trash: Vec::new(),
             local_drafts: Vec::new(),
             next_local_draft_id: 1,
@@ -268,9 +246,9 @@ impl DemoSessionState {
             next_sent_msg_id: 100_000,
             user_contacts: vec![UserContact {
                 id: 1,
-                email: "design@hylki.example".to_string(),
-                display_name: "产品设计组".to_string(),
-                notes: "产品设计组通讯录（演示）".to_string(),
+                email: "sophie@studio.dev".to_string(),
+                display_name: "Sophie Turner".to_string(),
+                notes: "产品设计与路线图负责人（演示）".to_string(),
                 ..UserContact::default()
             }],
             next_user_contact_id: 2,
@@ -300,22 +278,36 @@ impl DemoSessionState {
         items
     }
 
+    fn slice_for_path(&self, path: &str) -> &[MessageSummary] {
+        match path.to_ascii_uppercase().as_str() {
+            "INBOX" => &self.inbox,
+            "SENT" => &self.sent,
+            "DRAFTS" => &self.drafts,
+            "ARCHIVE" => &self.archive,
+            "JUNK" | "SPAM" => &self.junk,
+            "TRASH" | "DELETED" => &self.trash,
+            _ => &[],
+        }
+    }
+
     fn folders(&self) -> Vec<FolderSummaryDto> {
         self.base_folders
             .iter()
             .map(|f| {
                 let mut cloned = f.clone();
-                let slice: &[MessageSummary] = match f.id {
-                    DEMO_INBOX_ID => &self.inbox,
-                    DEMO_SENT_ID => &self.sent,
-                    DEMO_DRAFTS_ID => &self.drafts,
-                    DEMO_ARCHIVE_ID => &self.archive,
-                    DEMO_JUNK_ID => &self.junk,
-                    DEMO_TRASH_ID => &self.trash,
-                    _ => &[],
-                };
-                cloned.unread_count = slice.iter().filter(|m| m.unread).count() as u32;
-                cloned.total_count = slice.len();
+                let slice = self.slice_for_path(&f.path);
+                let mut unread = 0u32;
+                let mut total = 0usize;
+                for m in slice {
+                    if m.account_id == f.account_id && m.folder_id == f.id {
+                        total += 1;
+                        if m.unread {
+                            unread += 1;
+                        }
+                    }
+                }
+                cloned.unread_count = unread;
+                cloned.total_count = total;
                 cloned
             })
             .collect()
@@ -423,17 +415,21 @@ impl DemoSessionState {
                 MainViewDto::Junk => self.filter_slice(&self.junk, &parsed, quick, today_start),
                 MainViewDto::Trash => self.filter_slice(&self.trash, &parsed, quick, today_start),
                 MainViewDto::Snoozed => Vec::new(),
-                MainViewDto::AccountFolder { folder_id, .. } => {
-                    let slice: &[MessageSummary] = match folder_id {
-                        DEMO_INBOX_ID => &self.inbox,
-                        DEMO_SENT_ID => &self.sent,
-                        DEMO_DRAFTS_ID => &self.drafts,
-                        DEMO_ARCHIVE_ID => &self.archive,
-                        DEMO_JUNK_ID => &self.junk,
-                        DEMO_TRASH_ID => &self.trash,
-                        _ => &[],
-                    };
+                MainViewDto::AccountFolder {
+                    account_id,
+                    folder_id,
+                } => {
+                    let path = self
+                        .base_folders
+                        .iter()
+                        .find(|f| f.account_id == account_id && f.id == folder_id)
+                        .map(|f| f.path.as_str())
+                        .unwrap_or("");
+                    let slice = self.slice_for_path(path);
                     self.filter_slice(slice, &parsed, quick, today_start)
+                        .into_iter()
+                        .filter(|m| m.account_id == account_id && m.folder_id == folder_id)
+                        .collect()
                 }
             }
         };
@@ -500,37 +496,49 @@ impl DemoSessionState {
     }
 
     fn get_detail(&self, account_id: u32, message_id: u32) -> Option<MessageDetail> {
-        let summary = self.find_summary(account_id, message_id)?;
-        let mut detail = self.store.get_message_detail(message_id)?;
-        detail.folder_id = summary.folder_id;
-        detail.folder_path = summary.folder_path.clone();
-        detail.flagged = summary.flagged;
-        if let Some(first) = detail.thread_messages.first_mut() {
-            if first.id == summary.id {
-                first.unread = summary.unread;
-                first.flagged = summary.flagged;
-                first.folder_path = summary.folder_path.clone();
+        if let Some(summary) = self.find_summary(account_id, message_id) {
+            let mut detail = self.store.get_message_detail(message_id)?;
+            detail.folder_id = summary.folder_id;
+            detail.folder_path = summary.folder_path.clone();
+            detail.flagged = summary.flagged;
+            if let Some(first) = detail.thread_messages.first_mut() {
+                if first.id == summary.id {
+                    first.unread = summary.unread;
+                    first.flagged = summary.flagged;
+                    first.folder_path = summary.folder_path.clone();
+                }
             }
+            return Some(detail);
         }
-        Some(detail)
+        self.store
+            .get_message_detail(message_id)
+            .filter(|d| d.account_id == account_id)
     }
 
-    fn resolve_folder_by_path(&self, target: &str) -> Option<(u32, String)> {
+    fn resolve_folder_by_path(&self, account_id: u32, target: &str) -> Option<(u32, String)> {
         let trimmed = target.trim();
         self.base_folders
             .iter()
-            .find(|f| f.path.eq_ignore_ascii_case(trimmed) || f.name.eq_ignore_ascii_case(trimmed))
+            .find(|f| {
+                f.account_id == account_id
+                    && (f.path.eq_ignore_ascii_case(trimmed) || f.name.eq_ignore_ascii_case(trimmed))
+            })
             .map(|f| (f.id, f.path.clone()))
     }
 
     fn slice_mut_for_folder_id(&mut self, folder_id: u32) -> Option<&mut Vec<MessageSummary>> {
-        match folder_id {
-            DEMO_INBOX_ID => Some(&mut self.inbox),
-            DEMO_SENT_ID => Some(&mut self.sent),
-            DEMO_DRAFTS_ID => Some(&mut self.drafts),
-            DEMO_ARCHIVE_ID => Some(&mut self.archive),
-            DEMO_JUNK_ID => Some(&mut self.junk),
-            DEMO_TRASH_ID => Some(&mut self.trash),
+        let path = self
+            .base_folders
+            .iter()
+            .find(|f| f.id == folder_id)
+            .map(|f| f.path.to_ascii_uppercase())?;
+        match path.as_str() {
+            "INBOX" => Some(&mut self.inbox),
+            "SENT" => Some(&mut self.sent),
+            "DRAFTS" => Some(&mut self.drafts),
+            "ARCHIVE" => Some(&mut self.archive),
+            "JUNK" | "SPAM" => Some(&mut self.junk),
+            "TRASH" | "DELETED" => Some(&mut self.trash),
             _ => None,
         }
     }
@@ -543,16 +551,24 @@ impl DemoSessionState {
         preferred_folder_path: Option<&str>,
     ) -> Option<MessageSummary> {
         let preferred_fid = preferred_folder_path
-            .and_then(|p| self.resolve_folder_by_path(p))
+            .and_then(|p| self.resolve_folder_by_path(account_id, p))
             .map(|(fid, _)| fid);
-        let mut order = vec![
-            DEMO_INBOX_ID,
-            DEMO_SENT_ID,
-            DEMO_DRAFTS_ID,
-            DEMO_ARCHIVE_ID,
-            DEMO_JUNK_ID,
-            DEMO_TRASH_ID,
-        ];
+        let mut order: Vec<u32> = self
+            .base_folders
+            .iter()
+            .filter(|f| f.account_id == account_id)
+            .map(|f| f.id)
+            .collect();
+        if order.is_empty() {
+            order = vec![
+                DEMO_INBOX_ID,
+                DEMO_SENT_ID,
+                DEMO_DRAFTS_ID,
+                DEMO_ARCHIVE_ID,
+                DEMO_JUNK_ID,
+                DEMO_TRASH_ID,
+            ];
+        }
         if let Some(fid) = preferred_fid {
             order.retain(|&id| id != fid);
             order.insert(0, fid);
@@ -594,7 +610,7 @@ impl DemoSessionState {
             ));
         };
 
-        let Some((dest_fid, dest_path)) = self.resolve_folder_by_path(dest_raw) else {
+        let Some((dest_fid, dest_path)) = self.resolve_folder_by_path(account_id, dest_raw) else {
             return Err(IpcError::invalid_input(
                 format!("无效的目标文件夹: {dest_raw}"),
                 None,
@@ -633,7 +649,9 @@ impl DemoSessionState {
         current_folder_path: &str,
         original_folder_path: &str,
     ) -> Result<(bool, Option<u32>), IpcError> {
-        let Some((orig_fid, orig_path)) = self.resolve_folder_by_path(original_folder_path) else {
+        let Some((orig_fid, orig_path)) =
+            self.resolve_folder_by_path(account_id, original_folder_path)
+        else {
             return Err(IpcError::invalid_input(
                 format!("无效的原文件夹: {original_folder_path}"),
                 None,
@@ -4851,9 +4869,18 @@ pub(crate) mod tests {
         let boot = session.bootstrap();
         assert_eq!(boot.mode, AppMode::Demo);
         assert!(boot.cache_ready);
-        assert_eq!(boot.accounts.len(), 1);
-        assert_eq!(boot.folders[0].total_count, 10_000);
-        assert_eq!(boot.folders[0].unread_count, 126);
+        assert_eq!(boot.accounts.len(), 3);
+        assert_eq!(boot.accounts[0].display_name, "Jason M.");
+        assert_eq!(boot.accounts[1].display_name, "Hyprlab");
+        assert_eq!(boot.accounts[2].display_name, "Jason (Personal)");
+
+        let inbox1 = boot
+            .folders
+            .iter()
+            .find(|f| f.account_id == 1 && f.path == "INBOX")
+            .expect("account 1 inbox");
+        assert_eq!(inbox1.total_count, 10);
+        assert_eq!(inbox1.unread_count, 6);
 
         let page0 = session
             .list_messages(&ListMessagesInput {
@@ -4867,11 +4894,11 @@ pub(crate) mod tests {
                 limit: 50,
             })
             .expect("page 0");
-        assert_eq!(page0.total, 10_000);
-        assert_eq!(page0.items.len(), 50);
-        assert!(page0.has_more);
+        assert_eq!(page0.total, 18);
+        assert_eq!(page0.items.len(), 18);
+        assert!(!page0.has_more);
 
-        let last = session
+        let page_limited = session
             .list_messages(&ListMessagesInput {
                 request_id: "r2".to_string(),
                 view: MainViewDto::UnifiedInbox,
@@ -4879,12 +4906,30 @@ pub(crate) mod tests {
                 scope: SearchScopeDto::ThisFolder,
                 sort: MessageSortDto::DateNewest,
                 filter: MessageFilterDto::default(),
-                offset: 9_980,
+                offset: 10,
+                limit: 5,
+            })
+            .expect("middle page");
+        assert_eq!(page_limited.items.len(), 5);
+        assert!(page_limited.has_more);
+
+        let acct2_inbox = session
+            .list_messages(&ListMessagesInput {
+                request_id: "r2-acct2".to_string(),
+                view: MainViewDto::AccountFolder {
+                    account_id: 2,
+                    folder_id: 11,
+                },
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
                 limit: 50,
             })
-            .expect("last page");
-        assert_eq!(last.items.len(), 20);
-        assert!(!last.has_more);
+            .expect("account 2 inbox");
+        assert_eq!(acct2_inbox.total, 4);
+        assert!(acct2_inbox.items.iter().all(|m| m.account_id == 2));
 
         let unread = session
             .list_messages(&ListMessagesInput {
@@ -4901,14 +4946,14 @@ pub(crate) mod tests {
                 limit: 50,
             })
             .expect("unread filter");
-        assert_eq!(unread.total, 126);
+        assert_eq!(unread.total, 12);
         assert!(unread.items.iter().all(|m| m.unread));
 
         let search = session
             .list_messages(&ListMessagesInput {
                 request_id: "r4".to_string(),
                 view: MainViewDto::UnifiedInbox,
-                query: "归档".to_string(),
+                query: "roadmap".to_string(),
                 scope: SearchScopeDto::AllFolders,
                 sort: MessageSortDto::DateOldest,
                 filter: MessageFilterDto::default(),
@@ -4916,7 +4961,7 @@ pub(crate) mod tests {
                 limit: 50,
             })
             .expect("cross-folder search");
-        assert_eq!(search.total, 24);
+        assert_eq!(search.total, 2);
         assert!(search.items[0].date_ts <= search.items[1].date_ts);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4937,18 +4982,32 @@ pub(crate) mod tests {
             )
             .expect("open message #1");
         assert!(opened.has_html);
-        assert_eq!(opened.thread_messages.len(), 2);
+        assert_eq!(opened.thread_messages.len(), 6);
         assert!(!opened.attachments.is_empty());
         assert_eq!(opened.body_status, BodyStatusDto::Ready);
 
+        let q3 = session
+            .open_message(
+                &OpenMessageInput {
+                    request_id: "open-q3".to_string(),
+                    account_id: 1,
+                    message_id: 8,
+                },
+                "rs-q3".to_string(),
+            )
+            .expect("open Q3 roadmap review");
+        assert_eq!(q3.subject, "Q3 roadmap review");
+        assert_eq!(q3.thread_messages.len(), 5);
+        assert_eq!(q3.attachments.len(), 3);
+
         let boot_after = session.bootstrap();
-        assert_eq!(boot_after.folders[0].unread_count, 125);
-        assert_eq!(emitter.mail_changed.lock().unwrap().len(), 1);
+        assert_eq!(boot_after.folders[0].unread_count, 4);
+        assert_eq!(emitter.mail_changed.lock().unwrap().len(), 2);
 
         session
             .set_demo_message_unread(1, 1, true)
             .expect("mark #1 unread");
-        assert_eq!(session.bootstrap().folders[0].unread_count, 126);
+        assert_eq!(session.bootstrap().folders[0].unread_count, 5);
 
         let unread_view = session
             .list_messages(&ListMessagesInput {
@@ -4959,25 +5018,25 @@ pub(crate) mod tests {
                 sort: MessageSortDto::UnreadFirst,
                 filter: MessageFilterDto::default(),
                 offset: 0,
-                limit: 10,
+                limit: 50,
             })
             .expect("unread view");
-        assert_eq!(unread_view.total, 126);
+        assert_eq!(unread_view.total, 11);
 
         session
-            .set_demo_message_flagged(1, 2, true)
-            .expect("flag message #2");
-        let opened2 = session
+            .set_demo_message_flagged(1, 10, true)
+            .expect("flag message #10");
+        let opened10 = session
             .open_message(
                 &OpenMessageInput {
-                    request_id: "open-2".to_string(),
+                    request_id: "open-10".to_string(),
                     account_id: 1,
-                    message_id: 2,
+                    message_id: 10,
                 },
-                "rs-2".to_string(),
+                "rs-10".to_string(),
             )
-            .expect("open message #2");
-        assert!(opened2.flagged);
+            .expect("open message #10");
+        assert!(opened10.flagged);
 
         let refreshed = session
             .refresh_mail(&RefreshMailInput {
@@ -5588,6 +5647,10 @@ pub(crate) mod tests {
     #[test]
     fn demo_archive_delete_spam_move_and_undo_update_counts_and_emit_events() {
         let (session, emitter, dir) = make_test_session();
+        let boot_init = session.bootstrap();
+        let init_inbox_total = boot_init.folders[0].total_count;
+        let init_inbox_unread = boot_init.folders[0].unread_count;
+        let init_archive_total = boot_init.folders[3].total_count;
 
         // Archive unread message #1 from INBOX -> Archive.
         let archived = session
@@ -5601,9 +5664,9 @@ pub(crate) mod tests {
         assert_eq!(archived.rfc_message_id, "<demo-1@hylki.example>");
 
         let boot_arch = session.bootstrap();
-        assert_eq!(boot_arch.folders[0].total_count, 9_999);
-        assert_eq!(boot_arch.folders[0].unread_count, 125);
-        assert_eq!(boot_arch.folders[3].total_count, 25);
+        assert_eq!(boot_arch.folders[0].total_count, init_inbox_total - 1);
+        assert_eq!(boot_arch.folders[0].unread_count, init_inbox_unread - 1);
+        assert_eq!(boot_arch.folders[3].total_count, init_archive_total + 1);
 
         // Undo archive -> INBOX counts restored.
         let undo_arch = session
@@ -5617,16 +5680,16 @@ pub(crate) mod tests {
             .expect("undo archive #1");
         assert!(undo_arch.accepted);
         let boot_restored = session.bootstrap();
-        assert_eq!(boot_restored.folders[0].total_count, 10_000);
-        assert_eq!(boot_restored.folders[0].unread_count, 126);
+        assert_eq!(boot_restored.folders[0].total_count, init_inbox_total);
+        assert_eq!(boot_restored.folders[0].unread_count, init_inbox_unread);
 
-        // Delete #2 -> moves to Trash, then delete again -> permanently removed.
+        // Delete #7 -> moves to Trash, then delete again -> permanently removed.
         let deleted = session
             .delete_message(&MessageActionInput {
                 account_id: 1,
-                message_id: 2,
+                message_id: 7,
             })
-            .expect("delete #2");
+            .expect("delete #7");
         assert_eq!(deleted.target_folder_path, "Trash");
         let trash_page = session
             .list_messages(&ListMessagesInput {
@@ -5641,23 +5704,36 @@ pub(crate) mod tests {
             })
             .expect("list trash");
         assert_eq!(trash_page.total, 1);
-        assert_eq!(trash_page.items[0].id, 2);
+        assert_eq!(trash_page.items[0].id, 7);
 
         let perm_deleted = session
             .delete_message(&MessageActionInput {
                 account_id: 1,
-                message_id: 2,
+                message_id: 7,
             })
-            .expect("permanent delete #2");
+            .expect("permanent delete #7");
         assert_eq!(perm_deleted.target_folder_path, "");
 
-        // Mark #3 as spam -> Junk folder.
+        // Mark #8 as spam -> Junk folder.
+        let init_junk_total = session
+            .list_messages(&ListMessagesInput {
+                request_id: "junk-0".to_string(),
+                view: MainViewDto::Junk,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 10,
+            })
+            .expect("init junk")
+            .total;
         let spammed = session
             .mark_message_spam(&MessageActionInput {
                 account_id: 1,
-                message_id: 3,
+                message_id: 8,
             })
-            .expect("spam #3");
+            .expect("spam #8");
         assert_eq!(spammed.target_folder_path, "Junk");
         let junk_page = session
             .list_messages(&ListMessagesInput {
@@ -5671,26 +5747,26 @@ pub(crate) mod tests {
                 limit: 10,
             })
             .expect("list junk");
-        assert_eq!(junk_page.total, 1);
+        assert_eq!(junk_page.total, init_junk_total + 1);
 
-        // Move #4 -> Sent, then undo back to INBOX.
+        // Move #10 -> Sent, then undo back to INBOX.
         let moved = session
             .move_message(&MoveMessageInput {
                 account_id: 1,
-                message_id: 4,
+                message_id: 10,
                 target_folder_path: "Sent".to_string(),
             })
-            .expect("move #4");
+            .expect("move #10");
         assert_eq!(moved.target_folder_path, "Sent");
         let undo_move = session
             .undo_message_move(&UndoMessageMoveInput {
                 account_id: 1,
-                message_id: 4,
+                message_id: 10,
                 rfc_message_id: moved.rfc_message_id,
                 current_folder_path: "Sent".to_string(),
                 original_folder_path: "INBOX".to_string(),
             })
-            .expect("undo move #4");
+            .expect("undo move #10");
         assert!(undo_move.accepted);
 
         assert!(emitter.mail_changed.lock().unwrap().len() >= 6);
@@ -5759,7 +5835,7 @@ pub(crate) mod tests {
         let reloaded_prefs = PreferencesStore::open_in(dir.clone());
         assert_eq!(
             reloaded_prefs.snapshot_raw().allowed_remote_senders,
-            vec!["xiaoming@example.com".to_string()]
+            vec!["marcus@studio.dev".to_string()]
         );
 
         // Fresh session using same preferences dir sees sender already trusted.

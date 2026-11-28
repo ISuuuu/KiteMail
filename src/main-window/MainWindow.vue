@@ -1,5 +1,10 @@
 <template>
-  <div ref="rootRef" class="km-main-window" :class="layoutClass">
+  <div
+    ref="rootRef"
+    class="km-main-window"
+    :class="layoutClass"
+    @contextmenu="onDragRegionContextMenu"
+  >
     <FolderSidebar
       :accounts="state.accounts.value"
       :folders="state.folders.value"
@@ -133,12 +138,13 @@
       <PaneSplitter
         direction="vertical"
         label="调整列表栏宽度"
-        :value="state.layout.prefs.value.listWidth"
+        :value="state.layout.listVisualWidth.value"
         :min="LIST_MIN_WIDTH"
-        @dragStart="dragBaseList = state.layout.prefs.value.listWidth"
+        :max="state.layout.maxListWidth.value"
+        @dragStart="dragBaseList = state.layout.listVisualWidth.value"
         @drag="(delta) => state.layout.onListResize(dragBaseList + delta)"
         @dragEnd="state.layout.flushSave()"
-        @step="(delta) => state.layout.onListResize(state.layout.prefs.value.listWidth + delta)"
+        @step="(delta) => state.layout.onListResize(state.layout.listVisualWidth.value + delta)"
       />
       <ReaderPane
         class="km-reader-column"
@@ -362,6 +368,7 @@ import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
 } from "./usePaneLayout";
+import { onDragRegionContextMenu } from "./windowControls";
 
 const state = injectMainWindow();
 const rootRef = ref<HTMLElement | null>(null);
@@ -846,8 +853,9 @@ onUnmounted(() => {
 const listColumnStyle = computed(() => {
   const prefs = state.layout.prefs.value;
   if (prefs.readerPosition === "right") {
+    const w = state.layout.listVisualWidth.value;
     return {
-      width: `${prefs.listWidth}px`,
+      width: `${w}px`,
       minWidth: `${LIST_MIN_WIDTH}px`,
       flexShrink: 0,
     };
@@ -861,8 +869,9 @@ const listColumnStyle = computed(() => {
 const listSlotStyle = computed(() => {
   const prefs = state.layout.prefs.value;
   if (prefs.readerPosition === "below") {
+    const h = state.layout.listBelowVisualHeight.value;
     return {
-      height: `${prefs.listBelowHeight}px`,
+      height: `${h}px`,
       minHeight: `${BELOW_LIST_MIN_HEIGHT}px`,
       flexShrink: 0,
       display: "flex",

@@ -5,6 +5,7 @@ import path from "node:path";
 
 const TEST_FILES = [
   "tests/main-window.test.ts",
+  "tests/parity-shell.test.ts",
   "tests/compose.test.ts",
   "tests/accounts.test.ts",
   "tests/reader-tools.test.ts",

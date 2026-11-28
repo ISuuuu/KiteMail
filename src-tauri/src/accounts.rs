@@ -1248,7 +1248,7 @@ mod tests {
         let (session, emitter, dir) = make_test_session();
 
         let initial = session.list_accounts().unwrap();
-        assert_eq!(initial.accounts.len(), 1);
+        assert_eq!(initial.accounts.len(), 3);
         assert_eq!(initial.accounts[0].id, "1");
 
         let verify = session
@@ -1259,14 +1259,14 @@ mod tests {
         let saved = session
             .save_account(&sample_save_input(None, Some("auth-code")))
             .unwrap();
-        assert_eq!(saved.account.id, "2");
+        assert_eq!(saved.account.id, "4");
         assert_eq!(saved.account.email, "user@qq.com");
 
         // Editing without password keeps existing hasPassword=true.
         let edited = session
             .save_account(&SaveAccountInput {
                 display_name: "新昵称".to_string(),
-                ..sample_save_input(Some("2"), None)
+                ..sample_save_input(Some("4"), None)
             })
             .unwrap();
         assert_eq!(edited.account.display_name, "新昵称");
@@ -1274,7 +1274,7 @@ mod tests {
 
         let toggled = session
             .set_account_enabled(&SetAccountEnabledInput {
-                account_id: "2".to_string(),
+                account_id: "4".to_string(),
                 enabled: false,
             })
             .unwrap();
@@ -1288,15 +1288,15 @@ mod tests {
             })
             .unwrap();
         assert!(oauth.started);
-        assert_eq!(session.list_accounts().unwrap().accounts.len(), 3);
+        assert_eq!(session.list_accounts().unwrap().accounts.len(), 5);
 
         let deleted = session
             .delete_account(&DeleteAccountInput {
-                account_id: "2".to_string(),
+                account_id: "4".to_string(),
             })
             .unwrap();
         assert!(deleted.deleted);
-        assert_eq!(session.list_accounts().unwrap().accounts.len(), 2);
+        assert_eq!(session.list_accounts().unwrap().accounts.len(), 4);
         assert!(!emitter.account_events.lock().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);

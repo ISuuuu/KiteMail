@@ -362,6 +362,7 @@ fn main() {
             settings::manage_trusted_senders,
             settings::clear_body_caches,
             settings::check_app_update,
+            window_lifecycle::show_window_system_menu,
         ])
         .run(tauri::generate_context!())
         .expect("error while running KiteMail Tauri preview");

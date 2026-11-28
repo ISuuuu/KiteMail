@@ -2,13 +2,15 @@ import { ref, computed, onUnmounted, getCurrentInstance } from "vue";
 import type { MainPreferencesDto, MainPreferencesPatch, ReaderPosition } from "../ipc/types";
 import { updateMainPreferences } from "../ipc/main-window";
 
-// --- 布局常量（精确对齐 crates/app/src/app.rs） ---
+// --- 布局常量（对齐主窗口视觉基准与 GPUI 窄轨/迟滞规则） ---
 export const SIDEBAR_MIN_WIDTH = 180;
 export const SIDEBAR_MAX_WIDTH = 280;
-export const SIDEBAR_DEFAULT_WIDTH = 240;
+export const SIDEBAR_DEFAULT_WIDTH = 255;
+export const SIDEBAR_RAIL_WIDTH = 80;
 export const LIST_MIN_WIDTH = 280;
-export const LIST_DEFAULT_WIDTH = 360;
+export const LIST_DEFAULT_WIDTH = 350;
 export const READER_MIN_WIDTH = 441;
+export const SPLITTER_THICKNESS = 1;
 export const BELOW_LIST_MIN_HEIGHT = 240;
 export const BELOW_LIST_DEFAULT_HEIGHT = 360;
 export const BELOW_READER_MIN_HEIGHT = 180;
@@ -94,7 +96,7 @@ export function usePaneLayout() {
 
   // 窗口宽高（由 ResizeObserver 更新）
   const windowWidth = ref(typeof window !== "undefined" ? window.innerWidth : 1280);
-  const windowHeight = ref(typeof window !== "undefined" ? window.innerHeight : 800);
+  const windowHeight = ref(typeof window !== "undefined" ? window.innerHeight : 840);
 
   // darkMode === null 时跟随 OS prefers-color-scheme
   const followSystemScheme = computed(() => prefs.value.darkMode === null);
@@ -125,11 +127,52 @@ export function usePaneLayout() {
   // 是否处于图标窄轨（自动或手动折叠）
   const isRail = computed(() => autoRail.value || prefs.value.sidebarCollapsed);
 
-  // 实际侧栏视觉宽度（窄轨 60px）
-  const sidebarVisualWidth = computed(() => (isRail.value ? 60 : prefs.value.sidebarWidth));
+  // 实际侧栏视觉宽度（窄轨 80px）
+  const sidebarVisualWidth = computed(() =>
+    isRail.value ? SIDEBAR_RAIL_WIDTH : prefs.value.sidebarWidth
+  );
+
+  // 右侧阅读模式下的可用列表宽度上限（保证阅读区至少保有 READER_MIN_WIDTH，不覆盖已保存偏好）
+  const maxListWidth = computed(() =>
+    Math.max(
+      LIST_MIN_WIDTH,
+      windowWidth.value - sidebarVisualWidth.value - READER_MIN_WIDTH - SPLITTER_THICKNESS * 2
+    )
+  );
+
+  // 列表实际渲染宽度（受当前窗口客户区可用宽度约束，保留 prefs.listWidth 原偏好）
+  const listVisualWidth = computed(() =>
+    prefs.value.readerPosition === "right"
+      ? clampListWidth(prefs.value.listWidth, maxListWidth.value)
+      : prefs.value.listWidth
+  );
+
+  // 下方阅读模式下的可用列表高度上限（保证下方阅读区至少保有 BELOW_READER_MIN_HEIGHT）
+  const maxBelowHeight = computed(() =>
+    Math.max(
+      BELOW_LIST_MIN_HEIGHT,
+      windowHeight.value - BELOW_READER_MIN_HEIGHT - SPLITTER_THICKNESS
+    )
+  );
+
+  const listBelowVisualHeight = computed(() =>
+    clampBelowHeight(prefs.value.listBelowHeight, maxBelowHeight.value)
+  );
 
   // 列表宽模式迟滞
-  const listWide = ref(prefs.value.listWidth >= LIST_WIDE_ON);
+  const listWide = ref(listVisualWidth.value >= LIST_WIDE_ON);
+
+  function syncListWide() {
+    if (prefs.value.readerPosition !== "right") {
+      const avail = Math.max(
+        LIST_MIN_WIDTH,
+        windowWidth.value - sidebarVisualWidth.value - SPLITTER_THICKNESS
+      );
+      listWide.value = listWideNext(listWide.value, avail);
+    } else {
+      listWide.value = listWideNext(listWide.value, listVisualWidth.value);
+    }
+  }
 
   // 生效的亮暗模式（同步 DOM data-color-mode）
   const effectiveDark = ref(false);
@@ -223,7 +266,7 @@ export function usePaneLayout() {
       readerPosition: validateReaderPosition(p.readerPosition),
       readerZoomPercent: Math.min(250, Math.max(50, p.readerZoomPercent ?? 100)),
     };
-    listWide.value = prefs.value.listWidth >= LIST_WIDE_ON;
+    listWide.value = listVisualWidth.value >= LIST_WIDE_ON;
     syncDocumentTheme();
   }
 
@@ -231,27 +274,20 @@ export function usePaneLayout() {
     const clamped = clampSidebarWidth(newWidth);
     if (clamped === prefs.value.sidebarWidth) return;
     prefs.value = { ...prefs.value, sidebarWidth: clamped };
+    syncListWide();
     scheduleSave({ sidebarWidth: clamped });
   }
 
   function onListResize(newWidth: number) {
-    const maxAllowed = Math.max(
-      LIST_MIN_WIDTH,
-      windowWidth.value - sidebarVisualWidth.value - READER_MIN_WIDTH - 10
-    );
-    const clamped = clampListWidth(newWidth, maxAllowed);
+    const clamped = clampListWidth(newWidth, maxListWidth.value);
     if (clamped === prefs.value.listWidth) return;
     prefs.value = { ...prefs.value, listWidth: clamped };
-    listWide.value = listWideNext(listWide.value, clamped);
+    syncListWide();
     scheduleSave({ listWidth: clamped });
   }
 
   function onBelowResize(newHeight: number) {
-    const maxAllowed = Math.max(
-      BELOW_LIST_MIN_HEIGHT,
-      windowHeight.value - BELOW_READER_MIN_HEIGHT - 10
-    );
-    const clamped = clampBelowHeight(newHeight, maxAllowed);
+    const clamped = clampBelowHeight(newHeight, maxBelowHeight.value);
     if (clamped === prefs.value.listBelowHeight) return;
     prefs.value = { ...prefs.value, listBelowHeight: clamped };
     scheduleSave({ listBelowHeight: clamped });
@@ -260,6 +296,7 @@ export function usePaneLayout() {
   function toggleSidebarCollapsed() {
     const next = !prefs.value.sidebarCollapsed;
     prefs.value = { ...prefs.value, sidebarCollapsed: next };
+    syncListWide();
     updateMainPreferences({ sidebarCollapsed: next }).catch(() => {
       /* 忽略 */
     });
@@ -269,13 +306,7 @@ export function usePaneLayout() {
     const valid = validateReaderPosition(pos);
     if (prefs.value.readerPosition === valid) return;
     prefs.value = { ...prefs.value, readerPosition: valid };
-    if (valid !== "right") {
-      // 非右侧阅读模式时中栏铺满窗口剩余宽度，同步判断宽表格模式
-      const avail = Math.max(LIST_MIN_WIDTH, windowWidth.value - sidebarVisualWidth.value - 5);
-      listWide.value = listWideNext(listWide.value, avail);
-    } else {
-      listWide.value = listWideNext(listWide.value, prefs.value.listWidth);
-    }
+    syncListWide();
     updateMainPreferences({ readerPosition: valid }).catch(() => {
       /* 忽略 */
     });
@@ -323,10 +354,7 @@ export function usePaneLayout() {
   function setWindowSize(width: number, height: number) {
     windowWidth.value = width;
     windowHeight.value = height;
-    if (prefs.value.readerPosition !== "right") {
-      const avail = Math.max(LIST_MIN_WIDTH, width - sidebarVisualWidth.value - 5);
-      listWide.value = listWideNext(listWide.value, avail);
-    }
+    syncListWide();
   }
 
   function setWindowWidth(width: number) {
@@ -344,6 +372,10 @@ export function usePaneLayout() {
     isRail,
     listWide,
     sidebarVisualWidth,
+    maxListWidth,
+    listVisualWidth,
+    maxBelowHeight,
+    listBelowVisualHeight,
     applyPrefs,
     onSidebarResize,
     onListResize,
