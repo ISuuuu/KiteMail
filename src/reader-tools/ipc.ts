@@ -16,6 +16,7 @@ import type {
   CachedAttachmentDto,
   FetchAttachmentPreviewInput,
   FetchAttachmentPreviewOutput,
+  FetchAttachmentThumbnailOutput,
   GetMessagePrintHtmlInput,
   GetMessagePrintHtmlOutput,
   ListCachedAttachmentsInput,
@@ -413,6 +414,21 @@ function buildMockSvgPreviewUrl(att: CachedAttachmentDto): string {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
+/** 图片缩略图：受限尺寸（240x150）的小 SVG，模拟后端只返回小图的行为 */
+function buildMockImageThumbnailUrl(att: CachedAttachmentDto): string {
+  const palette = ["#3584e4", "#7253b9", "#2672af", "#1b7d50", "#ae552a", "#b75077"];
+  const accent = palette[att.id % palette.length];
+  const safeName = escapeHtml(att.filename);
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="150" viewBox="0 0 240 150">` +
+    `<rect width="240" height="150" rx="8" fill="#181b22"/>` +
+    `<circle cx="46" cy="42" r="16" fill="${accent}" fill-opacity="0.45"/>` +
+    `<path d="M16 124 L74 66 L120 104 L164 58 L228 124 Z" fill="${accent}" fill-opacity="0.4"/>` +
+    `<text x="16" y="24" fill="#f3f5f9" font-family="Segoe UI, sans-serif" font-size="11">${safeName}</text>` +
+    `</svg>`;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
 function buildMockTextPreviewUrl(att: CachedAttachmentDto): string {
   const previewText = [
     `文件名：${att.filename}`,
@@ -696,9 +712,20 @@ export async function fetchAttachmentPreview(
       attachmentId: att.id,
       filename: att.filename,
       mimeType: "application/pdf",
-      dataUrl: buildMockPdfDataUrl(att),
-      sizeBytes: att.sizeBytes,
+      dataUrl: input.thumbnailOnly ? "" : buildMockPdfDataUrl(att),
+      sizeBytes: input.thumbnailOnly ? 0 : att.sizeBytes,
       thumbnailDataUrl: buildMockPdfThumbnailUrl(att),
+    };
+  }
+
+  if (input.thumbnailOnly) {
+    return {
+      attachmentId: att.id,
+      filename: att.filename,
+      mimeType: att.mimeType,
+      dataUrl: "",
+      sizeBytes: 0,
+      thumbnailDataUrl: att.isImage ? buildMockImageThumbnailUrl(att) : null,
     };
   }
 
@@ -708,6 +735,20 @@ export async function fetchAttachmentPreview(
     mimeType: att.mimeType,
     dataUrl: att.isImage ? buildMockSvgPreviewUrl(att) : buildMockTextPreviewUrl(att),
     sizeBytes: att.sizeBytes,
+  };
+}
+
+/** 缩略图专用入口：只取受限尺寸小图，不拉取原文件 */
+export async function fetchAttachmentThumbnail(
+  input: FetchAttachmentPreviewInput
+): Promise<FetchAttachmentThumbnailOutput> {
+  const preview = await fetchAttachmentPreview({ ...input, thumbnailOnly: true });
+  return {
+    attachmentId: preview.attachmentId,
+    filename: preview.filename,
+    mimeType: preview.mimeType,
+    sizeBytes: preview.sizeBytes,
+    thumbnailDataUrl: preview.thumbnailDataUrl ?? null,
   };
 }
 

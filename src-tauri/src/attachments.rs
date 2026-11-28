@@ -27,6 +27,10 @@ use crate::mail_session::{
 };
 
 pub const MAX_ATTACHMENT_PREVIEW_BYTES: usize = 10 * 1024 * 1024;
+/// 缩略图最长边（像素）：抽屉网格最大 112 CSS px，按 2x DPR 预留。
+const ATTACHMENT_THUMBNAIL_MAX_EDGE: u32 = 256;
+/// 图像无法解码时允许直接回落的原文件上限，超过则不给缩略图，避免退回大图。
+const ATTACHMENT_THUMBNAIL_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const ATTACHMENT_WORKER_TIMEOUT: Duration = Duration::from_secs(20);
 
 const DEMO_SAFE_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"640\" height=\"360\" viewBox=\"0 0 640 360\"><rect width=\"640\" height=\"360\" rx=\"16\" fill=\"#f4f6fb\"/><rect x=\"24\" y=\"24\" width=\"156\" height=\"312\" rx=\"10\" fill=\"#e8edf7\"/><rect x=\"196\" y=\"24\" width=\"192\" height=\"312\" rx=\"10\" fill=\"#ffffff\" stroke=\"#d6dfef\"/><rect x=\"404\" y=\"24\" width=\"212\" height=\"312\" rx=\"10\" fill=\"#ffffff\" stroke=\"#d6dfef\"/><text x=\"320\" y=\"186\" text-anchor=\"middle\" font-family=\"Segoe UI, Microsoft YaHei, sans-serif\" font-size=\"18\" fill=\"#2a4b8d\">KiteMail Demo Preview</text></svg>";
@@ -649,8 +653,13 @@ fn render_pdf_first_page_png_winrt(
     Ok(Some(buf))
 }
 
+/// 在独立的 MTA 线程上执行 WinRT 调用，避免影响调用线程的 COM 状态。
 #[cfg(target_os = "windows")]
-fn render_pdf_first_page_png_worker(pdf_bytes: &[u8], target_width: u32) -> Option<Vec<u8>> {
+fn run_winrt_mta<T, F>(work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
     use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
@@ -663,15 +672,27 @@ fn render_pdf_first_page_png_worker(pdf_bytes: &[u8], target_width: u32) -> Opti
         }
     }
 
-    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    if hr.is_err() && hr != RPC_E_CHANGED_MODE {
-        return None;
-    }
-    let _com_guard = ComApartmentGuard(hr.is_ok());
+    std::thread::spawn(move || {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+            return None;
+        }
+        let _com_guard = ComApartmentGuard(hr.is_ok());
+        work()
+    })
+    .join()
+    .ok()
+    .flatten()
+}
 
-    render_pdf_first_page_png_winrt(pdf_bytes, target_width)
-        .ok()
-        .flatten()
+#[cfg(target_os = "windows")]
+fn render_pdf_first_page_png_worker(pdf_bytes: &[u8], target_width: u32) -> Option<Vec<u8>> {
+    let owned = pdf_bytes.to_vec();
+    run_winrt_mta(move || {
+        render_pdf_first_page_png_winrt(&owned, target_width)
+            .ok()
+            .flatten()
+    })
 }
 
 /// Render the first page of `pdf_bytes` to PNG using Windows WinRT `Windows.Data.Pdf`.
@@ -681,17 +702,166 @@ pub fn render_pdf_first_page_png(pdf_bytes: &[u8], target_width: u32) -> Option<
     if pdf_bytes.is_empty() || pdf_bytes.len() > MAX_ATTACHMENT_PREVIEW_BYTES {
         return None;
     }
-    let width = target_width.max(64);
-    let owned = pdf_bytes.to_vec();
-    std::thread::spawn(move || render_pdf_first_page_png_worker(&owned, width))
-        .join()
-        .ok()
-        .flatten()
+    render_pdf_first_page_png_worker(pdf_bytes, target_width.max(64))
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn render_pdf_first_page_png(_pdf_bytes: &[u8], _target_width: u32) -> Option<Vec<u8>> {
     None
+}
+
+/// 把图片解码并按最长边 `max_edge` 缩放到 PNG，用于抽屉/图库缩略图。
+#[cfg(target_os = "windows")]
+fn render_image_thumbnail_png_winrt(
+    image_bytes: &[u8],
+    max_edge: u32,
+) -> windows::core::Result<Option<Vec<u8>>> {
+    use windows::Graphics::Imaging::{
+        BitmapAlphaMode, BitmapDecoder, BitmapEncoder, BitmapInterpolationMode, BitmapPixelFormat,
+        BitmapTransform, ColorManagementMode, ExifOrientationMode,
+    };
+    use windows::Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream};
+
+    let input_stream = InMemoryRandomAccessStream::new()?;
+    let writer = DataWriter::CreateDataWriter(&input_stream)?;
+    writer.WriteBytes(image_bytes)?;
+    writer.StoreAsync()?.get()?;
+    writer.FlushAsync()?.get()?;
+    let _ = writer.DetachStream()?;
+    input_stream.Seek(0)?;
+
+    let decoder = BitmapDecoder::CreateAsync(&input_stream)?.get()?;
+    let (width, height) = (
+        decoder.OrientedPixelWidth()?,
+        decoder.OrientedPixelHeight()?,
+    );
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+
+    let edge = max_edge.max(32);
+    let scale = (edge as f64 / width.max(height) as f64).min(1.0);
+    let target_width = ((width as f64 * scale).round() as u32).max(1);
+    let target_height = ((height as f64 * scale).round() as u32).max(1);
+
+    let transform = BitmapTransform::new()?;
+    transform.SetScaledWidth(target_width)?;
+    transform.SetScaledHeight(target_height)?;
+    transform.SetInterpolationMode(BitmapInterpolationMode::Fant)?;
+
+    let provider = decoder
+        .GetPixelDataTransformedAsync(
+            BitmapPixelFormat::Bgra8,
+            BitmapAlphaMode::Straight,
+            &transform,
+            ExifOrientationMode::RespectExifOrientation,
+            ColorManagementMode::DoNotColorManage,
+        )?
+        .get()?;
+    let pixels = provider.DetachPixelData()?;
+    if pixels.is_empty() {
+        return Ok(None);
+    }
+
+    let out_stream = InMemoryRandomAccessStream::new()?;
+    let encoder = BitmapEncoder::CreateAsync(BitmapEncoder::PngEncoderId()?, &out_stream)?.get()?;
+    encoder.SetPixelData(
+        BitmapPixelFormat::Bgra8,
+        BitmapAlphaMode::Straight,
+        target_width,
+        target_height,
+        96.0,
+        96.0,
+        &pixels,
+    )?;
+    encoder.FlushAsync()?.get()?;
+    out_stream.FlushAsync()?.get()?;
+
+    let raw_size = out_stream.Size()?;
+    if raw_size == 0 || raw_size > MAX_ATTACHMENT_PREVIEW_BYTES as u64 {
+        return Ok(None);
+    }
+    let size = raw_size as u32;
+    out_stream.Seek(0)?;
+
+    let reader = DataReader::CreateDataReader(&out_stream)?;
+    let loaded = reader.LoadAsync(size)?.get()?;
+    if loaded == 0 || loaded > MAX_ATTACHMENT_PREVIEW_BYTES as u32 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; loaded as usize];
+    reader.ReadBytes(&mut buf)?;
+    let _ = reader.DetachStream();
+
+    if !buf.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok(None);
+    }
+    Ok(Some(buf))
+}
+
+#[cfg(target_os = "windows")]
+fn render_image_thumbnail_png(image_bytes: &[u8], max_edge: u32) -> Option<Vec<u8>> {
+    if image_bytes.is_empty() || image_bytes.len() > MAX_ATTACHMENT_PREVIEW_BYTES {
+        return None;
+    }
+    let owned = image_bytes.to_vec();
+    let edge = max_edge.max(32);
+    run_winrt_mta(move || {
+        render_image_thumbnail_png_winrt(&owned, edge)
+            .ok()
+            .flatten()
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn render_image_thumbnail_png(_image_bytes: &[u8], _max_edge: u32) -> Option<Vec<u8>> {
+    None
+}
+
+/// 按文件头识别图片类型，用于无法解码时（如 SVG）的安全回落。
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some("image/x-icon");
+    }
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
+    let head = head.trim_start();
+    if head.starts_with("<svg") || head.starts_with("<?xml") {
+        return Some("image/svg+xml");
+    }
+    None
+}
+
+/// 构造缩略图 data URL：PDF 用首页小图，图片用受限尺寸 PNG（无法解码时按文件头小图回落）。
+fn thumbnail_data_url_for_attachment(bytes: &[u8], is_image: bool, is_pdf: bool) -> Option<String> {
+    if is_pdf {
+        return render_pdf_first_page_png(bytes, 240)
+            .map(|png| format!("data:image/png;base64,{}", encode_base64(&png)));
+    }
+    if !is_image {
+        return None;
+    }
+    if let Some(png) = render_image_thumbnail_png(bytes, ATTACHMENT_THUMBNAIL_MAX_EDGE) {
+        return Some(format!("data:image/png;base64,{}", encode_base64(&png)));
+    }
+    if bytes.len() > ATTACHMENT_THUMBNAIL_FALLBACK_MAX_BYTES {
+        return None;
+    }
+    sniff_image_mime(bytes).map(|mime| format!("data:{mime};base64,{}", encode_base64(bytes)))
 }
 
 fn demo_attachment_payload(attachment_id: u32, filename: &str, mime_type: &str) -> Vec<u8> {
@@ -819,6 +989,21 @@ impl MailSession {
                         demo_attachment_payload(att.id, &att.filename, &att.mime_type),
                     )
                 };
+                if input.thumbnail_only {
+                    let thumbnail_data_url = thumbnail_data_url_for_attachment(
+                        &bytes,
+                        is_img,
+                        is_pdf_attachment(&att.mime_type, &att.filename),
+                    );
+                    return Ok(FetchAttachmentPreviewOutput {
+                        attachment_id: att.id,
+                        filename: att.filename,
+                        mime_type: preview_mime,
+                        data_url: String::new(),
+                        size_bytes: 0,
+                        thumbnail_data_url,
+                    });
+                }
                 let thumbnail_data_url = if is_pdf_attachment(&att.mime_type, &att.filename) {
                     render_pdf_first_page_png(&bytes, 240)
                         .map(|png| format!("data:image/png;base64,{}", encode_base64(&png)))
@@ -920,6 +1105,21 @@ impl MailSession {
                     ));
                 }
                 let safe_mime = sanitize_mime_for_data_url(&mime_type, &filename);
+                if input.thumbnail_only {
+                    let thumbnail_data_url = thumbnail_data_url_for_attachment(
+                        &bytes,
+                        is_image_attachment(&mime_type, &filename),
+                        is_pdf_attachment(&mime_type, &filename),
+                    );
+                    return Ok(FetchAttachmentPreviewOutput {
+                        attachment_id: input.attachment_id,
+                        filename,
+                        mime_type: safe_mime,
+                        data_url: String::new(),
+                        size_bytes: 0,
+                        thumbnail_data_url,
+                    });
+                }
                 let data_url = format!("data:{safe_mime};base64,{}", encode_base64(&bytes));
                 let size_bytes = bytes.len();
                 let thumbnail_data_url = if is_pdf_attachment(&mime_type, &filename) {
@@ -1679,6 +1879,7 @@ mod tests {
         let preview = session
             .fetch_attachment_preview(&FetchAttachmentPreviewInput {
                 attachment_id: first_img_id,
+                thumbnail_only: false,
             })
             .expect("preview demo image");
         assert!(preview.data_url.starts_with("data:image/svg+xml;base64,"));
@@ -1840,7 +2041,8 @@ mod tests {
         assert_eq!(
             session
                 .fetch_attachment_preview(&FetchAttachmentPreviewInput {
-                    attachment_id: small_id
+                    attachment_id: small_id,
+                    thumbnail_only: false,
                 })
                 .unwrap_err()
                 .code,
@@ -1895,6 +2097,7 @@ mod tests {
         let preview_ok = session
             .fetch_attachment_preview(&FetchAttachmentPreviewInput {
                 attachment_id: small_id,
+                thumbnail_only: false,
             })
             .expect("small text preview");
         assert_eq!(preview_ok.data_url, "data:text/plain;base64,aGVsbG8=");
@@ -1902,6 +2105,7 @@ mod tests {
         let preview_huge = session
             .fetch_attachment_preview(&FetchAttachmentPreviewInput {
                 attachment_id: huge_id,
+                thumbnail_only: false,
             })
             .unwrap_err();
         assert_eq!(preview_huge.code, "INVALID_INPUT");
@@ -1981,7 +2185,10 @@ mod tests {
         let (session, _, dir) = make_test_session();
 
         let preview = session
-            .fetch_attachment_preview(&FetchAttachmentPreviewInput { attachment_id: 801 })
+            .fetch_attachment_preview(&FetchAttachmentPreviewInput {
+                attachment_id: 801,
+                thumbnail_only: false,
+            })
             .expect("preview Q3-roadmap-draft.pdf");
         assert_eq!(preview.filename, "Q3-roadmap-draft.pdf");
         assert_eq!(preview.mime_type, "application/pdf");
@@ -2001,10 +2208,162 @@ mod tests {
         );
 
         let text_preview = session
-            .fetch_attachment_preview(&FetchAttachmentPreviewInput { attachment_id: 803 })
+            .fetch_attachment_preview(&FetchAttachmentPreviewInput {
+                attachment_id: 803,
+                thumbnail_only: false,
+            })
             .expect("preview notes.txt");
         assert_eq!(text_preview.thumbnail_data_url, None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn make_test_png(width: u32, height: u32) -> Vec<u8> {
+        use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapEncoder, BitmapPixelFormat};
+        use windows::Storage::Streams::{DataReader, InMemoryRandomAccessStream};
+
+        run_winrt_mta(move || {
+            let stream = InMemoryRandomAccessStream::new().ok()?;
+            let encoder = BitmapEncoder::CreateAsync(BitmapEncoder::PngEncoderId().ok()?, &stream)
+                .ok()?
+                .get()
+                .ok()?;
+            let pixels = vec![0x40u8; (width as usize) * (height as usize) * 4];
+            encoder
+                .SetPixelData(
+                    BitmapPixelFormat::Bgra8,
+                    BitmapAlphaMode::Straight,
+                    width,
+                    height,
+                    96.0,
+                    96.0,
+                    &pixels,
+                )
+                .ok()?;
+            encoder.FlushAsync().ok()?.get().ok()?;
+            stream.FlushAsync().ok()?.get().ok()?;
+            let size = stream.Size().ok()? as u32;
+            if size == 0 {
+                return None;
+            }
+            stream.Seek(0).ok()?;
+            let reader = DataReader::CreateDataReader(&stream).ok()?;
+            let loaded = reader.LoadAsync(size).ok()?.get().ok()?;
+            if loaded == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; loaded as usize];
+            reader.ReadBytes(&mut buf).ok()?;
+            Some(buf)
+        })
+        .expect("encode test png")
+    }
+
+    fn png_dimensions(png: &[u8]) -> (u32, u32) {
+        assert!(png.len() > 24, "png too short");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let width = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+        let height = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+        (width, height)
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn image_thumbnail_downscales_to_limited_edge() {
+        let source = make_test_png(1200, 800);
+        let thumb = render_image_thumbnail_png(&source, ATTACHMENT_THUMBNAIL_MAX_EDGE)
+            .expect("png thumbnail should render");
+        let (width, height) = png_dimensions(&thumb);
+        assert_eq!(width, ATTACHMENT_THUMBNAIL_MAX_EDGE);
+        assert!(height < 200, "unexpected thumbnail height {height}");
+        assert!(
+            thumb.len() < source.len(),
+            "thumbnail {} bytes should be smaller than source {} bytes",
+            thumb.len(),
+            source.len()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn thumbnail_only_preview_returns_small_image_without_original_payload() {
+        let (session, _, dir) = make_test_session();
+
+        let pdf_thumb = session
+            .fetch_attachment_preview(&FetchAttachmentPreviewInput {
+                attachment_id: 801,
+                thumbnail_only: true,
+            })
+            .expect("thumbnail for Q3-roadmap-draft.pdf");
+        assert_eq!(pdf_thumb.data_url, "");
+        assert_eq!(pdf_thumb.size_bytes, 0);
+        let pdf_png = decode_base64_for_test(
+            pdf_thumb
+                .thumbnail_data_url
+                .expect("pdf thumbnail")
+                .strip_prefix("data:image/png;base64,")
+                .expect("pdf thumbnail must be PNG"),
+        );
+        let (width, _height) = png_dimensions(&pdf_png);
+        assert!(width <= ATTACHMENT_THUMBNAIL_MAX_EDGE);
+
+        let image_item = {
+            let demo = session.demo.lock().expect("demo mutex poisoned");
+            demo.store
+                .list_cached_attachments("", 0, 10_000)
+                .into_iter()
+                .find(|a| is_image_attachment(&a.mime_type, &a.filename))
+        }
+        .expect("demo image attachment");
+        let image_thumb = session
+            .fetch_attachment_preview(&FetchAttachmentPreviewInput {
+                attachment_id: image_item.id,
+                thumbnail_only: true,
+            })
+            .expect("image thumbnail");
+        assert_eq!(image_thumb.data_url, "");
+        assert_eq!(image_thumb.size_bytes, 0);
+        assert!(
+            image_thumb
+                .thumbnail_data_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("data:image/")),
+            "image thumbnail must stay an image data url"
+        );
+
+        let text_thumb = session
+            .fetch_attachment_preview(&FetchAttachmentPreviewInput {
+                attachment_id: 803,
+                thumbnail_only: true,
+            })
+            .expect("thumbnail for notes.txt");
+        assert_eq!(text_thumb.thumbnail_data_url, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumbnail_helper_skips_corrupt_or_oversized_payloads() {
+        assert_eq!(
+            thumbnail_data_url_for_attachment(b"not a pdf", false, true),
+            None
+        );
+        assert_eq!(
+            thumbnail_data_url_for_attachment(b"not an image", true, false),
+            None
+        );
+        let oversized = vec![0x11u8; ATTACHMENT_THUMBNAIL_FALLBACK_MAX_BYTES + 1];
+        assert_eq!(
+            thumbnail_data_url_for_attachment(&oversized, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn thumbnail_helper_falls_back_to_raw_svg_data_url() {
+        let svg = DEMO_SAFE_SVG.as_bytes();
+        let url = thumbnail_data_url_for_attachment(svg, true, false).expect("svg fallback");
+        assert!(url.starts_with("data:image/svg+xml;base64,"));
     }
 }
