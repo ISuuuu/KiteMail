@@ -304,14 +304,15 @@
       <button type="button" class="km-link-btn" @click="emit('refresh')">重试</button>
     </div>
 
-    <!-- 虚拟滚动容器 -->
-    <div
-      ref="viewportRef"
-      class="km-list-viewport"
-      role="listbox"
-      aria-label="邮件列表"
-      @scroll="onScroll"
-    >
+    <!-- 虚拟滚动容器（零宽度占用的浮层滚动条，保持 350px 列表中卡片约 338px 净宽） -->
+    <div class="km-list-viewport-wrap">
+      <div
+        ref="viewportRef"
+        class="km-list-viewport"
+        role="listbox"
+        aria-label="邮件列表"
+        @scroll="onScroll"
+      >
       <div v-if="cacheReady === false && messages.length === 0" class="km-list-empty" role="status">
         <span class="km-initial-spinner" aria-hidden="true" />
         <p class="km-empty-title">正在初始化离线缓存并同步邮件…</p>
@@ -412,6 +413,24 @@
         >
           {{ loadingOlder ? "正在拉取更早邮件…" : "加载更早邮件" }}
         </button>
+      </div>
+      </div>
+
+      <div
+        v-if="overlayThumb.visible"
+        class="km-overlay-scrollbar"
+        :class="{ active: overlayScrollbarActive || isDraggingScrollbar }"
+        aria-hidden="true"
+      >
+        <div
+          class="km-overlay-scroll-thumb"
+          :class="{ dragging: isDraggingScrollbar }"
+          :style="{
+            height: `${overlayThumb.heightPx}px`,
+            transform: `translateY(${overlayThumb.topPx}px)`,
+          }"
+          @pointerdown.stop.prevent="onOverlayThumbPointerDown"
+        />
       </div>
     </div>
   </section>
@@ -730,7 +749,66 @@ const totalHeight = computed(() => virtualLayout.value.totalHeight);
 
 const scrollTop = ref(0);
 const viewportHeight = ref(600);
+const viewportScrollHeight = ref(0);
+const overlayScrollbarActive = ref(false);
+const isDraggingScrollbar = ref(false);
 const OVERSCAN_PX = 360;
+
+const overlayThumb = computed(() => {
+  const viewH = viewportHeight.value;
+  const contentH = Math.max(totalHeight.value, viewportScrollHeight.value);
+  if (viewH <= 0 || contentH <= viewH + 1) {
+    return { visible: false, heightPx: 0, topPx: 0, trackPx: 0, maxScroll: 0 };
+  }
+  const trackPx = Math.max(24, viewH - 8);
+  const heightPx = Math.max(28, Math.min(trackPx, Math.round((viewH / contentH) * trackPx)));
+  const maxScroll = Math.max(1, contentH - viewH);
+  const ratio = Math.min(1, Math.max(0, scrollTop.value / maxScroll));
+  const topPx = 4 + Math.round(ratio * Math.max(0, trackPx - heightPx));
+  return { visible: true, heightPx, topPx, trackPx, maxScroll };
+});
+
+let overlayFadeTimer: ReturnType<typeof setTimeout> | null = null;
+function bumpOverlayScrollbar() {
+  overlayScrollbarActive.value = true;
+  if (overlayFadeTimer) clearTimeout(overlayFadeTimer);
+  overlayFadeTimer = setTimeout(() => {
+    overlayScrollbarActive.value = false;
+    overlayFadeTimer = null;
+  }, 900);
+}
+
+let thumbDragStartY = 0;
+let thumbDragStartScroll = 0;
+
+function onOverlayThumbPointerMove(e: PointerEvent) {
+  if (!isDraggingScrollbar.value || !viewportRef.value) return;
+  const { trackPx, heightPx, maxScroll } = overlayThumb.value;
+  const scrollableTrack = Math.max(1, trackPx - heightPx);
+  const deltaY = e.clientY - thumbDragStartY;
+  const nextTop = Math.min(maxScroll, Math.max(0, thumbDragStartScroll + (deltaY / scrollableTrack) * maxScroll));
+  viewportRef.value.scrollTop = nextTop;
+  scrollTop.value = nextTop;
+}
+
+function stopOverlayThumbDrag() {
+  if (!isDraggingScrollbar.value) return;
+  isDraggingScrollbar.value = false;
+  window.removeEventListener("pointermove", onOverlayThumbPointerMove);
+  window.removeEventListener("pointerup", stopOverlayThumbDrag);
+  window.removeEventListener("pointercancel", stopOverlayThumbDrag);
+  bumpOverlayScrollbar();
+}
+
+function onOverlayThumbPointerDown(e: PointerEvent) {
+  if (!viewportRef.value || e.button !== 0) return;
+  isDraggingScrollbar.value = true;
+  thumbDragStartY = e.clientY;
+  thumbDragStartScroll = viewportRef.value.scrollTop;
+  window.addEventListener("pointermove", onOverlayThumbPointerMove);
+  window.addEventListener("pointerup", stopOverlayThumbDrag);
+  window.addEventListener("pointercancel", stopOverlayThumbDrag);
+}
 
 function findStartIndex(items: VirtualListItem[], targetTop: number): number {
   let lo = 0;
@@ -764,6 +842,7 @@ const visibleItems = computed(() => {
 let scrollRaf: number | null = null;
 function onScroll() {
   if (!viewportRef.value) return;
+  bumpOverlayScrollbar();
   if (scrollRaf !== null) return;
   scrollRaf = requestAnimationFrame(() => {
     scrollRaf = null;
@@ -771,6 +850,7 @@ function onScroll() {
     if (!el) return;
     scrollTop.value = el.scrollTop;
     viewportHeight.value = el.clientHeight;
+    viewportScrollHeight.value = el.scrollHeight;
     if (!props.loading && el.scrollTop + el.clientHeight >= el.scrollHeight - 400) {
       if (props.hasMore) {
         emit("loadMore");
@@ -896,8 +976,12 @@ onMounted(() => {
   document.addEventListener("pointerdown", onDocumentPointerDown);
   if (viewportRef.value) {
     viewportHeight.value = viewportRef.value.clientHeight || 600;
+    viewportScrollHeight.value = viewportRef.value.scrollHeight || 0;
     ro = new ResizeObserver((entries) => {
       viewportHeight.value = entries[0].contentRect.height || 600;
+      if (viewportRef.value) {
+        viewportScrollHeight.value = viewportRef.value.scrollHeight;
+      }
     });
     ro.observe(viewportRef.value);
   }
@@ -906,6 +990,8 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener("km-focus-search", onFocusSearchEvent);
   document.removeEventListener("pointerdown", onDocumentPointerDown);
+  stopOverlayThumbDrag();
+  if (overlayFadeTimer) clearTimeout(overlayFadeTimer);
   ro?.disconnect();
   if (scrollRaf !== null) cancelAnimationFrame(scrollRaf);
   if (searchTimer) clearTimeout(searchTimer);
@@ -919,17 +1005,9 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--km-surface, #fafafb);
+  background: var(--km-list-bg, var(--km-surface, #fafafb));
   color: var(--km-text);
   overflow: hidden;
-}
-
-:global(:root[data-theme="system"][data-color-mode="light"]) .km-list-pane {
-  background: #fafafb;
-}
-
-:global(:root[data-theme="system"][data-color-mode="dark"]) .km-list-pane {
-  background: #222226;
 }
 
 .km-list-header {
@@ -983,8 +1061,17 @@ onUnmounted(() => {
   color: var(--km-accent);
 }
 
+.km-window-close-btn {
+  width: 24px;
+  height: 24px;
+  margin-left: 2px;
+  border-radius: 999px;
+  background: var(--km-pill-bg);
+  color: var(--km-text);
+}
+
 .km-window-close-btn:hover {
-  background: var(--km-danger-soft);
+  background: color-mix(in srgb, var(--km-danger) 16%, var(--km-pill-bg));
   color: var(--km-danger);
 }
 
@@ -1305,12 +1392,60 @@ onUnmounted(() => {
   gap: 8px;
 }
 
+.km-list-viewport-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .km-list-viewport {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   position: relative;
+  scrollbar-width: none;
+}
+
+.km-list-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.km-overlay-scrollbar {
+  position: absolute;
+  top: 0;
+  right: 2px;
+  bottom: 0;
+  width: 6px;
+  pointer-events: none;
+  z-index: 5;
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.km-list-viewport-wrap:hover .km-overlay-scrollbar,
+.km-overlay-scrollbar.active {
+  opacity: 1;
+}
+
+.km-overlay-scroll-thumb {
+  width: 5px;
+  margin-left: 1px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--km-text-muted) 38%, transparent);
+  pointer-events: auto;
+  cursor: default;
+  transition: background-color 120ms ease, width 120ms ease;
+}
+
+.km-overlay-scroll-thumb:hover,
+.km-overlay-scroll-thumb.dragging {
+  width: 6px;
+  margin-left: 0;
+  background: color-mix(in srgb, var(--km-text-muted) 62%, transparent);
 }
 
 .km-virtual-spacer {
@@ -1329,7 +1464,7 @@ onUnmounted(() => {
 .km-date-group-header {
   width: 100%;
   height: 28px;
-  padding: 0 14px;
+  padding: 0 16px;
   border: none;
   display: flex;
   align-items: center;

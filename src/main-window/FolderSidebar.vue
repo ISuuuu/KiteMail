@@ -1316,10 +1316,6 @@ onUnmounted(() => {
   transition: width 120ms ease;
 }
 
-:global(:root[data-theme="system"][data-color-mode="dark"]) .km-sidebar {
-  background: #2e2e32;
-}
-
 .km-sidebar-header {
   height: 48px;
   min-height: 48px;
@@ -1694,13 +1690,9 @@ onUnmounted(() => {
 }
 
 .km-nav-row.active {
-  background: #d8d8db;
+  background: var(--km-sidebar-active-bg);
   color: var(--km-text);
   font-weight: 600;
-}
-
-:global(:root[data-color-mode="dark"]) .km-nav-row.active {
-  background: #434347;
 }
 
 .km-nav-icon {
@@ -1802,12 +1794,8 @@ onUnmounted(() => {
 }
 
 .km-subrow-btn.active {
-  background: #d8d8db;
+  background: var(--km-sidebar-active-bg);
   font-weight: 600;
-}
-
-:global(:root[data-color-mode="dark"]) .km-subrow-btn.active {
-  background: #434347;
 }
 
 .km-subrow-label {
@@ -1944,10 +1932,6 @@ onUnmounted(() => {
   line-height: 1;
 }
 
-:global(:root[data-theme="system"][data-color-mode="dark"]) .km-avatar-badge {
-  border-color: #2e2e32;
-}
-
 .km-account-meta {
   flex: 1 1 auto;
   min-width: 0;
@@ -2030,12 +2014,8 @@ onUnmounted(() => {
 }
 
 .km-folder-btn.active {
-  background: #d8d8db;
+  background: var(--km-sidebar-active-bg);
   font-weight: 600;
-}
-
-:global(:root[data-color-mode="dark"]) .km-folder-btn.active {
-  background: #434347;
 }
 
 .km-folder-total {
@@ -2073,11 +2053,7 @@ onUnmounted(() => {
 }
 
 .km-rail-icon-btn.active {
-  background: #d8d8db;
-}
-
-:global(:root[data-color-mode="dark"]) .km-rail-icon-btn.active {
-  background: #434347;
+  background: var(--km-sidebar-active-bg);
 }
 
 .km-rail-divider {
@@ -2104,11 +2080,7 @@ onUnmounted(() => {
 }
 
 .km-rail-account-btn.active {
-  background: #d8d8db;
-}
-
-:global(:root[data-color-mode="dark"]) .km-rail-account-btn.active {
-  background: #434347;
+  background: var(--km-sidebar-active-bg);
 }
 
 /* 底部固定两行：通讯录与附件 */
@@ -2153,11 +2125,7 @@ onUnmounted(() => {
 }
 
 .km-footer-row.active {
-  background: #d8d8db;
+  background: var(--km-sidebar-active-bg);
   font-weight: 600;
-}
-
-:global(:root[data-color-mode="dark"]) .km-footer-row.active {
-  background: #434347;
 }
 </style>

@@ -63,6 +63,11 @@
           title="调整网格缩略图大小"
         >
           <span class="sr-only">缩略图大小</span>
+          <svg class="km-slider-icon km-slider-icon-sm" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <rect x="2" y="3" width="12" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.35" />
+            <circle cx="5.6" cy="6.4" r="1.1" fill="currentColor" />
+            <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" d="m3.5 11.2 2.8-2.6 2 1.8 2.2-2.2 2 3" />
+          </svg>
           <input
             v-model.number="thumbSize"
             type="range"
@@ -73,6 +78,11 @@
             aria-label="缩略图大小"
             @change="persistDrawerPrefs"
           />
+          <svg class="km-slider-icon km-slider-icon-lg" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true">
+            <rect x="2" y="3" width="12" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3" />
+            <circle cx="5.6" cy="6.4" r="1.1" fill="currentColor" />
+            <path fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" d="m3.5 11.2 2.8-2.6 2 1.8 2.2-2.2 2 3" />
+          </svg>
         </label>
 
         <button
@@ -470,7 +480,7 @@ const totalBytes = computed(() =>
 );
 
 const savableIds = computed(() => aggregatedItems.value.map((item) => item.id));
-const showSizeSlider = computed(() => drawerWidth.value >= 420);
+const showSizeSlider = computed(() => drawerWidth.value >= 460);
 
 const drawerContainerStyle = computed(() => {
   if (!expanded.value) return {};
@@ -694,12 +704,9 @@ defineExpose({
   user-select: text;
 }
 
-:global(:root[data-color-mode="dark"]) .km-inline-drawer {
-  background: var(--km-drawer-bg, #29292d);
-}
-
 .km-drawer-handle {
-  height: 10px;
+  height: 16px;
+  padding-top: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -709,20 +716,21 @@ defineExpose({
 }
 
 .km-drawer-handle-pill {
-  width: 38px;
-  height: 4px;
+  width: 100px;
+  height: 5px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--km-text-muted) 42%, transparent);
+  background: color-mix(in srgb, var(--km-text-muted) 45%, transparent);
   transition: background-color 120ms ease, width 120ms ease;
 }
 
 .km-drawer-handle:hover .km-drawer-handle-pill {
-  width: 48px;
+  width: 112px;
   background: var(--km-accent);
 }
 
 .km-drawer-header {
-  height: 32px;
+  height: 40px;
+  min-height: 40px;
   padding: 0 12px 4px;
   display: flex;
   align-items: center;
@@ -732,16 +740,18 @@ defineExpose({
 }
 
 .km-drawer-summary-btn {
+  height: 34px;
+  min-width: 0;
   border: none;
   background: transparent;
   color: var(--km-text);
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 2px 6px;
+  padding: 0 8px;
   border-radius: var(--km-radius-sm);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
 }
 
@@ -750,19 +760,24 @@ defineExpose({
 }
 
 .km-drawer-title {
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .km-drawer-meta {
   font-size: 11px;
   font-weight: 400;
   color: var(--km-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .km-drawer-chevron {
   color: var(--km-text-muted);
   transition: transform 140ms ease;
+  flex-shrink: 0;
 }
 
 .km-drawer-chevron.collapsed {
@@ -772,24 +787,34 @@ defineExpose({
 .km-drawer-toolbar {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   flex-shrink: 0;
+  height: 34px;
 }
 
 .km-thumb-slider-wrap {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
+  height: 34px;
+}
+
+.km-slider-icon {
+  color: var(--km-text-muted);
+  flex-shrink: 0;
 }
 
 .km-thumb-slider {
-  width: 78px;
+  width: 110px;
+  height: 20px;
+  margin: 0;
   accent-color: var(--km-accent);
   cursor: pointer;
 }
 
 .km-drawer-icon-btn {
-  width: 26px;
-  height: 26px;
+  width: 32px;
+  height: 32px;
   border: none;
   border-radius: var(--km-radius-sm);
   background: transparent;
@@ -798,6 +823,7 @@ defineExpose({
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  flex-shrink: 0;
 }
 
 .km-drawer-icon-btn:hover {
@@ -806,14 +832,19 @@ defineExpose({
 }
 
 .km-btn-save-all {
-  height: 24px;
-  padding: 0 10px;
+  height: 34px;
+  padding: 0 14px;
   border: 1px solid var(--km-border);
-  border-radius: var(--km-radius-sm);
+  border-radius: var(--km-radius-md);
   background: var(--km-surface-raised);
   color: var(--km-text);
-  font-size: 11.5px;
-  font-weight: 500;
+  font-size: 12.5px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  flex-shrink: 0;
   cursor: pointer;
 }
 

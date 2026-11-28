@@ -1,7 +1,7 @@
 <template>
   <section class="km-reader-pane" :class="{ below: isBelow }" aria-label="邮件阅读区">
     <!-- 顶部一行无边框图标工具栏 (48px)，空白区支持拖拽窗口 -->
-    <header ref="toolbarRef" class="km-reader-toolbar">
+    <header ref="toolbarRef" class="km-reader-toolbar" :class="{ compact: isCompactToolbar }">
       <div v-if="message" class="km-toolbar-group km-toolbar-left">
         <button
           type="button"
@@ -429,35 +429,50 @@
           <div class="km-view-toggles">
             <button
               type="button"
-              class="km-tool-icon-btn km-mode-toggle"
-              :class="{ active: perMessageDark !== null && perMessageDark !== undefined }"
-              :aria-pressed="Boolean(perMessageDark)"
+              class="km-reader-switch"
+              :class="{ active: isPerMessageDarkActive }"
+              :aria-pressed="isPerMessageDarkActive"
               :title="perMessageDarkTitle"
-              aria-label="切换此邮件亮暗渲染"
+              :aria-label="perMessageDarkTitle"
               @click="emit('togglePerMessageDark')"
             >
-              <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
-                <path
-                  fill="currentColor"
-                  d="M8 1.8a6.2 6.2 0 1 0 0 12.4A6.2 6.2 0 0 0 8 1.8Zm0 1.4a4.8 4.8 0 0 1 0 9.6V3.2Z"
-                />
-              </svg>
+              <span class="km-switch-icon" aria-hidden="true">
+                <svg viewBox="0 0 16 16" width="15" height="15">
+                  <path
+                    fill="currentColor"
+                    d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1Zm0 1.4a5.6 5.6 0 1 1 0 11.2V2.4Z"
+                  />
+                  <path
+                    fill="currentColor"
+                    d="M8.5 3.4h3.9v1H8.5v-1Zm0 2h4.7v1H8.5v-1Zm0 2.1h5v1h-5v-1Zm0 2.1h4.7v1H8.5v-1Zm0 2h3.9v1H8.5v-1Z"
+                  />
+                </svg>
+              </span>
+              <span class="km-switch-track" aria-hidden="true">
+                <span class="km-switch-thumb" />
+              </span>
             </button>
             <button
               type="button"
-              class="km-tool-icon-btn km-mode-toggle"
+              role="switch"
+              class="km-reader-switch"
               :class="{ active: Boolean(readingView) }"
-              :aria-pressed="Boolean(readingView)"
+              :aria-checked="Boolean(readingView)"
               title="切换阅读视图（统一排版显示邮件内容）"
               aria-label="切换阅读视图"
               @click="emit('toggleReadingView')"
             >
-              <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
-                <path
-                  fill="currentColor"
-                  d="M1.5 7.5a2.6 2.6 0 0 1 5.05-.86c.42-.2.9-.3 1.45-.3s1.03.1 1.45.3A2.6 2.6 0 1 1 14.5 8.5a2.6 2.6 0 0 1-5.12-.62A1.8 1.8 0 0 0 8 7.5a1.8 1.8 0 0 0-1.38.38A2.6 2.6 0 1 1 1.5 7.5Zm2.6-1.3a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 0 0 0-2.6Zm7.8 0a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 0 0 0-2.6Z"
-                />
-              </svg>
+              <span class="km-switch-icon" aria-hidden="true">
+                <svg viewBox="0 0 16 16" width="16" height="16">
+                  <path
+                    fill="currentColor"
+                    d="M1 6.2c.9-1 2.1-1.2 3.1-1.2 1.1 0 2 .5 2.4 1.1.4-.2.9-.3 1.5-.3s1.1.1 1.5.3C9.9 5.5 10.8 5 11.9 5c1 0 2.2.2 3.1 1.2.6.2 1 .7 1 1.3 0 .3-.1.6-.2.8.1.3.2.6.2 1 0 2.2-1.4 3.4-3.5 3.4s-3.4-1.3-3.5-3.3c0-.5-.5-.9-1-.9s-1 .4-1 .9c-.1 2-1.4 3.3-3.5 3.3S0 11.5 0 9.3c0-.4.1-.7.2-1C.1 8.1 0 7.8 0 7.5c0-.6.4-1.1 1-1.3Zm2.5 1.1a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm9 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"
+                  />
+                </svg>
+              </span>
+              <span class="km-switch-track" aria-hidden="true">
+                <span class="km-switch-thumb" />
+              </span>
             </button>
           </div>
         </div>
@@ -699,6 +714,10 @@ const findInputRef = ref<HTMLInputElement | null>(null);
 const drawerRef = ref<InstanceType<typeof AttachmentDrawer> | null>(null);
 
 const overflowActions = computed(() => computeReaderOverflowActions(toolbarWidth.value));
+const isCompactToolbar = computed(() => toolbarWidth.value > 0 && toolbarWidth.value < 430);
+const isPerMessageDarkActive = computed(
+  () => props.perMessageDark !== null && props.perMessageDark !== undefined
+);
 
 function isOverflowed(id: ReaderOverflowActionId): boolean {
   return overflowActions.value.includes(id);
@@ -918,10 +937,6 @@ defineExpose({
   overflow: hidden;
 }
 
-:global(:root[data-color-mode="dark"]) .km-reader-pane {
-  background: var(--km-reader-header-bg, #222226);
-}
-
 .km-reader-pane.below {
   min-height: 180px;
 }
@@ -929,7 +944,7 @@ defineExpose({
 .km-reader-toolbar {
   height: 48px;
   min-height: 48px;
-  padding: 0 10px 0 12px;
+  padding: 0 12px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -937,20 +952,20 @@ defineExpose({
   flex-shrink: 0;
 }
 
-:global(:root[data-color-mode="dark"]) .km-reader-toolbar {
-  background: var(--km-reader-header-bg, #222226);
-}
-
 .km-toolbar-group {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
   flex-shrink: 0;
+}
+
+.km-reader-toolbar.compact .km-toolbar-group {
+  gap: 1px;
 }
 
 .km-toolbar-drag {
   flex: 1 1 auto;
-  min-width: 16px;
+  min-width: 8px;
   height: 100%;
 }
 
@@ -966,6 +981,16 @@ defineExpose({
   justify-content: center;
   cursor: pointer;
   padding: 0;
+}
+
+.km-reader-toolbar.compact .km-tool-icon-btn {
+  width: 26px;
+  height: 28px;
+}
+
+.km-reader-toolbar.compact .km-tool-close {
+  width: 24px;
+  height: 24px;
 }
 
 .km-tool-icon-btn:hover:not(:disabled) {
@@ -991,11 +1016,16 @@ defineExpose({
 }
 
 .km-tool-close {
-  color: var(--km-text-muted);
+  width: 24px;
+  height: 24px;
+  margin-left: 4px;
+  border-radius: 999px;
+  background: var(--km-pill-bg);
+  color: var(--km-text);
 }
 
 .km-tool-close:hover {
-  background: var(--km-danger-soft);
+  background: color-mix(in srgb, var(--km-danger) 16%, var(--km-pill-bg));
   color: var(--km-danger);
 }
 
@@ -1194,10 +1224,6 @@ defineExpose({
   flex-shrink: 0;
 }
 
-:global(:root[data-color-mode="dark"]) .km-reader-subject-header {
-  background: var(--km-reader-header-bg, #222226);
-}
-
 .km-subject-top-row {
   display: flex;
   align-items: center;
@@ -1210,12 +1236,14 @@ defineExpose({
   display: inline-flex;
   align-items: center;
   max-width: 75%;
-  padding: 2px 10px;
+  padding: 2px 9px;
   border-radius: 999px;
-  border: 1px solid var(--km-border);
-  background: color-mix(in srgb, var(--km-text-muted) 8%, transparent);
-  color: var(--km-text-muted);
+  border: none;
+  background: var(--km-account-pill-bg, color-mix(in srgb, var(--km-accent) 16%, transparent));
+  color: var(--km-account-pill-fg, var(--km-accent));
   font-size: 11.5px;
+  font-weight: 700;
+  line-height: 1.35;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1228,19 +1256,78 @@ defineExpose({
 .km-view-toggles {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: 12px;
   flex-shrink: 0;
 }
 
-.km-mode-toggle {
-  width: 28px;
-  height: 28px;
+.km-reader-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
   color: var(--km-text-muted);
+  cursor: pointer;
 }
 
-.km-mode-toggle.active {
+.km-reader-switch:focus-visible {
+  outline: 2px solid var(--km-accent);
+  outline-offset: 2px;
+}
+
+.km-switch-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.78;
+  transition: color 140ms ease, opacity 140ms ease;
+}
+
+.km-reader-switch:hover .km-switch-icon,
+.km-reader-switch.active .km-switch-icon {
+  opacity: 1;
+}
+
+.km-reader-switch.active .km-switch-icon {
   color: var(--km-accent);
-  background: var(--km-accent-soft);
+}
+
+.km-switch-track {
+  position: relative;
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--km-text) 20%, transparent);
+  transition: background-color 140ms ease;
+  flex-shrink: 0;
+}
+
+.km-reader-switch:hover .km-switch-track {
+  background: color-mix(in srgb, var(--km-text) 28%, transparent);
+}
+
+.km-reader-switch.active .km-switch-track {
+  background: var(--km-accent);
+}
+
+.km-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 140ms ease;
+}
+
+.km-reader-switch.active .km-switch-thumb {
+  transform: translateX(14px);
 }
 
 .km-subject-title {
