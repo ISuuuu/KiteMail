@@ -332,6 +332,11 @@ fn main() {
                         if quitting_for_tick.load(Ordering::SeqCst) {
                             break;
                         }
+                        // 真实窗口可见性：关闭到托盘、最小化到托盘与托盘/单实例唤醒都靠它收敛。
+                        // 持续后台超过阈值才挂起原生阅读器，短暂失焦或菜单遮挡不受影响。
+                        reader_for_tick.note_main_window_visibility(
+                            crate::reader::main_window_in_foreground(&handle_for_tick),
+                        );
                         if let Some(ref t) = tray_for_tick {
                             t.set_lock_enabled(session_for_tick.has_passcode());
                             if prefs_for_tick.snapshot_raw().minimize_to_tray

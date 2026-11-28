@@ -5809,14 +5809,15 @@ pub(crate) mod tests {
         }
         fn apply_layout(
             &self,
+            _: String,
             _: crate::window_lifecycle::PhysicalRect,
             _: crate::window_lifecycle::PhysicalRect,
             _: bool,
-        ) -> Result<(), String> {
-            Ok(())
+        ) -> Result<crate::reader::LayoutDelivery, String> {
+            Ok(crate::reader::LayoutDelivery::Delivered)
         }
         fn set_visible(&self, _: bool) {}
-        fn set_zoom(&self, _: u32) {}
+        fn set_zoom(&self, _: String, _: u32) {}
         fn close(&self) {}
         fn emit_status(&self, event: ReaderStatusEvent) {
             self.events.lock().unwrap().push(event);
