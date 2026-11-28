@@ -1,6 +1,17 @@
 <template>
   <!-- 独立设置窗：同一前端仅渲染设置窗内容（WP-01），不跑主窗口 bootstrap / 锁屏流程 -->
-  <SettingsWindow v-if="isSettings" />
+  <div v-if="isSettings" class="km-app">
+    <component :is="settingsComponent" v-if="settingsComponent" />
+    <div v-else-if="settingsLoadError" class="km-error-page" role="alert">
+      <p class="km-error-title">偏好设置加载失败</p>
+      <p class="km-error-msg">{{ settingsLoadError }}</p>
+      <button type="button" class="km-retry-btn" @click="loadSettingsModule">重试</button>
+    </div>
+    <div v-else class="km-splash">
+      <span class="km-splash-spinner" aria-hidden="true" />
+      <span class="km-splash-text">正在打开偏好设置…</span>
+    </div>
+  </div>
   <div v-else class="km-app" :class="{ locked: state!.locked.value }">
     <MainWindow v-if="!state!.loading.value && !state!.error.value && !state!.locked.value" />
     <div v-else-if="state!.loading.value" class="km-splash">
@@ -30,11 +41,10 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onMounted, ref, watch } from "vue";
+import { nextTick, onMounted, ref, shallowRef, watch, type Component } from "vue";
 import { revealMainWindow } from "./ipc/windows";
 import MainWindow from "./main-window/MainWindow.vue";
 import LockScreen from "./main-window/LockScreen.vue";
-import SettingsWindow from "./settings/SettingsWindow.vue";
 import { provideMainWindow } from "./main-window/useMainWindow";
 import { triggerEarlyWindowReveal } from "./main-window/startupHelpers";
 import { isSettingsWindow } from "./settings/windowEnv";
@@ -43,6 +53,25 @@ import { isSettingsWindow } from "./settings/windowEnv";
 const isSettings = isSettingsWindow();
 const state = isSettings ? null : provideMainWindow();
 const revealError = ref<string | null>(null);
+
+// 设置窗内容按需加载：主窗口首屏不静态打包整套设置面板。
+const settingsComponent = shallowRef<Component | null>(null);
+const settingsLoadError = ref<string | null>(null);
+
+async function loadSettingsModule(): Promise<void> {
+  settingsLoadError.value = null;
+  try {
+    const mod = await import("./settings/SettingsWindow.vue");
+    settingsComponent.value = mod.default;
+  } catch (err) {
+    settingsLoadError.value = err instanceof Error ? err.message : String(err);
+    console.error("[startup] settings window module load failed:", err);
+  }
+}
+
+if (isSettings) {
+  void loadSettingsModule();
+}
 
 if (!isSettings && state) {
   let revealed = false;
