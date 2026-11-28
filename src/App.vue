@@ -26,6 +26,8 @@
 </template>
 
 <script setup lang="ts">
+import { nextTick, watch } from "vue";
+import { revealMainWindow } from "./ipc/windows";
 import MainWindow from "./main-window/MainWindow.vue";
 import LockScreen from "./main-window/LockScreen.vue";
 import SettingsWindow from "./settings/SettingsWindow.vue";
@@ -35,6 +37,25 @@ import { isSettingsWindow } from "./settings/windowEnv";
 // 入口分流一次性判定：设置窗不初始化主窗口状态。
 const isSettings = isSettingsWindow();
 const state = isSettings ? null : provideMainWindow();
+
+if (!isSettings && state) {
+  let revealed = false;
+  watch(
+    () => state.loading.value,
+    (isLoading) => {
+      if (isLoading || revealed) return;
+      revealed = true;
+      void nextTick(() => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            void revealMainWindow().catch(() => {});
+          });
+        });
+      });
+    },
+    { immediate: true }
+  );
+}
 </script>
 
 <style scoped>

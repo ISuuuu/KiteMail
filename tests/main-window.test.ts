@@ -53,6 +53,7 @@ import {
   updateMainPreferences,
 } from "../src/ipc/main-window.ts";
 import type { MessageSummaryDto } from "../src/ipc/types.ts";
+import { classifyFolderRole } from "../src/main-window/parityHelpers.ts";
 import {
   buildTauriDevConfig,
   buildTauriDevInvocation,
@@ -756,6 +757,40 @@ test("归档/删除/标垃圾/移动自动选中下一封并支持撤销状态�
     () => loadOlderMessages({ view: { kind: "unifiedInbox" }, limit: 20 }),
     isLockedError
   );
+
+  win.dispose();
+  resetMockSession();
+});
+
+test("classifyFolderRole 与在途 mail-changed 合并刷新兼容 Outlook 文件夹", async () => {
+  assert.equal(classifyFolderRole("AQMkADAwATNiZmYAZC04", "收件箱"), "inbox");
+  assert.equal(classifyFolderRole("AQMkGraphInboxId", "Inbox"), "inbox");
+  assert.equal(classifyFolderRole("AQMkGraphSentId", "Sent Items"), "sent");
+  assert.equal(classifyFolderRole("AQMkGraphDraftsId", "Drafts"), "drafts");
+  assert.equal(classifyFolderRole("AQMkGraphArchiveId", "存档"), "archive");
+  assert.equal(classifyFolderRole("AQMkGraphDeletedId", "Deleted Items"), "trash");
+  assert.equal(classifyFolderRole("AQMkGraphJunkId", "Junk Email"), "junk");
+
+  resetMockSession({ locked: false });
+  const win = useMainWindow();
+  await win.init();
+
+  // 在途切换视图期间爆发多次 mail-changed，不应丢弃首个列表响应或陷入失败态
+  win.selectView({ kind: "unifiedInbox" });
+  const baseVer = win.stateVersion.value;
+  emitMockEvent("main://mail-changed", {
+    stateVersion: baseVer + 1,
+    reason: "foldersLoaded",
+  });
+  emitMockEvent("main://mail-changed", {
+    stateVersion: baseVer + 2,
+    reason: "folderSynced",
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.equal(win.listLoading.value, false);
+  assert.equal(win.listError.value, null);
+  assert.ok(win.messages.value.length > 0);
 
   win.dispose();
   resetMockSession();

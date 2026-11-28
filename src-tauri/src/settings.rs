@@ -2,13 +2,14 @@
 //! trusted remote senders allowlist, cache pruning/clearing, and update checking.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 
 use kitemail_mail_core::app_lock::{
     hash_passcode, set_lock_persisted_in, validate_new_passcode, verify_passcode,
 };
 use kitemail_mail_core::cache::CacheStore;
-use kitemail_mail_core::config::{app_storage_summary_in, normalize_app_lock_idle_minutes};
+use kitemail_mail_core::config::{normalize_app_lock_idle_minutes, resolve_mail_data_dir_in};
 use kitemail_mail_core::{secrets, update, MailRequest};
 use tauri::State;
 
@@ -32,18 +33,68 @@ fn non_empty_opt(s: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn walk_dir_stats(
+    root: &std::path::Path,
+    skip_dir: Option<&std::path::Path>,
+    skip_dir_names: &[&str],
+) -> (u64, u64) {
+    let mut total_bytes = 0u64;
+    let mut file_count = 0u64;
+    let canonical_skip =
+        skip_dir.map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return (0, 0);
+    };
+    let mut stack = vec![entries];
+    while let Some(entries) = stack.pop() {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if skip_dir_names
+                            .iter()
+                            .any(|skip| name.eq_ignore_ascii_case(skip))
+                        {
+                            continue;
+                        }
+                    }
+                    if let Some(ref skip) = canonical_skip {
+                        let cmp = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                        if &cmp == skip {
+                            continue;
+                        }
+                    }
+                    if let Ok(sub) = std::fs::read_dir(&path) {
+                        stack.push(sub);
+                    }
+                }
+                Ok(ft) if ft.is_file() => {
+                    if let Ok(meta) = entry.metadata() {
+                        total_bytes = total_bytes.saturating_add(meta.len());
+                        file_count = file_count.saturating_add(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (total_bytes, file_count)
+}
+
 fn compute_storage_stats_for(data_dir: &std::path::Path) -> (String, String, StorageStatsDto) {
-    let summary = app_storage_summary_in(data_dir);
-    let config_bytes = summary.config_stats.total_bytes;
-    let mail_bytes = summary.mail_stats.total_bytes;
+    let mail_data_dir = resolve_mail_data_dir_in(data_dir);
+    let (config_bytes, config_files) = walk_dir_stats(
+        data_dir,
+        Some(&mail_data_dir),
+        &["WebView2", "WebView2-reader", "EBWebView"],
+    );
+    let (mail_bytes, mail_files) = walk_dir_stats(&mail_data_dir, None, &[]);
     let total_bytes = config_bytes.saturating_add(mail_bytes);
-    let file_count = summary
-        .config_stats
-        .file_count
-        .saturating_add(summary.mail_stats.file_count);
+    let file_count = config_files.saturating_add(mail_files);
     (
-        summary.app_data_dir.to_string_lossy().into_owned(),
-        summary.mail_data_dir.to_string_lossy().into_owned(),
+        data_dir.to_string_lossy().into_owned(),
+        mail_data_dir.to_string_lossy().into_owned(),
         StorageStatsDto {
             total_bytes,
             mail_bytes,
@@ -465,11 +516,22 @@ impl MailSession {
     }
 }
 
+async fn run_settings_blocking<T, F>(f: F) -> Result<T, IpcError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, IpcError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| IpcError::internal(format!("设置命令执行失败: {e}"), None))?
+}
+
 #[tauri::command]
-pub fn get_full_preferences(
+pub async fn get_full_preferences(
     state: State<'_, AppState>,
 ) -> Result<GetFullPreferencesOutput, IpcError> {
-    state.session.get_full_preferences()
+    let session = Arc::clone(&state.session);
+    run_settings_blocking(move || session.get_full_preferences()).await
 }
 
 #[tauri::command]
@@ -497,16 +559,18 @@ pub fn manage_trusted_senders(
 }
 
 #[tauri::command]
-pub fn clear_body_caches(
+pub async fn clear_body_caches(
     state: State<'_, AppState>,
     input: ClearBodyCachesInput,
 ) -> Result<ClearBodyCachesOutput, IpcError> {
-    state.session.clear_body_caches(&input)
+    let session = Arc::clone(&state.session);
+    run_settings_blocking(move || session.clear_body_caches(&input)).await
 }
 
 #[tauri::command]
-pub fn check_app_update(state: State<'_, AppState>) -> Result<CheckAppUpdateOutput, IpcError> {
-    state.session.check_app_update()
+pub async fn check_app_update(state: State<'_, AppState>) -> Result<CheckAppUpdateOutput, IpcError> {
+    let session = Arc::clone(&state.session);
+    run_settings_blocking(move || session.check_app_update()).await
 }
 
 #[cfg(test)]
@@ -862,5 +926,28 @@ mod tests {
                 "capabilities/main.json missing permission {perm}"
             );
         }
+    }
+
+    #[test]
+    fn compute_storage_stats_skips_webview2_and_avoids_double_counting_mail_dir() {
+        let base = std::env::temp_dir().join(format!("kitemail-stats-{}", uuid::Uuid::new_v4()));
+        let mail_acc = base.join("mail").join("acc@example.com");
+        let webview = base.join("WebView2").join("EBWebView").join("Cache");
+        let reader_wv = base.join("WebView2-reader").join("Default");
+        std::fs::create_dir_all(&mail_acc).unwrap();
+        std::fs::create_dir_all(&webview).unwrap();
+        std::fs::create_dir_all(&reader_wv).unwrap();
+        std::fs::write(base.join("global.db"), [1u8; 100]).unwrap();
+        std::fs::write(mail_acc.join("mail.db"), [2u8; 250]).unwrap();
+        std::fs::write(webview.join("data_0"), [3u8; 1000]).unwrap();
+        std::fs::write(reader_wv.join("data_1"), [4u8; 2000]).unwrap();
+
+        let (_, _, stats) = compute_storage_stats_for(&base);
+        assert_eq!(stats.config_bytes, 100);
+        assert_eq!(stats.mail_bytes, 250);
+        assert_eq!(stats.total_bytes, 350);
+        assert_eq!(stats.file_count, 2);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

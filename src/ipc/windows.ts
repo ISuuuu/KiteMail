@@ -15,3 +15,11 @@ export async function openSettingsWindow(tab?: string): Promise<boolean> {
   await invoke("open_settings_window", { tab: tab ?? null });
   return true;
 }
+
+/**
+ * 首帧绘制完成后显式展示主窗口（避免 WebView2 初始化期间出现白屏闪现）。
+ */
+export async function revealMainWindow(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("reveal_main_window");
+}

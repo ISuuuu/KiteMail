@@ -1,6 +1,6 @@
 //! Mail account management, provider presets, and Microsoft OAuth2 IPC handlers.
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use kitemail_mail_core::config::{
@@ -1125,49 +1125,65 @@ impl MailSession {
     }
 }
 
-#[tauri::command]
-pub fn list_accounts(state: State<'_, AppState>) -> Result<ListAccountsOutput, IpcError> {
-    state.session.list_accounts()
+async fn run_accounts_blocking<T, F>(f: F) -> Result<T, IpcError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, IpcError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| IpcError::internal(format!("账号命令执行失败: {e}"), None))?
 }
 
 #[tauri::command]
-pub fn verify_account(
+pub async fn list_accounts(state: State<'_, AppState>) -> Result<ListAccountsOutput, IpcError> {
+    let session = Arc::clone(&state.session);
+    run_accounts_blocking(move || session.list_accounts()).await
+}
+
+#[tauri::command]
+pub async fn verify_account(
     state: State<'_, AppState>,
     input: SaveAccountInput,
 ) -> Result<VerifyAccountOutput, IpcError> {
-    state.session.verify_account(&input)
+    let session = Arc::clone(&state.session);
+    run_accounts_blocking(move || session.verify_account(&input)).await
 }
 
 #[tauri::command]
-pub fn save_account(
+pub async fn save_account(
     state: State<'_, AppState>,
     input: SaveAccountInput,
 ) -> Result<SaveAccountOutput, IpcError> {
-    state.session.save_account(&input)
+    let session = Arc::clone(&state.session);
+    run_accounts_blocking(move || session.save_account(&input)).await
 }
 
 #[tauri::command]
-pub fn delete_account(
+pub async fn delete_account(
     state: State<'_, AppState>,
     input: DeleteAccountInput,
 ) -> Result<DeleteAccountOutput, IpcError> {
-    state.session.delete_account(&input)
+    let session = Arc::clone(&state.session);
+    run_accounts_blocking(move || session.delete_account(&input)).await
 }
 
 #[tauri::command]
-pub fn set_account_enabled(
+pub async fn set_account_enabled(
     state: State<'_, AppState>,
     input: SetAccountEnabledInput,
 ) -> Result<SetAccountEnabledOutput, IpcError> {
-    state.session.set_account_enabled(&input)
+    let session = Arc::clone(&state.session);
+    run_accounts_blocking(move || session.set_account_enabled(&input)).await
 }
 
 #[tauri::command]
-pub fn start_microsoft_oauth(
+pub async fn start_microsoft_oauth(
     state: State<'_, AppState>,
     input: StartMicrosoftOAuthInput,
 ) -> Result<StartMicrosoftOAuthOutput, IpcError> {
-    state.session.start_microsoft_oauth(&input)
+    let session = Arc::clone(&state.session);
+    run_accounts_blocking(move || session.start_microsoft_oauth(&input)).await
 }
 
 #[cfg(test)]

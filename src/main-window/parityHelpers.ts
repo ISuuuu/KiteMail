@@ -233,12 +233,31 @@ const ROLE_ORDER: readonly FolderRoleKind[] = [
 export function classifyFolderRole(path: string, name: string): FolderRoleKind | null {
   const p = path.trim().toUpperCase();
   const n = name.trim();
-  if (p === "INBOX" || n.includes("收件箱")) return "inbox";
-  if (p.includes("DRAFT") || n.includes("草稿")) return "drafts";
-  if (p.includes("SENT") || n.includes("已发送")) return "sent";
-  if (p.includes("ARCHIVE") || n.includes("归档")) return "archive";
-  if (p.includes("TRASH") || p.includes("DELETED") || n.includes("已删除")) return "trash";
-  if (p.includes("JUNK") || p.includes("SPAM") || n.includes("垃圾")) return "junk";
+  const nu = n.toUpperCase();
+  if (p === "INBOX" || nu === "INBOX" || n.includes("收件箱")) return "inbox";
+  if (p.includes("DRAFT") || nu === "DRAFTS" || nu === "DRAFT" || n.includes("草稿")) return "drafts";
+  if (p.includes("SENT") || nu === "SENT ITEMS" || nu === "SENT" || n.includes("已发送")) return "sent";
+  if (p.includes("ARCHIVE") || nu === "ARCHIVE" || n.includes("归档") || n.includes("存档")) return "archive";
+  if (
+    p.includes("TRASH") ||
+    p.includes("DELETED") ||
+    nu === "DELETED ITEMS" ||
+    nu === "TRASH" ||
+    n.includes("已删除") ||
+    n.includes("废件")
+  ) {
+    return "trash";
+  }
+  if (
+    p.includes("JUNK") ||
+    p.includes("SPAM") ||
+    nu === "JUNK EMAIL" ||
+    nu === "JUNK" ||
+    nu === "SPAM" ||
+    n.includes("垃圾")
+  ) {
+    return "junk";
+  }
   return null;
 }
 

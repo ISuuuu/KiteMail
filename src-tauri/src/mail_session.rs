@@ -1251,6 +1251,7 @@ pub struct MailSession {
     pub(crate) lock_state: Mutex<AppLockState>,
     pub(crate) demo: Mutex<DemoSessionState>,
     pub(crate) live: Mutex<LiveSessionState>,
+    read_cache: Mutex<Option<CacheStore>>,
     pub(crate) prefs: Arc<PreferencesStore>,
     reader: Arc<ReaderManager>,
     pub(crate) emitter: Arc<dyn MainEventEmitter>,
@@ -1299,6 +1300,7 @@ impl MailSession {
             lock_state: Mutex::new(AppLockState::new(None, false, None)),
             demo: Mutex::new(DemoSessionState::new()),
             live: Mutex::new(LiveSessionState::empty()),
+            read_cache: Mutex::new(None),
             prefs,
             reader,
             emitter,
@@ -1420,6 +1422,7 @@ impl MailSession {
             }),
             demo: Mutex::new(DemoSessionState::new()),
             live: Mutex::new(live_state),
+            read_cache: Mutex::new(None),
             prefs,
             reader,
             emitter,
@@ -1466,14 +1469,18 @@ impl MailSession {
         let (sender, events_rx) = worker_handle.split();
         let worker = Arc::new(RealMailWorkerSink { sender });
 
-        let has_accounts = {
+        let (has_accounts, cache_ready) = {
             let mut live = self.live.lock().expect("live mutex poisoned");
             live.worker = Some(worker.clone());
-            !live.account_configs.is_empty()
+            (!live.account_configs.is_empty(), live.cache_ready)
         };
 
         if has_accounts {
-            worker.send(MailRequest::LoadAllCached);
+            // Startup already hydrated folder/draft/outbox snapshots synchronously from read-only cache;
+            // only run full cache warmup when no local cache DB existed yet.
+            if !cache_ready {
+                worker.send(MailRequest::LoadAllCached);
+            }
             worker.send(MailRequest::SyncAllAccounts {
                 user_initiated: false,
             });
@@ -1602,11 +1609,19 @@ impl MailSession {
         Ok(next)
     }
 
+    pub(crate) fn reset_read_cache(&self) {
+        if let Ok(mut guard) = self.read_cache.lock() {
+            *guard = None;
+        }
+    }
+
     pub(crate) fn clear_live_body_cache(&self) {
         if self.mode == AppMode::Live {
             let mut live = self.live.lock().expect("live mutex poisoned");
             live.body_cache.clear();
             live.body_cache_order.clear();
+            drop(live);
+            self.reset_read_cache();
         }
     }
 
@@ -1769,11 +1784,43 @@ impl MailSession {
             }
             AppMode::Live => {
                 let page = self.query_live_messages_page(input)?;
-                *self
-                    .current_view
-                    .lock()
-                    .expect("current_view mutex poisoned") = input.view;
+                let prev_view = {
+                    let mut cur = self
+                        .current_view
+                        .lock()
+                        .expect("current_view mutex poisoned");
+                    let prev = *cur;
+                    *cur = input.view;
+                    prev
+                };
                 self.prefs.update_last_location(input.view);
+                if let MainViewDto::AccountFolder {
+                    account_id,
+                    folder_id,
+                } = input.view
+                {
+                    // Switching into a specific account folder schedules a background sync for that
+                    // folder so Outlook Graph folders load remote headers without user manual refresh.
+                    if prev_view != input.view && input.offset == 0 {
+                        let (worker, folder_path) = {
+                            let live = self.live.lock().expect("live mutex poisoned");
+                            let path = live
+                                .folders_by_account
+                                .get(&account_id)
+                                .and_then(|fs| fs.iter().find(|f| f.id == folder_id))
+                                .map(|f| f.path.clone());
+                            (live.worker.clone(), path)
+                        };
+                        if let (Some(w), Some(path)) = (worker, folder_path) {
+                            w.send(MailRequest::SyncFolder {
+                                account_id,
+                                folder_id,
+                                folder_path: path,
+                                user_initiated: false,
+                            });
+                        }
+                    }
+                }
                 let offset = input.offset.min(page.total);
                 let has_more = offset.saturating_add(page.items.len()) < page.total;
                 let items = page.items.iter().map(MessageSummaryDto::from).collect();
@@ -1953,9 +2000,11 @@ impl MailSession {
         };
 
         if let (Some(w), Some(page_req)) = (worker.as_ref(), worker_query) {
-            if let Some(res) = w.query_page(page_req) {
-                return res
-                    .map_err(|e| IpcError::internal(format!("查询邮件列表失败: {e}"), req_id));
+            if !w.is_async_worker() {
+                if let Some(res) = w.query_page(page_req) {
+                    return res
+                        .map_err(|e| IpcError::internal(format!("查询邮件列表失败: {e}"), req_id));
+                }
             }
         }
 
@@ -1968,116 +2017,38 @@ impl MailSession {
             });
         }
 
-        let cache = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
-            IpcError::internal(format!("打开本地只读缓存失败: {e}"), req_id.clone())
-        })?;
+        let mut cache_guard = self.read_cache.lock().expect("read_cache mutex poisoned");
+        if cache_guard.is_none() {
+            let opened = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
+                IpcError::internal(format!("打开本地只读缓存失败: {e}"), req_id.clone())
+            })?;
+            *cache_guard = Some(opened);
+        }
 
-        let res = if cross_folder {
-            cache.search_all_folders(
+        let run_query = |cache: &CacheStore| {
+            execute_live_page_query(
+                cache,
+                input,
+                cross_folder,
                 &scoped_enabled_ids,
-                &input.query,
+                &scoped_unified_ids,
                 quick,
                 sort,
-                input.offset,
                 limit,
             )
-        } else {
-            match input.view {
-                MainViewDto::UnifiedInbox => cache.list_unified_inbox_for_accounts(
-                    &scoped_unified_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Unread => cache.list_unread_messages_for_accounts(
-                    &scoped_unified_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Starred => cache.list_starred_messages_for_accounts(
-                    &scoped_unified_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Sent => cache.list_sent_messages_for_accounts(
-                    &scoped_unified_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Archive => cache.list_archived_messages_for_accounts(
-                    &scoped_unified_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Junk => cache.list_junk_messages_for_accounts(
-                    &scoped_unified_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Trash => cache.list_trash_messages_for_accounts(
-                    &scoped_unified_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Snoozed => cache.list_snoozed_messages_for_accounts(
-                    &scoped_unified_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Filters => cache.search_all_folders(
-                    &scoped_enabled_ids,
-                    &input.query,
-                    quick,
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Tags => cache.search_all_folders(
-                    &scoped_enabled_ids,
-                    &input.query,
-                    QuickFilterSet {
-                        tagged: true,
-                        ..quick
-                    },
-                    sort,
-                    input.offset,
-                    limit,
-                ),
-                MainViewDto::Drafts => {
-                    list_live_drafts_page(&cache, &input.query, input.offset, limit)
-                }
-                MainViewDto::AccountFolder { folder_id, .. } => cache
-                    .list_messages_page_with_options(
-                        folder_id,
-                        &input.query,
-                        quick,
-                        sort,
-                        input.offset,
-                        limit,
-                    ),
+        };
+
+        let first = run_query(cache_guard.as_ref().expect("read_cache initialized"));
+        let res = match first {
+            Ok(page) => Ok(page),
+            Err(_) => {
+                // Reopen read-only cache once in case worker migration or schema refresh invalidated the handle.
+                *cache_guard = None;
+                let reopened = CacheStore::open_for_data_dir_read_only(&data_dir).map_err(|e| {
+                    IpcError::internal(format!("打开本地只读缓存失败: {e}"), req_id.clone())
+                })?;
+                *cache_guard = Some(reopened);
+                run_query(cache_guard.as_ref().expect("read_cache reopened"))
             }
         };
 
@@ -2772,6 +2743,7 @@ impl MailSession {
                 WorkerEvent::AccountSaved { account } => {
                     let acc_id = account.id;
                     let email = account.email.clone();
+                    self.reset_read_cache();
                     {
                         let mut live = self.live.lock().expect("live mutex poisoned");
                         if let Some(existing) =
@@ -2809,6 +2781,7 @@ impl MailSession {
                     });
                 }
                 WorkerEvent::AccountDeleted { account_id } => {
+                    self.reset_read_cache();
                     {
                         let mut live = self.live.lock().expect("live mutex poisoned");
                         live.account_configs.retain(|a| a.id != account_id);
@@ -2870,6 +2843,7 @@ impl MailSession {
                     });
                 }
                 WorkerEvent::AccountsUpdated { accounts } => {
+                    self.reset_read_cache();
                     let dtos: Vec<AccountSummaryDto> =
                         accounts.iter().map(AccountSummaryDto::from).collect();
                     {
@@ -3265,7 +3239,7 @@ impl MailSession {
                         for folders in live.folders_by_account.values_mut() {
                             for f in folders.iter_mut() {
                                 if folder_id == 0 {
-                                    if f.path.eq_ignore_ascii_case("INBOX") {
+                                    if is_inbox_folder(f) {
                                         f.has_more_remote = has_more_remote;
                                     }
                                 } else if f.id == folder_id {
@@ -3355,13 +3329,52 @@ impl MailSession {
                         let _ = tx.send(Ok(path));
                     }
                 }
+                WorkerEvent::FolderSyncFailed {
+                    user_initiated,
+                    removed_from_server,
+                    message,
+                    ..
+                } => {
+                    if user_initiated || removed_from_server {
+                        let any_syncing = !self
+                            .live
+                            .lock()
+                            .expect("live mutex poisoned")
+                            .syncing_accounts
+                            .is_empty();
+                        let ver = self.bump_state_version();
+                        let next_status = {
+                            let mut status =
+                                self.sync_status.lock().expect("sync_status mutex poisoned");
+                            if !any_syncing {
+                                status.syncing = false;
+                            }
+                            status.message = Some(message);
+                            status.clone()
+                        };
+                        self.emitter.emit_sync_status(SyncStatusEvent {
+                            state_version: ver,
+                            sync_status: next_status,
+                        });
+                    }
+                }
                 WorkerEvent::Error {
                     account_id,
                     message,
                 } => {
-                    let handled_save_waiter = {
+                    let (handled_save_waiter, all_done) = {
                         let mut live = self.live.lock().expect("live mutex poisoned");
                         if let Some(acc_id) = account_id {
+                            live.syncing_accounts.remove(&acc_id);
+                        } else {
+                            live.syncing_accounts.clear();
+                        }
+                        if !live.account_configs.is_empty()
+                            || config::global_db_in(&live.data_dir).exists()
+                        {
+                            live.cache_ready = true;
+                        }
+                        let handled = if let Some(acc_id) = account_id {
                             if let Some(tx) = live.waiters.save_account.remove(&acc_id) {
                                 let _ = tx.send(Err(message.clone()));
                                 true
@@ -3373,7 +3386,8 @@ impl MailSession {
                                 let _ = tx.send(Err(message.clone()));
                             }
                             false
-                        }
+                        };
+                        (handled, live.syncing_accounts.is_empty())
                     };
                     let ver = self.bump_state_version();
                     if handled_save_waiter {
@@ -3389,7 +3403,9 @@ impl MailSession {
                     let next_status = {
                         let mut status =
                             self.sync_status.lock().expect("sync_status mutex poisoned");
-                        status.syncing = false;
+                        if all_done {
+                            status.syncing = false;
+                        }
                         status.message = Some(message);
                         status.clone()
                     };
@@ -4053,6 +4069,7 @@ impl MailSession {
             cvar.notify_all();
         }
         if self.mode == AppMode::Live {
+            self.reset_read_cache();
             let worker = self
                 .live
                 .lock()
@@ -4223,10 +4240,11 @@ impl MailSession {
                     let live = self.live.lock().expect("live mutex poisoned");
                     match input.view {
                         MainViewDto::UnifiedInbox => {
-                            let more =
-                                live.folders_by_account.values().flatten().any(|f| {
-                                    f.path.eq_ignore_ascii_case("INBOX") && f.has_more_remote
-                                });
+                            let more = live
+                                .folders_by_account
+                                .values()
+                                .flatten()
+                                .any(|f| is_inbox_folder(f) && f.has_more_remote);
                             (live.worker.clone(), Some(0u32), more)
                         }
                         MainViewDto::AccountFolder {
@@ -5333,6 +5351,130 @@ fn is_detail_unread(data_dir: &Path, detail: &MessageDetail) -> bool {
     false
 }
 
+fn is_inbox_folder(folder: &FolderSummaryDto) -> bool {
+    let name = folder.name.trim();
+    folder.path.eq_ignore_ascii_case("INBOX")
+        || name == "收件箱"
+        || name.eq_ignore_ascii_case("Inbox")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_live_page_query(
+    cache: &CacheStore,
+    input: &ListMessagesInput,
+    cross_folder: bool,
+    scoped_enabled_ids: &[u32],
+    scoped_unified_ids: &[u32],
+    quick: QuickFilterSet,
+    sort: MessageSort,
+    limit: usize,
+) -> Result<MailPage, String> {
+    if cross_folder {
+        return cache.search_all_folders(
+            scoped_enabled_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        );
+    }
+    match input.view {
+        MainViewDto::UnifiedInbox => cache.list_unified_inbox_for_accounts(
+            scoped_unified_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Unread => cache.list_unread_messages_for_accounts(
+            scoped_unified_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Starred => cache.list_starred_messages_for_accounts(
+            scoped_unified_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Sent => cache.list_sent_messages_for_accounts(
+            scoped_unified_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Archive => cache.list_archived_messages_for_accounts(
+            scoped_unified_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Junk => cache.list_junk_messages_for_accounts(
+            scoped_unified_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Trash => cache.list_trash_messages_for_accounts(
+            scoped_unified_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Snoozed => cache.list_snoozed_messages_for_accounts(
+            scoped_unified_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Filters => cache.search_all_folders(
+            scoped_enabled_ids,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Tags => cache.search_all_folders(
+            scoped_enabled_ids,
+            &input.query,
+            QuickFilterSet {
+                tagged: true,
+                ..quick
+            },
+            sort,
+            input.offset,
+            limit,
+        ),
+        MainViewDto::Drafts => list_live_drafts_page(cache, &input.query, input.offset, limit),
+        MainViewDto::AccountFolder { folder_id, .. } => cache.list_messages_page_with_options(
+            folder_id,
+            &input.query,
+            quick,
+            sort,
+            input.offset,
+            limit,
+        ),
+    }
+}
+
 fn list_live_drafts_page(
     cache: &CacheStore,
     query: &str,
@@ -5652,6 +5794,7 @@ pub(crate) mod tests {
             )),
             demo: Mutex::new(DemoSessionState::new()),
             live: Mutex::new(live),
+            read_cache: Mutex::new(None),
             prefs,
             reader,
             emitter: emitter.clone(),
@@ -7022,6 +7165,240 @@ pub(crate) mod tests {
         session.prepare_quit();
         assert!(*session.auto_sync_signal.0.lock().unwrap());
         assert!(!session.try_auto_sync_at(start + Duration::from_secs(1_200)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct AsyncWorkerMock {
+        requests: Mutex<Vec<MailRequest>>,
+        query_calls: AtomicU64,
+    }
+
+    impl AsyncWorkerMock {
+        fn new() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                query_calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl LiveWorkerSink for AsyncWorkerMock {
+        fn send(&self, req: MailRequest) {
+            self.requests.lock().unwrap().push(req);
+        }
+        fn prepare_quit(&self) {}
+        fn query_page(&self, _req: PageQueryRequest) -> Option<Result<MailPage, String>> {
+            self.query_calls.fetch_add(1, Ordering::SeqCst);
+            Some(Err("should not route list query through async worker".to_string()))
+        }
+        fn is_async_worker(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn live_read_cache_bypasses_async_worker_and_resets_cleanly() {
+        let (session, _, _, _, dir) = make_live_test_session(true, None);
+        let async_worker = Arc::new(AsyncWorkerMock::new());
+        let folder_id = {
+            let mut live = session.live.lock().unwrap();
+            live.worker = Some(async_worker.clone());
+            live.folders_by_account
+                .get(&1)
+                .and_then(|fs| fs.first())
+                .expect("inbox")
+                .id
+        };
+
+        let out1 = session
+            .list_messages(&ListMessagesInput {
+                request_id: "r1".to_string(),
+                view: MainViewDto::AccountFolder {
+                    account_id: 1,
+                    folder_id,
+                },
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: crate::dto::MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 50,
+            })
+            .expect("first live query succeeds via read_cache");
+        assert_eq!(out1.total, 2);
+        assert_eq!(async_worker.query_calls.load(Ordering::SeqCst), 0);
+        assert!(session.read_cache.lock().unwrap().is_some());
+
+        // Switching into AccountFolder at offset=0 triggers a single background SyncFolder.
+        {
+            let reqs = async_worker.requests.lock().unwrap();
+            assert_eq!(
+                reqs.iter()
+                    .filter(|r| matches!(
+                        r,
+                        MailRequest::SyncFolder {
+                            account_id: 1,
+                            folder_id: fid,
+                            user_initiated: false,
+                            ..
+                        } if *fid == folder_id
+                    ))
+                    .count(),
+                1
+            );
+        }
+
+        // Reloading the same AccountFolder must NOT trigger a second SyncFolder loop.
+        let out2 = session
+            .list_messages(&ListMessagesInput {
+                request_id: "r2".to_string(),
+                view: MainViewDto::AccountFolder {
+                    account_id: 1,
+                    folder_id,
+                },
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: crate::dto::MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 50,
+            })
+            .expect("second live query reuses read_cache");
+        assert_eq!(out2.total, 2);
+        assert_eq!(
+            async_worker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r, MailRequest::SyncFolder { .. }))
+                .count(),
+            1
+        );
+
+        session.reset_read_cache();
+        assert!(session.read_cache.lock().unwrap().is_none());
+        let out3 = session
+            .list_messages(&ListMessagesInput {
+                request_id: "r3".to_string(),
+                view: MainViewDto::UnifiedInbox,
+                query: String::new(),
+                scope: SearchScopeDto::ThisFolder,
+                sort: crate::dto::MessageSortDto::DateNewest,
+                filter: MessageFilterDto::default(),
+                offset: 0,
+                limit: 50,
+            })
+            .expect("query reopens read_cache after reset");
+        assert_eq!(out3.total, 2);
+
+        session.prepare_quit();
+        assert!(session.read_cache.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_worker_error_and_folder_sync_failed_update_sync_state() {
+        let (session, emitter, _, _, dir) = make_live_test_session(false, None);
+        {
+            let mut live = session.live.lock().unwrap();
+            live.syncing_accounts = [1u32, 2u32].into_iter().collect();
+            live.cache_ready = false;
+        }
+        {
+            let mut st = session.sync_status.lock().unwrap();
+            st.syncing = true;
+            st.message = Some("正在同步邮箱...".to_string());
+        }
+
+        // One account errors while account 2 is still syncing -> syncing stays true.
+        session.process_worker_events(vec![WorkerEvent::Error {
+            account_id: Some(1),
+            message: "Outlook 令牌过期".to_string(),
+        }]);
+        {
+            let st = session.sync_status.lock().unwrap();
+            assert!(st.syncing);
+            assert_eq!(st.message.as_deref(), Some("Outlook 令牌过期"));
+            let live = session.live.lock().unwrap();
+            assert!(!live.syncing_accounts.contains(&1));
+            assert!(live.syncing_accounts.contains(&2));
+            assert!(live.cache_ready);
+        }
+
+        // Second account errors -> syncing_accounts empty, syncing becomes false.
+        session.process_worker_events(vec![WorkerEvent::Error {
+            account_id: Some(2),
+            message: "网络超时".to_string(),
+        }]);
+        {
+            let st = session.sync_status.lock().unwrap();
+            assert!(!st.syncing);
+            assert_eq!(st.message.as_deref(), Some("网络超时"));
+        }
+
+        // User-initiated FolderSyncFailed surfaces message in sync_status.
+        session.process_worker_events(vec![WorkerEvent::FolderSyncFailed {
+            account_id: 1,
+            folder_id: 10,
+            folder_path: "AAMkGraphId".to_string(),
+            folder_name: "收件箱".to_string(),
+            user_initiated: true,
+            removed_from_server: false,
+            message: "文件夹同步失败".to_string(),
+        }]);
+        assert_eq!(
+            session.sync_status.lock().unwrap().message.as_deref(),
+            Some("文件夹同步失败")
+        );
+        assert!(emitter.sync_status.lock().unwrap().len() >= 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_older_messages_matches_outlook_opaque_inbox_path() {
+        let (session, _, _, worker, dir) = make_live_test_session(false, None);
+        {
+            let mut live = session.live.lock().unwrap();
+            live.folders_by_account.insert(
+                1,
+                vec![FolderSummaryDto {
+                    account_id: 1,
+                    id: 99,
+                    name: "收件箱".to_string(),
+                    path: "AQMkADAwATNiZmYAZC04".to_string(),
+                    unread_count: 10,
+                    total_count: 50,
+                    has_more_remote: true,
+                }],
+            );
+            live.cache_ready = true;
+        }
+
+        let older = session
+            .load_older_messages(&LoadOlderMessagesInput {
+                view: MainViewDto::UnifiedInbox,
+                limit: 50,
+            })
+            .expect("load_older_messages on outlook inbox");
+        assert!(older.accepted);
+        assert!(older.has_more_remote);
+        assert!(worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, MailRequest::LoadOlderMessages { folder_id: 0, limit: 50 })));
+
+        session.process_worker_events(vec![WorkerEvent::OlderMessagesLoaded {
+            folder_id: 0,
+            fetched_count: 10,
+            has_more_remote: false,
+        }]);
+        let boot = session.bootstrap();
+        assert!(!boot.folders[0].has_more_remote);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

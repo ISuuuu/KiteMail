@@ -70,6 +70,7 @@ import {
   nextReaderLayoutRevision,
 } from "../ipc/main-window";
 import { usePaneLayout } from "./usePaneLayout";
+import { classifyFolderRole, type FolderRoleKind } from "./parityHelpers";
 
 // ---------- 日期分组（对齐 crates/mail-core/src/lib.rs date_group_label） ----------
 export function dateGroupLabel(dateTs: number, nowTs: number): string {
@@ -410,6 +411,9 @@ export function useMainWindow() {
   // 请求代次防乱序
   let queryEpoch = 0;
   let inFlightOffset = -1;
+  let pendingMailChangedReload = false;
+  let foldersSyncPromise: Promise<void> | null = null;
+  let foldersSyncQueued = false;
   let openEpoch = 0;
   let activeOpenRequestId = "";
   let lastReaderSessionId = "";
@@ -460,26 +464,19 @@ export function useMainWindow() {
       );
       return Boolean(folder?.hasMoreRemote);
     }
-    switch (view.kind) {
-      case "unifiedInbox":
-        return folders.value.some((f) => f.path.toUpperCase() === "INBOX" && f.hasMoreRemote);
-      case "sent":
-        return folders.value.some((f) => f.path.toUpperCase() === "SENT" && f.hasMoreRemote);
-      case "drafts":
-        return folders.value.some((f) => f.path.toUpperCase() === "DRAFTS" && f.hasMoreRemote);
-      case "archive":
-        return folders.value.some((f) => f.path.toUpperCase() === "ARCHIVE" && f.hasMoreRemote);
-      case "junk":
-        return folders.value.some(
-          (f) => (f.path.toUpperCase() === "JUNK" || f.path.toUpperCase() === "SPAM") && f.hasMoreRemote
-        );
-      case "trash":
-        return folders.value.some(
-          (f) => (f.path.toUpperCase() === "TRASH" || f.path.toUpperCase() === "DELETED") && f.hasMoreRemote
-        );
-      default:
-        return false;
-    }
+    const roleMap: Partial<Record<ViewDto["kind"], FolderRoleKind>> = {
+      unifiedInbox: "inbox",
+      sent: "sent",
+      drafts: "drafts",
+      archive: "archive",
+      junk: "junk",
+      trash: "trash",
+    };
+    const targetRole = roleMap[view.kind];
+    if (!targetRole) return false;
+    return folders.value.some(
+      (f) => classifyFolderRole(f.path, f.name) === targetRole && f.hasMoreRemote
+    );
   });
 
   const groupedMessages = computed<MessageGroup[]>(() => {
@@ -570,6 +567,8 @@ export function useMainWindow() {
     movingMessage.value = false;
     queryEpoch += 1;
     inFlightOffset = -1;
+    pendingMailChangedReload = false;
+    foldersSyncQueued = false;
     openEpoch += 1;
     activeOpenRequestId = "";
     accounts.value = [];
@@ -629,6 +628,7 @@ export function useMainWindow() {
     if (resetList) {
       queryEpoch += 1;
       inFlightOffset = -1;
+      pendingMailChangedReload = false;
       if (!preserveAnchor) {
         messages.value = [];
         listTotal.value = 0;
@@ -692,6 +692,10 @@ export function useMainWindow() {
       if (epoch === queryEpoch) {
         listLoading.value = false;
         inFlightOffset = -1;
+        if (pendingMailChangedReload && !locked.value) {
+          pendingMailChangedReload = false;
+          void loadMessages(true, { preserveAnchor: true });
+        }
       }
     }
   }
@@ -718,7 +722,7 @@ export function useMainWindow() {
               ? { ...f, hasMoreRemote: false }
               : f;
           }
-          if (view.kind === "unifiedInbox" && f.path.toUpperCase() === "INBOX") {
+          if (view.kind === "unifiedInbox" && classifyFolderRole(f.path, f.name) === "inbox") {
             return { ...f, hasMoreRemote: false };
           }
           return f;
@@ -1589,21 +1593,34 @@ export function useMainWindow() {
   // --- 事件处理 ---
   async function syncFoldersMetadata() {
     if (locked.value) return;
-    try {
-      const bootstrap = await mainBootstrap();
-      if (bootstrap.locked) {
-        enterLockedState("locked", bootstrap.hasPasscode ?? hasPasscode.value);
-        return;
-      }
-      accounts.value = bootstrap.accounts;
-      folders.value = bootstrap.folders;
-      tags.value = bootstrap.tags ?? [];
-      templates.value = bootstrap.templates ?? [];
-      hasPasscode.value = Boolean(bootstrap.hasPasscode);
-      cacheReady.value = bootstrap.cacheReady ?? true;
-    } catch (e) {
-      handleIpcError(e);
+    if (foldersSyncPromise) {
+      foldersSyncQueued = true;
+      return foldersSyncPromise;
     }
+    foldersSyncPromise = (async () => {
+      do {
+        foldersSyncQueued = false;
+        if (locked.value) break;
+        try {
+          const bootstrap = await mainBootstrap();
+          if (bootstrap.locked) {
+            enterLockedState("locked", bootstrap.hasPasscode ?? hasPasscode.value);
+            break;
+          }
+          accounts.value = bootstrap.accounts;
+          folders.value = bootstrap.folders;
+          tags.value = bootstrap.tags ?? [];
+          templates.value = bootstrap.templates ?? [];
+          hasPasscode.value = Boolean(bootstrap.hasPasscode);
+          cacheReady.value = bootstrap.cacheReady ?? true;
+        } catch (e) {
+          handleIpcError(e);
+        }
+      } while (foldersSyncQueued && !locked.value);
+    })().finally(() => {
+      foldersSyncPromise = null;
+    });
+    return foldersSyncPromise;
   }
 
   function handleMailChanged(e: MailChangedEvent) {
@@ -1611,7 +1628,12 @@ export function useMainWindow() {
     if (e.stateVersion > stateVersion.value) {
       stateVersion.value = e.stateVersion;
       cacheReady.value = true;
-      void loadMessages(true, { preserveAnchor: true });
+      if (listLoading.value) {
+        // 已有列表查询在途时不丢弃当前响应，完成时合并触发一次尾部刷新。
+        pendingMailChangedReload = true;
+      } else {
+        void loadMessages(true, { preserveAnchor: true });
+      }
       if (e.reason !== "seenChanged" && e.reason !== "flaggedChanged") {
         void syncFoldersMetadata();
       }
@@ -1717,6 +1739,8 @@ export function useMainWindow() {
         tags.value = bootstrap.tags ?? [];
         templates.value = bootstrap.templates ?? [];
         currentView.value = bootstrap.currentView;
+        // 壳层信息已就绪，先展示主界面与骨架，列表和标签异步并行加载。
+        loading.value = false;
         await Promise.all([loadMessages(true), loadTagsCatalog()]);
       }
     } catch (e) {

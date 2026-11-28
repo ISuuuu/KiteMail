@@ -127,16 +127,62 @@ pub fn compute_clipped_rects(
     Some((clip, bounds))
 }
 
-/// Restore initial main window bounds, maximized flag, and fullscreen flag.
-pub fn restore_main_window_geometry(window: &tauri::WebviewWindow, prefs: &AppPreferences) {
+/// Resolve the initial window/WebView2 canvas background color matching `src/styles/theme.css`.
+pub fn resolve_window_background_color(
+    prefs: &AppPreferences,
+    system_dark: bool,
+) -> tauri::window::Color {
+    let dark = prefs.dark_mode.unwrap_or(system_dark);
+    let theme = prefs.theme_id.as_str();
+    match (theme, dark) {
+        ("default", false) => tauri::window::Color(245, 246, 248, 255),
+        ("default", true) => tauri::window::Color(28, 30, 36, 255),
+        ("midnight", false) => tauri::window::Color(248, 247, 249, 255),
+        ("midnight", true) => tauri::window::Color(29, 25, 41, 255),
+        ("tidal", false) => tauri::window::Color(245, 247, 248, 255),
+        ("tidal", true) => tauri::window::Color(23, 33, 43, 255),
+        ("rose", false) => tauri::window::Color(253, 247, 253, 255),
+        ("rose", true) => tauri::window::Color(41, 25, 33, 255),
+        ("earth", false) => tauri::window::Color(249, 247, 245, 255),
+        ("earth", true) => tauri::window::Color(41, 30, 26, 255),
+        ("forest", false) => tauri::window::Color(243, 247, 244, 255),
+        ("forest", true) => tauri::window::Color(27, 40, 33, 255),
+        (_, true) => tauri::window::Color(19, 19, 21, 255),
+        (_, false) => tauri::window::Color(241, 241, 241, 255),
+    }
+}
+
+/// Apply saved logical dimensions before revealing the hidden main window.
+pub fn apply_initial_main_window_size(window: &tauri::WebviewWindow, prefs: &AppPreferences) {
     let (width, height) = resolve_window_size(prefs);
     let _ = window.set_size(tauri::LogicalSize::new(f64::from(width), f64::from(height)));
+}
+
+/// Reveal the hidden main window once, restoring maximized and fullscreen state after show.
+pub fn reveal_main_window_with_geometry(
+    window: &tauri::WebviewWindow,
+    prefs: &AppPreferences,
+    revealed_flag: &std::sync::atomic::AtomicBool,
+) {
+    if revealed_flag
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _ = window.show();
     if prefs.window_maximized {
         let _ = window.maximize();
     }
     if prefs.start_fullscreen {
         let _ = window.set_fullscreen(true);
     }
+    let _ = window.set_focus();
 }
 
 /// Capture and persist current main window geometry from Tauri window state.
@@ -217,6 +263,17 @@ fn show_win32_system_menu_at_cursor(window: &tauri::WebviewWindow) -> Result<(),
 
 #[cfg(not(windows))]
 fn show_win32_system_menu_at_cursor(_window: &tauri::WebviewWindow) -> Result<(), crate::dto::IpcError> {
+    Ok(())
+}
+
+/// Show the hidden main window after the first frontend paint (or no-op if already revealed).
+#[tauri::command]
+pub fn reveal_main_window(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, crate::commands::AppState>,
+) -> Result<(), crate::dto::IpcError> {
+    let raw_prefs = state.prefs.snapshot_raw();
+    reveal_main_window_with_geometry(&window, &raw_prefs, &state.main_window_revealed);
     Ok(())
 }
 
@@ -362,5 +419,27 @@ mod tests {
             bottom: 100,
         };
         assert!(compute_clipped_rects(phys_150, disjoint).is_none());
+    }
+
+    #[test]
+    fn window_background_color_matches_theme_tokens() {
+        let mut prefs = AppPreferences::default();
+        prefs.theme_id = "system".to_string();
+        prefs.dark_mode = None;
+        assert_eq!(
+            resolve_window_background_color(&prefs, false),
+            tauri::window::Color(241, 241, 241, 255)
+        );
+        assert_eq!(
+            resolve_window_background_color(&prefs, true),
+            tauri::window::Color(19, 19, 21, 255)
+        );
+
+        prefs.theme_id = "midnight".to_string();
+        prefs.dark_mode = Some(true);
+        assert_eq!(
+            resolve_window_background_color(&prefs, false),
+            tauri::window::Color(29, 25, 41, 255)
+        );
     }
 }

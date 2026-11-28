@@ -70,6 +70,17 @@ where
     AppMode::Live
 }
 
+fn is_non_empty_env(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_some_and(|v| v.to_str().map_or(!v.is_empty(), |s| !s.trim().is_empty()))
+}
+
+fn should_export_data_dir_env(
+    mail_env: Option<&std::ffi::OsStr>,
+    preview_env: Option<&std::ffi::OsStr>,
+) -> bool {
+    !is_non_empty_env(mail_env) && is_non_empty_env(preview_env)
+}
+
 fn main() {
     let mode = parse_launch_mode(
         std::env::args(),
@@ -84,9 +95,13 @@ fn main() {
         AppMode::Demo => preview_data_dir(),
         AppMode::Live => match resolve_and_verify_live_data_dir() {
             Ok((dir, _mail_dir)) => {
-                // Ensure `kitemail_mail_core::secrets` / `config::data_dir()` also stay isolated
-                // inside `dir` instead of falling back to production `%LOCALAPPDATA%\KiteMail`.
-                if std::env::var_os("KITEMAIL_DATA_DIR").is_none_or(|v| v.is_empty()) {
+                // Only mirror `KITEMAIL_PREVIEW_DATA_DIR` into `KITEMAIL_DATA_DIR` for isolated
+                // preview runs; standard/portable Live launches must keep `KITEMAIL_DATA_DIR`
+                // unset so `kitemail_mail_core::secrets` reads GPUI's `KiteMail.Windows` namespace.
+                if should_export_data_dir_env(
+                    std::env::var_os("KITEMAIL_DATA_DIR").as_deref(),
+                    std::env::var_os("KITEMAIL_PREVIEW_DATA_DIR").as_deref(),
+                ) {
                     std::env::set_var("KITEMAIL_DATA_DIR", &dir);
                 }
                 dir
@@ -160,12 +175,15 @@ fn main() {
                 session.attach_tray(Arc::clone(t));
             }
 
+            let main_window_revealed = Arc::new(AtomicBool::new(false));
+
             app.manage(AppState {
                 session: Arc::clone(&session),
                 prefs: prefs_store.clone(),
                 reader: reader.clone(),
                 tray: tray_for_setup.clone(),
                 quitting: Arc::clone(&quitting_for_setup),
+                main_window_revealed: Arc::clone(&main_window_revealed),
             });
 
             if let Some(main_win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
@@ -180,7 +198,11 @@ fn main() {
                 }
 
                 let raw_prefs = prefs_store.snapshot_raw();
-                window_lifecycle::restore_main_window_geometry(&main_win, &raw_prefs);
+                let system_dark = matches!(main_win.theme(), Ok(tauri::Theme::Dark));
+                let bg_color =
+                    window_lifecycle::resolve_window_background_color(&raw_prefs, system_dark);
+                let _ = main_win.set_background_color(Some(bg_color));
+                window_lifecycle::apply_initial_main_window_size(&main_win, &raw_prefs);
 
                 let win_for_events = main_win.clone();
                 let prefs_for_events = prefs_store.clone();
@@ -188,20 +210,25 @@ fn main() {
                 let session_for_events = Arc::clone(&session);
                 let tray_for_events = tray_for_setup.clone();
                 let quitting_for_events = Arc::clone(&quitting_for_setup);
+                let revealed_for_events = Arc::clone(&main_window_revealed);
                 let handle_for_events = handle.clone();
 
                 main_win.on_window_event(move |event| match event {
                     WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                        window_lifecycle::save_main_window_geometry(
-                            &win_for_events,
-                            &prefs_for_events,
-                        );
+                        if revealed_for_events.load(Ordering::SeqCst) {
+                            window_lifecycle::save_main_window_geometry(
+                                &win_for_events,
+                                &prefs_for_events,
+                            );
+                        }
                     }
                     WindowEvent::CloseRequested { api, .. } => {
-                        window_lifecycle::save_main_window_geometry(
-                            &win_for_events,
-                            &prefs_for_events,
-                        );
+                        if revealed_for_events.load(Ordering::SeqCst) {
+                            window_lifecycle::save_main_window_geometry(
+                                &win_for_events,
+                                &prefs_for_events,
+                            );
+                        }
                         let close_to_tray = !quitting_for_events.load(Ordering::SeqCst)
                             && prefs_for_events.snapshot_raw().close_to_minimize
                             && tray_for_events.is_some();
@@ -237,6 +264,27 @@ fn main() {
                 });
             }
 
+            // Fallback reveal guard in case frontend initialization stalls before `reveal_main_window`.
+            let handle_for_fallback = handle.clone();
+            let prefs_for_fallback = prefs_store.clone();
+            let revealed_for_fallback = Arc::clone(&main_window_revealed);
+            let _ = std::thread::Builder::new()
+                .name("kitemail-main-reveal-fallback".to_string())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_millis(2000));
+                    if !revealed_for_fallback.load(Ordering::SeqCst) {
+                        if let Some(win) = handle_for_fallback.get_webview_window(MAIN_WINDOW_LABEL)
+                        {
+                            let raw_prefs = prefs_for_fallback.snapshot_raw();
+                            window_lifecycle::reveal_main_window_with_geometry(
+                                &win,
+                                &raw_prefs,
+                                &revealed_for_fallback,
+                            );
+                        }
+                    }
+                });
+
             // Spawn background 1s monitor for tray actions, minimize_to_tray, and auto-lock.
             let handle_for_tick = handle.clone();
             let session_for_tick = Arc::clone(&session);
@@ -244,6 +292,7 @@ fn main() {
             let reader_for_tick = reader.clone();
             let tray_for_tick = tray_for_setup.clone();
             let quitting_for_tick = Arc::clone(&quitting_for_setup);
+            let revealed_for_tick = Arc::clone(&main_window_revealed);
             let _ = std::thread::Builder::new()
                 .name("kitemail-tauri-tray-lock-tick".to_string())
                 .spawn(move || {
@@ -262,6 +311,7 @@ fn main() {
                             for cmd in t.drain_commands() {
                                 match cmd {
                                     TrayCommand::ShowWindow => {
+                                        revealed_for_tick.store(true, Ordering::SeqCst);
                                         t.show_main_window();
                                         if let Some(win) =
                                             handle_for_tick.get_webview_window(MAIN_WINDOW_LABEL)
@@ -372,6 +422,7 @@ fn main() {
             settings::manage_trusted_senders,
             settings::clear_body_caches,
             settings::check_app_update,
+            window_lifecycle::reveal_main_window,
             window_lifecycle::show_window_system_menu,
         ])
         .run(tauri::generate_context!())
@@ -381,6 +432,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn launch_mode_parses_demo_flag_and_env() {
@@ -393,5 +445,22 @@ mod tests {
             parse_launch_mode(["kitemail.exe"], Some("1")),
             AppMode::Demo
         );
+    }
+
+    #[test]
+    fn live_data_dir_env_export_preserves_gpui_credential_namespace() {
+        assert!(!should_export_data_dir_env(None, None));
+        assert!(!should_export_data_dir_env(
+            Some(OsStr::new("")),
+            Some(OsStr::new("   "))
+        ));
+        assert!(!should_export_data_dir_env(
+            Some(OsStr::new("C:\\custom")),
+            Some(OsStr::new("C:\\preview"))
+        ));
+        assert!(should_export_data_dir_env(
+            None,
+            Some(OsStr::new("C:\\preview"))
+        ));
     }
 }

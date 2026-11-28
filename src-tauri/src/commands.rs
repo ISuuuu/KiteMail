@@ -29,6 +29,7 @@ pub struct AppState {
     pub reader: Arc<ReaderManager>,
     pub tray: Option<Arc<TrayHandle>>,
     pub quitting: Arc<AtomicBool>,
+    pub main_window_revealed: Arc<AtomicBool>,
 }
 
 fn validate_request_id(request_id: &str) -> Result<(), IpcError> {
@@ -38,13 +39,26 @@ fn validate_request_id(request_id: &str) -> Result<(), IpcError> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn main_bootstrap(state: State<'_, AppState>) -> Result<MainBootstrapDto, IpcError> {
-    Ok(state.session.bootstrap())
+async fn run_session_blocking<T, F>(req_id: Option<String>, f: F) -> Result<T, IpcError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, IpcError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| IpcError::internal(format!("后台命令执行失败: {e}"), req_id))?
 }
 
 #[tauri::command]
-pub fn list_messages(
+pub async fn main_bootstrap(state: State<'_, AppState>) -> Result<MainBootstrapDto, IpcError> {
+    let session = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || session.bootstrap())
+        .await
+        .map_err(|e| IpcError::internal(format!("初始化主窗口失败: {e}"), None))
+}
+
+#[tauri::command]
+pub async fn list_messages(
     state: State<'_, AppState>,
     input: ListMessagesInput,
 ) -> Result<ListMessagesOutput, IpcError> {
@@ -59,19 +73,21 @@ pub fn list_messages(
             req_id,
         ));
     }
-    state.session.list_messages(&input)
+    let session = Arc::clone(&state.session);
+    run_session_blocking(req_id, move || session.list_messages(&input)).await
 }
 
 #[tauri::command]
-pub fn list_thread_summaries(
+pub async fn list_thread_summaries(
     state: State<'_, AppState>,
     input: ListThreadSummariesInput,
 ) -> Result<ListThreadSummariesOutput, IpcError> {
-    state.session.list_thread_summaries(&input)
+    let session = Arc::clone(&state.session);
+    run_session_blocking(None, move || session.list_thread_summaries(&input)).await
 }
 
 #[tauri::command]
-pub fn open_message(
+pub async fn open_message(
     state: State<'_, AppState>,
     input: OpenMessageInput,
 ) -> Result<OpenMessageOutput, IpcError> {
@@ -84,7 +100,11 @@ pub fn open_message(
         ));
     }
     let reader_session_id = uuid::Uuid::new_v4().to_string();
-    state.session.open_message(&input, reader_session_id)
+    let session = Arc::clone(&state.session);
+    run_session_blocking(req_id, move || {
+        session.open_message(&input, reader_session_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -114,11 +134,12 @@ pub fn update_main_preferences(
 }
 
 #[tauri::command]
-pub fn refresh_mail(
+pub async fn refresh_mail(
     state: State<'_, AppState>,
     input: RefreshMailInput,
 ) -> Result<RefreshMailOutput, IpcError> {
-    state.session.refresh_mail(&input)
+    let session = Arc::clone(&state.session);
+    run_session_blocking(None, move || session.refresh_mail(&input)).await
 }
 
 #[tauri::command]
@@ -159,11 +180,12 @@ pub fn allow_remote_images(
 }
 
 #[tauri::command]
-pub fn load_older_messages(
+pub async fn load_older_messages(
     state: State<'_, AppState>,
     input: LoadOlderMessagesInput,
 ) -> Result<LoadOlderMessagesOutput, IpcError> {
-    state.session.load_older_messages(&input)
+    let session = Arc::clone(&state.session);
+    run_session_blocking(None, move || session.load_older_messages(&input)).await
 }
 
 #[tauri::command]
@@ -207,8 +229,9 @@ pub fn undo_message_move(
 }
 
 #[tauri::command]
-pub fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagItemDto>, IpcError> {
-    state.session.list_tags()
+pub async fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagItemDto>, IpcError> {
+    let session = Arc::clone(&state.session);
+    run_session_blocking(None, move || session.list_tags()).await
 }
 
 #[tauri::command]

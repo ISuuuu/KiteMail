@@ -76,6 +76,7 @@
     "allow-manage-trusted-senders",
     "allow-clear-body-caches",
     "allow-check-app-update",
-    "allow-open-settings-window"
+    "allow-open-settings-window",
+    "allow-reveal-main-window"
   ]
 }

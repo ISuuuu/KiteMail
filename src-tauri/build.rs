@@ -65,6 +65,7 @@ fn main() {
             "clear_body_caches",
             "check_app_update",
             "open_settings_window",
+            "reveal_main_window",
             "show_window_system_menu",
         ]),
     ))

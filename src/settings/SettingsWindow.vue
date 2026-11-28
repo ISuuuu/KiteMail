@@ -181,6 +181,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { KNOWN_THEMES, resolveDarkMode } from "../main-window/usePaneLayout";
 import { isTauriRuntime } from "./windowEnv";
@@ -467,6 +468,9 @@ watch(
 );
 
 let schemeQuery: MediaQueryList | null = null;
+let unlistenSelectTab: (() => void) | null = null;
+let unmounted = false;
+
 function onSystemSchemeChange() {
   if (state.preferences.value.darkMode === null) {
     syncDocumentTheme(state.preferences.value);
@@ -505,9 +509,38 @@ onMounted(() => {
     window.addEventListener("keydown", onKeyDown, true);
     keyboardListenerAttached = true;
   }
+  if (isTauriRuntime()) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (unmounted) return;
+        const win = getCurrentWindow();
+        void win
+          .show()
+          .then(() => win.setFocus())
+          .catch(() => {});
+      });
+    });
+    void listen<string>("settings://select-tab", (event) => {
+      const meta = SETTINGS_TABS.find((t) => t.id === event.payload);
+      if (meta) {
+        selectTab(meta.id);
+      }
+    })
+      .then((unlisten) => {
+        if (unmounted) {
+          unlisten();
+        } else {
+          unlistenSelectTab = unlisten;
+        }
+      })
+      .catch(() => {});
+  }
 });
 
 onBeforeUnmount(() => {
+  unmounted = true;
+  unlistenSelectTab?.();
+  unlistenSelectTab = null;
   window.removeEventListener("keydown", onSettingsKeydown);
   if (highlightTimer) {
     clearTimeout(highlightTimer);
