@@ -567,7 +567,8 @@ pub fn build_demo_pdf_bytes(title: &str, subtitle: &str) -> Vec<u8> {
     let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec();
     let obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec();
     let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n".to_vec();
-    let obj4 = b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec();
+    let obj4 =
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec();
     let obj5 = format!(
         "5 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
         stream_body.len(),
@@ -591,8 +592,7 @@ pub fn build_demo_pdf_bytes(title: &str, subtitle: &str) -> Vec<u8> {
         pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
     }
     pdf.extend_from_slice(
-        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
-            .as_bytes(),
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
     );
     pdf
 }
@@ -1425,7 +1425,9 @@ fn launch_path_with_default_app(path: &str) -> Result<bool, IpcError> {
     }
 }
 
-pub fn pick_directory_blocking(parent_hwnd: Option<isize>) -> Result<PickDirectoryOutput, IpcError> {
+pub fn pick_directory_blocking(
+    parent_hwnd: Option<isize>,
+) -> Result<PickDirectoryOutput, IpcError> {
     #[cfg(all(windows, not(test)))]
     {
         use windows::Win32::Foundation::HWND;
@@ -1443,19 +1445,16 @@ pub fn pick_directory_blocking(parent_hwnd: Option<isize>) -> Result<PickDirecto
             unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
         let needs_uninit = co_hr.is_ok();
         let result = (|| -> Result<PickDirectoryOutput, IpcError> {
-            let dialog: IFileOpenDialog =
-                unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL) }.map_err(|e| {
-                    IpcError::internal(format!("初始化文件夹选择器失败: {e}"), None)
-                })?;
-            let opts = unsafe { dialog.GetOptions() }.map_err(|e| {
-                IpcError::internal(format!("读取文件夹选择器选项失败: {e}"), None)
-            })?;
+            let dialog: IFileOpenDialog = unsafe {
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL)
+            }
+            .map_err(|e| IpcError::internal(format!("初始化文件夹选择器失败: {e}"), None))?;
+            let opts = unsafe { dialog.GetOptions() }
+                .map_err(|e| IpcError::internal(format!("读取文件夹选择器选项失败: {e}"), None))?;
             unsafe {
                 dialog
                     .SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)
-                    .map_err(|e| {
-                        IpcError::internal(format!("配置文件夹选择器失败: {e}"), None)
-                    })?;
+                    .map_err(|e| IpcError::internal(format!("配置文件夹选择器失败: {e}"), None))?;
             }
             let owner = parent_hwnd.map(|h| HWND(h as *mut core::ffi::c_void));
             if let Err(err) = unsafe { dialog.Show(owner) } {
