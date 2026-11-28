@@ -309,11 +309,11 @@ function tagStyle(tag: string) {
 }
 
 .km-row-shell.is-child {
-  padding-left: 12px;
+  padding-left: 10px;
 }
 
 .km-thread-rail {
-  width: 14px;
+  width: 12px;
   flex-shrink: 0;
   position: relative;
   display: flex;
@@ -323,7 +323,7 @@ function tagStyle(tag: string) {
 
 .km-thread-rail-line {
   position: absolute;
-  left: 6px;
+  left: 5px;
   top: 0;
   bottom: 0;
   width: 1.5px;
@@ -356,16 +356,20 @@ function tagStyle(tag: string) {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 9px 10px 9px 8px;
+  padding: 9px 8px 9px 10px;
   text-align: left;
   cursor: pointer;
   overflow: hidden;
   transition: background-color 100ms ease;
 }
 
+.km-message-row.child {
+  margin: 2px 6px 2px 4px;
+}
+
 .km-message-row.compact {
   border-radius: 10px;
-  padding: 7px 10px 7px 8px;
+  padding: 7px 8px 7px 10px;
 }
 
 .km-message-row.wide {
@@ -429,13 +433,23 @@ function tagStyle(tag: string) {
   opacity: 0.55;
 }
 
+/* 星标按钮恒定占位 14px，仅用透明度显隐，避免 hover 时右侧日期横向跳动 */
+.km-card-star {
+  width: 14px;
+  height: 14px;
+  opacity: 1;
+  transition: opacity 120ms ease;
+}
+
 .km-card-star:not(.flagged) {
   opacity: 0;
+  pointer-events: none;
 }
 
 .km-message-row:hover .km-card-star:not(.flagged),
 .km-card-star:focus-visible {
   opacity: 0.65;
+  pointer-events: auto;
 }
 
 /* 44px 圆环头像 */
@@ -476,11 +490,14 @@ function tagStyle(tag: string) {
   align-items: center;
   justify-content: space-between;
   gap: 6px;
+  min-width: 0;
 }
 
 .km-card-sender {
+  flex: 1 1 80px;
+  min-width: 0;
   font-size: 13.5px;
-  font-weight: 500;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -496,7 +513,15 @@ function tagStyle(tag: string) {
   font-weight: 700;
 }
 
-.km-card-badges,
+.km-card-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+}
+
 .km-wide-meta {
   display: inline-flex;
   align-items: center;
@@ -516,6 +541,7 @@ function tagStyle(tag: string) {
   flex: 1 1 auto;
   min-width: 0;
   font-size: 13px;
+  font-weight: 400;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -536,7 +562,7 @@ function tagStyle(tag: string) {
 
 .km-tag-chip {
   font-size: 10.5px;
-  font-weight: 600;
+  font-weight: 700;
   padding: 0 7px;
   height: 18px;
   border-radius: 999px;
@@ -596,11 +622,16 @@ function tagStyle(tag: string) {
   display: inline-flex;
   align-items: center;
   color: var(--km-text-muted);
+  flex-shrink: 0;
 }
 
 .km-date-text {
+  flex: 0 1 auto;
+  min-width: 0;
   font-size: 11px;
   color: var(--km-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -613,6 +644,7 @@ function tagStyle(tag: string) {
 .km-wide-sender {
   width: 168px;
   flex-shrink: 0;
+  font-weight: 400;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -72,7 +72,7 @@
             <div class="km-card-sender-col">
               <span class="km-thread-sender">{{ card.senderName || "(未知发件人)" }}</span>
               <span v-if="card.senderEmail && !isCardFolded(card.id)" class="km-thread-email">
-                {{ card.senderEmail }}
+                &lt;{{ card.senderEmail }}&gt;
               </span>
             </div>
 
@@ -740,10 +740,6 @@ onUnmounted(() => {
   position: relative;
 }
 
-:global(:root[data-color-mode="dark"]) .km-reader-viewport {
-  background: var(--km-reader-canvas, #131315);
-}
-
 .km-reader-viewport.km-body-force-light {
   --km-reader-canvas: #f1f1f1;
   --km-card-bg: #ffffff;
@@ -896,7 +892,7 @@ onUnmounted(() => {
 .km-thread-card {
   border: 1px solid var(--km-border);
   border-radius: 12px;
-  padding: 18px 20px;
+  padding: 14px 16px 16px;
   background: var(--km-card-bg, #ffffff);
   box-shadow: var(--km-shadow-card);
   display: flex;
@@ -904,25 +900,21 @@ onUnmounted(() => {
   gap: 10px;
 }
 
-:global(:root[data-color-mode="dark"]) .km-reader-viewport:not(.km-body-force-light) .km-thread-card {
-  background: var(--km-card-bg, #1d1d20);
-}
-
 .km-thread-card.folded {
-  padding: 12px 18px;
+  padding: 12px 16px;
 }
 
 .km-thread-head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   cursor: pointer;
   min-width: 0;
 }
 
 .km-card-avatar {
-  width: 34px;
-  height: 34px;
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
   flex-shrink: 0;
   display: inline-flex;
@@ -930,18 +922,21 @@ onUnmounted(() => {
   justify-content: center;
   color: #ffffff;
   font-weight: 700;
-  font-size: 14px;
+  font-size: 11px;
 }
 
 .km-thread-card.folded .km-card-avatar {
-  width: 28px;
-  height: 28px;
-  font-size: 12px;
+  width: 26px;
+  height: 26px;
+  font-size: 11px;
 }
 
 .km-card-sender-col {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 6px;
+  flex: 0 1 auto;
   min-width: 0;
 }
 
@@ -1062,11 +1057,11 @@ onUnmounted(() => {
 }
 
 .km-rcpts-detail {
-  padding-left: 44px;
+  padding-left: 34px;
   display: flex;
   flex-direction: column;
   gap: 2px;
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--km-text-muted);
   user-select: text;
 }
@@ -1108,14 +1103,14 @@ onUnmounted(() => {
 .km-card-atts {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  padding-top: 8px;
+  gap: 6px;
+  padding-top: 6px;
 }
 
 .km-card-att-chip {
   display: inline-flex;
   align-items: stretch;
-  border-radius: 8px;
+  border-radius: 6px;
   border: 1px solid var(--km-border);
   background: color-mix(in srgb, var(--km-text-muted) 7%, transparent);
   overflow: hidden;
@@ -1129,7 +1124,7 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 10px;
+  padding: 4px 8px;
   cursor: pointer;
 }
 
@@ -1155,7 +1150,7 @@ onUnmounted(() => {
   border-left: 1px solid var(--km-border);
   background: transparent;
   color: var(--km-text-muted);
-  padding: 0 9px;
+  padding: 0 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;

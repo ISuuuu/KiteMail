@@ -458,14 +458,14 @@ body{{padding:14px 14px 20px;}}\
 ::-webkit-scrollbar-thumb{{background:{scroll_thumb};border-radius:4px;}}\
 ::-webkit-scrollbar-track{{background:transparent;}}\
 .km-card{{background:var(--km-card);border:1px solid var(--km-border);border-radius:12px;\
-padding:18px 20px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}}\
+padding:14px 16px 16px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,0.04);}}\
 .km-card:last-child{{margin-bottom:0;}}\
 .km-card.km-current{{box-shadow:0 1px 3px rgba(0,0,0,0.06);}}\
-.km-card.km-folded{{background:var(--km-card);padding:12px 20px;}}\
-.km-hdr{{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;min-width:0;}}\
-.km-ava{{width:32px;height:32px;border-radius:50%;flex:none;display:flex;align-items:center;\
-justify-content:center;color:#fff;font-weight:700;font-size:13px;}}\
-.km-card.km-folded .km-ava{{width:28px;height:28px;font-size:11.5px;}}\
+.km-card.km-folded{{background:var(--km-card);padding:12px 16px;}}\
+.km-hdr{{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;min-width:0;}}\
+.km-ava{{width:26px;height:26px;border-radius:50%;flex:none;display:flex;align-items:center;\
+justify-content:center;color:#fff;font-weight:700;font-size:11px;}}\
+.km-card.km-folded .km-ava{{width:26px;height:26px;font-size:11px;}}\
 .km-sender-col{{min-width:0;display:flex;flex-direction:row;align-items:baseline;gap:6px;flex:0 1 auto;}}\
 .km-card.km-folded .km-sender-col{{align-items:center;gap:8px;flex:1;}}\
 .km-name{{font-size:{base_px:.2}px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;}}\
@@ -494,8 +494,8 @@ color:var(--km-muted);cursor:pointer;display:inline-flex;align-items:center;just
 font-size:16px;line-height:1;}}\
 .km-more-btn:hover{{background:var(--km-accent-soft);color:var(--km-text);}}\
 .km-card.km-folded .km-details{{display:none;}}\
-.km-details{{display:flex;flex-direction:column;gap:12px;margin-top:10px;}}\
-.km-rcpts{{padding-left:42px;display:flex;flex-direction:column;gap:3px;font-size:{small_px:.2}px;color:var(--km-muted);user-select:text;}}\
+.km-details{{display:flex;flex-direction:column;gap:10px;margin-top:10px;}}\
+.km-rcpts{{padding-left:34px;display:flex;flex-direction:column;gap:3px;font-size:{small_px:.2}px;color:var(--km-muted);user-select:text;}}\
 .km-rcpts[hidden]{{display:none;}}\
 .km-rcpts div{{overflow-wrap:anywhere;}}\
 .km-banner{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 12px;\
@@ -517,18 +517,18 @@ iframe.km-frame.km-live{{visibility:visible;}}\
 .km-raw{{margin:0;padding:12px;border-radius:8px;background:var(--km-canvas);border:1px solid var(--km-border);\
 font-family:ui-monospace,Consolas,monospace;font-size:{raw_font_px:.2}px;white-space:pre-wrap;overflow-wrap:anywhere;}}\
 .km-loading{{padding:20px 0;text-align:center;font-size:{base_px:.2}px;color:var(--km-muted);}}\
-.km-atts{{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-top:10px;}}\
-.km-att-chip{{display:inline-flex;align-items:stretch;border-radius:8px;\
+.km-atts{{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding-top:6px;}}\
+.km-att-chip{{display:inline-flex;align-items:stretch;border-radius:6px;\
 border:1px solid var(--km-border);background:var(--km-pill-bg);font-size:{small_px:.2}px;overflow:hidden;}}\
 .km-att-open{{appearance:none;border:0;background:transparent;color:var(--km-text);display:inline-flex;align-items:center;gap:6px;\
-padding:5px 10px;font-size:{small_px:.2}px;cursor:pointer;}}\
+padding:4px 8px;font-size:{small_px:.2}px;cursor:pointer;}}\
 .km-att-open:hover{{background:var(--km-accent-soft);}}\
 .km-att-icon{{display:inline-flex;align-items:center;color:var(--km-muted);flex:none;}}\
 .km-att-icon.is-pdf{{color:#e01b24;}}\
 .km-att-name{{max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500;}}\
 .km-att-size{{color:var(--km-muted);font-size:11px;}}\
 .km-att-dl{{appearance:none;border:0;border-left:1px solid var(--km-border);background:transparent;color:var(--km-muted);\
-display:inline-flex;align-items:center;justify-content:center;padding:0 9px;cursor:pointer;}}\
+display:inline-flex;align-items:center;justify-content:center;padding:0 8px;cursor:pointer;}}\
 .km-att-dl:hover{{background:var(--km-accent-soft);color:var(--km-text);}}\
 .km-menu{{position:fixed;z-index:9999;min-width:176px;padding:4px;border-radius:8px;\
 background:var(--km-raised);border:1px solid var(--km-border);box-shadow:{menu_shadow};\
@@ -1231,5 +1231,45 @@ mod tests {
         assert!(doc.contains("&lt;table class=&quot;mail-wrap&quot;&gt;"));
         assert!(doc.contains("data:image/png;base64,AAA"));
         assert!(!doc.contains("tracker.example/open.png"));
+    }
+
+    #[test]
+    fn thread_card_styles_align_26px_avatar_and_padding() {
+        let msg = sample_thread_msg(1, None, "Body");
+        let detail = sample_detail(vec![msg.clone()]);
+        let inputs = vec![ThreadCardRenderInput {
+            message: &msg,
+            is_current: true,
+            is_collapsed: false,
+            show_raw_source: false,
+            block_remote: true,
+            card_dark: false,
+            card_pending: false,
+            eml_exporting: false,
+            auth_results: None,
+            unsubscribe_url: None,
+        }];
+        let palette = ThreadPalette::for_dark(false);
+        let ctx = ThreadDocContext {
+            detail: &detail,
+            cards: &inputs,
+            palette: &palette,
+            app_dark_mode: false,
+            zoom_percent: 100,
+            ui_text_scale_percent: 100,
+            date_style: "relative",
+            clock_style: "24h",
+            show_remote_banner: true,
+            always_show_recipients: false,
+            card_attachments: true,
+            demo_mode: false,
+            read_receipt_policy: "ask",
+            initial_anchor: None,
+        };
+        let (bytes, _) = build_thread_document(&ctx);
+        let doc = String::from_utf8(bytes).unwrap();
+        assert!(doc.contains(".km-ava{width:26px;height:26px;"));
+        assert!(doc.contains("padding:14px 16px 16px;"));
+        assert!(doc.contains(".km-rcpts{padding-left:34px;"));
     }
 }
